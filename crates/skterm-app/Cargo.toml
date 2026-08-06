@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "skterm"
+path = "src/main.rs"
+
 [dependencies]
 skterm-core = { workspace = true }
 skterm-render = { workspace = true }
