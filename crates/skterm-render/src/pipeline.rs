@@ -1,4 +1,4 @@
-//! GPU render pipeline setup, instance buffers, and batch submission.
+//! GPU render pipeline setup, instance buffers, and batch submission for background, text, and images.
 
 use crate::atlas::GlyphAtlas;
 use crate::shader::TERMINAL_SHADER;
@@ -81,14 +81,39 @@ impl GlyphInstance {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct ImageInstance {
+    pub rect: [f32; 4],
+}
+
+impl ImageInstance {
+    pub fn desc() -> VertexBufferLayout<'static> {
+        VertexBufferLayout {
+            array_stride: std::mem::size_of::<ImageInstance>() as wgpu::BufferAddress,
+            step_mode: VertexStepMode::Instance,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        }
+    }
+}
+
 pub struct TerminalPipeline {
     pub bg_pipeline: RenderPipeline,
     pub glyph_pipeline: RenderPipeline,
+    pub image_pipeline: RenderPipeline,
     pub uniform_buffer: Buffer,
     pub bg_instance_buffer: Buffer,
     pub glyph_instance_buffer: Buffer,
+    pub image_instance_buffer: Buffer,
     pub bind_group: BindGroup,
     pub bind_group_layout: BindGroupLayout,
+    pub image_bind_group_layout: BindGroupLayout,
     pub max_instances: usize,
 }
 
@@ -165,13 +190,41 @@ impl TerminalPipeline {
             ],
         });
 
+        let image_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("skterm_image_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("skterm_pipeline_layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
-        // Background Pipeline
+        let image_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("skterm_image_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout, &image_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
         let bg_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("skterm_bg_pipeline"),
             layout: Some(&pipeline_layout),
@@ -193,7 +246,12 @@ impl TerminalPipeline {
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
-                ..Default::default()
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
             },
             depth_stencil: None,
             multisample: MultisampleState::default(),
@@ -201,7 +259,6 @@ impl TerminalPipeline {
             cache: None,
         });
 
-        // Glyph Text Pipeline
         let glyph_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("skterm_glyph_pipeline"),
             layout: Some(&pipeline_layout),
@@ -223,7 +280,46 @@ impl TerminalPipeline {
             }),
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
-                ..Default::default()
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let image_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("skterm_image_pipeline"),
+            layout: Some(&image_pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_image"),
+                buffers: &[ImageInstance::desc()],
+                compilation_options: PipelineCompilationOptions::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_image"),
+                targets: &[Some(ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: PipelineCompilationOptions::default(),
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
             },
             depth_stencil: None,
             multisample: MultisampleState::default(),
@@ -245,14 +341,24 @@ impl TerminalPipeline {
             mapped_at_creation: false,
         });
 
+        let image_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("skterm_image_instance_buffer"),
+            size: (1024 * std::mem::size_of::<ImageInstance>()) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Ok(Self {
             bg_pipeline,
             glyph_pipeline,
+            image_pipeline,
             uniform_buffer,
             bg_instance_buffer,
             glyph_instance_buffer,
+            image_instance_buffer,
             bind_group,
             bind_group_layout,
+            image_bind_group_layout,
             max_instances: Self::INITIAL_MAX_INSTANCES,
         })
     }
@@ -269,45 +375,44 @@ impl TerminalPipeline {
     }
 }
 
-/// Convert skterm Color to RGBA float array.
+/// Convert Color to [r, g, b, a] f32
 pub fn color_to_rgba(color: Color, is_bg: bool) -> [f32; 4] {
     match color {
-        Color::DefaultFg => [0.92, 0.92, 0.95, 1.0],
-        Color::DefaultBg => {
-            if is_bg {
-                [0.08, 0.08, 0.12, 1.0]
-            } else {
-                [0.08, 0.08, 0.12, 1.0]
-            }
-        }
+        Color::DefaultFg => [0.85, 0.85, 0.90, 1.0],
+        Color::DefaultBg => [0.10, 0.10, 0.15, 1.0],
+        Color::Rgb(r, g, b) => [
+            r as f32 / 255.0,
+            g as f32 / 255.0,
+            b as f32 / 255.0,
+            1.0,
+        ],
         Color::Named(named) => named_color_to_rgba(named),
-        Color::Indexed(idx) => indexed_color_to_rgba(idx),
-        Color::Rgb(r, g, b) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0],
+        Color::Indexed(idx) => indexed_color_to_rgba(idx, is_bg),
     }
 }
 
 fn named_color_to_rgba(named: NamedColor) -> [f32; 4] {
     match named {
-        NamedColor::Black => [0.15, 0.15, 0.18, 1.0],
-        NamedColor::Red => [0.95, 0.35, 0.35, 1.0],
-        NamedColor::Green => [0.35, 0.85, 0.45, 1.0],
-        NamedColor::Yellow => [0.95, 0.85, 0.40, 1.0],
-        NamedColor::Blue => [0.40, 0.65, 0.95, 1.0],
-        NamedColor::Magenta => [0.85, 0.45, 0.85, 1.0],
-        NamedColor::Cyan => [0.40, 0.85, 0.85, 1.0],
-        NamedColor::White => [0.85, 0.85, 0.88, 1.0],
-        NamedColor::BrightBlack => [0.45, 0.45, 0.50, 1.0],
-        NamedColor::BrightRed => [1.0, 0.50, 0.50, 1.0],
-        NamedColor::BrightGreen => [0.50, 1.0, 0.60, 1.0],
-        NamedColor::BrightYellow => [1.0, 0.95, 0.55, 1.0],
-        NamedColor::BrightBlue => [0.55, 0.80, 1.0, 1.0],
-        NamedColor::BrightMagenta => [1.0, 0.60, 1.0, 1.0],
-        NamedColor::BrightCyan => [0.55, 1.0, 1.0, 1.0],
+        NamedColor::Black => [0.0, 0.0, 0.0, 1.0],
+        NamedColor::Red => [0.80, 0.20, 0.20, 1.0],
+        NamedColor::Green => [0.20, 0.80, 0.20, 1.0],
+        NamedColor::Yellow => [0.80, 0.80, 0.20, 1.0],
+        NamedColor::Blue => [0.20, 0.40, 0.80, 1.0],
+        NamedColor::Magenta => [0.80, 0.20, 0.80, 1.0],
+        NamedColor::Cyan => [0.20, 0.80, 0.80, 1.0],
+        NamedColor::White => [0.80, 0.80, 0.80, 1.0],
+        NamedColor::BrightBlack => [0.40, 0.40, 0.40, 1.0],
+        NamedColor::BrightRed => [1.0, 0.35, 0.35, 1.0],
+        NamedColor::BrightGreen => [0.35, 1.0, 0.35, 1.0],
+        NamedColor::BrightYellow => [1.0, 1.0, 0.35, 1.0],
+        NamedColor::BrightBlue => [0.35, 0.65, 1.0, 1.0],
+        NamedColor::BrightMagenta => [1.0, 0.35, 1.0, 1.0],
+        NamedColor::BrightCyan => [0.35, 1.0, 1.0, 1.0],
         NamedColor::BrightWhite => [1.0, 1.0, 1.0, 1.0],
     }
 }
 
-fn indexed_color_to_rgba(idx: u8) -> [f32; 4] {
+fn indexed_color_to_rgba(idx: u8, _is_bg: bool) -> [f32; 4] {
     if idx < 16 {
         let named = match idx {
             0 => NamedColor::Black,
@@ -327,17 +432,19 @@ fn indexed_color_to_rgba(idx: u8) -> [f32; 4] {
             14 => NamedColor::BrightCyan,
             _ => NamedColor::BrightWhite,
         };
-        named_color_to_rgba(named)
-    } else if idx < 232 {
-        let rem = idx - 16;
-        let r = (rem / 36) % 6;
-        let g = (rem / 6) % 6;
-        let b = rem % 6;
-        let to_val = |v: u8| if v == 0 { 0.0 } else { (v as f32 * 40.0 + 55.0) / 255.0 };
-        [to_val(r), to_val(g), to_val(b), 1.0]
-    } else {
-        let gray = (idx - 232) as f32 * 10.0 + 8.0;
-        let val = gray / 255.0;
-        [val, val, val, 1.0]
+        return named_color_to_rgba(named);
     }
+
+    if idx < 232 {
+        let mut n = idx - 16;
+        let b = (n % 6) as f32 / 5.0;
+        n /= 6;
+        let g = (n % 6) as f32 / 5.0;
+        n /= 6;
+        let r = (n % 6) as f32 / 5.0;
+        return [r, g, b, 1.0];
+    }
+
+    let gray = (idx - 232) as f32 / 23.0;
+    [gray, gray, gray, 1.0]
 }

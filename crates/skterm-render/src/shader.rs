@@ -1,6 +1,6 @@
-//! WGSL Shaders for background cell quads, glyph text, and cursor rendering.
+//! WGSL Shaders for background cell quads, glyph text, cursor, and graphic images (Sixel / Kitty).
 
-/// Combined WGSL shader source for instanced terminal cell backgrounds and glyph quads.
+/// Combined WGSL shader source for instanced terminal cell backgrounds, glyph quads, and images.
 pub const TERMINAL_SHADER: &str = r#"
 struct Uniforms {
     screen_size: vec2<f32>,
@@ -32,7 +32,6 @@ fn vs_bg(
     @builtin(vertex_index) vertex_index: u32,
     instance: BgInstance,
 ) -> BgVertexOutput {
-    // 0: top-left, 1: bottom-left, 2: top-right, 3: bottom-right
     var pos = vec2<f32>(0.0, 0.0);
     switch (vertex_index) {
         case 0u: { pos = vec2<f32>(instance.rect.x, instance.rect.y); }
@@ -44,7 +43,6 @@ fn vs_bg(
         default: {}
     }
 
-    // Convert pixel position to NDC [-1, 1]
     let ndc_x = (pos.x / uniforms.screen_size.x) * 2.0 - 1.0;
     let ndc_y = 1.0 - (pos.y / uniforms.screen_size.y) * 2.0;
 
@@ -114,5 +112,58 @@ fn vs_glyph(
 fn fs_glyph(in: GlyphVertexOutput) -> @location(0) vec4<f32> {
     let alpha = textureSample(glyph_texture, glyph_sampler, in.uv).r;
     return vec4<f32>(in.color.rgb, in.color.a * alpha);
+}
+
+// --- RGBA Graphic Image Quad (Sixel / Kitty) ---
+@group(1) @binding(0)
+var image_texture: texture_2d<f32>;
+
+@group(1) @binding(1)
+var image_sampler: sampler;
+
+struct ImageInstance {
+    @location(0) rect: vec4<f32>, // [x, y, w, h] in screen pixels
+};
+
+struct ImageVertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_image(
+    @builtin(vertex_index) vertex_index: u32,
+    instance: ImageInstance,
+) -> ImageVertexOutput {
+    var pos = vec2<f32>(0.0, 0.0);
+    var uv = vec2<f32>(0.0, 0.0);
+
+    let x0 = instance.rect.x;
+    let y0 = instance.rect.y;
+    let x1 = instance.rect.x + instance.rect.z;
+    let y1 = instance.rect.y + instance.rect.w;
+
+    switch (vertex_index) {
+        case 0u: { pos = vec2<f32>(x0, y0); uv = vec2<f32>(0.0, 0.0); }
+        case 1u: { pos = vec2<f32>(x0, y1); uv = vec2<f32>(0.0, 1.0); }
+        case 2u: { pos = vec2<f32>(x1, y0); uv = vec2<f32>(1.0, 0.0); }
+        case 3u: { pos = vec2<f32>(x1, y1); uv = vec2<f32>(1.0, 1.0); }
+        case 4u: { pos = vec2<f32>(x0, y1); uv = vec2<f32>(0.0, 1.0); }
+        case 5u: { pos = vec2<f32>(x1, y0); uv = vec2<f32>(1.0, 0.0); }
+        default: {}
+    }
+
+    let ndc_x = (pos.x / uniforms.screen_size.x) * 2.0 - 1.0;
+    let ndc_y = 1.0 - (pos.y / uniforms.screen_size.y) * 2.0;
+
+    var out: ImageVertexOutput;
+    out.position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fs_image(in: ImageVertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(image_texture, image_sampler, in.uv);
 }
 "#;

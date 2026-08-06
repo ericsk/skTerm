@@ -1,7 +1,9 @@
-//! VT100, xterm, and 24-bit TrueColor ANSI escape sequence parser and handler.
+//! VT100, xterm, 24-bit TrueColor ANSI, Sixel, and Kitty Graphics escape sequence handler.
 
+use crate::graphics::{GraphicImage, KittyGraphicsParser, SixelDecoder};
 use crate::grid::{CellFlags, Color, CursorShape, NamedColor, SavedCursor, ScreenGrid};
 use std::sync::Arc;
+use tracing::info;
 use vte::{Params, Perform};
 
 /// Mouse reporting modes supported by xterm.
@@ -36,6 +38,9 @@ pub struct TerminalState {
     pub bracketed_paste: bool,
     pub mouse_protocol: MouseProtocol,
     pub mouse_format: MouseFormat,
+    pub in_sixel: bool,
+    pub sixel_buffer: Vec<u8>,
+    pub kitty_parser: KittyGraphicsParser,
 }
 
 impl TerminalState {
@@ -51,6 +56,9 @@ impl TerminalState {
             bracketed_paste: false,
             mouse_protocol: MouseProtocol::None,
             mouse_format: MouseFormat::X10,
+            in_sixel: false,
+            sixel_buffer: Vec::new(),
+            kitty_parser: KittyGraphicsParser::new(),
         }
     }
 
@@ -102,9 +110,9 @@ impl TerminalState {
             return;
         }
 
-        let mut i = 0;
-        while i < flat_params.len() {
-            match flat_params[i] {
+        let mut iter = flat_params.into_iter();
+        while let Some(code) = iter.next() {
+            match code {
                 0 => self.reset_sgr(),
                 1 => self.flags.insert(CellFlags::BOLD),
                 2 => self.flags.insert(CellFlags::DIM),
@@ -114,169 +122,207 @@ impl TerminalState {
                 7 => self.flags.insert(CellFlags::INVERSE),
                 8 => self.flags.insert(CellFlags::HIDDEN),
                 9 => self.flags.insert(CellFlags::STRIKETHROUGH),
-                22 => {
-                    self.flags.remove(CellFlags::BOLD);
-                    self.flags.remove(CellFlags::DIM);
-                }
+                22 => self.flags.remove(CellFlags::BOLD | CellFlags::DIM),
                 23 => self.flags.remove(CellFlags::ITALIC),
                 24 => self.flags.remove(CellFlags::UNDERLINE),
                 25 => self.flags.remove(CellFlags::BLINK),
                 27 => self.flags.remove(CellFlags::INVERSE),
                 28 => self.flags.remove(CellFlags::HIDDEN),
                 29 => self.flags.remove(CellFlags::STRIKETHROUGH),
-                // 30-37 Standard FG
-                30 => self.fg = Color::Named(NamedColor::Black),
-                31 => self.fg = Color::Named(NamedColor::Red),
-                32 => self.fg = Color::Named(NamedColor::Green),
-                33 => self.fg = Color::Named(NamedColor::Yellow),
-                34 => self.fg = Color::Named(NamedColor::Blue),
-                35 => self.fg = Color::Named(NamedColor::Magenta),
-                36 => self.fg = Color::Named(NamedColor::Cyan),
-                37 => self.fg = Color::Named(NamedColor::White),
-                // 38 Extended FG
+
+                30..=37 => self.fg = Color::Named(named_from_code(code - 30, false)),
                 38 => {
-                    if i + 1 < flat_params.len() {
-                        match flat_params[i + 1] {
-                            5 => {
-                                // 256 Color: 38;5;n
-                                if i + 2 < flat_params.len() {
-                                    self.fg = Color::Indexed(flat_params[i + 2] as u8);
-                                    i += 2;
-                                }
-                            }
-                            2 => {
-                                // TrueColor RGB: 38;2;r;g;b
-                                if i + 4 < flat_params.len() {
-                                    let r = flat_params[i + 2] as u8;
-                                    let g = flat_params[i + 3] as u8;
-                                    let b = flat_params[i + 4] as u8;
-                                    self.fg = Color::Rgb(r, g, b);
-                                    i += 4;
-                                }
-                            }
-                            _ => {}
-                        }
+                    if let Some(color) = parse_extended_color(&mut iter) {
+                        self.fg = color;
                     }
                 }
                 39 => self.fg = Color::DefaultFg,
-                // 40-47 Standard BG
-                40 => self.bg = Color::Named(NamedColor::Black),
-                41 => self.bg = Color::Named(NamedColor::Red),
-                42 => self.bg = Color::Named(NamedColor::Green),
-                43 => self.bg = Color::Named(NamedColor::Yellow),
-                44 => self.bg = Color::Named(NamedColor::Blue),
-                45 => self.bg = Color::Named(NamedColor::Magenta),
-                46 => self.bg = Color::Named(NamedColor::Cyan),
-                47 => self.bg = Color::Named(NamedColor::White),
-                // 48 Extended BG
+
+                40..=47 => self.bg = Color::Named(named_from_code(code - 40, false)),
                 48 => {
-                    if i + 1 < flat_params.len() {
-                        match flat_params[i + 1] {
-                            5 => {
-                                // 256 Color: 48;5;n
-                                if i + 2 < flat_params.len() {
-                                    self.bg = Color::Indexed(flat_params[i + 2] as u8);
-                                    i += 2;
-                                }
-                            }
-                            2 => {
-                                // TrueColor RGB: 48;2;r;g;b
-                                if i + 4 < flat_params.len() {
-                                    let r = flat_params[i + 2] as u8;
-                                    let g = flat_params[i + 3] as u8;
-                                    let b = flat_params[i + 4] as u8;
-                                    self.bg = Color::Rgb(r, g, b);
-                                    i += 4;
-                                }
-                            }
-                            _ => {}
-                        }
+                    if let Some(color) = parse_extended_color(&mut iter) {
+                        self.bg = color;
                     }
                 }
                 49 => self.bg = Color::DefaultBg,
-                // 90-97 Bright FG
-                90 => self.fg = Color::Named(NamedColor::BrightBlack),
-                91 => self.fg = Color::Named(NamedColor::BrightRed),
-                92 => self.fg = Color::Named(NamedColor::BrightGreen),
-                93 => self.fg = Color::Named(NamedColor::BrightYellow),
-                94 => self.fg = Color::Named(NamedColor::BrightBlue),
-                95 => self.fg = Color::Named(NamedColor::BrightMagenta),
-                96 => self.fg = Color::Named(NamedColor::BrightCyan),
-                97 => self.fg = Color::Named(NamedColor::BrightWhite),
-                // 100-107 Bright BG
-                100 => self.bg = Color::Named(NamedColor::BrightBlack),
-                101 => self.bg = Color::Named(NamedColor::BrightRed),
-                102 => self.bg = Color::Named(NamedColor::BrightGreen),
-                103 => self.bg = Color::Named(NamedColor::BrightYellow),
-                104 => self.bg = Color::Named(NamedColor::BrightBlue),
-                105 => self.bg = Color::Named(NamedColor::BrightMagenta),
-                106 => self.bg = Color::Named(NamedColor::BrightCyan),
-                107 => self.bg = Color::Named(NamedColor::BrightWhite),
+
+                90..=97 => self.fg = Color::Named(named_from_code(code - 90, true)),
+                100..=107 => self.bg = Color::Named(named_from_code(code - 100, true)),
+
                 _ => {}
             }
-            i += 1;
         }
+    }
+}
+
+fn named_from_code(offset: u16, bright: bool) -> NamedColor {
+    match (offset, bright) {
+        (0, false) => NamedColor::Black,
+        (1, false) => NamedColor::Red,
+        (2, false) => NamedColor::Green,
+        (3, false) => NamedColor::Yellow,
+        (4, false) => NamedColor::Blue,
+        (5, false) => NamedColor::Magenta,
+        (6, false) => NamedColor::Cyan,
+        (7, false) => NamedColor::White,
+        (0, true) => NamedColor::BrightBlack,
+        (1, true) => NamedColor::BrightRed,
+        (2, true) => NamedColor::BrightGreen,
+        (3, true) => NamedColor::BrightYellow,
+        (4, true) => NamedColor::BrightBlue,
+        (5, true) => NamedColor::BrightMagenta,
+        (6, true) => NamedColor::BrightCyan,
+        (7, true) => NamedColor::BrightWhite,
+        _ => NamedColor::White,
+    }
+}
+
+fn parse_extended_color(iter: &mut impl Iterator<Item = u16>) -> Option<Color> {
+    match iter.next()? {
+        2 => {
+            let r = iter.next()? as u8;
+            let g = iter.next()? as u8;
+            let b = iter.next()? as u8;
+            Some(Color::Rgb(r, g, b))
+        }
+        5 => {
+            let idx = iter.next()? as u8;
+            Some(Color::Indexed(idx))
+        }
+        _ => None,
     }
 }
 
 impl Perform for TerminalState {
     fn print(&mut self, c: char) {
-        self.grid.active_mut().write_char(
-            c,
-            self.fg,
-            self.bg,
-            self.flags,
-            self.current_hyperlink.clone(),
-        );
+        let fg = self.fg;
+        let bg = self.bg;
+        let flags = self.flags;
+        self.grid.active_mut().write_char(c, fg, bg, flags, None);
     }
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            b'\n' => self.grid.active_mut().linefeed(),
-            b'\r' => self.grid.active_mut().carriage_return(),
-            b'\t' => self.grid.active_mut().tab(),
-            0x08 => self.grid.active_mut().backspace(), // BS
-            0x07 => {}                                  // Bell
+            b'\n' | 0x0B | 0x0C => self.grid.active_mut().linefeed(),
+            b'\r' => self.grid.active_mut().cursor.col = 0,
+            b'\t' => {
+                let active = self.grid.active_mut();
+                let next_tab = (active.cursor.col / 8 + 1) * 8;
+                active.cursor.col = next_tab.min(active.cols.saturating_sub(1));
+                active.cursor.pending_wrap = false;
+            }
+            0x08 => self.grid.active_mut().move_backward(1),
+            0x07 => {} // Bell
             _ => {}
         }
     }
 
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
+        if action == 'q' {
+            // Sixel Graphics DCS entry
+            self.in_sixel = true;
+            self.sixel_buffer.clear();
+        }
+    }
 
-    fn put(&mut self, _byte: u8) {}
+    fn put(&mut self, byte: u8) {
+        if self.in_sixel {
+            self.sixel_buffer.push(byte);
+        }
+    }
 
-    fn unhook(&mut self) {}
+    fn unhook(&mut self) {
+        if self.in_sixel {
+            self.in_sixel = false;
+            let mut decoder = SixelDecoder::new();
+            if let Some((w_px, h_px, rgba)) = decoder.decode(&self.sixel_buffer) {
+                let cell_w = 9.0;
+                let cell_h = 18.0;
+                let w_cells = ((w_px as f32 / cell_w).ceil() as usize).max(1);
+                let h_cells = ((h_px as f32 / cell_h).ceil() as usize).max(1);
+
+                let id = self.grid.next_image_id;
+                self.grid.next_image_id += 1;
+
+                let cur_row = self.grid.active().cursor.row;
+                let cur_col = self.grid.active().cursor.col;
+
+                let img = GraphicImage {
+                    id,
+                    row: cur_row,
+                    col: cur_col,
+                    width_px: w_px,
+                    height_px: h_px,
+                    width_cells: w_cells,
+                    height_cells: h_cells,
+                    rgba_data: rgba,
+                    z_index: 0,
+                };
+
+                info!("Decoded Sixel image: {}x{} px (cells: {}x{})", w_px, h_px, w_cells, h_cells);
+                self.grid.active_mut().add_image(img);
+
+                // Advance cursor down below the image
+                self.grid.active_mut().move_down(h_cells);
+            }
+            self.sixel_buffer.clear();
+        }
+    }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         if params.is_empty() {
             return;
         }
 
-        if let Ok(cmd_str) = std::str::from_utf8(params[0]) {
-            match cmd_str {
-                "0" | "2" => {
-                    // Set window title
-                    if params.len() > 1 {
-                        if let Ok(title) = std::str::from_utf8(params[1]) {
-                            self.title = title.to_string();
+        match params[0] {
+            b"0" | b"2" => {
+                if params.len() > 1 {
+                    if let Ok(title) = std::str::from_utf8(params[1]) {
+                        self.title = title.to_string();
+                    }
+                }
+            }
+            b"8" => {
+                if params.len() >= 3 {
+                    if let Ok(uri) = std::str::from_utf8(params[2]) {
+                        if !uri.is_empty() {
+                            self.current_hyperlink = Some(Arc::new(uri.to_string()));
+                        } else {
+                            self.current_hyperlink = None;
                         }
                     }
                 }
-                "8" => {
-                    // OSC 8 Hyperlink: \x1b]8;params;url\x1b\
-                    if params.len() >= 3 {
-                        if let Ok(url) = std::str::from_utf8(params[2]) {
-                            if url.is_empty() {
-                                self.current_hyperlink = None;
-                            } else {
-                                self.current_hyperlink = Some(Arc::new(url.to_string()));
-                            }
+            }
+            _ => {
+                // Check Kitty Graphics via OSC or APC
+                if let Ok(cmd) = std::str::from_utf8(params[0]) {
+                    if cmd.starts_with('G') {
+                        if let Some((w, h, rgba, z)) = self.kitty_parser.parse_command(&cmd[1..]) {
+                            let id = self.grid.next_image_id;
+                            self.grid.next_image_id += 1;
+
+                            let cur_row = self.grid.active().cursor.row;
+                            let cur_col = self.grid.active().cursor.col;
+
+                            let w_cells = ((w as f32 / 9.0).ceil() as usize).max(1);
+                            let h_cells = ((h as f32 / 18.0).ceil() as usize).max(1);
+
+                            let img = GraphicImage {
+                                id,
+                                row: cur_row,
+                                col: cur_col,
+                                width_px: w,
+                                height_px: h,
+                                width_cells: w_cells,
+                                height_cells: h_cells,
+                                rgba_data: rgba,
+                                z_index: z,
+                            };
+                            info!("Decoded Kitty Graphics image: {}x{} px", w, h);
+                            self.grid.active_mut().add_image(img);
                         }
-                    } else {
-                        self.current_hyperlink = None;
                     }
                 }
-                _ => {}
             }
         }
     }
@@ -288,85 +334,70 @@ impl Perform for TerminalState {
         _ignore: bool,
         action: char,
     ) {
-        let first_param = params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0);
-        let n = if first_param == 0 { 1 } else { first_param as usize };
         let is_private = intermediates.first() == Some(&b'?');
+        let mut first_param = 0;
+        if let Some(param) = params.iter().next() {
+            if let Some(&val) = param.first() {
+                first_param = val;
+            }
+        }
 
         match action {
-            // Cursor Movement
-            'A' => self.grid.active_mut().move_up(n),
-            'B' => self.grid.active_mut().move_down(n),
-            'C' => self.grid.active_mut().move_forward(n),
-            'D' => self.grid.active_mut().move_backward(n),
-            'E' => {
-                let active = self.grid.active_mut();
-                active.move_down(n);
-                active.carriage_return();
+            'm' => self.parse_sgr(params),
+            'H' | 'f' => {
+                let mut row = 1;
+                let mut col = 1;
+                let mut iter = params.iter();
+                if let Some(p) = iter.next() {
+                    if let Some(&r) = p.first() {
+                        if r > 0 { row = r; }
+                    }
+                }
+                if let Some(p) = iter.next() {
+                    if let Some(&c) = p.first() {
+                        if c > 0 { col = c; }
+                    }
+                }
+                self.grid.active_mut().move_cursor((row as usize) - 1, (col as usize) - 1);
             }
-            'F' => {
-                let active = self.grid.active_mut();
-                active.move_up(n);
-                active.carriage_return();
-            }
-            'G' | '`' => {
-                let col = n.saturating_sub(1);
+            'A' => self.grid.active_mut().move_up((first_param as usize).max(1)),
+            'B' => self.grid.active_mut().move_down((first_param as usize).max(1)),
+            'C' => self.grid.active_mut().move_forward((first_param as usize).max(1)),
+            'D' => self.grid.active_mut().move_backward((first_param as usize).max(1)),
+            'G' => {
+                let col = (first_param as usize).max(1) - 1;
                 self.grid.active_mut().cursor.col = col.min(self.grid.active().cols.saturating_sub(1));
                 self.grid.active_mut().cursor.pending_wrap = false;
             }
-            'H' | 'f' => {
-                let mut iter = params.iter();
-                let r = iter
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1)
-                    .max(1) as usize;
-                let c = iter
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1)
-                    .max(1) as usize;
-                self.grid.active_mut().goto(r - 1, c - 1);
-            }
             'd' => {
-                let row = n.saturating_sub(1);
+                let row = (first_param as usize).max(1) - 1;
                 self.grid.active_mut().cursor.row = row.min(self.grid.active().rows.saturating_sub(1));
                 self.grid.active_mut().cursor.pending_wrap = false;
             }
-
-            // Erase / Delete / Insert
-            'J' => self.grid.active_mut().erase_in_display(first_param),
-            'K' => self.grid.active_mut().erase_in_line(first_param),
-            '@' => self.grid.active_mut().insert_chars(n),
-            'P' => self.grid.active_mut().delete_chars(n),
-            'L' => self.grid.active_mut().insert_lines(n),
-            'M' => self.grid.active_mut().delete_lines(n),
-            'X' => self.grid.active_mut().erase_chars(n),
-
-            // Scroll
-            'S' => self.grid.active_mut().scroll_up(n),
-            'T' => self.grid.active_mut().scroll_down(n),
-
-            // Margins / Scroll Region
+            'J' => self.grid.active_mut().erase_in_display(first_param as usize, self.bg),
+            'K' => self.grid.active_mut().erase_in_line(first_param as usize, self.bg),
+            'S' => self.grid.active_mut().scroll_up((first_param as usize).max(1)),
+            'T' => self.grid.active_mut().scroll_down((first_param as usize).max(1)),
             'r' => {
+                let mut top = 1;
+                let mut bottom = self.grid.active().rows;
                 let mut iter = params.iter();
-                let top = iter
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(1)
-                    .max(1) as usize;
-                let bottom = iter
-                    .next()
-                    .and_then(|p| p.first().copied())
-                    .unwrap_or(self.grid.active().rows as u16) as usize;
-                self.grid
-                    .active_mut()
-                    .set_scroll_region(top - 1, bottom.saturating_sub(1));
+                if let Some(p) = iter.next() {
+                    if let Some(&t) = p.first() {
+                        if t > 0 { top = t as usize; }
+                    }
+                }
+                if let Some(p) = iter.next() {
+                    if let Some(&b) = p.first() {
+                        if b > 0 { bottom = b as usize; }
+                    }
+                }
+                if top < bottom && bottom <= self.grid.active().rows {
+                    self.grid.active_mut().scroll_region = (top - 1, bottom - 1);
+                    self.grid.active_mut().cursor.row = top - 1;
+                    self.grid.active_mut().cursor.col = 0;
+                }
             }
-
-            // SGR (Select Graphic Rendition)
-            'm' => self.parse_sgr(params),
-
-            // Mode Set (SM / DECSET)
             'h' => {
                 for param in params.iter() {
                     for &mode in param {
@@ -374,9 +405,10 @@ impl Perform for TerminalState {
                             match mode {
                                 1 => self.application_cursor_keys = true,
                                 25 => self.grid.active_mut().cursor.visible = true,
-                                47 => self.grid.set_alternate(true),
-                                1049 => {
-                                    self.save_cursor();
+                                47 | 1049 => {
+                                    if mode == 1049 {
+                                        self.save_cursor();
+                                    }
                                     self.grid.set_alternate(true);
                                 }
                                 2004 => self.bracketed_paste = true,
@@ -390,8 +422,6 @@ impl Perform for TerminalState {
                     }
                 }
             }
-
-            // Mode Reset (RM / DECRST)
             'l' => {
                 for param in params.iter() {
                     for &mode in param {
@@ -413,15 +443,12 @@ impl Perform for TerminalState {
                     }
                 }
             }
-
-            // Cursor Shape (DECSCUSR)
             'q' if intermediates.first() == Some(&b' ') => match first_param {
                 1 | 2 => self.grid.active_mut().cursor.shape = CursorShape::Block,
                 3 | 4 => self.grid.active_mut().cursor.shape = CursorShape::Underline,
                 5 | 6 => self.grid.active_mut().cursor.shape = CursorShape::Beam,
                 _ => {}
             },
-
             _ => {}
         }
     }
@@ -431,7 +458,6 @@ impl Perform for TerminalState {
             b'7' => self.save_cursor(),
             b'8' => self.restore_cursor(),
             b'M' => {
-                // Reverse Index (RI)
                 let active = self.grid.active_mut();
                 if active.cursor.row == active.scroll_region.0 {
                     active.scroll_down(1);
@@ -439,10 +465,9 @@ impl Perform for TerminalState {
                     active.move_up(1);
                 }
             }
-            b'D' => self.grid.active_mut().linefeed(), // Index (IND)
-            b'E' => self.grid.active_mut().newline(),  // Next Line (NEL)
+            b'D' => self.grid.active_mut().linefeed(),
+            b'E' => self.grid.active_mut().newline(),
             b'c' => {
-                // Reset to Initial State (RIS)
                 let rows = self.grid.active().rows;
                 let cols = self.grid.active().cols;
                 let max_scroll = self.grid.primary.max_scrollback;

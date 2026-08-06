@@ -6,10 +6,6 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "skterm"
-path = "src/main.rs"
-
 [dependencies]
 skterm-core = { workspace = true }
 skterm-render = { workspace = true }
@@ -19,3 +15,4 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }

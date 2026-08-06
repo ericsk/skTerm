@@ -1,14 +1,16 @@
-//! Main Terminal Renderer combining wgpu Device, Queue, Surface, Atlas, and Pipeline with HiDPI, Tabs, and Split Panes.
+//! Main Terminal Renderer combining wgpu Device, Queue, Surface, Atlas, Graphics Images, and Pipelines.
 
 use crate::atlas::GlyphAtlas;
-use crate::pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
+use crate::pipeline::{color_to_rgba, BgInstance, GlyphInstance, ImageInstance, TerminalPipeline};
 use skterm_core::{CellFlags, Color, CursorShape, ScreenGrid};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
 use wgpu::{
-    Backends, CompositeAlphaMode, Device, DeviceDescriptor, Features, Instance, InstanceDescriptor,
-    Limits, PowerPreference, PresentMode, Queue, RequestAdapterOptions, Surface,
-    SurfaceConfiguration, TextureUsages,
+    Backends, CompositeAlphaMode, Device, DeviceDescriptor, Extent3d, Features, Instance,
+    InstanceDescriptor, Limits, Origin3d, PowerPreference, PresentMode, Queue, RequestAdapterOptions,
+    Surface, SurfaceConfiguration, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
+    TextureDimension, TextureFormat, TextureUsages,
 };
 use winit::window::Window;
 
@@ -73,6 +75,8 @@ pub struct TermRenderer {
     pub theme: RenderTheme,
     pub scale_factor: f32,
     pub font_size_pt: f32,
+    pub image_sampler: wgpu::Sampler,
+    pub image_cache: HashMap<u32, (wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
 }
 
 impl TermRenderer {
@@ -140,6 +144,17 @@ impl TermRenderer {
         let atlas = GlyphAtlas::new(&device, &queue, physical_font_size, None)?;
         let pipeline = TerminalPipeline::new(&device, &config, &atlas)?;
 
+        let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("skterm_image_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         Ok(Self {
             window,
             surface,
@@ -153,6 +168,8 @@ impl TermRenderer {
             theme: RenderTheme::default(),
             scale_factor,
             font_size_pt,
+            image_sampler,
+            image_cache: HashMap::new(),
         })
     }
 
@@ -190,7 +207,7 @@ impl TermRenderer {
         self.atlas.cell_height
     }
 
-    /// Render tabs, split panes, separators, and text grids
+    /// Render tabs, split panes, graphic images (Sixel/Kitty), separators, and text grids
     pub fn render_workspace(
         &mut self,
         tabs: &[TabItem],
@@ -217,12 +234,13 @@ impl TermRenderer {
 
         let mut bg_instances = Vec::new();
         let mut glyph_instances = Vec::new();
+        let mut image_draw_calls: Vec<(u32, ImageInstance)> = Vec::new();
 
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
         let baseline = self.atlas.baseline_offset;
 
-        // 1. Draw Default Window Background Quad across entire surface
+        // 1. Full Screen Background
         bg_instances.push(BgInstance {
             rect: [
                 0.0,
@@ -233,9 +251,8 @@ impl TermRenderer {
             color: self.theme.default_bg,
         });
 
-        // 2. Draw Tab Bar (if multiple tabs exist or tab_bar_h > 0)
+        // 2. Tab Bar
         if tab_bar_h > 0.0 && !tabs.is_empty() {
-            // Tab Bar Background
             bg_instances.push(BgInstance {
                 rect: [0.0, 0.0, self.config.width as f32, tab_bar_h],
                 color: self.theme.tab_bar_bg,
@@ -255,19 +272,16 @@ impl TermRenderer {
                     self.theme.tab_inactive_fg
                 };
 
-                // Tab button rect
                 bg_instances.push(BgInstance {
                     rect: [tab_x, 0.0, tab_w, tab_bar_h],
                     color: bg_color,
                 });
 
-                // Tab border separator
                 bg_instances.push(BgInstance {
                     rect: [tab_x + tab_w - 1.0, 0.0, 1.0, tab_bar_h],
                     color: self.theme.border_color,
                 });
 
-                // Tab title text
                 let text_start_x = tab_x + 12.0 * self.scale_factor;
                 let text_y = (tab_bar_h - cell_h) / 2.0;
 
@@ -295,27 +309,24 @@ impl TermRenderer {
                 }
             }
 
-            // Tab bar bottom border line
             bg_instances.push(BgInstance {
                 rect: [0.0, tab_bar_h - 1.0, self.config.width as f32, 1.0],
                 color: self.theme.border_color,
             });
         }
 
-        // 3. Render Each Split Pane
+        // 3. Panes and Images
         for pane in panes {
             let px = pane.rect_x;
             let py = pane.rect_y;
             let pw = pane.rect_w;
             let ph = pane.rect_h;
 
-            // Pane Background
             bg_instances.push(BgInstance {
                 rect: [px, py, pw, ph],
                 color: self.theme.default_bg,
             });
 
-            // Pane Separator Border
             let border_col = if pane.is_focused && panes.len() > 1 {
                 self.theme.focused_border_color
             } else {
@@ -341,8 +352,81 @@ impl TermRenderer {
                 });
             }
 
-            // Grid Cells
             let active_buf = pane.grid.active();
+
+            // Sixel / Kitty Images in this pane
+            for img in &active_buf.images {
+                if !self.image_cache.contains_key(&img.id) && img.width_px > 0 && img.height_px > 0 {
+                    let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some(&format!("skterm_image_{}", img.id)),
+                        size: Extent3d {
+                            width: img.width_px,
+                            height: img.height_px,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: TextureDimension::D2,
+                        format: TextureFormat::Rgba8Unorm,
+                        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+
+                    self.queue.write_texture(
+                        TexelCopyTextureInfo {
+                            texture: &texture,
+                            mip_level: 0,
+                            origin: Origin3d::ZERO,
+                            aspect: TextureAspect::All,
+                        },
+                        &img.rgba_data,
+                        TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(img.width_px * 4),
+                            rows_per_image: Some(img.height_px),
+                        },
+                        Extent3d {
+                            width: img.width_px,
+                            height: img.height_px,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+
+                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("skterm_image_bg_{}", img.id)),
+                        layout: &self.pipeline.image_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.image_sampler),
+                            },
+                        ],
+                    });
+
+                    self.image_cache.insert(img.id, (texture, view, bind_group));
+                }
+
+                let ix = px + self.padding_x + (img.col as f32 * cell_w);
+                let iy = py + self.padding_y + (img.row as f32 * cell_h);
+                let iw = (img.width_cells as f32 * cell_w).min(pw);
+                let ih = (img.height_cells as f32 * cell_h).min(ph);
+
+                if ix < px + pw && iy < py + ph {
+                    image_draw_calls.push((
+                        img.id,
+                        ImageInstance {
+                            rect: [ix, iy, iw, ih],
+                        },
+                    ));
+                }
+            }
+
+            // Grid Cells
             for r_idx in 0..active_buf.rows {
                 let y = py + self.padding_y + (r_idx as f32 * cell_h);
                 if y + cell_h > py + ph {
@@ -415,7 +499,7 @@ impl TermRenderer {
                 }
             }
 
-            // Cursor (only if pane is focused and at bottom)
+            // Cursor
             if pane.is_focused && active_buf.cursor.visible && active_buf.scroll_offset == 0 {
                 let cur_x = px + self.padding_x + (active_buf.cursor.col as f32 * cell_w);
                 let cur_y = py + self.padding_y + (active_buf.cursor.row as f32 * cell_h);
@@ -481,14 +565,29 @@ impl TermRenderer {
 
             render_pass.set_bind_group(0, &self.pipeline.bind_group, &[]);
 
-            // Draw Background Quads
+            // 1. Draw Background Quads
             if !bg_instances.is_empty() {
                 render_pass.set_pipeline(&self.pipeline.bg_pipeline);
                 render_pass.set_vertex_buffer(0, self.pipeline.bg_instance_buffer.slice(..));
                 render_pass.draw(0..6, 0..bg_instances.len() as u32);
             }
 
-            // Draw Text Glyphs
+            // 2. Draw Graphic Images (Sixel / Kitty)
+            for (id, img_inst) in &image_draw_calls {
+                if let Some((_, _, img_bg)) = self.image_cache.get(id) {
+                    self.queue.write_buffer(
+                        &self.pipeline.image_instance_buffer,
+                        0,
+                        bytemuck::cast_slice(&[*img_inst]),
+                    );
+                    render_pass.set_pipeline(&self.pipeline.image_pipeline);
+                    render_pass.set_bind_group(1, img_bg, &[]);
+                    render_pass.set_vertex_buffer(0, self.pipeline.image_instance_buffer.slice(..));
+                    render_pass.draw(0..6, 0..1);
+                }
+            }
+
+            // 3. Draw Text Glyphs
             if !glyph_instances.is_empty() {
                 render_pass.set_pipeline(&self.pipeline.glyph_pipeline);
                 render_pass.set_vertex_buffer(0, self.pipeline.glyph_instance_buffer.slice(..));

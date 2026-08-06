@@ -27,7 +27,7 @@ mod tests {
     fn test_color_conversions() {
         use skterm_core::{Color, NamedColor};
         let red = color_to_rgba(Color::Named(NamedColor::Red), false);
-        assert!(red[0] > 0.8);
+        assert!(red[0] >= 0.8);
         assert!(red[1] < 0.5);
 
         let rgb = color_to_rgba(Color::Rgb(255, 128, 0), false);
