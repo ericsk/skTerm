@@ -1,4 +1,4 @@
-//! Main Terminal Renderer combining wgpu Device, Queue, Surface, Atlas, and Pipeline with HiDPI support.
+//! Main Terminal Renderer combining wgpu Device, Queue, Surface, Atlas, and Pipeline with HiDPI, Tabs, and Split Panes.
 
 use crate::atlas::GlyphAtlas;
 use crate::pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
@@ -19,6 +19,12 @@ pub struct RenderTheme {
     pub default_bg: [f32; 4],
     pub cursor_color: [f32; 4],
     pub selection_color: [f32; 4],
+    pub tab_bar_bg: [f32; 4],
+    pub tab_active_bg: [f32; 4],
+    pub tab_active_fg: [f32; 4],
+    pub tab_inactive_fg: [f32; 4],
+    pub border_color: [f32; 4],
+    pub focused_border_color: [f32; 4],
 }
 
 impl Default for RenderTheme {
@@ -28,8 +34,30 @@ impl Default for RenderTheme {
             default_bg: [0.12, 0.12, 0.18, 1.0],
             cursor_color: [0.96, 0.88, 0.79, 0.8],
             selection_color: [0.36, 0.39, 0.49, 0.45],
+            tab_bar_bg: [0.09, 0.09, 0.14, 1.0],
+            tab_active_bg: [0.12, 0.12, 0.18, 1.0],
+            tab_active_fg: [0.80, 0.84, 0.96, 1.0],
+            tab_inactive_fg: [0.50, 0.52, 0.60, 1.0],
+            border_color: [0.19, 0.20, 0.27, 1.0],
+            focused_border_color: [0.55, 0.65, 0.90, 1.0],
         }
     }
+}
+
+/// Render descriptor for an individual pane on screen
+pub struct PaneRenderItem<'a> {
+    pub grid: &'a ScreenGrid,
+    pub rect_x: f32,
+    pub rect_y: f32,
+    pub rect_w: f32,
+    pub rect_h: f32,
+    pub is_focused: bool,
+}
+
+/// Render descriptor for a tab item in the tab bar
+pub struct TabItem {
+    pub title: String,
+    pub is_active: bool,
 }
 
 pub struct TermRenderer {
@@ -105,18 +133,12 @@ impl TermRenderer {
 
         surface.configure(&device, &config);
 
-        // Calculate physical font size based on Retina / HiDPI scale factor
         let physical_font_size = font_size_pt * scale_factor;
         let padding_x = 8.0 * scale_factor;
         let padding_y = 8.0 * scale_factor;
 
         let atlas = GlyphAtlas::new(&device, &queue, physical_font_size, None)?;
         let pipeline = TerminalPipeline::new(&device, &config, &atlas)?;
-
-        info!(
-            "HiDPI Init: scale_factor={}, font_size_pt={}, physical_font_size={}, cell_w={}, cell_h={}",
-            scale_factor, font_size_pt, physical_font_size, atlas.cell_width, atlas.cell_height
-        );
 
         Ok(Self {
             window,
@@ -168,7 +190,13 @@ impl TermRenderer {
         self.atlas.cell_height
     }
 
-    pub fn render(&mut self, grid: &ScreenGrid) -> anyhow::Result<()> {
+    /// Render tabs, split panes, separators, and text grids
+    pub fn render_workspace(
+        &mut self,
+        tabs: &[TabItem],
+        panes: &[PaneRenderItem],
+        tab_bar_h: f32,
+    ) -> anyhow::Result<()> {
         let output = match self.surface.get_current_texture() {
             Ok(texture) => texture,
             Err(wgpu::SurfaceError::Lost) => {
@@ -190,12 +218,11 @@ impl TermRenderer {
         let mut bg_instances = Vec::new();
         let mut glyph_instances = Vec::new();
 
-        let active_buf = grid.active();
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
         let baseline = self.atlas.baseline_offset;
 
-        // 1. Draw Default Window Background Quad across full screen
+        // 1. Draw Default Window Background Quad across entire surface
         bg_instances.push(BgInstance {
             rect: [
                 0.0,
@@ -206,109 +233,209 @@ impl TermRenderer {
             color: self.theme.default_bg,
         });
 
-        // 2. Iterate through visible lines (support scrollback history)
-        for r_idx in 0..active_buf.rows {
-            let y = self.padding_y + (r_idx as f32 * cell_h);
-            if y >= self.config.height as f32 {
-                break;
-            }
+        // 2. Draw Tab Bar (if multiple tabs exist or tab_bar_h > 0)
+        if tab_bar_h > 0.0 && !tabs.is_empty() {
+            // Tab Bar Background
+            bg_instances.push(BgInstance {
+                rect: [0.0, 0.0, self.config.width as f32, tab_bar_h],
+                color: self.theme.tab_bar_bg,
+            });
 
-            if let Some(row) = active_buf.get_visible_row(r_idx) {
-                for (c_idx, cell) in row.cells.iter().enumerate() {
-                    let x = self.padding_x + (c_idx as f32 * cell_w);
-                    if x >= self.config.width as f32 {
+            let tab_w = 140.0 * self.scale_factor;
+            for (idx, tab) in tabs.iter().enumerate() {
+                let tab_x = (idx as f32 * tab_w).min(self.config.width as f32 - tab_w);
+                let bg_color = if tab.is_active {
+                    self.theme.tab_active_bg
+                } else {
+                    self.theme.tab_bar_bg
+                };
+                let fg_color = if tab.is_active {
+                    self.theme.tab_active_fg
+                } else {
+                    self.theme.tab_inactive_fg
+                };
+
+                // Tab button rect
+                bg_instances.push(BgInstance {
+                    rect: [tab_x, 0.0, tab_w, tab_bar_h],
+                    color: bg_color,
+                });
+
+                // Tab border separator
+                bg_instances.push(BgInstance {
+                    rect: [tab_x + tab_w - 1.0, 0.0, 1.0, tab_bar_h],
+                    color: self.theme.border_color,
+                });
+
+                // Tab title text
+                let text_start_x = tab_x + 12.0 * self.scale_factor;
+                let text_y = (tab_bar_h - cell_h) / 2.0;
+
+                for (ch_idx, c) in tab.title.chars().enumerate() {
+                    let gx = text_start_x + (ch_idx as f32 * cell_w);
+                    if gx + cell_w > tab_x + tab_w - 10.0 {
                         break;
                     }
-
-                    // Selection highlight
-                    let is_selected = active_buf
-                        .selection
-                        .as_ref()
-                        .map(|s| s.contains(r_idx, c_idx))
-                        .unwrap_or(false);
-
-                    let is_inverse = cell.flags.contains(CellFlags::INVERSE);
-                    let (fg_rgba, bg_rgba) = if is_inverse {
-                        (
-                            color_to_rgba_themed(cell.bg, false, &self.theme),
-                            color_to_rgba_themed(cell.fg, true, &self.theme),
-                        )
-                    } else {
-                        (
-                            color_to_rgba_themed(cell.fg, false, &self.theme),
-                            color_to_rgba_themed(cell.bg, true, &self.theme),
-                        )
-                    };
-
-                    // Draw Cell Background
-                    if bg_rgba != self.theme.default_bg {
-                        bg_instances.push(BgInstance {
-                            rect: [x, y, cell_w, cell_h],
-                            color: bg_rgba,
-                        });
+                    if let Some(glyph_info) = self.atlas.get_or_insert_glyph(&self.queue, c, false, false) {
+                        if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
+                            let draw_x = gx + glyph_info.offset[0];
+                            let draw_y = text_y + baseline - glyph_info.offset[1] - glyph_info.size[1];
+                            glyph_instances.push(GlyphInstance {
+                                rect: [draw_x, draw_y, glyph_info.size[0], glyph_info.size[1]],
+                                uv: [
+                                    glyph_info.uv_min[0],
+                                    glyph_info.uv_min[1],
+                                    glyph_info.uv_max[0],
+                                    glyph_info.uv_max[1],
+                                ],
+                                color: fg_color,
+                            });
+                        }
                     }
+                }
+            }
 
-                    // Draw Selection Highlight
-                    if is_selected {
-                        bg_instances.push(BgInstance {
-                            rect: [x, y, cell_w, cell_h],
-                            color: self.theme.selection_color,
-                        });
-                    }
+            // Tab bar bottom border line
+            bg_instances.push(BgInstance {
+                rect: [0.0, tab_bar_h - 1.0, self.config.width as f32, 1.0],
+                color: self.theme.border_color,
+            });
+        }
 
-                    // Render Char Glyph
-                    if cell.c != ' ' && cell.c != '\0' && !cell.flags.contains(CellFlags::WIDE_CHAR_SPACER)
-                    {
-                        let is_bold = cell.flags.contains(CellFlags::BOLD);
-                        let is_italic = cell.flags.contains(CellFlags::ITALIC);
+        // 3. Render Each Split Pane
+        for pane in panes {
+            let px = pane.rect_x;
+            let py = pane.rect_y;
+            let pw = pane.rect_w;
+            let ph = pane.rect_h;
 
-                        if let Some(glyph_info) =
-                            self.atlas.get_or_insert_glyph(&self.queue, cell.c, is_bold, is_italic)
-                        {
-                            if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
-                                let glyph_x = x + glyph_info.offset[0];
-                                let glyph_y = y + baseline - glyph_info.offset[1] - glyph_info.size[1];
+            // Pane Background
+            bg_instances.push(BgInstance {
+                rect: [px, py, pw, ph],
+                color: self.theme.default_bg,
+            });
 
-                                glyph_instances.push(GlyphInstance {
-                                    rect: [
-                                        glyph_x,
-                                        glyph_y,
-                                        glyph_info.size[0],
-                                        glyph_info.size[1],
-                                    ],
-                                    uv: [
-                                        glyph_info.uv_min[0],
-                                        glyph_info.uv_min[1],
-                                        glyph_info.uv_max[0],
-                                        glyph_info.uv_max[1],
-                                    ],
-                                    color: fg_rgba,
-                                });
+            // Pane Separator Border
+            let border_col = if pane.is_focused && panes.len() > 1 {
+                self.theme.focused_border_color
+            } else {
+                self.theme.border_color
+            };
+
+            if panes.len() > 1 {
+                bg_instances.push(BgInstance {
+                    rect: [px, py, pw, 1.0],
+                    color: border_col,
+                });
+                bg_instances.push(BgInstance {
+                    rect: [px, py + ph - 1.0, pw, 1.0],
+                    color: border_col,
+                });
+                bg_instances.push(BgInstance {
+                    rect: [px, py, 1.0, ph],
+                    color: border_col,
+                });
+                bg_instances.push(BgInstance {
+                    rect: [px + pw - 1.0, py, 1.0, ph],
+                    color: border_col,
+                });
+            }
+
+            // Grid Cells
+            let active_buf = pane.grid.active();
+            for r_idx in 0..active_buf.rows {
+                let y = py + self.padding_y + (r_idx as f32 * cell_h);
+                if y + cell_h > py + ph {
+                    break;
+                }
+
+                if let Some(row) = active_buf.get_visible_row(r_idx) {
+                    for (c_idx, cell) in row.cells.iter().enumerate() {
+                        let x = px + self.padding_x + (c_idx as f32 * cell_w);
+                        if x + cell_w > px + pw {
+                            break;
+                        }
+
+                        let is_selected = active_buf
+                            .selection
+                            .as_ref()
+                            .map(|s| s.contains(r_idx, c_idx))
+                            .unwrap_or(false);
+
+                        let is_inverse = cell.flags.contains(CellFlags::INVERSE);
+                        let (fg_rgba, bg_rgba) = if is_inverse {
+                            (
+                                color_to_rgba_themed(cell.bg, false, &self.theme),
+                                color_to_rgba_themed(cell.fg, true, &self.theme),
+                            )
+                        } else {
+                            (
+                                color_to_rgba_themed(cell.fg, false, &self.theme),
+                                color_to_rgba_themed(cell.bg, true, &self.theme),
+                            )
+                        };
+
+                        if bg_rgba != self.theme.default_bg {
+                            bg_instances.push(BgInstance {
+                                rect: [x, y, cell_w, cell_h],
+                                color: bg_rgba,
+                            });
+                        }
+
+                        if is_selected {
+                            bg_instances.push(BgInstance {
+                                rect: [x, y, cell_w, cell_h],
+                                color: self.theme.selection_color,
+                            });
+                        }
+
+                        if cell.c != ' ' && cell.c != '\0' && !cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                            let is_bold = cell.flags.contains(CellFlags::BOLD);
+                            let is_italic = cell.flags.contains(CellFlags::ITALIC);
+
+                            if let Some(glyph_info) = self.atlas.get_or_insert_glyph(&self.queue, cell.c, is_bold, is_italic) {
+                                if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
+                                    let glyph_x = x + glyph_info.offset[0];
+                                    let glyph_y = y + baseline - glyph_info.offset[1] - glyph_info.size[1];
+
+                                    glyph_instances.push(GlyphInstance {
+                                        rect: [glyph_x, glyph_y, glyph_info.size[0], glyph_info.size[1]],
+                                        uv: [
+                                            glyph_info.uv_min[0],
+                                            glyph_info.uv_min[1],
+                                            glyph_info.uv_max[0],
+                                            glyph_info.uv_max[1],
+                                        ],
+                                        color: fg_rgba,
+                                    });
+                                }
                             }
                         }
                     }
                 }
             }
+
+            // Cursor (only if pane is focused and at bottom)
+            if pane.is_focused && active_buf.cursor.visible && active_buf.scroll_offset == 0 {
+                let cur_x = px + self.padding_x + (active_buf.cursor.col as f32 * cell_w);
+                let cur_y = py + self.padding_y + (active_buf.cursor.row as f32 * cell_h);
+
+                if cur_x + cell_w <= px + pw && cur_y + cell_h <= py + ph {
+                    let (cx, cy, cw, ch) = match active_buf.cursor.shape {
+                        CursorShape::Block => (cur_x, cur_y, cell_w, cell_h),
+                        CursorShape::Beam => (cur_x, cur_y, 2.0 * self.scale_factor, cell_h),
+                        CursorShape::Underline => (cur_x, cur_y + cell_h - 2.0 * self.scale_factor, cell_w, 2.0 * self.scale_factor),
+                    };
+
+                    bg_instances.push(BgInstance {
+                        rect: [cx, cy, cw, ch],
+                        color: self.theme.cursor_color,
+                    });
+                }
+            }
         }
 
-        // 3. Render Cursor (only when at bottom / active view)
-        if active_buf.cursor.visible && active_buf.scroll_offset == 0 {
-            let cur_x = self.padding_x + (active_buf.cursor.col as f32 * cell_w);
-            let cur_y = self.padding_y + (active_buf.cursor.row as f32 * cell_h);
-
-            let (cx, cy, cw, ch) = match active_buf.cursor.shape {
-                CursorShape::Block => (cur_x, cur_y, cell_w, cell_h),
-                CursorShape::Beam => (cur_x, cur_y, 2.0 * self.scale_factor, cell_h),
-                CursorShape::Underline => (cur_x, cur_y + cell_h - 2.0 * self.scale_factor, cell_w, 2.0 * self.scale_factor),
-            };
-
-            bg_instances.push(BgInstance {
-                rect: [cx, cy, cw, ch],
-                color: self.theme.cursor_color,
-            });
-        }
-
-        // Write instance data to GPU buffers
+        // Upload instances to GPU buffers
         if !bg_instances.is_empty() {
             self.queue.write_buffer(
                 &self.pipeline.bg_instance_buffer,
