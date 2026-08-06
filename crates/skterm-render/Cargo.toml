@@ -13,6 +13,7 @@ wgpu = { workspace = true }
 bytemuck = { workspace = true }
 cosmic-text = { workspace = true }
 fontdue = { workspace = true }
+unicode-width = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

@@ -1,4 +1,4 @@
-//! Main Terminal Renderer combining wgpu Device, Queue, Surface, Atlas, and Pipeline.
+//! Main Terminal Renderer combining wgpu Device, Queue, Surface, Atlas, and Pipeline with HiDPI support.
 
 use crate::atlas::GlyphAtlas;
 use crate::pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
@@ -12,6 +12,26 @@ use wgpu::{
 };
 use winit::window::Window;
 
+/// Theme color overrides for custom themes
+#[derive(Debug, Clone, Copy)]
+pub struct RenderTheme {
+    pub default_fg: [f32; 4],
+    pub default_bg: [f32; 4],
+    pub cursor_color: [f32; 4],
+    pub selection_color: [f32; 4],
+}
+
+impl Default for RenderTheme {
+    fn default() -> Self {
+        Self {
+            default_fg: [0.80, 0.84, 0.96, 1.0],
+            default_bg: [0.12, 0.12, 0.18, 1.0],
+            cursor_color: [0.96, 0.88, 0.79, 0.8],
+            selection_color: [0.36, 0.39, 0.49, 0.45],
+        }
+    }
+}
+
 pub struct TermRenderer {
     pub window: Arc<Window>,
     pub surface: Surface<'static>,
@@ -22,13 +42,17 @@ pub struct TermRenderer {
     pub pipeline: TerminalPipeline,
     pub padding_x: f32,
     pub padding_y: f32,
+    pub theme: RenderTheme,
+    pub scale_factor: f32,
+    pub font_size_pt: f32,
 }
 
 impl TermRenderer {
-    pub async fn new(window: Arc<Window>, font_size: f32) -> anyhow::Result<Self> {
+    pub async fn new(window: Arc<Window>, font_size_pt: f32) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
+        let scale_factor = (window.scale_factor() as f32).max(1.0);
 
         let instance = Instance::new(&InstanceDescriptor {
             backends: Backends::all(),
@@ -81,8 +105,18 @@ impl TermRenderer {
 
         surface.configure(&device, &config);
 
-        let atlas = GlyphAtlas::new(&device, &queue, font_size, None)?;
+        // Calculate physical font size based on Retina / HiDPI scale factor
+        let physical_font_size = font_size_pt * scale_factor;
+        let padding_x = 8.0 * scale_factor;
+        let padding_y = 8.0 * scale_factor;
+
+        let atlas = GlyphAtlas::new(&device, &queue, physical_font_size, None)?;
         let pipeline = TerminalPipeline::new(&device, &config, &atlas)?;
+
+        info!(
+            "HiDPI Init: scale_factor={}, font_size_pt={}, physical_font_size={}, cell_w={}, cell_h={}",
+            scale_factor, font_size_pt, physical_font_size, atlas.cell_width, atlas.cell_height
+        );
 
         Ok(Self {
             window,
@@ -92,8 +126,11 @@ impl TermRenderer {
             config,
             atlas,
             pipeline,
-            padding_x: 8.0,
-            padding_y: 8.0,
+            padding_x,
+            padding_y,
+            theme: RenderTheme::default(),
+            scale_factor,
+            font_size_pt,
         })
     }
 
@@ -105,6 +142,22 @@ impl TermRenderer {
             self.pipeline
                 .update_screen_size(&self.queue, width as f32, height as f32);
         }
+    }
+
+    pub fn update_scale_factor(&mut self, new_scale: f32) -> anyhow::Result<()> {
+        if (self.scale_factor - new_scale).abs() > 0.01 {
+            self.scale_factor = new_scale;
+            let physical_font_size = self.font_size_pt * new_scale;
+            self.padding_x = 8.0 * new_scale;
+            self.padding_y = 8.0 * new_scale;
+            self.atlas = GlyphAtlas::new(&self.device, &self.queue, physical_font_size, None)?;
+            self.pipeline = TerminalPipeline::new(&self.device, &self.config, &self.atlas)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_theme(&mut self, theme: RenderTheme) {
+        self.theme = theme;
     }
 
     pub fn cell_width(&self) -> f32 {
@@ -150,86 +203,108 @@ impl TermRenderer {
                 self.config.width as f32,
                 self.config.height as f32,
             ],
-            color: color_to_rgba(Color::DefaultBg, true),
+            color: self.theme.default_bg,
         });
 
-        // 2. Iterate through grid cells
-        for (r_idx, row) in active_buf.grid.iter().enumerate() {
+        // 2. Iterate through visible lines (support scrollback history)
+        for r_idx in 0..active_buf.rows {
             let y = self.padding_y + (r_idx as f32 * cell_h);
             if y >= self.config.height as f32 {
                 break;
             }
 
-            for (c_idx, cell) in row.cells.iter().enumerate() {
-                let x = self.padding_x + (c_idx as f32 * cell_w);
-                if x >= self.config.width as f32 {
-                    break;
-                }
+            if let Some(row) = active_buf.get_visible_row(r_idx) {
+                for (c_idx, cell) in row.cells.iter().enumerate() {
+                    let x = self.padding_x + (c_idx as f32 * cell_w);
+                    if x >= self.config.width as f32 {
+                        break;
+                    }
 
-                // Custom Background
-                let is_inverse = cell.flags.contains(CellFlags::INVERSE);
-                let (fg_color, bg_color) = if is_inverse {
-                    (cell.bg, cell.fg)
-                } else {
-                    (cell.fg, cell.bg)
-                };
+                    // Selection highlight
+                    let is_selected = active_buf
+                        .selection
+                        .as_ref()
+                        .map(|s| s.contains(r_idx, c_idx))
+                        .unwrap_or(false);
 
-                if bg_color != Color::DefaultBg {
-                    bg_instances.push(BgInstance {
-                        rect: [x, y, cell_w, cell_h],
-                        color: color_to_rgba(bg_color, true),
-                    });
-                }
+                    let is_inverse = cell.flags.contains(CellFlags::INVERSE);
+                    let (fg_rgba, bg_rgba) = if is_inverse {
+                        (
+                            color_to_rgba_themed(cell.bg, false, &self.theme),
+                            color_to_rgba_themed(cell.fg, true, &self.theme),
+                        )
+                    } else {
+                        (
+                            color_to_rgba_themed(cell.fg, false, &self.theme),
+                            color_to_rgba_themed(cell.bg, true, &self.theme),
+                        )
+                    };
 
-                // Render Char Glyph
-                if cell.c != ' ' && cell.c != '\0' && !cell.flags.contains(CellFlags::WIDE_CHAR_SPACER)
-                {
-                    let is_bold = cell.flags.contains(CellFlags::BOLD);
-                    let is_italic = cell.flags.contains(CellFlags::ITALIC);
+                    // Draw Cell Background
+                    if bg_rgba != self.theme.default_bg {
+                        bg_instances.push(BgInstance {
+                            rect: [x, y, cell_w, cell_h],
+                            color: bg_rgba,
+                        });
+                    }
 
-                    if let Some(glyph_info) =
-                        self.atlas.get_or_insert_glyph(&self.queue, cell.c, is_bold, is_italic)
+                    // Draw Selection Highlight
+                    if is_selected {
+                        bg_instances.push(BgInstance {
+                            rect: [x, y, cell_w, cell_h],
+                            color: self.theme.selection_color,
+                        });
+                    }
+
+                    // Render Char Glyph
+                    if cell.c != ' ' && cell.c != '\0' && !cell.flags.contains(CellFlags::WIDE_CHAR_SPACER)
                     {
-                        if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
-                            let glyph_x = x + glyph_info.offset[0];
-                            let glyph_y = y + baseline - glyph_info.offset[1] - glyph_info.size[1];
+                        let is_bold = cell.flags.contains(CellFlags::BOLD);
+                        let is_italic = cell.flags.contains(CellFlags::ITALIC);
 
-                            glyph_instances.push(GlyphInstance {
-                                rect: [
-                                    glyph_x,
-                                    glyph_y,
-                                    glyph_info.size[0],
-                                    glyph_info.size[1],
-                                ],
-                                uv: [
-                                    glyph_info.uv_min[0],
-                                    glyph_info.uv_min[1],
-                                    glyph_info.uv_max[0],
-                                    glyph_info.uv_max[1],
-                                ],
-                                color: color_to_rgba(fg_color, false),
-                            });
+                        if let Some(glyph_info) =
+                            self.atlas.get_or_insert_glyph(&self.queue, cell.c, is_bold, is_italic)
+                        {
+                            if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
+                                let glyph_x = x + glyph_info.offset[0];
+                                let glyph_y = y + baseline - glyph_info.offset[1] - glyph_info.size[1];
+
+                                glyph_instances.push(GlyphInstance {
+                                    rect: [
+                                        glyph_x,
+                                        glyph_y,
+                                        glyph_info.size[0],
+                                        glyph_info.size[1],
+                                    ],
+                                    uv: [
+                                        glyph_info.uv_min[0],
+                                        glyph_info.uv_min[1],
+                                        glyph_info.uv_max[0],
+                                        glyph_info.uv_max[1],
+                                    ],
+                                    color: fg_rgba,
+                                });
+                            }
                         }
                     }
                 }
             }
         }
 
-        // 3. Render Cursor
-        if active_buf.cursor.visible {
+        // 3. Render Cursor (only when at bottom / active view)
+        if active_buf.cursor.visible && active_buf.scroll_offset == 0 {
             let cur_x = self.padding_x + (active_buf.cursor.col as f32 * cell_w);
             let cur_y = self.padding_y + (active_buf.cursor.row as f32 * cell_h);
-            let cursor_color = [0.85, 0.85, 0.95, 0.75];
 
             let (cx, cy, cw, ch) = match active_buf.cursor.shape {
                 CursorShape::Block => (cur_x, cur_y, cell_w, cell_h),
-                CursorShape::Beam => (cur_x, cur_y, 2.0, cell_h),
-                CursorShape::Underline => (cur_x, cur_y + cell_h - 2.0, cell_w, 2.0),
+                CursorShape::Beam => (cur_x, cur_y, 2.0 * self.scale_factor, cell_h),
+                CursorShape::Underline => (cur_x, cur_y + cell_h - 2.0 * self.scale_factor, cell_w, 2.0 * self.scale_factor),
             };
 
             bg_instances.push(BgInstance {
                 rect: [cx, cy, cw, ch],
-                color: cursor_color,
+                color: self.theme.cursor_color,
             });
         }
 
@@ -264,9 +339,9 @@ impl TermRenderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.08,
-                            g: 0.08,
-                            b: 0.12,
+                            r: self.theme.default_bg[0] as f64,
+                            g: self.theme.default_bg[1] as f64,
+                            b: self.theme.default_bg[2] as f64,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -298,5 +373,14 @@ impl TermRenderer {
         output.present();
 
         Ok(())
+    }
+}
+
+/// Convert skterm Color to RGBA considering active theme.
+pub fn color_to_rgba_themed(color: Color, is_bg: bool, theme: &RenderTheme) -> [f32; 4] {
+    match color {
+        Color::DefaultFg => theme.default_fg,
+        Color::DefaultBg => theme.default_bg,
+        _ => color_to_rgba(color, is_bg),
     }
 }

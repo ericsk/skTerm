@@ -7,7 +7,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     info!("Starting skTerm GPU-accelerated terminal emulator...");
 
-    let app = App::new(14.0);
+    let app = App::new();
     app.run()?;
 
     Ok(())

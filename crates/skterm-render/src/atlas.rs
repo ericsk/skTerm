@@ -1,8 +1,9 @@
-//! Dynamic Glyph Texture Atlas and Fontdue-based text rasterization.
+//! Dynamic Glyph Texture Atlas, CJK Multi-Font Fallback, and Fontdue-based text rasterization.
 
 use fontdue::{Font, FontSettings};
 use std::collections::HashMap;
 use tracing::{info, warn};
+
 use wgpu::{
     Extent3d, Origin3d, Queue, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
     TextureDimension, TextureFormat, TextureUsages,
@@ -25,7 +26,7 @@ pub struct GlyphInfo {
     pub offset: [f32; 2],
 }
 
-/// 2D dynamic texture atlas for font glyph caching.
+/// 2D dynamic texture atlas for font glyph caching with CJK fallback.
 pub struct GlyphAtlas {
     pub texture: Texture,
     pub texture_view: wgpu::TextureView,
@@ -39,6 +40,7 @@ pub struct GlyphAtlas {
     regular_font: Font,
     bold_font: Option<Font>,
     italic_font: Option<Font>,
+    fallback_fonts: Vec<Font>,
     pub font_size: f32,
     pub cell_width: f32,
     pub cell_height: f32,
@@ -103,8 +105,8 @@ impl GlyphAtlas {
             ..Default::default()
         });
 
-        // Load system or custom font
-        let (regular_font, bold_font, italic_font) = load_system_or_fallback_fonts(custom_font_data)?;
+        let (regular_font, bold_font, italic_font, fallback_fonts) =
+            load_system_fonts_with_cjk(custom_font_data)?;
 
         // Compute metrics for cell dimensions
         let regular_metrics = regular_font.metrics('M', font_size);
@@ -118,8 +120,8 @@ impl GlyphAtlas {
         let baseline_offset = line_metrics.map(|m| m.ascent.ceil()).unwrap_or(font_size);
 
         info!(
-            "Loaded font metrics: font_size={}, cell_width={}, cell_height={}, baseline={}",
-            font_size, cell_width, cell_height, baseline_offset
+            "Loaded font metrics: font_size={}, cell_width={}, cell_height={}, baseline={}, fallback_fonts={}",
+            font_size, cell_width, cell_height, baseline_offset, fallback_fonts.len()
         );
 
         Ok(Self {
@@ -135,6 +137,7 @@ impl GlyphAtlas {
             regular_font,
             bold_font,
             italic_font,
+            fallback_fonts,
             font_size,
             cell_width,
             cell_height,
@@ -142,7 +145,7 @@ impl GlyphAtlas {
         })
     }
 
-    /// Retrieve glyph from cache or rasterize and upload to GPU texture.
+    /// Retrieve glyph from cache or rasterize (checking primary font then CJK fallbacks) and upload to GPU texture.
     pub fn get_or_insert_glyph(
         &mut self,
         queue: &Queue,
@@ -160,7 +163,7 @@ impl GlyphAtlas {
             return Some(info);
         }
 
-        let font = if is_bold && self.bold_font.is_some() {
+        let primary = if is_bold && self.bold_font.is_some() {
             self.bold_font.as_ref().unwrap()
         } else if is_italic && self.italic_font.is_some() {
             self.italic_font.as_ref().unwrap()
@@ -168,7 +171,24 @@ impl GlyphAtlas {
             &self.regular_font
         };
 
-        let (metrics, bitmap) = font.rasterize(c, self.font_size);
+        // Try rasterizing from primary font first
+        let (metrics, bitmap) = if primary.lookup_glyph_index(c) != 0 {
+            primary.rasterize(c, self.font_size)
+        } else {
+            // Find in fallback fonts (CJK, Emoji, Symbols)
+            let mut found = None;
+            for fallback in &self.fallback_fonts {
+                if fallback.lookup_glyph_index(c) != 0 {
+                    let res = fallback.rasterize(c, self.font_size);
+                    if res.0.width > 0 && !res.1.is_empty() {
+                        found = Some(res);
+                        break;
+                    }
+                }
+            }
+            found.unwrap_or_else(|| primary.rasterize(c, self.font_size))
+        };
+
         let glyph_w = metrics.width as u32;
         let glyph_h = metrics.height as u32;
 
@@ -250,37 +270,76 @@ impl GlyphAtlas {
     }
 }
 
-/// Load standard monospace fonts from system.
-fn load_system_or_fallback_fonts(
+/// Load primary monospace fonts and CJK / Symbol fallback fonts.
+fn load_system_fonts_with_cjk(
     custom_font_data: Option<&[u8]>,
-) -> anyhow::Result<(Font, Option<Font>, Option<Font>)> {
+) -> anyhow::Result<(Font, Option<Font>, Option<Font>, Vec<Font>)> {
+    let mut primary_font = None;
+    let mut fallback_fonts = Vec::new();
+
     if let Some(data) = custom_font_data {
         let font = Font::from_bytes(data, FontSettings::default())
             .map_err(|e| anyhow::anyhow!("Failed to parse custom font: {}", e))?;
-        return Ok((font, None, None));
+        primary_font = Some(font);
     }
 
-    let candidate_paths = [
+    // Primary monospace candidates
+    let primary_candidates = [
         "/System/Library/Fonts/Menlo.ttc",
         "/System/Library/Fonts/Monaco.ttf",
         "/System/Library/Fonts/SFMono-Regular.otf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
         "C:\\Windows\\Fonts\\consola.ttf",
         "C:\\Windows\\Fonts\\cascadiamono.ttf",
-        "C:\\Windows\\Fonts\\lucon.ttf",
     ];
 
-    for path in &candidate_paths {
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
-                info!("Using system monospace font: {}", path);
-                return Ok((font, None, None));
+    if primary_font.is_none() {
+        for path in &primary_candidates {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                    info!("Using primary monospace font: {}", path);
+                    primary_font = Some(font);
+                    break;
+                }
             }
         }
     }
 
-    Err(anyhow::anyhow!("No standard system monospace font found on host system."))
+    // CJK and International Fallback font candidates
+    let cjk_candidates = [
+        // macOS
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Apple Color Emoji.ttc",
+        // Linux
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        // Windows
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\simsun.ttc",
+        "C:\\Windows\\Fonts\\mingliu.ttc",
+        "C:\\Windows\\Fonts\\meiryo.ttc",
+    ];
+
+    for path in &cjk_candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                info!("Loaded CJK/international fallback font: {}", path);
+                fallback_fonts.push(font);
+            }
+        }
+    }
+
+    let primary = primary_font.ok_or_else(|| {
+        anyhow::anyhow!("No standard system monospace font found on host system.")
+    })?;
+
+    Ok((primary, None, None, fallback_fonts))
 }

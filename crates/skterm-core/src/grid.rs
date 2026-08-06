@@ -1,4 +1,4 @@
-//! Screen Grid buffer, Cell attributes, Rows, and Cursor management.
+//! Screen Grid buffer, Cell attributes, Rows, Cursor, Selection, and Scrollback management.
 
 use bitflags::bitflags;
 use std::collections::VecDeque;
@@ -179,6 +179,63 @@ pub struct SavedCursor {
     pub pending_wrap: bool,
 }
 
+/// Text Selection Mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectionMode {
+    #[default]
+    Simple,
+    Word,
+    Line,
+    Block,
+}
+
+/// Active text selection range
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    pub start: (usize, usize), // (row, col)
+    pub end: (usize, usize),   // (row, col)
+    pub mode: SelectionMode,
+}
+
+impl Selection {
+    pub fn new(start: (usize, usize), end: (usize, usize), mode: SelectionMode) -> Self {
+        Self { start, end, mode }
+    }
+
+    pub fn normalized(&self) -> ((usize, usize), (usize, usize)) {
+        if self.start <= self.end {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
+
+    pub fn contains(&self, row: usize, col: usize) -> bool {
+        let (start, end) = self.normalized();
+        match self.mode {
+            SelectionMode::Block => {
+                let min_col = start.1.min(end.1);
+                let max_col = start.1.max(end.1);
+                row >= start.0 && row <= end.0 && col >= min_col && col <= max_col
+            }
+            SelectionMode::Line => row >= start.0 && row <= end.0,
+            SelectionMode::Simple | SelectionMode::Word => {
+                if row < start.0 || row > end.0 {
+                    false
+                } else if row == start.0 && row == end.0 {
+                    col >= start.1 && col <= end.1
+                } else if row == start.0 {
+                    col >= start.1
+                } else if row == end.0 {
+                    col <= end.1
+                } else {
+                    true
+                }
+            }
+        }
+    }
+}
+
 /// A single screen buffer containing grid rows, scrollback history, and cursor state.
 #[derive(Debug, Clone)]
 pub struct ScreenBuffer {
@@ -190,6 +247,8 @@ pub struct ScreenBuffer {
     pub cursor: Cursor,
     pub saved_cursor: Option<SavedCursor>,
     pub scroll_region: (usize, usize), // (top, bottom) inclusive, 0-indexed
+    pub selection: Option<Selection>,
+    pub scroll_offset: usize, // 0 = at bottom, > 0 = viewing history
 }
 
 impl ScreenBuffer {
@@ -204,6 +263,8 @@ impl ScreenBuffer {
             cursor: Cursor::default(),
             saved_cursor: None,
             scroll_region: (0, rows.saturating_sub(1)),
+            selection: None,
+            scroll_offset: 0,
         }
     }
 
@@ -212,7 +273,6 @@ impl ScreenBuffer {
             return;
         }
 
-        // Resize all existing rows to new_cols
         for row in &mut self.grid {
             row.resize(new_cols);
         }
@@ -220,14 +280,11 @@ impl ScreenBuffer {
             row.resize(new_cols);
         }
 
-        // Adjust row count
         if new_rows > self.rows {
-            // Grow: add new blank rows at bottom
             for _ in self.rows..new_rows {
                 self.grid.push(Row::new(new_cols));
             }
         } else if new_rows < self.rows {
-            // Shrink: push top lines to scrollback or truncate bottom
             let diff = self.rows - new_rows;
             for _ in 0..diff {
                 if !self.grid.is_empty() {
@@ -246,10 +303,72 @@ impl ScreenBuffer {
         self.cols = new_cols;
         self.scroll_region = (0, self.rows.saturating_sub(1));
 
-        // Clamp cursor
         self.cursor.row = self.cursor.row.min(self.rows.saturating_sub(1));
         self.cursor.col = self.cursor.col.min(self.cols.saturating_sub(1));
         self.cursor.pending_wrap = false;
+        self.selection = None;
+    }
+
+    pub fn scroll_display(&mut self, delta: isize) {
+        if delta < 0 {
+            // Scroll down towards bottom
+            let abs_delta = (-delta) as usize;
+            self.scroll_offset = self.scroll_offset.saturating_sub(abs_delta);
+        } else {
+            // Scroll up into history
+            let max_offset = self.scrollback.len();
+            self.scroll_offset = (self.scroll_offset + delta as usize).min(max_offset);
+        }
+    }
+
+    /// Retrieve the row that should be displayed at visible line index `r` (0..rows).
+    pub fn get_visible_row(&self, r: usize) -> Option<&Row> {
+        if self.scroll_offset == 0 {
+            self.grid.get(r)
+        } else {
+            let total_sb = self.scrollback.len();
+            let start_sb_idx = total_sb.saturating_sub(self.scroll_offset);
+            if start_sb_idx + r < total_sb {
+                self.scrollback.get(start_sb_idx + r)
+            } else {
+                let grid_idx = (start_sb_idx + r) - total_sb;
+                self.grid.get(grid_idx)
+            }
+        }
+    }
+
+    /// Extract text from active selection.
+    pub fn extract_selected_text(&self) -> String {
+        let Some(sel) = &self.selection else {
+            return String::new();
+        };
+
+        let (start, end) = sel.normalized();
+        let mut result = String::new();
+
+        for r in start.0..=end.0 {
+            if let Some(row) = self.grid.get(r) {
+                let start_col = if r == start.0 { start.1 } else { 0 };
+                let end_col = if r == end.0 { end.1 } else { self.cols.saturating_sub(1) };
+
+                let mut row_str = String::new();
+                for c in start_col..=end_col.min(row.cells.len().saturating_sub(1)) {
+                    let cell = &row.cells[c];
+                    if !cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                        row_str.push(cell.c);
+                    }
+                }
+
+                if r < end.0 && !row.is_wrapped {
+                    result.push_str(row_str.trim_end());
+                    result.push('\n');
+                } else {
+                    result.push_str(&row_str);
+                }
+            }
+        }
+
+        result
     }
 
     pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
@@ -269,7 +388,6 @@ impl ScreenBuffer {
         }
 
         for _ in 0..count {
-            // If scrolling the entire screen and not alternate, push top line to scrollback
             if top == 0 && bottom == self.rows.saturating_sub(1) && self.max_scrollback > 0 {
                 let removed = self.grid.remove(0);
                 if self.scrollback.len() >= self.max_scrollback {
@@ -399,20 +517,17 @@ impl ScreenBuffer {
         let row = &mut self.grid[r];
         match mode {
             0 => {
-                // Cursor to end of line
                 for col in c..row.cells.len() {
                     row.cells[col].reset();
                 }
             }
             1 => {
-                // Start of line to cursor
                 let end = (c + 1).min(row.cells.len());
                 for col in 0..end {
                     row.cells[col].reset();
                 }
             }
             2 => {
-                // Entire line
                 row.clear();
             }
             _ => {}
@@ -423,7 +538,6 @@ impl ScreenBuffer {
     pub fn erase_in_display(&mut self, mode: u16) {
         match mode {
             0 => {
-                // Cursor to end of screen
                 self.erase_in_line(0);
                 for r in (self.cursor.row + 1)..self.rows {
                     if r < self.grid.len() {
@@ -432,7 +546,6 @@ impl ScreenBuffer {
                 }
             }
             1 => {
-                // Start of screen to cursor
                 for r in 0..self.cursor.row {
                     if r < self.grid.len() {
                         self.grid[r].clear();
@@ -441,13 +554,11 @@ impl ScreenBuffer {
                 self.erase_in_line(1);
             }
             2 => {
-                // Entire screen
                 for row in &mut self.grid {
                     row.clear();
                 }
             }
             3 => {
-                // Clear scrollback
                 self.scrollback.clear();
             }
             _ => {}
@@ -464,16 +575,9 @@ impl ScreenBuffer {
     ) {
         let char_width = UnicodeWidthChar::width(c).unwrap_or(1);
         if char_width == 0 {
-            // Zero-width / combining character: attach to previous cell if possible
-            if self.cursor.col > 0 && self.cursor.row < self.grid.len() {
-                let prev_col = self.cursor.col - 1;
-                // Currently store base char
-                let _ = prev_col;
-            }
             return;
         }
 
-        // Handle auto-wrap
         if self.cursor.pending_wrap {
             self.cursor.col = 0;
             if self.cursor.row >= self.scroll_region.1 {
@@ -487,9 +591,7 @@ impl ScreenBuffer {
             self.cursor.pending_wrap = false;
         }
 
-        // If writing a double-width char at the rightmost column, wrap early
         if char_width == 2 && self.cursor.col >= self.cols.saturating_sub(1) {
-            // Erase current cell
             if self.cursor.row < self.grid.len() && self.cursor.col < self.cols {
                 self.grid[self.cursor.row].cells[self.cursor.col].reset();
                 self.grid[self.cursor.row].mark_dirty();
@@ -542,7 +644,6 @@ impl ScreenBuffer {
             row.mark_dirty();
         }
 
-        // Advance cursor
         if self.cursor.col + char_width >= self.cols {
             self.cursor.col = self.cols.saturating_sub(1);
             self.cursor.pending_wrap = true;
@@ -632,7 +733,7 @@ impl ScreenGrid {
     pub fn new(rows: usize, cols: usize, max_scrollback: usize) -> Self {
         Self {
             primary: ScreenBuffer::new(rows, cols, max_scrollback),
-            alternate: ScreenBuffer::new(rows, cols, 0), // Alternate buffer has no scrollback
+            alternate: ScreenBuffer::new(rows, cols, 0),
             is_alternate: false,
         }
     }

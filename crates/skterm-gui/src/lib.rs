@@ -1,4 +1,4 @@
-//! `skterm-gui`: Windowing, tabs, split panes (multiplexing), input handling, and clipboard.
+//! `skterm-gui`: Windowing, tabs, split panes (multiplexing), input handling, clipboard, and config.
 
 pub mod app_window;
 pub mod config;
@@ -6,6 +6,7 @@ pub mod input;
 pub mod layout;
 
 pub use app_window::App;
+pub use config::{Config, ConfigManager, Theme};
 pub use input::{encode_key, encode_key_event};
 
 /// skterm-gui version and basic info
@@ -41,6 +42,42 @@ mod tests {
         let mut mods = ModifiersState::empty();
         mods.insert(ModifiersState::CONTROL);
         let encoded = encode_key(&key_c, None, ElementState::Pressed, mods, false);
-        assert_eq!(encoded, Some(vec![0x03])); // ASCII ETX (Ctrl+C)
+        assert_eq!(encoded, Some(vec![0x03]));
+    }
+
+    #[test]
+    fn test_theme_presets() {
+        let mocha = Theme::get("catppuccin-mocha");
+        assert_eq!(mocha.name, "catppuccin-mocha");
+
+        let dracula = Theme::get("dracula");
+        assert_eq!(dracula.name, "dracula");
+
+        let solarized = Theme::get("solarized-dark");
+        assert_eq!(solarized.name, "solarized-dark");
+    }
+
+    #[test]
+    fn test_config_parsing() {
+        let toml_str = r#"
+        [font]
+        family = "JetBrains Mono"
+        size = 16.0
+        line_height = 1.3
+
+        [colors]
+        theme = "tokyo-night"
+
+        [cursor]
+        shape = "beam"
+        blink = false
+        "#;
+
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.font.family, "JetBrains Mono");
+        assert_eq!(cfg.font.size, 16.0);
+        assert_eq!(cfg.colors.theme, "tokyo-night");
+        assert_eq!(cfg.cursor.shape, "beam");
+        assert!(!cfg.cursor.blink);
     }
 }

@@ -12,6 +12,7 @@ skterm-render = { workspace = true }
 winit = { workspace = true }
 arboard = { workspace = true }
 notify = { workspace = true }
+crossbeam-channel = { workspace = true }
 pollster = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }

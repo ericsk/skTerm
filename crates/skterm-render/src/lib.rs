@@ -7,7 +7,7 @@ pub mod shader;
 
 pub use atlas::{GlyphAtlas, GlyphInfo, GlyphKey};
 pub use pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
-pub use renderer::TermRenderer;
+pub use renderer::{color_to_rgba_themed, RenderTheme, TermRenderer};
 
 /// skterm-render version and basic info
 pub fn render_info() -> &'static str {
@@ -32,5 +32,19 @@ mod tests {
 
         let rgb = color_to_rgba(Color::Rgb(255, 128, 0), false);
         assert_eq!(rgb, [1.0, 128.0 / 255.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_theme_color_overrides() {
+        use skterm_core::Color;
+        let theme = RenderTheme {
+            default_fg: [0.1, 0.2, 0.3, 1.0],
+            default_bg: [0.9, 0.8, 0.7, 1.0],
+            cursor_color: [1.0, 1.0, 1.0, 1.0],
+            selection_color: [0.5, 0.5, 0.5, 0.5],
+        };
+
+        assert_eq!(color_to_rgba_themed(Color::DefaultFg, false, &theme), [0.1, 0.2, 0.3, 1.0]);
+        assert_eq!(color_to_rgba_themed(Color::DefaultBg, true, &theme), [0.9, 0.8, 0.7, 1.0]);
     }
 }

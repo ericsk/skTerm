@@ -2216,6 +2216,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "crossbeam-channel",
  "notify",
  "pollster",
  "serde",
@@ -2238,6 +2239,7 @@ dependencies = [
  "skterm-core",
  "thiserror 2.0.19",
  "tracing",
+ "unicode-width 0.2.2",
  "wgpu",
  "winit",
 ]
