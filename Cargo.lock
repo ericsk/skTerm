@@ -2195,6 +2195,7 @@ name = "skterm-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bitflags 2.13.1",
  "crossbeam-channel",
  "portable-pty",
  "thiserror 2.0.19",
