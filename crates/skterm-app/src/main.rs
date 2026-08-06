@@ -1,13 +1,14 @@
 //! `skterm`: Main application entry point for skTerm cross-platform terminal emulator.
 
+use skterm_gui::App;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    info!("Starting skTerm terminal emulator...");
-    println!("skTerm - High-Performance Cross-Platform Terminal Emulator (v0.1.0)");
-    println!("  - Core: {}", skterm_core::core_info());
-    println!("  - Render: {}", skterm_render::render_info());
-    println!("  - GUI: {}", skterm_gui::gui_info());
+    info!("Starting skTerm GPU-accelerated terminal emulator...");
+
+    let app = App::new(14.0);
+    app.run()?;
+
     Ok(())
 }

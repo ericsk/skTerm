@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 skterm-core = { workspace = true }
+winit = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
 cosmic-text = { workspace = true }

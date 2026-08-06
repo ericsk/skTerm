@@ -28,6 +28,7 @@ anyhow = "1.0"
 
 # Async & threading
 crossbeam-channel = "0.5"
+pollster = "0.4"
 
 # Terminal & PTY
 portable-pty = "0.8"

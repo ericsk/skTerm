@@ -1,46 +1,44 @@
 # Session Handoff & 開發進度總表
 
 ## 1. 當前專案狀態 (Current Status)
-* **當前分支**：`feat/p1-terminal-core`
-* **當前階段**：**Phase 1 (PTY 抽象、VT 狀態機與 Screen Grid 核心)**
+* **當前分支**：`feat/p2-wgpu-renderer`
+* **當前階段**：**Phase 2 (wgpu GPU 渲染管線、Glyph Atlas 與原生開窗顯示)**
 * **已完成項目**：
   - [x] `Phase 0`: Workspace 結構、4 個核心 crates、`docs/specs/` 全部 9 份規格文件建立並已合併至 `main`。
-  - [x] `skterm-core::grid`:
-    - `Color`（支援 Default, 16 Named, 256 Indexed, 24-bit TrueColor RGB）。
-    - `CellFlags`（Bold, Dim, Italic, Underline, Blink, Inverse, Hidden, Strikethrough, Wide Char, Spacer, Wrapped）。
-    - `Cell` & `Row`（支援 CJK 雙寬字元標記、Damage Tracking / Dirty Lines 標記）。
-    - `ScreenBuffer`（Primary 支援 Scrollback 歷史行緩衝、Alternate 專供全螢幕 TUI、DECSTBM 滾動區域、Line/Char Insert/Delete、Erase Display/Line）。
-    - `ScreenGrid`（雙緩衝管理、活動緩衝區切換）。
-  - [x] `skterm-core::vt`:
-    - 完整實作 `vte::Perform` trait。
-    - 游標定位（CUP, HVP, CUU, CUD, CUF, CUB, CNL, CPL, CHA, VPA）。
-    - 清除指令（ED, EL, ECH, DCH, ICH, DL, IL）。
-    - SGR 樣式與色彩解析（16 色、256 色、24-bit TrueColor RGB 支援 `;` 與 `:` 參數格式）。
-    - DEC 私有模式（Alternate Screen `?1049h/l`、光標顯示 `?25h/l`、Bracketed Paste `?2004h/l`、滑鼠回報協定）。
-    - ESC 序列（DECSC/DECRC 游標儲存/復原、RI、IND、NEL、RIS 重設）。
-    - OSC 序列（OSC 0/2 視窗標題、OSC 8 點擊超連結）。
-  - [x] `skterm-core::pty`:
-    - 跨平台 PTY 子行程管理（Windows ConPTY + Unix POSIX openpty）。
-    - 預設 Shell 自動探測（`$SHELL` / `/bin/zsh` / `/bin/bash` / `powershell.exe`）。
-    - 背景非同步讀取執行緒與 Crossbeam MPSC 通道。
-    - 執行緒安全寫入器與 PTY Master 尺寸即時同步。
-  - [x] `skterm-core::terminal`:
-    - 整合 Terminal 高階實例（結合 PTY, VTE Parser, ScreenGrid）。
-    - 支援 Headless 模式（便於自動化測試）。
-  - [x] 單元測試：7 項核心單元測試 + 2 項 Workspace 測試全部 PASS。
-  - [x] 整合範例：`cargo run --example headless_pty -p skterm-core` 實際啟動 Shell 並成功寫入/解析/渲染至 Grid。
+  - [x] `Phase 1`: PTY 抽象、VT100/xterm 狀態機、ScreenGrid 雙緩衝與單元測試建立並已合併至 `main`。
+  - [x] `skterm-render::atlas`:
+    - 基於 `fontdue` 的極速字型光柵化引擎。
+    - 2048x2048 2D 動態 Glyph Texture Atlas 與 Shelf Packing 演算法。
+    - 支援 macOS (`Menlo.ttc`, `Monaco.ttf`), Linux (`DejaVuSansMono.ttf`), Windows (`consola.ttf`) 系統等寬字型自動載入。
+    - 即時單元格尺寸與 Baseline 運算。
+  - [x] `skterm-render::shader`:
+    - 撰寫高效 WGSL 著色器，支援 Instanced Quads（背景色塊與文字頂點）。
+    - 支援 Alpha Blending、反白樣式與 24-bit TrueColor/256 色/16 色即時色彩映射。
+  - [x] `skterm-render::pipeline`:
+    - `TerminalPipeline` 實作（背景 Quad 管線、文字 Glyph 採樣管線、Uniform 緩衝區與 Instance 緩衝區）。
+  - [x] `skterm-render::renderer`:
+    - `TermRenderer` 封裝 `wgpu::Device`, `wgpu::Queue`, `wgpu::Surface<'static>`，支援自動 VSync 與 Damage Tracking。
+  - [x] `skterm-gui::input`:
+    - 鍵盤事件編碼器（Enter, Backspace, Tab, Escape, 方向鍵, Home/End, F1-F12, Ctrl+Letter 組合鍵, 常用文字與 IME 輸入）。
+  - [x] `skterm-gui::app_window`:
+    - 基於 `winit 0.30` 的 `ApplicationHandler` 視窗生命週期調度。
+    - 視窗縮放自動計算 Grid 網格維度（Cols, Rows）並同步至 PTY Master。
+    - 幀率調度與事件迴圈：PTY 有新輸出或 Grid Dirty 時觸發 Redraw。
+  - [x] `skterm-app`:
+    - 整合主入口，直接啟動原生 GPU 加速終端應用程式開窗運行。
+  - [x] 單元測試：全部 **12/12 PASS**。
 
 ---
 
-## 2. 下一步行動 (Next Steps - Phase 2)
-在使用者驗收並確認 Phase 1 之後：
-1. Commit `feat/p1-terminal-core` 並合併至 `main` 分支。
-2. 切換至新分支 `feat/p2-wgpu-renderer`。
-3. 實作 `skterm-render` 與視窗渲染管線：
-   - 建立 `winit` 視窗並初始化 `wgpu`（支援 Metal / DX12 / Vulkan）。
-   - 實作 Glyph Texture Atlas 與字型排版（支援等寬字、CJK 與 Emoji）。
-   - 實作 WGSL 著色器（背景色塊 Instanced Quads、文字頂點與紋理採樣、光標與選取高亮）。
-   - 結合 `skterm-core::Terminal` 達成 60/120 FPS 原生終端開窗顯示。
+## 2. 下一步行動 (Next Steps - Phase 3)
+在使用者驗收並確認 Phase 2 之後：
+1. Commit `feat/p2-wgpu-renderer` 並合併至 `main` 分支。
+2. 切換至新分支 `feat/p3-input-and-config`。
+3. 實作 Phase 3：現代互動與設定系統：
+   - 支援滑鼠反白選取文字（字元/單詞/整行）與邊界高亮渲染。
+   - 整合 `arboard` 實作跨平台剪貼簿複製 (`Cmd/Ctrl+C`) 與貼上 (`Cmd/Ctrl+V`, Bracketed Paste)。
+   - 支援 Kitty Keyboard Protocol（無歧義按鍵與釋放事件）。
+   - 實作 TOML 設定檔系統（`config.toml`）與 `notify` 熱重載（即時變更字型大小、主題色彩與透明度）。
 
 ---
 
@@ -49,6 +47,6 @@
 # 執行所有單元測試
 cargo test --workspace
 
-# 執行真實 PTY Shell 互動輸出測試
-cargo run --example headless_pty -p skterm-core
+# 執行真實原生 GPU 終端開窗應用程式（可在 macOS/Windows/Linux 開窗互動並輸入指令）
+cargo run -p skterm-app
 ```
