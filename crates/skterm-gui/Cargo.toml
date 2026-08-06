@@ -1,0 +1,21 @@
+[package]
+name = "skterm-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+skterm-core = { workspace = true }
+skterm-render = { workspace = true }
+winit = { workspace = true }
+arboard = { workspace = true }
+notify = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]

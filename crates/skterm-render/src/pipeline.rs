@@ -1,0 +1,1 @@
+//! wgpu render pipeline placeholder.

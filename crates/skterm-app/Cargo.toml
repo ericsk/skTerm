@@ -1,0 +1,21 @@
+[package]
+name = "skterm-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "skterm"
+path = "src/main.rs"
+
+[dependencies]
+skterm-core = { workspace = true }
+skterm-render = { workspace = true }
+skterm-gui = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]

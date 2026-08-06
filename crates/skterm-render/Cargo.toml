@@ -1,0 +1,19 @@
+[package]
+name = "skterm-render"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+skterm-core = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+cosmic-text = { workspace = true }
+fontdue = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
