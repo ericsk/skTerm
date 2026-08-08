@@ -8,7 +8,7 @@ pub mod vt;
 
 pub use graphics::{GraphicImage, KittyGraphicsParser, SixelDecoder};
 pub use grid::{Cell, CellFlags, Color, Cursor, CursorShape, NamedColor, Row, ScreenBuffer, ScreenGrid, Selection, SelectionMode};
-pub use pty::{PtyEvent, PtyProcess};
+pub use pty::{PtyEvent, PtyProcess, PtySpawnOptions};
 pub use terminal::Terminal;
 pub use vt::{MouseFormat, MouseProtocol, TerminalState};
 

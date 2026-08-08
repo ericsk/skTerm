@@ -45,6 +45,11 @@ bytemuck = { version = "1.21", features = ["derive"] }
 cosmic-text = "0.12"
 fontdue = "0.9"
 
+# GUI & Preferences UI
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = { version = "0.31", default-features = false }
+
 # Config & Utilities
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"

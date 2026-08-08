@@ -4,11 +4,13 @@ pub mod app_window;
 pub mod config;
 pub mod input;
 pub mod layout;
+pub mod preferences_gui;
 
 pub use app_window::App;
-pub use config::{Config, ConfigManager, Theme};
+pub use config::{default_config_template, parse_hex_color, Config, ConfigManager, Theme};
 pub use input::{encode_key, encode_key_event};
 pub use layout::{PaneId, PaneNode, Rect, SplitDirection, Tab, TabId, Workspace};
+pub use preferences_gui::{PreferencesGui, PreferencesTab};
 
 /// skterm-gui version and basic info
 pub fn gui_info() -> &'static str {
@@ -45,33 +47,94 @@ mod tests {
     }
 
     #[test]
-    fn test_config_parsing() {
-        let toml_str = r#"
+    fn test_full_config_parsing() {
+        let toml_str = r##"
             [font]
-            family = "Menlo"
-            size = 16.0
-            line_height = 1.2
+            family = "JetBrains Mono"
+            size = 18.0
+            line_height = 1.3
+            fallback_families = ["Hiragino Sans GB", "PingFang TC"]
 
             [window]
-            opacity = 0.95
-            padding_x = 10.0
-            padding_y = 10.0
+            columns = 100
+            rows = 30
+            opacity = 0.90
+            padding_x = 12.0
+            padding_y = 12.0
+            startup_mode = "maximized"
+            decorations = "transparent"
+            tab_bar_style = "always"
+
+            [terminal]
+            term = "xterm-direct"
+            scrollback_lines = 20000
+            option_as_alt = "only_left"
+            bell = "sound"
+            working_directory = "~"
+
+            [terminal.env]
+            COLORTERM = "truecolor"
+            MY_ENV = "test123"
 
             [colors]
-            theme = "catppuccin-mocha"
+            theme = "dracula"
+            foreground = "#f8f8f2"
+            background = "#282a36"
+            cursor = "#f1fa8c"
+            selection = "#44475a"
+
+            [colors.palette]
+            black = "#21222c"
+            red = "#ff5555"
+            green = "#50fa7b"
 
             [cursor]
-            shape = "beam"
-            blink = false
-        "#;
+            shape = "underline"
+            blink = true
+            blink_interval_ms = 400
 
-        let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.font.family, "Menlo");
-        assert_eq!(cfg.font.size, 16.0);
-        assert_eq!(cfg.window.opacity, 0.95);
-        assert_eq!(cfg.colors.theme, "catppuccin-mocha");
-        assert_eq!(cfg.cursor.shape, "beam");
-        assert!(!cfg.cursor.blink);
+            [keybindings]
+            "cmd+t" = "new_tab"
+        "##;
+
+        let cfg: Config = toml::from_str(toml_str).expect("Failed to parse full config");
+        assert_eq!(cfg.font.family, "JetBrains Mono");
+        assert_eq!(cfg.font.size, 18.0);
+        assert_eq!(cfg.font.fallback_families.len(), 2);
+        assert_eq!(cfg.window.columns, 100);
+        assert_eq!(cfg.window.rows, 30);
+        assert_eq!(cfg.window.opacity, 0.90);
+        assert_eq!(cfg.window.startup_mode, "maximized");
+        assert_eq!(cfg.window.decorations, "transparent");
+        assert_eq!(cfg.window.tab_bar_style, "always");
+
+        assert_eq!(cfg.terminal.term, "xterm-direct");
+        assert_eq!(cfg.terminal.scrollback_lines, 20000);
+        assert_eq!(cfg.terminal.option_as_alt, "only_left");
+        assert_eq!(cfg.terminal.bell, "sound");
+        assert_eq!(cfg.terminal.env.get("MY_ENV").unwrap(), "test123");
+
+        assert_eq!(cfg.colors.theme, "dracula");
+        assert_eq!(cfg.colors.foreground.as_deref(), Some("#f8f8f2"));
+        assert_eq!(cfg.colors.palette.as_ref().unwrap().red.as_deref(), Some("#ff5555"));
+
+        assert_eq!(cfg.cursor.shape, "underline");
+        assert_eq!(cfg.cursor.blink_interval_ms, 400);
+    }
+
+    #[test]
+    fn test_parse_hex_color() {
+        assert_eq!(parse_hex_color("#ffffff"), Some([1.0, 1.0, 1.0, 1.0]));
+        assert_eq!(parse_hex_color("000000"), Some([0.0, 0.0, 0.0, 1.0]));
+        assert_eq!(parse_hex_color("#ff000080"), Some([1.0, 0.0, 0.0, 128.0 / 255.0]));
+        assert_eq!(parse_hex_color("invalid"), None);
+    }
+
+    #[test]
+    fn test_default_config_template_validity() {
+        let template = default_config_template();
+        let cfg: Result<Config, _> = toml::from_str(template);
+        assert!(cfg.is_ok(), "default_config_template should parse as a valid Config");
     }
 
     #[test]
@@ -104,7 +167,7 @@ mod tests {
         assert_eq!(ws.active_tab_idx, 1);
 
         // Test Pane Splitting in Active Tab
-        let split_res = ws.split_active_pane(SplitDirection::Horizontal, 24, 80);
+        let split_res = ws.split_active_pane(SplitDirection::Horizontal, 24, 80, 1000, skterm_core::PtySpawnOptions::default());
         assert!(split_res.is_ok());
 
         let rects = ws.compute_active_pane_rects(800.0, 600.0, 32.0);
@@ -114,13 +177,40 @@ mod tests {
         assert_eq!(rects[0].1.y, 32.0);
 
         // Test Pane Closing
-        let closed = ws.close_active_pane_or_tab();
-        assert!(closed);
+        let closed_tab = ws.close_active_pane();
+        assert!(!closed_tab);
         assert_eq!(ws.tabs.len(), 2);
 
-        // Close the whole second tab
-        let closed_tab = ws.close_active_pane_or_tab();
-        assert!(closed_tab);
+        // Close second tab
+        let closed_second = ws.close_active_pane();
+        assert!(!closed_second);
         assert_eq!(ws.tabs.len(), 1);
+    }
+
+    #[test]
+    fn test_preferences_gui_state() {
+        let mut gui = PreferencesGui::new();
+        assert!(!gui.is_open);
+
+        let default_cfg = Config::default();
+        gui.toggle(&default_cfg);
+        assert!(gui.is_open);
+        assert_eq!(gui.font_family, "Menlo");
+        assert_eq!(gui.columns, 80);
+        assert_eq!(gui.rows, 24);
+
+        gui.font_family = "Fira Code".to_string();
+        gui.font_size = 20.0;
+        gui.theme = "tokyo-night".to_string();
+        gui.columns = 120;
+
+        let modified_cfg = gui.to_config(&default_cfg);
+        assert_eq!(modified_cfg.font.family, "Fira Code");
+        assert_eq!(modified_cfg.font.size, 20.0);
+        assert_eq!(modified_cfg.colors.theme, "tokyo-night");
+        assert_eq!(modified_cfg.window.columns, 120);
+
+        gui.toggle(&default_cfg);
+        assert!(!gui.is_open);
     }
 }

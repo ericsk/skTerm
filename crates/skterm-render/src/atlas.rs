@@ -1,7 +1,8 @@
-//! Dynamic Glyph Texture Atlas, Lazy CJK Multi-Font Fallback, and Fontdue-based text rasterization.
+//! Dynamic Glyph Texture Atlas, Font Resolution Engine, Multi-Font Fallback, and Fontdue-based text rasterization.
 
 use fontdue::{Font, FontSettings};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use wgpu::{
     Extent3d, Origin3d, Queue, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
@@ -25,7 +26,7 @@ pub struct GlyphInfo {
     pub offset: [f32; 2],
 }
 
-/// 2D dynamic texture atlas for font glyph caching with lazy CJK fallback.
+/// 2D dynamic texture atlas for font glyph caching with user-configured font chains & CJK fallback.
 pub struct GlyphAtlas {
     pub texture: Texture,
     pub texture_view: wgpu::TextureView,
@@ -54,6 +55,17 @@ impl GlyphAtlas {
         device: &wgpu::Device,
         queue: &Queue,
         font_size: f32,
+        custom_font_data: Option<&[u8]>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_family(device, queue, font_size, "Menlo", &[], custom_font_data)
+    }
+
+    pub fn new_with_family(
+        device: &wgpu::Device,
+        queue: &Queue,
+        font_size: f32,
+        font_family: &str,
+        fallback_families: &[String],
         custom_font_data: Option<&[u8]>,
     ) -> anyhow::Result<Self> {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -105,8 +117,14 @@ impl GlyphAtlas {
             ..Default::default()
         });
 
-        // Fast Load: Load primary monospace font immediately
-        let (regular_font, bold_font, italic_font) = load_primary_font(custom_font_data)?;
+        // Load configured font chain
+        let (regular_font, bold_font, italic_font, fallback_fonts) = if let Some(data) = custom_font_data {
+            let font = Font::from_bytes(data, FontSettings::default())
+                .map_err(|e| anyhow::anyhow!("Failed to parse custom font: {}", e))?;
+            (font, None, None, Vec::new())
+        } else {
+            load_configured_font_chain(font_family, fallback_families)
+        };
 
         // Compute metrics for cell dimensions
         let regular_metrics = regular_font.metrics('M', font_size);
@@ -120,8 +138,8 @@ impl GlyphAtlas {
         let baseline_offset = line_metrics.map(|m| m.ascent.ceil()).unwrap_or(font_size);
 
         info!(
-            "Instant Font Init: font_size={}, cell_width={}, cell_height={}, baseline={}",
-            font_size, cell_width, cell_height, baseline_offset
+            "Font Engine Loaded: family='{}', size={}, cell_w={}, cell_h={}, fallbacks_count={}",
+            font_family, font_size, cell_width, cell_height, fallback_fonts.len()
         );
 
         Ok(Self {
@@ -137,7 +155,7 @@ impl GlyphAtlas {
             regular_font,
             bold_font,
             italic_font,
-            fallback_fonts: Vec::new(),
+            fallback_fonts,
             fallback_initialized: false,
             font_size,
             cell_width,
@@ -146,40 +164,40 @@ impl GlyphAtlas {
         })
     }
 
-    /// Lazy-load CJK / Emoji fallback fonts on first demand
+    /// Lazy-load standard system CJK / Emoji fallback fonts on first demand if not already in chain
     fn ensure_fallback_loaded(&mut self) {
         if !self.fallback_initialized {
             self.fallback_initialized = true;
             let cjk_candidates = [
                 // macOS
                 "/System/Library/Fonts/Hiragino Sans GB.ttc",
-                "/System/Library/Fonts/STHeiti Medium.ttc",
                 "/System/Library/Fonts/STHeiti Light.ttc",
-                "/System/Library/Fonts/Supplemental/Songti.ttc",
                 "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                "/System/Library/Fonts/Supplemental/Songti.ttc",
+                "/System/Library/Fonts/PingFang.ttc",
                 // Linux
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
                 "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
                 "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
                 // Windows
                 "C:\\Windows\\Fonts\\msyh.ttc",
                 "C:\\Windows\\Fonts\\simsun.ttc",
             ];
 
-            // Load the first available CJK font on system
             for path in &cjk_candidates {
                 if let Ok(bytes) = std::fs::read(path) {
                     if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
-                        info!("Loaded CJK fallback font on demand: {}", path);
+                        info!("Loaded system CJK fallback font: {}", path);
                         self.fallback_fonts.push(font);
-                        break; // Found primary CJK fallback, stop further heavy disk I/O!
+                        break;
                     }
                 }
             }
         }
     }
 
-    /// Retrieve glyph from cache or rasterize (checking primary font then CJK fallbacks) and upload to GPU texture.
+    /// Retrieve glyph from cache or rasterize (checking primary font, configured fallbacks, then system fallbacks) and upload to GPU texture.
     pub fn get_or_insert_glyph(
         &mut self,
         queue: &Queue,
@@ -197,6 +215,7 @@ impl GlyphAtlas {
             return Some(info);
         }
 
+        // 1. Check primary font
         let has_glyph = if is_bold && self.bold_font.is_some() {
             self.bold_font.as_ref().unwrap().lookup_glyph_index(c) != 0
         } else if is_italic && self.italic_font.is_some() {
@@ -215,18 +234,30 @@ impl GlyphAtlas {
             };
             primary.rasterize(c, self.font_size)
         } else {
-            self.ensure_fallback_loaded();
+            // 2. Check configured fallback chain
             let mut found = None;
             for fallback in &self.fallback_fonts {
                 if fallback.lookup_glyph_index(c) != 0 {
-                    let res = fallback.rasterize(c, self.font_size);
-                    if res.0.width > 0 && !res.1.is_empty() {
-                        found = Some(res);
+                    found = Some(fallback.rasterize(c, self.font_size));
+                    break;
+                }
+            }
+
+            // 3. Check system fallback fonts
+            if found.is_none() {
+                self.ensure_fallback_loaded();
+                for fallback in &self.fallback_fonts {
+                    if fallback.lookup_glyph_index(c) != 0 {
+                        found = Some(fallback.rasterize(c, self.font_size));
                         break;
                     }
                 }
             }
-            found.unwrap_or_else(|| self.regular_font.rasterize(c, self.font_size))
+
+            match found {
+                Some(res) => res,
+                None => self.regular_font.rasterize('?', self.font_size),
+            }
         };
 
         let glyph_w = metrics.width as u32;
@@ -237,13 +268,13 @@ impl GlyphAtlas {
                 uv_min: [0.0, 0.0],
                 uv_max: [0.0, 0.0],
                 size: [0.0, 0.0],
-                offset: [metrics.xmin as f32, metrics.ymin as f32],
+                offset: [0.0, 0.0],
             };
             self.cache.insert(key, info);
             return Some(info);
         }
 
-        // Shelf packing with 1px padding
+        // Shelf packing algorithm
         if self.cursor_x + glyph_w + 1 >= self.width {
             self.cursor_x = 1;
             self.cursor_y += self.row_height + 1;
@@ -310,35 +341,173 @@ impl GlyphAtlas {
     }
 }
 
-/// Load primary monospace font immediately (fast single-file load).
-fn load_primary_font(
-    custom_font_data: Option<&[u8]>,
-) -> anyhow::Result<(Font, Option<Font>, Option<Font>)> {
-    if let Some(data) = custom_font_data {
-        let font = Font::from_bytes(data, FontSettings::default())
-            .map_err(|e| anyhow::anyhow!("Failed to parse custom font: {}", e))?;
-        return Ok((font, None, None));
+fn clean_name(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
+}
+
+/// Search user and system font directories for a font family name.
+pub fn find_font_file(query: &str) -> Option<(Vec<u8>, PathBuf)> {
+    let clean_q = clean_name(query);
+    if clean_q.is_empty() {
+        return None;
     }
 
-    let primary_candidates = [
-        "/System/Library/Fonts/Menlo.ttc",
-        "/System/Library/Fonts/Monaco.ttf",
-        "/System/Library/Fonts/SFMono-Regular.otf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-        "C:\\Windows\\Fonts\\consola.ttf",
-        "C:\\Windows\\Fonts\\cascadiamono.ttf",
-    ];
+    let mut search_dirs = Vec::new();
 
-    for path in &primary_candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
-                info!("Loaded primary monospace font: {}", path);
-                return Ok((font, None, None));
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = PathBuf::from(home);
+        search_dirs.push(home_path.join("Library/Fonts"));
+        search_dirs.push(home_path.join(".local/share/fonts"));
+        search_dirs.push(home_path.join(".fonts"));
+    }
+    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+        search_dirs.push(PathBuf::from(appdata).join("Microsoft\\Windows\\Fonts"));
+    }
+
+    search_dirs.push(PathBuf::from("/Library/Fonts"));
+    search_dirs.push(PathBuf::from("/System/Library/Fonts"));
+    search_dirs.push(PathBuf::from("/System/Library/Fonts/Supplemental"));
+    search_dirs.push(PathBuf::from("/usr/share/fonts"));
+    search_dirs.push(PathBuf::from("/usr/local/share/fonts"));
+    search_dirs.push(PathBuf::from("C:\\Windows\\Fonts"));
+
+    for dir in search_dirs {
+        if dir.exists() {
+            if let Some(res) = scan_dir_for_font(&dir, &clean_q) {
+                return Some(res);
+            }
+        }
+    }
+    None
+}
+
+fn scan_dir_for_font(dir: &Path, clean_q: &str) -> Option<(Vec<u8>, PathBuf)> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                let ext_lower = ext.to_lowercase();
+                if ext_lower == "ttf" || ext_lower == "ttc" || ext_lower == "otf" {
+                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                        let clean = clean_name(file_name);
+                        files.push((path, clean));
+                    }
+                }
             }
         }
     }
 
-    Err(anyhow::anyhow!("No standard system monospace font found on host system."))
+    // 1. Direct contains match (e.g. "notosansmnerdfontmono")
+    for (path, clean_f) in &files {
+        if clean_f.contains(clean_q) {
+            if let Ok(bytes) = std::fs::read(path) {
+                if Font::from_bytes(bytes.as_slice(), FontSettings::default()).is_ok() {
+                    return Some((bytes, path.clone()));
+                }
+            }
+        }
+    }
+
+    // 2. Multi-token fallback match (e.g. "noto mono" matching "notosansmnerdfontmono" or "notosanstc")
+    let tokens: Vec<&str> = if clean_q.contains("noto") && clean_q.contains("mono") {
+        vec!["noto", "mono"]
+    } else if clean_q.contains("noto") && clean_q.contains("nerd") {
+        vec!["noto", "nerd"]
+    } else if clean_q.contains("noto") && clean_q.contains("tc") {
+        vec!["noto", "tc"]
+    } else {
+        vec![]
+    };
+
+    if !tokens.is_empty() {
+        for (path, clean_f) in &files {
+            if tokens.iter().all(|t| clean_f.contains(t)) {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if Font::from_bytes(bytes.as_slice(), FontSettings::default()).is_ok() {
+                        return Some((bytes, path.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Load full configured font chain (Primary Monospace + Fallbacks)
+pub fn load_configured_font_chain(
+    family_str: &str,
+    fallback_families: &[String],
+) -> (Font, Option<Font>, Option<Font>, Vec<Font>) {
+    let mut queries = Vec::new();
+
+    // Comma-separated entries in family string
+    for token in family_str.split(',') {
+        let t = token.trim();
+        if !t.is_empty() {
+            queries.push(t.to_string());
+        }
+    }
+
+    // Additional fallback families
+    for f in fallback_families {
+        let t = f.trim();
+        if !t.is_empty() && !queries.contains(&t.to_string()) {
+            queries.push(t.to_string());
+        }
+    }
+
+    let mut primary_font: Option<Font> = None;
+    let mut bold_font: Option<Font> = None;
+    let mut italic_font: Option<Font> = None;
+    let mut fallback_fonts: Vec<Font> = Vec::new();
+
+    for q in &queries {
+        if let Some((bytes, path)) = find_font_file(q) {
+            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                if primary_font.is_none() {
+                    info!("Found primary font match for '{}': {:?}", q, path);
+                    primary_font = Some(font);
+
+                    // Try finding bold/italic variants
+                    let bold_query = format!("{}Bold", q);
+                    if let Some((b_bytes, _)) = find_font_file(&bold_query) {
+                        bold_font = Font::from_bytes(b_bytes, FontSettings::default()).ok();
+                    }
+                    let italic_query = format!("{}Italic", q);
+                    if let Some((i_bytes, _)) = find_font_file(&italic_query) {
+                        italic_font = Font::from_bytes(i_bytes, FontSettings::default()).ok();
+                    }
+                } else {
+                    info!("Found fallback font match for '{}': {:?}", q, path);
+                    fallback_fonts.push(font);
+                }
+            }
+        }
+    }
+
+    // If primary font still not found, fallback to system standard monospace fonts
+    let primary = primary_font.unwrap_or_else(|| {
+        let defaults = [
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/Monaco.ttf",
+            "/System/Library/Fonts/SFMono-Regular.otf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            "C:\\Windows\\Fonts\\consola.ttf",
+        ];
+        for d in defaults {
+            if let Ok(b) = std::fs::read(d) {
+                if let Ok(f) = Font::from_bytes(b, FontSettings::default()) {
+                    info!("Loaded default fallback primary monospace font: {}", d);
+                    return f;
+                }
+            }
+        }
+        panic!("FATAL: No valid monospace font found on system!");
+    });
+
+    (primary, bold_font, italic_font, fallback_fonts)
 }

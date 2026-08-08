@@ -14,7 +14,7 @@ use wgpu::{
 };
 use winit::window::Window;
 
-/// Theme color overrides for custom themes
+/// Theme color overrides for custom themes and ANSI palettes
 #[derive(Debug, Clone, Copy)]
 pub struct RenderTheme {
     pub default_fg: [f32; 4],
@@ -27,6 +27,7 @@ pub struct RenderTheme {
     pub tab_inactive_fg: [f32; 4],
     pub border_color: [f32; 4],
     pub focused_border_color: [f32; 4],
+    pub ansi_palette: Option<[[f32; 4]; 16]>,
 }
 
 impl Default for RenderTheme {
@@ -42,6 +43,7 @@ impl Default for RenderTheme {
             tab_inactive_fg: [0.50, 0.52, 0.60, 1.0],
             border_color: [0.19, 0.20, 0.27, 1.0],
             focused_border_color: [0.55, 0.65, 0.90, 1.0],
+            ansi_palette: None,
         }
     }
 }
@@ -75,12 +77,23 @@ pub struct TermRenderer {
     pub theme: RenderTheme,
     pub scale_factor: f32,
     pub font_size_pt: f32,
+    pub font_family: String,
+    pub fallback_families: Vec<String>,
     pub image_sampler: wgpu::Sampler,
     pub image_cache: HashMap<u32, (wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
 }
 
 impl TermRenderer {
     pub async fn new(window: Arc<Window>, font_size_pt: f32) -> anyhow::Result<Self> {
+        Self::new_with_font(window, font_size_pt, "Menlo", &[]).await
+    }
+
+    pub async fn new_with_font(
+        window: Arc<Window>,
+        font_size_pt: f32,
+        font_family: &str,
+        fallback_families: &[String],
+    ) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
@@ -141,7 +154,14 @@ impl TermRenderer {
         let padding_x = 8.0 * scale_factor;
         let padding_y = 8.0 * scale_factor;
 
-        let atlas = GlyphAtlas::new(&device, &queue, physical_font_size, None)?;
+        let atlas = GlyphAtlas::new_with_family(
+            &device,
+            &queue,
+            physical_font_size,
+            font_family,
+            fallback_families,
+            None,
+        )?;
         let pipeline = TerminalPipeline::new(&device, &config, &atlas)?;
 
         let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -168,6 +188,8 @@ impl TermRenderer {
             theme: RenderTheme::default(),
             scale_factor,
             font_size_pt,
+            font_family: font_family.to_string(),
+            fallback_families: fallback_families.to_vec(),
             image_sampler,
             image_cache: HashMap::new(),
         })
@@ -189,10 +211,46 @@ impl TermRenderer {
             let physical_font_size = self.font_size_pt * new_scale;
             self.padding_x = 8.0 * new_scale;
             self.padding_y = 8.0 * new_scale;
-            self.atlas = GlyphAtlas::new(&self.device, &self.queue, physical_font_size, None)?;
+            self.atlas = GlyphAtlas::new_with_family(
+                &self.device,
+                &self.queue,
+                physical_font_size,
+                &self.font_family,
+                &self.fallback_families,
+                None,
+            )?;
             self.pipeline = TerminalPipeline::new(&self.device, &self.config, &self.atlas)?;
         }
         Ok(())
+    }
+
+    pub fn update_font(
+        &mut self,
+        font_family: &str,
+        font_size_pt: f32,
+        fallback_families: &[String],
+    ) -> anyhow::Result<()> {
+        self.font_family = font_family.to_string();
+        self.font_size_pt = font_size_pt.clamp(8.0, 72.0);
+        self.fallback_families = fallback_families.to_vec();
+
+        let physical_font_size = self.font_size_pt * self.scale_factor;
+        self.atlas = GlyphAtlas::new_with_family(
+            &self.device,
+            &self.queue,
+            physical_font_size,
+            &self.font_family,
+            &self.fallback_families,
+            None,
+        )?;
+        self.pipeline = TerminalPipeline::new(&self.device, &self.config, &self.atlas)?;
+        Ok(())
+    }
+
+    pub fn update_font_size(&mut self, new_pt: f32) -> anyhow::Result<()> {
+        let fam = self.font_family.clone();
+        let fallbacks = self.fallback_families.clone();
+        self.update_font(&fam, new_pt, &fallbacks)
     }
 
     pub fn set_theme(&mut self, theme: RenderTheme) {
@@ -214,6 +272,20 @@ impl TermRenderer {
         panes: &[PaneRenderItem],
         tab_bar_h: f32,
     ) -> anyhow::Result<()> {
+        self.render_workspace_with_overlay(tabs, panes, tab_bar_h, None::<fn(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration)>)
+    }
+
+    /// Render workspace with optional custom overlay (e.g. egui UI).
+    pub fn render_workspace_with_overlay<F>(
+        &mut self,
+        tabs: &[TabItem],
+        panes: &[PaneRenderItem],
+        tab_bar_h: f32,
+        overlay_fn: Option<F>,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration),
+    {
         let output = match self.surface.get_current_texture() {
             Ok(texture) => texture,
             Err(wgpu::SurfaceError::Lost) => {
@@ -553,7 +625,7 @@ impl TermRenderer {
                             r: self.theme.default_bg[0] as f64,
                             g: self.theme.default_bg[1] as f64,
                             b: self.theme.default_bg[2] as f64,
-                            a: 1.0,
+                            a: self.theme.default_bg[3] as f64,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -596,17 +668,37 @@ impl TermRenderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+
+        if let Some(overlay) = overlay_fn {
+            overlay(&self.device, &self.queue, &view, &self.config);
+        }
+
         output.present();
 
         Ok(())
     }
 }
 
-/// Convert skterm Color to RGBA considering active theme.
+/// Convert skterm Color to RGBA considering active theme and custom palette.
 pub fn color_to_rgba_themed(color: Color, is_bg: bool, theme: &RenderTheme) -> [f32; 4] {
     match color {
         Color::DefaultFg => theme.default_fg,
         Color::DefaultBg => theme.default_bg,
+        Color::Named(named) => {
+            if let Some(palette) = theme.ansi_palette {
+                let idx = named as usize;
+                if idx < 16 {
+                    return palette[idx];
+                }
+            }
+            color_to_rgba(color, is_bg)
+        }
+        Color::Indexed(idx) if idx < 16 => {
+            if let Some(palette) = theme.ansi_palette {
+                return palette[idx as usize];
+            }
+            color_to_rgba(color, is_bg)
+        }
         _ => color_to_rgba(color, is_bg),
     }
 }

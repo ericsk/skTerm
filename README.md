@@ -2,7 +2,7 @@
 
 > **跨平台原生高效能 GPU 加速終端機 (High-Performance GPU-Accelerated Terminal Emulator in Rust)**
 
-skTerm 是一款以 Rust 全新打造的跨平台原生終端機，兼具極致吞吐效能、現代化多工排版與先進圖像協定支援。
+skTerm 是一款以 Rust 全新打造的跨平台原生終端機，兼具極致吞吐效能、現代化多工排版、完善偏好設定系統與先進圖像協定支援。
 
 ---
 
@@ -10,9 +10,9 @@ skTerm 是一款以 Rust 全新打造的跨平台原生終端機，兼具極致�
 
 - 🚀 **極致效能與 GPU 渲染**：
   - 基於 `wgpu 24.0` 跨平台硬體加速渲染（macOS Metal / Windows DX12 & Vulkan / Linux Vulkan）。
-  - 動態 2D Glyph Texture Atlas 快取，實測超過 **110 萬行/秒 (100+ MB/s)** 吞吐量。
+  - 動態 2D Glyph Texture Atlas 快取與極速冷啟動（< 15ms），實測超過 **111 萬行/秒 (102 MB/s)** 吞吐量。
 - 🖥️ **完整 VT100 / xterm / 24-bit TrueColor 相容**：
-  - 雙緩衝架構（Primary Buffer with 10,000 行 Scrollback + Alternate Screen Buffer）。
+  - 雙緩衝架構（Primary Buffer with 10,000+ 行 Scrollback + Alternate Screen Buffer）。
   - 完整支援 16 色、256 色與 24-bit TrueColor RGB 配色。
   - 支援 DECSTBM 自訂滾動區域、游標形狀切換（Block/Underline/Beam）與 OSC 8 超連結。
 - 🌏 **完善 CJK 與國際化支援**：
@@ -26,10 +26,11 @@ skTerm 是一款以 Rust 全新打造的跨平台原生終端機，兼具極致�
 - 🖼️ **進階終端圖像協定**：
   - **DEC Sixel**：完整點陣光柵解碼與調色盤支援。
   - **Kitty Graphics Protocol**：支援 32-bit RGBA、24-bit RGB 與 PNG 圖像直接由 GPU 紋理管線渲染。
-- 🎨 **TOML 設定檔即時熱重載 (Hot Reload)**：
-  - 設定檔位置：`~/.config/skterm/config.toml`。
-  - 內建 6 款熱門主題：Catppuccin Mocha、Tokyo Night、Dracula、Solarized Dark、Nord、Default Dark。
-  - 修改設定檔無需重啟，即時熱更新主題色彩與邊距。
+- ⚙️ **強大偏好設定 GUI 介面與即時熱重載 (Preferences GUI & Hot Reload)**：
+  - 內建精美圖形化偏好設定視窗（Preferences Modal），按 `Cmd+,`（`Ctrl+,`）即可直接呼叫 GUI 介面進行分頁視覺化設定。
+  - 支援外觀字型、色彩主題、模擬器 Shell、游標動態即時設定並一鍵儲存套用，同步支援 TOML 文字編輯器開啟。
+  - 支援自訂字型、初始視窗幾何尺寸（80x24）、Shell 執行檔與自訂環境變數、16 色 ANSI 調色盤覆蓋、游標樣式與透明度。
+  - 修改設定檔無需重啟，存檔即時熱更新外觀。
 
 ---
 
@@ -37,6 +38,10 @@ skTerm 是一款以 Rust 全新打造的跨平台原生終端機，兼具極致�
 
 | 快捷鍵 (macOS) | 快捷鍵 (Linux/Windows) | 說明 |
 | :--- | :--- | :--- |
+| `Cmd + ,` | `Ctrl + ,` | **開啟偏好設定 GUI 視窗 (Open Preferences GUI)** |
+| `Cmd + =` / `Cmd + +` | `Ctrl + =` | **放大字型大小 (Zoom In Font Size)** |
+| `Cmd + -` | `Ctrl + -` | **縮小字型大小 (Zoom Out Font Size)** |
+| `Cmd + 0` | `Ctrl + 0` | **重設字型大小 (Reset Font Size)** |
 | `Cmd + T` | `Ctrl + Shift + T` | **新增分頁 (New Tab)** |
 | `Cmd + W` | `Ctrl + Shift + W` | **關閉當前窗格/分頁 (Close Pane/Tab)** |
 | `Cmd + D` | `Ctrl + Shift + O` | **垂直切分窗格 (左右分割)** |
@@ -59,7 +64,7 @@ skTerm 是一款以 Rust 全新打造的跨平台原生終端機，兼具極致�
 
 ### 開發與測試
 ```bash
-# 執行全部 20+ 項單元測試與相容性測試
+# 執行全部 29 項單元測試與相容性測試
 cargo test --workspace
 
 # 啟動開發模式
@@ -87,22 +92,76 @@ cargo run --release --example benchmark -p skterm-app
 
 ```toml
 [font]
+# 主要等寬字型家族名稱
 family = "Menlo"
+# 字型大小 (pt 單位)
 size = 16.0
+# 行高倍率
 line_height = 1.2
+# 自訂 CJK 多重回退字型搜尋清單 (選填)
+# fallback_families = ["Hiragino Sans GB", "PingFang TC", "Noto Sans CJK TC"]
 
 [window]
-opacity = 1.0
+# 初始終端幾何大小 (欄數與行數)
+columns = 80
+rows = 24
+# 視窗邊距 (單位: pt)
 padding_x = 8.0
 padding_y = 8.0
+# 視窗背景不透明度 (0.1 ~ 1.0)
+opacity = 1.0
+# 啟動視窗模式 ("normal", "maximized", "fullscreen")
+startup_mode = "normal"
+# 標題列與視窗外觀 ("full", "transparent", "none")
+decorations = "full"
+# 分頁標籤列顯示策略 ("auto", "always", "never")
+tab_bar_style = "auto"
+
+[terminal]
+# 終端模擬器 TERM 環境變數 (預設: "xterm-256color")
+term = "xterm-256color"
+# 自訂預設 Shell 與啟動參數 (選填)
+# shell = { program = "/bin/zsh", args = ["--login"] }
+# 初始工作目錄 (選填)
+# working_directory = "~"
+# 歷史滾動緩衝區行數
+scrollback_lines = 10000
+# 自訂環境變數表 (選填)
+# [terminal.env]
+# COLORTERM = "truecolor"
+# EDITOR = "vim"
+# macOS Option 鍵行為 ("both", "only_left", "only_right", "none")
+option_as_alt = "both"
+# 終端鈴聲模式 ("visual", "sound", "none")
+bell = "visual"
 
 [colors]
-# 支援: "catppuccin-mocha", "tokyo-night", "dracula", "solarized-dark", "nord", "default-dark"
+# 內建色彩主題: "catppuccin-mocha", "tokyo-night", "dracula", "solarized-dark", "nord", "default-dark"
 theme = "catppuccin-mocha"
+# 自訂色彩覆蓋 (選填 Hex 碼)
+# foreground = "#cdd6f4"
+# background = "#1e1e2e"
+# cursor     = "#f5e0dc"
+# selection  = "#585b70"
+
+# 自訂 16 色 ANSI 調色盤覆蓋 (選填)
+# [colors.palette]
+# black   = "#45475a"
+# red     = "#f38ba8"
+# green   = "#a6e3a1"
+# yellow  = "#f9e2af"
+# blue    = "#89b4fa"
+# magenta = "#f5c2e7"
+# cyan    = "#94e2d5"
+# white   = "#bac2de"
 
 [cursor]
-shape = "block" # "block", "beam", "underline"
+# 游標形狀 ("block", "beam", "underline")
+shape = "block"
+# 游標是否閃爍 (true / false)
 blink = true
+# 游標閃爍間隔毫秒數
+blink_interval_ms = 500
 ```
 
 ---
@@ -111,9 +170,9 @@ blink = true
 
 ```mermaid
 graph TD
-    App[skterm-app (Entry & App Bundle)] --> GUI[skterm-gui (winit Window, Tabs & Panes Layout, Config)]
-    GUI --> Core[skterm-core (vte DEC Parser, ScreenGrid, PTY, Sixel & Kitty Decoders)]
-    GUI --> Render[skterm-render (wgpu Pipeline, Glyph Atlas, Shaders, Textures)]
+    App[skterm-app (Entry & App Bundle)] --> GUI[skterm-gui (winit Window, ConfigManager, Tabs & Panes Layout)]
+    GUI --> Core[skterm-core (vte DEC Parser, ScreenGrid, PTY Options, Sixel & Kitty Decoders)]
+    GUI --> Render[skterm-render (wgpu Pipeline, Glyph Atlas, Shaders, Palette & Textures)]
     Render --> Core
 ```
 
