@@ -10,7 +10,7 @@ use std::process::Command;
 use tracing::{info, warn};
 
 /// Root Configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub font: FontConfig,
@@ -40,7 +40,7 @@ impl Default for Config {
 }
 
 /// Font settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FontConfig {
     #[serde(default = "default_font_family")]
     pub family: String,
@@ -80,7 +80,7 @@ impl Default for FontConfig {
 }
 
 /// Window appearance & dimensions settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowConfig {
     #[serde(default = "default_columns")]
     pub columns: u16,
@@ -138,7 +138,7 @@ impl Default for WindowConfig {
 }
 
 /// Terminal emulator & shell process settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminalConfig {
     #[serde(default = "default_term")]
     pub term: String,
@@ -182,7 +182,7 @@ impl Default for TerminalConfig {
 }
 
 /// Shell executable and arguments
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShellConfig {
     pub program: String,
     #[serde(default)]
@@ -190,7 +190,7 @@ pub struct ShellConfig {
 }
 
 /// Color theme settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColorsConfig {
     #[serde(default = "default_theme_name")]
     pub theme: String,
@@ -202,7 +202,7 @@ pub struct ColorsConfig {
 }
 
 fn default_theme_name() -> String {
-    "catppuccin-mocha".to_string()
+    "pure-black".to_string()
 }
 
 impl Default for ColorsConfig {
@@ -219,7 +219,7 @@ impl Default for ColorsConfig {
 }
 
 /// Custom 16-color ANSI Palette configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct PaletteConfig {
     pub black: Option<String>,
     pub red: Option<String>,
@@ -240,7 +240,7 @@ pub struct PaletteConfig {
 }
 
 /// Cursor visual settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CursorConfig {
     #[serde(default = "default_cursor_shape")]
     pub shape: String,
@@ -271,7 +271,7 @@ impl Default for CursorConfig {
 }
 
 /// Keybindings configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct KeybindingsConfig {
     #[serde(default)]
     pub bindings: HashMap<String, String>,
@@ -285,6 +285,7 @@ pub struct Theme {
     pub background: [f32; 4],
     pub cursor: [f32; 4],
     pub selection: [f32; 4],
+    pub palette: [[f32; 4]; 16],
 }
 
 impl Theme {
@@ -296,6 +297,16 @@ impl Theme {
                 background: [0.12, 0.12, 0.18, 1.0],
                 cursor: [0.96, 0.88, 0.79, 0.8],
                 selection: [0.36, 0.39, 0.49, 0.45],
+                palette: [
+                    [0.27, 0.29, 0.38, 1.0], [0.95, 0.55, 0.66, 1.0],
+                    [0.65, 0.89, 0.63, 1.0], [0.98, 0.89, 0.69, 1.0],
+                    [0.54, 0.71, 0.98, 1.0], [0.96, 0.76, 0.91, 1.0],
+                    [0.58, 0.89, 0.87, 1.0], [0.73, 0.76, 0.89, 1.0],
+                    [0.34, 0.36, 0.46, 1.0], [0.95, 0.55, 0.66, 1.0],
+                    [0.65, 0.89, 0.63, 1.0], [0.98, 0.89, 0.69, 1.0],
+                    [0.54, 0.71, 0.98, 1.0], [0.96, 0.76, 0.91, 1.0],
+                    [0.58, 0.89, 0.87, 1.0], [0.66, 0.70, 0.83, 1.0],
+                ],
             },
             "dracula" => Self {
                 name: "dracula",
@@ -303,6 +314,16 @@ impl Theme {
                 background: [0.16, 0.16, 0.21, 1.0],
                 cursor: [0.74, 0.47, 0.86, 0.8],
                 selection: [0.27, 0.28, 0.35, 0.5],
+                palette: [
+                    [0.13, 0.13, 0.17, 1.0], [1.00, 0.33, 0.33, 1.0],
+                    [0.31, 0.98, 0.48, 1.0], [0.95, 0.98, 0.55, 1.0],
+                    [0.74, 0.57, 1.00, 1.0], [1.00, 0.47, 0.78, 1.0],
+                    [0.55, 0.91, 0.99, 1.0], [0.97, 0.97, 0.95, 1.0],
+                    [0.38, 0.45, 0.56, 1.0], [1.00, 0.43, 0.43, 1.0],
+                    [0.41, 1.00, 0.58, 1.0], [1.00, 1.00, 0.65, 1.0],
+                    [0.84, 0.67, 1.00, 1.0], [1.00, 0.57, 0.88, 1.0],
+                    [0.65, 1.00, 1.00, 1.0], [1.00, 1.00, 1.00, 1.0],
+                ],
             },
             "solarized-dark" => Self {
                 name: "solarized-dark",
@@ -310,6 +331,16 @@ impl Theme {
                 background: [0.00, 0.17, 0.21, 1.0],
                 cursor: [0.58, 0.63, 0.63, 0.8],
                 selection: [0.03, 0.21, 0.26, 0.5],
+                palette: [
+                    [0.03, 0.21, 0.26, 1.0], [0.86, 0.20, 0.18, 1.0],
+                    [0.52, 0.60, 0.00, 1.0], [0.71, 0.54, 0.00, 1.0],
+                    [0.15, 0.55, 0.82, 1.0], [0.83, 0.21, 0.51, 1.0],
+                    [0.16, 0.63, 0.60, 1.0], [0.93, 0.91, 0.83, 1.0],
+                    [0.00, 0.17, 0.21, 1.0], [0.80, 0.29, 0.09, 1.0],
+                    [0.35, 0.43, 0.46, 1.0], [0.39, 0.48, 0.51, 1.0],
+                    [0.51, 0.58, 0.59, 1.0], [0.42, 0.44, 0.77, 1.0],
+                    [0.58, 0.63, 0.63, 1.0], [0.99, 0.96, 0.89, 1.0],
+                ],
             },
             "tokyo-night" => Self {
                 name: "tokyo-night",
@@ -317,6 +348,16 @@ impl Theme {
                 background: [0.10, 0.10, 0.16, 1.0],
                 cursor: [0.75, 0.79, 0.92, 0.8],
                 selection: [0.20, 0.24, 0.38, 0.5],
+                palette: [
+                    [0.26, 0.27, 0.40, 1.0], [0.96, 0.46, 0.46, 1.0],
+                    [0.45, 0.85, 0.79, 1.0], [0.88, 0.69, 0.43, 1.0],
+                    [0.49, 0.81, 1.00, 1.0], [0.73, 0.60, 0.97, 1.0],
+                    [0.49, 0.81, 1.00, 1.0], [0.75, 0.79, 0.92, 1.0],
+                    [0.34, 0.35, 0.51, 1.0], [1.00, 0.62, 0.39, 1.0],
+                    [0.45, 0.85, 0.79, 1.0], [0.88, 0.69, 0.43, 1.0],
+                    [0.49, 0.81, 1.00, 1.0], [0.73, 0.60, 0.97, 1.0],
+                    [0.49, 0.81, 1.00, 1.0], [0.75, 0.79, 0.92, 1.0],
+                ],
             },
             "nord" => Self {
                 name: "nord",
@@ -324,13 +365,50 @@ impl Theme {
                 background: [0.18, 0.20, 0.25, 1.0],
                 cursor: [0.85, 0.87, 0.91, 0.8],
                 selection: [0.26, 0.30, 0.37, 0.5],
+                palette: [
+                    [0.23, 0.26, 0.32, 1.0], [0.75, 0.38, 0.41, 1.0],
+                    [0.64, 0.75, 0.55, 1.0], [0.92, 0.80, 0.55, 1.0],
+                    [0.51, 0.63, 0.76, 1.0], [0.71, 0.56, 0.68, 1.0],
+                    [0.53, 0.75, 0.82, 1.0], [0.90, 0.92, 0.96, 1.0],
+                    [0.30, 0.34, 0.42, 1.0], [0.75, 0.38, 0.41, 1.0],
+                    [0.64, 0.75, 0.55, 1.0], [0.92, 0.80, 0.55, 1.0],
+                    [0.51, 0.63, 0.76, 1.0], [0.71, 0.56, 0.68, 1.0],
+                    [0.53, 0.75, 0.82, 1.0], [0.93, 0.94, 0.96, 1.0],
+                ],
+            },
+            "pure-black" => Self {
+                name: "pure-black",
+                foreground: [0.96, 0.96, 0.97, 1.0], // Crisp White (#F5F5F7)
+                background: [0.00, 0.00, 0.00, 1.0], // OLED Pure Black (#000000)
+                cursor: [0.039, 0.518, 1.00, 0.85],  // macOS System Blue Accent
+                selection: [0.18, 0.28, 0.45, 0.5],
+                palette: [
+                    [0.00, 0.00, 0.00, 1.0], [0.95, 0.30, 0.30, 1.0],
+                    [0.20, 0.85, 0.35, 1.0], [0.95, 0.75, 0.15, 1.0],
+                    [0.25, 0.60, 1.00, 1.0], [0.90, 0.35, 0.85, 1.0],
+                    [0.25, 0.85, 0.90, 1.0], [0.92, 0.92, 0.94, 1.0],
+                    [0.30, 0.30, 0.35, 1.0], [1.00, 0.45, 0.45, 1.0],
+                    [0.35, 0.95, 0.50, 1.0], [1.00, 0.88, 0.35, 1.0],
+                    [0.45, 0.75, 1.00, 1.0], [1.00, 0.50, 0.95, 1.0],
+                    [0.45, 0.95, 1.00, 1.0], [1.00, 1.00, 1.00, 1.0],
+                ],
             },
             _ => Self {
                 name: "default-dark",
-                foreground: [0.92, 0.92, 0.95, 1.0],
-                background: [0.08, 0.08, 0.12, 1.0],
-                cursor: [0.85, 0.85, 0.95, 0.75],
-                selection: [0.30, 0.45, 0.70, 0.4],
+                foreground: [0.96, 0.96, 0.97, 1.0],
+                background: [0.00, 0.00, 0.00, 1.0], // Pure black
+                cursor: [0.039, 0.518, 1.00, 0.85],
+                selection: [0.18, 0.28, 0.45, 0.5],
+                palette: [
+                    [0.00, 0.00, 0.00, 1.0], [0.95, 0.30, 0.30, 1.0],
+                    [0.20, 0.85, 0.35, 1.0], [0.95, 0.75, 0.15, 1.0],
+                    [0.25, 0.60, 1.00, 1.0], [0.90, 0.35, 0.85, 1.0],
+                    [0.25, 0.85, 0.90, 1.0], [0.92, 0.92, 0.94, 1.0],
+                    [0.30, 0.30, 0.35, 1.0], [1.00, 0.45, 0.45, 1.0],
+                    [0.35, 0.95, 0.50, 1.0], [1.00, 0.88, 0.35, 1.0],
+                    [0.45, 0.75, 1.00, 1.0], [1.00, 0.50, 0.95, 1.0],
+                    [0.45, 0.95, 1.00, 1.0], [1.00, 1.00, 1.00, 1.0],
+                ],
             },
         }
     }
@@ -556,8 +634,8 @@ bell = "visual"
 
 [colors]
 # 內建色彩主題名稱
-# 支援: "catppuccin-mocha", "tokyo-night", "dracula", "solarized-dark", "nord", "default-dark"
-theme = "catppuccin-mocha"
+# 支援: "pure-black", "catppuccin-mocha", "tokyo-night", "dracula", "solarized-dark", "nord", "default-dark"
+theme = "pure-black"
 
 # 自訂色彩覆蓋 (選填 Hex 碼，若指定將覆蓋上述主題之預設值)
 # foreground = "#cdd6f4"

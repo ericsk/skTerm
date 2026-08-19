@@ -1,23 +1,28 @@
 # Session Handoff & 開發進度總表
 
 ## 1. 當前專案狀態 (Current Status)
-* **當前分支**：`main` (已完全整合並通過所有測試)
-* **當前階段**：**偏好設定系統 (Preferences & Configuration System)**
+* **當前分支**：`refactor/macos-preferences-ui` (準備合併至 `main`)
+* **當前階段**：**macOS HIG 偏好設定視窗重構、即時主題同步與純黑預設外觀 (macOS Sonoma HIG & Live Theming)**
 * **已完成項目**：
   - [x] `Phase 0 ~ Phase 6`: 核心終端機、GPU 渲染管線、輸入與 IME、多窗格分頁、Sixel/Kitty 圖像協定與發行打包已全數合併至 `main`。
-  - [x] **偏好設定系統 (Preferences & Configuration)**：
-    - `[font]`：主字型家族、字型大小 (pt)、行高、粗體/斜體自訂與 CJK 多重回退字型搜尋清單。
-    - `[window]`：初始欄數 (`columns = 80`)、行數 (`rows = 24`)、邊距 (`padding_x`, `padding_y`)、背景不透明度 (`opacity`)、啟動模式 (`startup_mode`)、標題列 (`decorations`) 與分頁列顯示策略 (`tab_bar_style`)。
-    - `[terminal]`：`term` (`TERM` 變數)、`shell` (自訂程式與參數)、初始工作目錄 (`working_directory`)、`scrollback_lines` 歷史行數、自訂環境變數表 (`env`)、macOS Option 鍵模式 (`option_as_alt`)、鈴聲模式 (`bell`)。
-    - `[colors]`：6 款內建主題、自訂 Hex 覆蓋值 (`foreground`, `background`, `cursor`, `selection`) 與自訂 16 色 ANSI 調色盤 (`palette`)。
-    - `[cursor]`：游標形狀 (`shape`)、閃爍開關 (`blink`) 與閃爍間隔毫秒數 (`blink_interval_ms`)。
-    - `[keybindings]`：自訂快捷鍵對應。
-    - **圖形化偏好設定視窗 (Preferences GUI)**：在終端機內按下 `Cmd+,`（macOS）或 `Ctrl+Shift+,`（Linux/Windows）直接呼叫內建 GUI 介面（Appearance、Colors、Terminal、Cursor 四大分頁），並提供一鍵儲存、重設預設值與開啟 TOML 檔案。
-    - **原生字型搜尋與解析引擎**：自動搜尋使用者與系統字型庫，支援複合 Nerd Fonts / CJK 混合鏈與即時動態更換字型。
-    - **快捷鍵規範分流**：macOS 採用 `Cmd` 觸發視窗與窗格分割（`Cmd+D` 左右分割、`Cmd+Shift+D` 上下分割），`Ctrl+D` 忠實作為 EOF 傳入 Shell；Linux/Windows 採用 `Ctrl+Shift+<Key>`，完全避免熱鍵衝突。
-    - **字型動態縮放**：支援 `Cmd+=`（放大）、`Cmd+-`（縮小）、`Cmd+0`（還原）。
-    - **即時熱重載 (Hot-Reload)**：背景檔案監聽，存檔後即時無重啟套用外觀與主題色彩。
-  - [x] 單元測試：全部 **30/30 PASS**（100% 成功，0 Warning，0 Error）。
+  - [x] **macOS Sonoma/Sequoia HIG 獨立偏好設定視窗 (`PreferencesWindow`)**：
+    - `190pt` 左側導航欄，整合狀態指示點與檔案快捷存取。
+    - 右側 Inset Grouped Table Cards 樣式卡片。
+    - 翠綠色 Toggle Switch (`#30D158`)、Segmented Control 分段切換按鈕、Keyboard Badges 膠囊徽章。
+  - [x] **一鍵主題卡片畫廊 (1-Click Theme Gallery)**：
+    - 6 款主題卡片一鍵切換，支援即時 Hover 微光與 macOS 系統藍高亮邊框 (`#0A84FF`)。
+  - [x] **純黑預設主題 (Pure Black OLED #000000)**：
+    - 預設背景純黑 `#000000` + 亮白 `#F5F5F7` 文字 + 鮮明 16 色 ANSI 調色盤。
+    - 自訂色彩覆蓋區支援調色盤選色器、Hex 輸入與快速一鍵色點（純黑、深墨黑、亮白、駭客綠、琥珀黃等）。
+  - [x] **視窗尺寸自動記住 (Debounced Geometry Auto-Save)**：
+    - 拖拉視窗改變大小後 400ms 背景防抖存檔，下次啟動時精準維持前一次拉好的視窗大小。
+  - [x] **零延遲即時同步與效能優化 (Zero-Latency Live Sync)**：
+    - 消除純切換主題時的 WGPU Shader 與字形 Atlas 重建卡頓。
+    - 實作背景執行緒寫入 `config.toml`，消除磁碟 I/O 阻塞。
+    - 加入回聲熱重載過濾 (`Echo Hot-Reload Filter`)，避免自動存檔引發連鎖卡頓。
+  - [x] **VT100 狀態機修復**：
+    - 實作延遲自動換行 (`pending_wrap`) 在 `\r` (Carriage Return) 與 `\x1b[2J`/`\x1b[3J` 清除畫面時的重置邏輯，徹底解決 zsh `PROMPT_SP` 執行 `clear` 後畫面頂部殘留 `%` 符號的問題。
+  - [x] 單元測試：全部 **32/32 PASS**（100% 成功，0 Warning，0 Error）。
 
 ---
 

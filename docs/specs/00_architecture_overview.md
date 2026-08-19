@@ -45,6 +45,6 @@ sequenceDiagram
 | Crate 名稱 | 職責定義 | 外部關鍵依賴 |
 | :--- | :--- | :--- |
 | `skterm-core` | PTY 行程抽象、DEC VT 狀態機、Screen Grid 雙緩衝、Unicode/CJK 寬度處理、Damage Tracking | `portable-pty`, `vte`, `unicode-width` |
-| `skterm-render` | wgpu 渲染管線、動態 Glyph Atlas 快取、WGSL 著色器（背景、文字、游標、選取區） | `wgpu`, `cosmic-text`, `fontdue`, `bytemuck` |
-| `skterm-gui` | 視窗管理、分頁與 BSP 窗格切分、鍵盤/滑鼠事件路由、剪貼簿、設定檔熱重載 | `winit`, `arboard`, `notify`, `toml` |
+| `skterm-render` | wgpu 渲染管線、動態 Glyph Atlas 快取、WGSL 著色器（背景、文字、游標、選取區）、16 色 ANSI 調色盤管理 | `wgpu`, `cosmic-text`, `fontdue`, `bytemuck` |
+| `skterm-gui` | 視窗管理、macOS HIG 獨立偏好設定視窗 (`PreferencesWindow`)、BSP 窗格切分、即時主題同步、視窗尺寸防抖自動存檔、鍵盤/滑鼠事件路由、剪貼簿、設定檔熱重載 | `winit`, `egui`, `egui-wgpu`, `arboard`, `notify`, `toml` |
 | `skterm-app` | CLI 參數解析、日誌初始化、各模組組裝與應用程式入口 | `tracing`, `tracing-subscriber`, `anyhow` |

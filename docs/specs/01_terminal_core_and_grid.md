@@ -36,3 +36,10 @@
 2. 根據新的 `new_cols` 重新計算字元折行點。
 3. 雙寬字元（CJK/Emoji）不可跨邊界截斷；若位於行末最後一格則自動換至下一行開頭。
 4. 動態調整游標與 Scrollback 歷史行位置。
+
+---
+
+## 3. VT100 延遲自動換行機制 (Deferred Auto-Wrap / Wrap-at-EOL)
+為完美支援 `zsh` 的 `PROMPT_SP` 檢查機制與 Unix shell 終端互動：
+- **行尾等待換行狀態 (`pending_wrap`)**：當文字剛好填滿一行的最後一欄時，游標停留在最後一欄，並將 `pending_wrap` 設為 `true`。只有當**下一個可列印文字字元**寫入時才觸發真正的換行 (`newline`)。
+- **重置旗標條件**：當收到 `\r` (Carriage Return)、游標絕對/相對移動指令 (`H`, `f`, `A`, `B`, `C`, `D`, `G`, `d`)、或是螢幕/行清除指令 (`\x1b[2J`, `\x1b[3J`, `\x1b[K`) 時，**無條件重置 `pending_wrap = false`**，避免提示字元換行錯誤並確保 `clear` 指令後不殘留 `%` 符號。

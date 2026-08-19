@@ -204,7 +204,11 @@ impl Perform for TerminalState {
     fn execute(&mut self, byte: u8) {
         match byte {
             b'\n' | 0x0B | 0x0C => self.grid.active_mut().linefeed(),
-            b'\r' => self.grid.active_mut().cursor.col = 0,
+            b'\r' => {
+                let active = self.grid.active_mut();
+                active.cursor.col = 0;
+                active.cursor.pending_wrap = false;
+            }
             b'\t' => {
                 let active = self.grid.active_mut();
                 let next_tab = (active.cursor.col / 8 + 1) * 8;

@@ -303,196 +303,378 @@ impl PreferencesGui {
     }
 
     fn render_appearance_tab(&mut self, ui: &mut Ui) {
-        ui.heading("字型設定 (Font)");
-        egui::Grid::new("font_grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-            ui.label("字型家族 (Family):");
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.font_family);
-                egui::ComboBox::from_id_salt("font_family_preset")
-                    .selected_text("常用預設...")
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.font_family, "NotoSansMNerdFontMono, NotoSansTC, Menlo".to_string(), "NotoSansM Nerd Font (推薦 🚀)");
-                        ui.selectable_value(&mut self.font_family, "JetBrainsMono Nerd Font, PingFang TC".to_string(), "JetBrainsMono Nerd Font");
-                        ui.selectable_value(&mut self.font_family, "FiraCode Nerd Font, PingFang TC".to_string(), "FiraCode Nerd Font");
-                        ui.selectable_value(&mut self.font_family, "Menlo, PingFang TC".to_string(), "Menlo (macOS Default)");
-                        ui.selectable_value(&mut self.font_family, "SF Mono, PingFang TC".to_string(), "SF Mono (macOS)");
-                        ui.selectable_value(&mut self.font_family, "DejaVu Sans Mono".to_string(), "DejaVu Sans Mono (Linux)");
-                        ui.selectable_value(&mut self.font_family, "Cascadia Mono, Microsoft YaHei".to_string(), "Cascadia Mono (Windows)");
-                        ui.selectable_value(&mut self.font_family, "Consolas".to_string(), "Consolas (Windows)");
-                    });
+        crate::preferences_window::render_inset_card(ui, "字型與排版 (Typography)", |b| {
+            b.row(
+                "主要等寬字型",
+                Some("支援複合 Nerd Fonts 與 CJK 字型混合鏈"),
+                |ui| {
+                    egui::ComboBox::from_id_salt("font_family_preset")
+                        .selected_text(if self.font_family.is_empty() {
+                            "選擇或自訂字型..."
+                        } else {
+                            &self.font_family
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.font_family,
+                                "NotoSansMNerdFontMono, NotoSansTC, Menlo".to_string(),
+                                "NotoSansM Nerd Font (推薦 🚀)",
+                            );
+                            ui.selectable_value(
+                                &mut self.font_family,
+                                "JetBrainsMono Nerd Font, PingFang TC".to_string(),
+                                "JetBrainsMono Nerd Font",
+                            );
+                            ui.selectable_value(
+                                &mut self.font_family,
+                                "FiraCode Nerd Font, PingFang TC".to_string(),
+                                "FiraCode Nerd Font",
+                            );
+                            ui.selectable_value(
+                                &mut self.font_family,
+                                "Menlo, PingFang TC".to_string(),
+                                "Menlo (macOS Default)",
+                            );
+                            ui.selectable_value(
+                                &mut self.font_family,
+                                "SF Mono, PingFang TC".to_string(),
+                                "SF Mono (macOS)",
+                            );
+                            ui.selectable_value(
+                                &mut self.font_family,
+                                "DejaVu Sans Mono".to_string(),
+                                "DejaVu Sans Mono (Linux)",
+                            );
+                            ui.selectable_value(
+                                &mut self.font_family,
+                                "Cascadia Mono, Microsoft YaHei".to_string(),
+                                "Cascadia Mono (Windows)",
+                            );
+                            ui.selectable_value(
+                                &mut self.font_family,
+                                "Consolas".to_string(),
+                                "Consolas (Windows)",
+                            );
+                        });
+                },
+            );
+
+            b.row("自訂字型名稱", Some("直接輸入字型家族名稱"), |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.font_family).desired_width(160.0));
             });
-            ui.end_row();
 
-            ui.label("字型大小 (Size pt):");
-            ui.add(egui::Slider::new(&mut self.font_size, 9.0..=32.0).suffix(" pt"));
-            ui.end_row();
+            b.row("字型大小 (Size pt)", Some("以 pt 為單位"), |ui| {
+                ui.add(egui::Slider::new(&mut self.font_size, 9.0..=32.0).suffix(" pt"));
+            });
 
-            ui.label("行高倍率 (Line Height):");
-            ui.add(egui::Slider::new(&mut self.line_height, 1.0..=2.0).step_by(0.05));
-            ui.end_row();
+            b.row("行高倍率 (Line Height)", Some("1.0 為緊湊，1.2 為標準舒適"), |ui| {
+                ui.add(egui::Slider::new(&mut self.line_height, 1.0..=2.0).step_by(0.05));
+            });
         });
 
-        ui.add_space(10.0);
-        ui.heading("視窗幾何與佈局 (Window & Layout)");
-        egui::Grid::new("window_grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-            ui.label("預設欄數 (Columns):");
-            ui.add(egui::Slider::new(&mut self.columns, 40..=240));
-            ui.end_row();
+        crate::preferences_window::render_inset_card(ui, "視窗幾何與邊距 (Window & Layout)", |b| {
+            b.row(
+                "預設終端大小",
+                Some("啟動時初始網格行列數 (列 × 行)"),
+                |ui| {
+                    ui.add(egui::DragValue::new(&mut self.columns).range(40..=240).prefix("W: "));
+                    ui.label("×");
+                    ui.add(egui::DragValue::new(&mut self.rows).range(10..=100).prefix("H: "));
+                },
+            );
 
-            ui.label("預設行數 (Rows):");
-            ui.add(egui::Slider::new(&mut self.rows, 10..=100));
-            ui.end_row();
+            b.row(
+                "內距 (Padding X / Y)",
+                Some("文字四周保留空白像素"),
+                |ui| {
+                    ui.add(egui::Slider::new(&mut self.padding_x, 0.0..=40.0).suffix(" pt").prefix("X: "));
+                    ui.add(egui::Slider::new(&mut self.padding_y, 0.0..=40.0).suffix(" pt").prefix("Y: "));
+                },
+            );
 
-            ui.label("邊距 (Padding X / Y):");
-            ui.horizontal(|ui| {
-                ui.label("X:");
-                ui.add(egui::DragValue::new(&mut self.padding_x).range(0.0..=40.0));
-                ui.label("Y:");
-                ui.add(egui::DragValue::new(&mut self.padding_y).range(0.0..=40.0));
-            });
-            ui.end_row();
+            b.row(
+                "背景不透明度 (Opacity)",
+                Some("1.0 為完全不透明，搭配毛玻璃"),
+                |ui| {
+                    ui.add(egui::Slider::new(&mut self.opacity, 0.2..=1.0).step_by(0.05));
+                },
+            );
 
-            ui.label("背景不透明度 (Opacity):");
-            ui.add(egui::Slider::new(&mut self.opacity, 0.2..=1.0).step_by(0.05));
-            ui.end_row();
+            b.row(
+                "啟動模式 (Startup Mode)",
+                Some("應用程式啟動時視窗狀態"),
+                |ui| {
+                    let mut cur = self.startup_mode.as_str();
+                    let opts = [
+                        ("normal", "一般視窗"),
+                        ("maximized", "最大化"),
+                        ("fullscreen", "全螢幕"),
+                    ];
+                    if crate::preferences_window::render_macos_segmented_control(ui, &mut cur, &opts) {
+                        self.startup_mode = cur.to_string();
+                    }
+                },
+            );
 
-            ui.label("啟動模式 (Startup Mode):");
-            egui::ComboBox::from_id_salt("startup_mode")
-                .selected_text(&self.startup_mode)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.startup_mode, "normal".to_string(), "一般視窗 (Normal)");
-                    ui.selectable_value(&mut self.startup_mode, "maximized".to_string(), "最大化 (Maximized)");
-                    ui.selectable_value(&mut self.startup_mode, "fullscreen".to_string(), "全螢幕 (Fullscreen)");
-                });
-            ui.end_row();
-
-            ui.label("分頁列顯示 (Tab Bar):");
-            egui::ComboBox::from_id_salt("tab_bar_style")
-                .selected_text(&self.tab_bar_style)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.tab_bar_style, "auto".to_string(), "自動 (多於1個分頁時顯示)");
-                    ui.selectable_value(&mut self.tab_bar_style, "always".to_string(), "恆常顯示 (Always)");
-                    ui.selectable_value(&mut self.tab_bar_style, "never".to_string(), "永不顯示 (Never)");
-                });
-            ui.end_row();
+            b.row(
+                "分頁列顯示 (Tab Bar)",
+                Some("控制多分頁標籤列何時出現"),
+                |ui| {
+                    let mut cur = self.tab_bar_style.as_str();
+                    let opts = [
+                        ("auto", "自動隱藏"),
+                        ("always", "恆常顯示"),
+                        ("never", "永不顯示"),
+                    ];
+                    if crate::preferences_window::render_macos_segmented_control(ui, &mut cur, &opts) {
+                        self.tab_bar_style = cur.to_string();
+                    }
+                },
+            );
         });
     }
 
     fn render_colors_tab(&mut self, ui: &mut Ui) {
-        ui.heading("色彩主題 (Themes)");
-        egui::Grid::new("theme_grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-            ui.label("主題預設 (Preset Theme):");
-            egui::ComboBox::from_id_salt("theme_preset")
-                .selected_text(&self.theme)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.theme, "catppuccin-mocha".to_string(), "Catppuccin Mocha ☕");
-                    ui.selectable_value(&mut self.theme, "tokyo-night".to_string(), "Tokyo Night 🌃");
-                    ui.selectable_value(&mut self.theme, "dracula".to_string(), "Dracula 🧛");
-                    ui.selectable_value(&mut self.theme, "solarized-dark".to_string(), "Solarized Dark ☀️");
-                    ui.selectable_value(&mut self.theme, "nord".to_string(), "Nord ❄️");
-                    ui.selectable_value(&mut self.theme, "default-dark".to_string(), "Default Dark 🌑");
-                });
-            ui.end_row();
+        crate::preferences_window::render_inset_card(ui, "色彩主題 (Preset Themes)", |b| {
+            b.row(
+                "一鍵主題卡片畫廊 (Theme Gallery)",
+                Some("點擊卡片立即套用底色與 ANSI 16 色調色盤"),
+                |ui| {
+                    let themes = [
+                        ("pure-black", "Pure Black 經典黑 🖤"),
+                        ("catppuccin-mocha", "Catppuccin Mocha ☕"),
+                        ("tokyo-night", "Tokyo Night 🌃"),
+                        ("dracula", "Dracula 🧛"),
+                        ("solarized-dark", "Solarized Dark ☀️"),
+                        ("nord", "Nord ❄️"),
+                    ];
+
+                    let old_theme = self.theme.clone();
+                    egui::Grid::new("gui_theme_swatch_grid")
+                        .num_columns(2)
+                        .spacing(egui::vec2(10.0, 8.0))
+                        .show(ui, |ui| {
+                            for (idx, (id, label)) in themes.iter().enumerate() {
+                                ui.push_id(id, |ui| {
+                                    let is_selected = self.theme == *id;
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        egui::vec2(165.0, 48.0),
+                                        egui::Sense::click(),
+                                    );
+                                    let hover = resp.hovered();
+
+                                    let bg = if is_selected {
+                                        Color32::from_rgb(36, 48, 76)
+                                    } else if hover {
+                                        Color32::from_rgb(44, 47, 62)
+                                    } else {
+                                        Color32::from_rgb(28, 30, 40)
+                                    };
+
+                                    let stroke = if is_selected {
+                                        egui::Stroke::new(1.8, Color32::from_rgb(10, 132, 255))
+                                    } else if hover {
+                                        egui::Stroke::new(1.0, Color32::from_rgb(75, 82, 108))
+                                    } else {
+                                        egui::Stroke::new(1.0, Color32::from_rgb(48, 51, 68))
+                                    };
+
+                                    ui.painter().rect(
+                                        rect,
+                                        egui::CornerRadius::same(8),
+                                        bg,
+                                        stroke,
+                                        egui::StrokeKind::Outside,
+                                    );
+
+                                    let text_color = if is_selected {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_rgb(215, 220, 235)
+                                    };
+
+                                    ui.painter().text(
+                                        rect.left_top() + egui::vec2(10.0, 7.0),
+                                        egui::Align2::LEFT_TOP,
+                                        label,
+                                        egui::FontId::proportional(11.5),
+                                        text_color,
+                                    );
+
+                                    let preset = crate::config::Theme::get(id);
+                                    let dot_colors = [
+                                        preset.background,
+                                        preset.foreground,
+                                        preset.palette[1],
+                                        preset.palette[2],
+                                        preset.palette[4],
+                                    ];
+                                    let start_x = rect.left() + 10.0;
+                                    let dot_y = rect.bottom() - 10.0;
+                                    for (i, c_rgba) in dot_colors.iter().enumerate() {
+                                        let c32 = Color32::from_rgba_unmultiplied(
+                                            (c_rgba[0] * 255.0) as u8,
+                                            (c_rgba[1] * 255.0) as u8,
+                                            (c_rgba[2] * 255.0) as u8,
+                                            255,
+                                        );
+                                        let dot_x = start_x + (i as f32 * 14.0);
+                                        ui.painter().circle_filled(
+                                            egui::pos2(dot_x, dot_y),
+                                            4.0,
+                                            c32,
+                                        );
+                                        ui.painter().circle_stroke(
+                                            egui::pos2(dot_x, dot_y),
+                                            4.0,
+                                            egui::Stroke::new(0.5, Color32::from_white_alpha(70)),
+                                        );
+                                    }
+
+                                    if resp.clicked() {
+                                        self.theme = id.to_string();
+                                    }
+                                });
+
+                                if idx % 2 == 1 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+
+                    if old_theme != self.theme {
+                        self.fg_override.clear();
+                        self.bg_override.clear();
+                        self.cursor_override.clear();
+                        self.selection_override.clear();
+                    }
+                },
+            );
         });
 
-        ui.add_space(10.0);
-        ui.heading("自訂色彩覆蓋 (Hex Overrides)");
-        ui.label("若留空則套用主題預設值：");
-
-        egui::Grid::new("color_overrides").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-            ui.label("前景色彩 (Foreground):");
-            ui.text_edit_singleline(&mut self.fg_override);
-            ui.end_row();
-
-            ui.label("背景色彩 (Background):");
-            ui.text_edit_singleline(&mut self.bg_override);
-            ui.end_row();
-
-            ui.label("游標色彩 (Cursor):");
-            ui.text_edit_singleline(&mut self.cursor_override);
-            ui.end_row();
-
-            ui.label("選取區域 (Selection):");
-            ui.text_edit_singleline(&mut self.selection_override);
-            ui.end_row();
+        crate::preferences_window::render_inset_card(ui, "自訂色彩覆蓋 (Color Overrides)", |b| {
+            b.row("前景文字色 (Foreground)", Some("留空則繼承主題預設值"), |ui| {
+                crate::preferences_window::render_color_row(ui, "", &mut self.fg_override);
+            });
+            b.row("背景底色 (Background)", Some("留空則繼承主題預設值"), |ui| {
+                crate::preferences_window::render_color_row(ui, "", &mut self.bg_override);
+            });
+            b.row("游標顏色 (Cursor)", Some("留空則繼承主題預設值"), |ui| {
+                crate::preferences_window::render_color_row(ui, "", &mut self.cursor_override);
+            });
+            b.row("選取文字底色 (Selection)", Some("留空則繼承主題預設值"), |ui| {
+                crate::preferences_window::render_color_row(ui, "", &mut self.selection_override);
+            });
         });
     }
 
     fn render_terminal_tab(&mut self, ui: &mut Ui) {
-        ui.heading("模擬器與環境 (Terminal & Environment)");
-        egui::Grid::new("term_grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-            ui.label("TERM 變數:");
-            ui.text_edit_singleline(&mut self.term);
-            ui.end_row();
+        crate::preferences_window::render_inset_card(ui, "模擬器與環境 (Terminal & Environment)", |b| {
+            b.row("TERM 變數", Some("環境變數 $TERM 預設值"), |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.term).desired_width(140.0));
+            });
 
-            ui.label("滾動歷史行數 (Scrollback):");
-            ui.add(egui::Slider::new(&mut self.scrollback_lines, 1000..=50000).step_by(1000.0));
-            ui.end_row();
+            b.row(
+                "指定自訂 Shell 程式",
+                Some("預設使用系統 $SHELL"),
+                |ui| {
+                    crate::preferences_window::render_macos_toggle_switch(ui, &mut self.custom_shell_enabled);
+                },
+            );
 
-            ui.label("初始工作目錄 (Working Dir):");
-            ui.text_edit_singleline(&mut self.working_directory);
-            ui.end_row();
-
-            ui.label("macOS Option 鍵 (Meta):");
-            egui::ComboBox::from_id_salt("option_as_alt")
-                .selected_text(&self.option_as_alt)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.option_as_alt, "both".to_string(), "左右 Option 皆發送 Esc+ (Both)");
-                    ui.selectable_value(&mut self.option_as_alt, "only_left".to_string(), "僅左 Option (Only Left)");
-                    ui.selectable_value(&mut self.option_as_alt, "only_right".to_string(), "僅右 Option (Only Right)");
-                    ui.selectable_value(&mut self.option_as_alt, "none".to_string(), "不轉換 (None)");
+            if self.custom_shell_enabled {
+                b.row("Shell 執行檔路徑", None, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.shell_program).hint_text("/bin/zsh"));
                 });
-            ui.end_row();
 
-            ui.label("鈴聲模式 (Bell):");
-            egui::ComboBox::from_id_salt("bell_mode")
-                .selected_text(&self.bell)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.bell, "visual".to_string(), "視覺閃爍 (Visual)");
-                    ui.selectable_value(&mut self.bell, "sound".to_string(), "系統聲音 (Sound)");
-                    ui.selectable_value(&mut self.bell, "none".to_string(), "靜音 (None)");
+                b.row("啟動參數 (Args)", None, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.shell_args).hint_text("--login"));
                 });
-            ui.end_row();
+            }
+
+            b.row("初始工作目錄", Some("終端啟動預設路徑"), |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.working_directory).hint_text("預設使用者家目錄 (~/)"));
+            });
         });
 
-        ui.add_space(10.0);
-        ui.heading("自訂 Shell (Custom Shell)");
-        ui.checkbox(&mut self.custom_shell_enabled, "指定自訂 Shell 程式 (預設使用系統 $SHELL)");
+        crate::preferences_window::render_inset_card(ui, "緩衝區與操作行為 (Buffer & Interaction)", |b| {
+            b.row(
+                "滾動歷史行數 (Scrollback)",
+                Some("保留向上捲動緩衝行數"),
+                |ui| {
+                    ui.add(egui::Slider::new(&mut self.scrollback_lines, 1000..=50000).step_by(1000.0));
+                },
+            );
 
-        if self.custom_shell_enabled {
-            egui::Grid::new("shell_grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                ui.label("Shell 執行檔路徑:");
-                ui.text_edit_singleline(&mut self.shell_program);
-                ui.end_row();
+            b.row(
+                "macOS Option 鍵 (Meta)",
+                Some("是否傳遞 Meta (Esc+) 序列"),
+                |ui| {
+                    let mut cur = self.option_as_alt.as_str();
+                    let opts = [
+                        ("both", "左右 Option 均作 Meta"),
+                        ("only_left", "僅左 Option"),
+                        ("only_right", "僅右 Option"),
+                        ("none", "不轉換"),
+                    ];
+                    if crate::preferences_window::render_macos_segmented_control(ui, &mut cur, &opts) {
+                        self.option_as_alt = cur.to_string();
+                    }
+                },
+            );
 
-                ui.label("啟動參數 (Args):");
-                ui.text_edit_singleline(&mut self.shell_args);
-                ui.end_row();
-            });
-        }
+            b.row(
+                "終端鈴聲模式 (Bell)",
+                Some("遇警示訊號時回饋方式"),
+                |ui| {
+                    let mut cur = self.bell.as_str();
+                    let opts = [
+                        ("visual", "視覺閃爍"),
+                        ("sound", "系統聲音"),
+                        ("none", "靜音"),
+                    ];
+                    if crate::preferences_window::render_macos_segmented_control(ui, &mut cur, &opts) {
+                        self.bell = cur.to_string();
+                    }
+                },
+            );
+        });
     }
 
     fn render_cursor_tab(&mut self, ui: &mut Ui) {
-        ui.heading("游標樣式與動態 (Cursor)");
-        egui::Grid::new("cursor_grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-            ui.label("游標形狀 (Shape):");
-            egui::ComboBox::from_id_salt("cursor_shape")
-                .selected_text(&self.cursor_shape)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.cursor_shape, "block".to_string(), "方塊游標 (Block █)");
-                    ui.selectable_value(&mut self.cursor_shape, "beam".to_string(), "直條游標 (Beam ❘)");
-                    ui.selectable_value(&mut self.cursor_shape, "underline".to_string(), "底線游標 (Underline  )");
-                });
-            ui.end_row();
+        crate::preferences_window::render_inset_card(ui, "游標樣式與動態 (Cursor Style)", |b| {
+            b.row(
+                "游標形狀 (Shape)",
+                Some("終端游標幾何外觀"),
+                |ui| {
+                    let mut cur = self.cursor_shape.as_str();
+                    let opts = [
+                        ("block", "方塊 (Block █)"),
+                        ("beam", "直條 (Beam ❘)"),
+                        ("underline", "底線 (Underline _)"),
+                    ];
+                    if crate::preferences_window::render_macos_segmented_control(ui, &mut cur, &opts) {
+                        self.cursor_shape = cur.to_string();
+                    }
+                },
+            );
 
-            ui.label("游標閃爍 (Blink):");
-            ui.checkbox(&mut self.cursor_blink, "開啟閃爍");
-            ui.end_row();
+            b.row(
+                "游標閃爍 (Blink)",
+                Some("開啟游標平滑呼吸動畫"),
+                |ui| {
+                    crate::preferences_window::render_macos_toggle_switch(ui, &mut self.cursor_blink);
+                },
+            );
 
             if self.cursor_blink {
-                ui.label("閃爍頻率 (Interval):");
-                ui.add(egui::Slider::new(&mut self.blink_interval_ms, 200..=1000).suffix(" ms"));
-                ui.end_row();
+                b.row(
+                    "閃爍頻率 (Interval)",
+                    Some("游標閃爍頻率毫秒"),
+                    |ui| {
+                        ui.add(egui::Slider::new(&mut self.blink_interval_ms, 200..=1000).suffix(" ms"));
+                    },
+                );
             }
         });
     }

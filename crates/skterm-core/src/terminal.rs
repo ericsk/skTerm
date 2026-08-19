@@ -1,6 +1,6 @@
 //! High-level Terminal engine integrating PTY, VTE Parser, and ScreenGrid.
 
-use crate::grid::ScreenGrid;
+use crate::grid::{CursorShape, ScreenGrid};
 use crate::pty::{PtyEvent, PtyProcess, PtySpawnOptions};
 use crate::vt::TerminalState;
 use vte::Parser;
@@ -123,5 +123,10 @@ impl Terminal {
     /// Mutable reference to the underlying ScreenGrid.
     pub fn grid_mut(&mut self) -> &mut ScreenGrid {
         &mut self.state.grid
+    }
+
+    /// Set cursor visual shape (Block / Beam / Underline).
+    pub fn set_cursor_shape(&mut self, shape: CursorShape) {
+        self.state.grid.set_cursor_shape(shape);
     }
 }

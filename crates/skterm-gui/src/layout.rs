@@ -1,6 +1,6 @@
 //! Binary Space Partitioning (BSP) tree for split panes, tabs, and multi-terminal management.
 
-use skterm_core::{PtySpawnOptions, Terminal};
+use skterm_core::{CursorShape, PtySpawnOptions, Terminal};
 
 /// Unique identifier for a split pane.
 pub type PaneId = u32;
@@ -264,6 +264,18 @@ impl PaneNode {
                 let p1 = first.poll_all_ptys();
                 let p2 = second.poll_all_ptys();
                 p1 || p2
+            }
+        }
+    }
+
+    pub fn update_cursor_shape(&mut self, shape: CursorShape) {
+        match self {
+            PaneNode::Leaf { terminal, .. } => {
+                terminal.set_cursor_shape(shape);
+            }
+            PaneNode::Split { first, second, .. } => {
+                first.update_cursor_shape(shape);
+                second.update_cursor_shape(shape);
             }
         }
     }
@@ -605,6 +617,13 @@ impl Workspace {
                     let _ = terminal.resize(rows.max(1), cols.max(1));
                 }
             }
+        }
+    }
+
+    /// Update cursor shape across all tabs and panes.
+    pub fn update_cursor_shape(&mut self, shape: CursorShape) {
+        for tab in &mut self.tabs {
+            tab.root.update_cursor_shape(shape);
         }
     }
 }

@@ -5,12 +5,14 @@ pub mod config;
 pub mod input;
 pub mod layout;
 pub mod preferences_gui;
+pub mod preferences_window;
 
 pub use app_window::App;
 pub use config::{default_config_template, parse_hex_color, Config, ConfigManager, Theme};
 pub use input::{encode_key, encode_key_event};
 pub use layout::{PaneId, PaneNode, Rect, SplitDirection, Tab, TabId, Workspace};
 pub use preferences_gui::{PreferencesGui, PreferencesTab};
+pub use preferences_window::{PreferencesCategory, PreferencesWindow};
 
 /// skterm-gui version and basic info
 pub fn gui_info() -> &'static str {
@@ -212,5 +214,12 @@ mod tests {
 
         gui.toggle(&default_cfg);
         assert!(!gui.is_open);
+    }
+
+    #[test]
+    fn test_preferences_window_font_scan() {
+        let fonts = preferences_window::scan_available_monospace_fonts();
+        // Even if empty on minimal CI container, it should safely return a Vec<String>
+        assert!(fonts.len() <= 30);
     }
 }

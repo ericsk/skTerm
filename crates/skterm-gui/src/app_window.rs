@@ -1,9 +1,9 @@
-//! Main Application Event Loop, Window Handler, Tabs, Split Panes, Clipboard, CJK IME, and In-App Preferences GUI.
+//! Main Application Event Loop, Window Handler, Tabs, Split Panes, Clipboard, CJK IME, and Native Preferences Window.
 
-use crate::config::{parse_hex_color, ConfigManager, Theme};
+use crate::config::{parse_hex_color, Config, ConfigManager, Theme};
 use crate::input::encode_key_event;
 use crate::layout::{PaneId, SplitDirection, Workspace};
-use crate::preferences_gui::PreferencesGui;
+use crate::preferences_window::PreferencesWindow;
 use arboard::Clipboard;
 use skterm_core::{PtySpawnOptions, Selection, SelectionMode};
 use skterm_render::{PaneRenderItem, RenderTheme, TabItem, TermRenderer};
@@ -20,10 +20,7 @@ use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 /// skTerm GUI Application instance.
 pub struct App {
     pub config_manager: ConfigManager,
-    pub preferences_gui: PreferencesGui,
-    pub egui_ctx: egui::Context,
-    pub egui_state: Option<egui_winit::State>,
-    pub egui_renderer: Option<egui_wgpu::Renderer>,
+    pub preferences_window: Option<PreferencesWindow>,
     pub window: Option<Arc<Window>>,
     pub renderer: Option<TermRenderer>,
     pub workspace: Option<Workspace>,
@@ -33,6 +30,8 @@ pub struct App {
     pub is_mouse_down: bool,
     pub last_click_time: Instant,
     pub click_count: usize,
+    pub pending_geometry_save: bool,
+    pub last_resize_time: Option<Instant>,
 }
 
 impl Default for App {
@@ -44,9 +43,6 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         let config_manager = ConfigManager::load_or_create();
-        let preferences_gui = PreferencesGui::new();
-        let egui_ctx = egui::Context::default();
-        crate::preferences_gui::setup_egui_cjk_fonts(&egui_ctx);
 
         let clipboard = match Clipboard::new() {
             Ok(cb) => Some(Arc::new(Mutex::new(cb))),
@@ -58,10 +54,7 @@ impl App {
 
         Self {
             config_manager,
-            preferences_gui,
-            egui_ctx,
-            egui_state: None,
-            egui_renderer: None,
+            preferences_window: None,
             window: None,
             renderer: None,
             workspace: None,
@@ -71,6 +64,8 @@ impl App {
             is_mouse_down: false,
             last_click_time: Instant::now(),
             click_count: 0,
+            pending_geometry_save: false,
+            last_resize_time: None,
         }
     }
 
@@ -79,6 +74,77 @@ impl App {
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
         event_loop.run_app(&mut self)?;
         Ok(())
+    }
+
+    pub fn open_preferences_window(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(pref) = &self.preferences_window {
+            pref.window.focus_window();
+            pref.window.request_redraw();
+            return;
+        }
+
+        match pollster::block_on(PreferencesWindow::create(event_loop, &self.config_manager.current_config)) {
+            Ok(pref) => {
+                info!("Opened dedicated Preferences Window (ID: {:?})", pref.id());
+                self.preferences_window = Some(pref);
+            }
+            Err(e) => {
+                error!("Failed to open Preferences Window: {:?}", e);
+            }
+        }
+    }
+
+    pub fn apply_config_live(&mut self, new_cfg: &Config) {
+        info!("Applying live configuration update to terminal...");
+        let old_font = self.config_manager.current_config.font.clone();
+        let font_changed = old_font.family != new_cfg.font.family
+            || (old_font.size - new_cfg.font.size).abs() > 0.01
+            || old_font.fallback_families != new_cfg.font.fallback_families;
+
+        self.config_manager.current_config = new_cfg.clone();
+
+        // 1. Update font (only if changed), padding, and opacity
+        if let Some(renderer) = &mut self.renderer {
+            if font_changed {
+                info!("Font settings changed, rebuilding WGPU glyph atlas...");
+                let _ = renderer.update_font(
+                    &new_cfg.font.family,
+                    new_cfg.font.size,
+                    &new_cfg.font.fallback_families,
+                );
+            }
+            renderer.update_padding(new_cfg.window.padding_x, new_cfg.window.padding_y);
+            renderer.update_opacity(new_cfg.window.opacity);
+        }
+
+        // 2. Update theme
+        self.apply_theme_to_renderer();
+
+        // 3. Update cursor shape
+        let cursor_shape = match new_cfg.cursor.shape.as_str() {
+            "beam" => skterm_core::CursorShape::Beam,
+            "underline" => skterm_core::CursorShape::Underline,
+            _ => skterm_core::CursorShape::Block,
+        };
+        if let Some(workspace) = &mut self.workspace {
+            workspace.update_cursor_shape(cursor_shape);
+        }
+
+        // 4. Sync workspace pane sizes to updated cell size & padding
+        self.sync_all_pane_sizes();
+
+        // 5. Request redraw on main window
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+
+        // 6. Auto-save to config.toml in background thread
+        if let Ok(toml_str) = toml::to_string_pretty(new_cfg) {
+            let path = self.config_manager.path.clone();
+            std::thread::spawn(move || {
+                let _ = std::fs::write(&path, toml_str);
+            });
+        }
     }
 
     fn build_pty_options(&self) -> PtySpawnOptions {
@@ -98,230 +164,77 @@ impl App {
         }
     }
 
-    fn apply_theme_to_renderer(&mut self) {
+    pub fn apply_theme_to_renderer(&mut self) {
+        let config = &self.config_manager.current_config;
+        let preset = Theme::get(&config.colors.theme);
+        let mut render_theme = RenderTheme {
+            default_fg: preset.foreground,
+            default_bg: preset.background,
+            cursor_color: preset.cursor,
+            selection_color: preset.selection,
+            tab_bar_bg: [preset.background[0] * 0.85, preset.background[1] * 0.85, preset.background[2] * 0.85, 1.0],
+            tab_active_bg: preset.background,
+            tab_active_fg: preset.foreground,
+            tab_inactive_fg: [preset.foreground[0] * 0.6, preset.foreground[1] * 0.6, preset.foreground[2] * 0.6, 1.0],
+            border_color: [0.3, 0.3, 0.35, 1.0],
+            focused_border_color: [0.5, 0.7, 1.0, 1.0],
+            ansi_palette: Some(preset.palette),
+        };
+
+        if let Some(fg_hex) = &config.colors.foreground {
+            if let Some(c) = parse_hex_color(fg_hex) {
+                render_theme.default_fg = c;
+                render_theme.tab_active_fg = c;
+            }
+        }
+        if let Some(bg_hex) = &config.colors.background {
+            if let Some(c) = parse_hex_color(bg_hex) {
+                render_theme.default_bg = c;
+                render_theme.tab_active_bg = c;
+            }
+        }
+        if let Some(cur_hex) = &config.colors.cursor {
+            if let Some(c) = parse_hex_color(cur_hex) {
+                render_theme.cursor_color = c;
+            }
+        }
+        if let Some(sel_hex) = &config.colors.selection {
+            if let Some(c) = parse_hex_color(sel_hex) {
+                render_theme.selection_color = c;
+            }
+        }
+
+        if let Some(palette_cfg) = &config.colors.palette {
+            let mut pal = preset.palette;
+
+            if let Some(c) = palette_cfg.black.as_ref().and_then(|h| parse_hex_color(h)) { pal[0] = c; }
+            if let Some(c) = palette_cfg.red.as_ref().and_then(|h| parse_hex_color(h)) { pal[1] = c; }
+            if let Some(c) = palette_cfg.green.as_ref().and_then(|h| parse_hex_color(h)) { pal[2] = c; }
+            if let Some(c) = palette_cfg.yellow.as_ref().and_then(|h| parse_hex_color(h)) { pal[3] = c; }
+            if let Some(c) = palette_cfg.blue.as_ref().and_then(|h| parse_hex_color(h)) { pal[4] = c; }
+            if let Some(c) = palette_cfg.magenta.as_ref().and_then(|h| parse_hex_color(h)) { pal[5] = c; }
+            if let Some(c) = palette_cfg.cyan.as_ref().and_then(|h| parse_hex_color(h)) { pal[6] = c; }
+            if let Some(c) = palette_cfg.white.as_ref().and_then(|h| parse_hex_color(h)) { pal[7] = c; }
+            if let Some(c) = palette_cfg.bright_black.as_ref().and_then(|h| parse_hex_color(h)) { pal[8] = c; }
+            if let Some(c) = palette_cfg.bright_red.as_ref().and_then(|h| parse_hex_color(h)) { pal[9] = c; }
+            if let Some(c) = palette_cfg.bright_green.as_ref().and_then(|h| parse_hex_color(h)) { pal[10] = c; }
+            if let Some(c) = palette_cfg.bright_yellow.as_ref().and_then(|h| parse_hex_color(h)) { pal[11] = c; }
+            if let Some(c) = palette_cfg.bright_blue.as_ref().and_then(|h| parse_hex_color(h)) { pal[12] = c; }
+            if let Some(c) = palette_cfg.bright_magenta.as_ref().and_then(|h| parse_hex_color(h)) { pal[13] = c; }
+            if let Some(c) = palette_cfg.bright_cyan.as_ref().and_then(|h| parse_hex_color(h)) { pal[14] = c; }
+            if let Some(c) = palette_cfg.bright_white.as_ref().and_then(|h| parse_hex_color(h)) { pal[15] = c; }
+
+            render_theme.ansi_palette = Some(pal);
+        }
+
         if let Some(renderer) = &mut self.renderer {
-            let colors_cfg = &self.config_manager.current_config.colors;
-            let window_cfg = &self.config_manager.current_config.window;
-            let theme = Theme::get(&colors_cfg.theme);
-
-            let fg = colors_cfg
-                .foreground
-                .as_deref()
-                .and_then(parse_hex_color)
-                .unwrap_or(theme.foreground);
-
-            let mut bg = colors_cfg
-                .background
-                .as_deref()
-                .and_then(parse_hex_color)
-                .unwrap_or(theme.background);
-
-            // Apply opacity to background
-            bg[3] = window_cfg.opacity.clamp(0.1, 1.0);
-
-            let cursor = colors_cfg
-                .cursor
-                .as_deref()
-                .and_then(parse_hex_color)
-                .unwrap_or(theme.cursor);
-
-            let selection = colors_cfg
-                .selection
-                .as_deref()
-                .and_then(parse_hex_color)
-                .unwrap_or(theme.selection);
-
-            // Custom ANSI Palette
-            let ansi_palette = colors_cfg.palette.as_ref().map(|p| {
-                let mut pal = [
-                    [0.0, 0.0, 0.0, 1.0],       // 0: Black
-                    [0.80, 0.20, 0.20, 1.0],    // 1: Red
-                    [0.20, 0.80, 0.20, 1.0],    // 2: Green
-                    [0.80, 0.80, 0.20, 1.0],    // 3: Yellow
-                    [0.20, 0.40, 0.80, 1.0],    // 4: Blue
-                    [0.80, 0.20, 0.80, 1.0],    // 5: Magenta
-                    [0.20, 0.80, 0.80, 1.0],    // 6: Cyan
-                    [0.80, 0.80, 0.80, 1.0],    // 7: White
-                    [0.40, 0.40, 0.40, 1.0],    // 8: Bright Black
-                    [1.0, 0.35, 0.35, 1.0],     // 9: Bright Red
-                    [0.35, 1.0, 0.35, 1.0],     // 10: Bright Green
-                    [1.0, 1.0, 0.35, 1.0],      // 11: Bright Yellow
-                    [0.35, 0.65, 1.0, 1.0],     // 12: Bright Blue
-                    [1.0, 0.35, 1.0, 1.0],      // 13: Bright Magenta
-                    [0.35, 1.0, 1.0, 1.0],      // 14: Bright Cyan
-                    [1.0, 1.0, 1.0, 1.0],       // 15: Bright White
-                ];
-
-                if let Some(c) = p.black.as_deref().and_then(parse_hex_color) { pal[0] = c; }
-                if let Some(c) = p.red.as_deref().and_then(parse_hex_color) { pal[1] = c; }
-                if let Some(c) = p.green.as_deref().and_then(parse_hex_color) { pal[2] = c; }
-                if let Some(c) = p.yellow.as_deref().and_then(parse_hex_color) { pal[3] = c; }
-                if let Some(c) = p.blue.as_deref().and_then(parse_hex_color) { pal[4] = c; }
-                if let Some(c) = p.magenta.as_deref().and_then(parse_hex_color) { pal[5] = c; }
-                if let Some(c) = p.cyan.as_deref().and_then(parse_hex_color) { pal[6] = c; }
-                if let Some(c) = p.white.as_deref().and_then(parse_hex_color) { pal[7] = c; }
-                if let Some(c) = p.bright_black.as_deref().and_then(parse_hex_color) { pal[8] = c; }
-                if let Some(c) = p.bright_red.as_deref().and_then(parse_hex_color) { pal[9] = c; }
-                if let Some(c) = p.bright_green.as_deref().and_then(parse_hex_color) { pal[10] = c; }
-                if let Some(c) = p.bright_yellow.as_deref().and_then(parse_hex_color) { pal[11] = c; }
-                if let Some(c) = p.bright_blue.as_deref().and_then(parse_hex_color) { pal[12] = c; }
-                if let Some(c) = p.bright_magenta.as_deref().and_then(parse_hex_color) { pal[13] = c; }
-                if let Some(c) = p.bright_cyan.as_deref().and_then(parse_hex_color) { pal[14] = c; }
-                if let Some(c) = p.bright_white.as_deref().and_then(parse_hex_color) { pal[15] = c; }
-
-                pal
-            });
-
-            renderer.set_theme(RenderTheme {
-                default_fg: fg,
-                default_bg: bg,
-                cursor_color: cursor,
-                selection_color: selection,
-                ansi_palette,
-                ..Default::default()
-            });
-
-            renderer.padding_x = window_cfg.padding_x * renderer.scale_factor;
-            renderer.padding_y = window_cfg.padding_y * renderer.scale_factor;
+            renderer.set_theme(render_theme);
         }
     }
 
-    fn get_tab_bar_height(&self) -> f32 {
-        if let (Some(workspace), Some(renderer)) = (&self.workspace, &self.renderer) {
-            match self.config_manager.current_config.window.tab_bar_style.as_str() {
-                "always" => 32.0 * renderer.scale_factor,
-                "never" => 0.0,
-                _ => {
-                    if workspace.tabs.len() > 1 {
-                        32.0 * renderer.scale_factor
-                    } else {
-                        0.0
-                    }
-                }
-            }
-        } else {
-            0.0
-        }
-    }
-
-    fn pixel_to_pane_grid(&self, px: f32, py: f32) -> Option<(PaneId, (usize, usize))> {
-        if let (Some(renderer), Some(workspace)) = (&self.renderer, &self.workspace) {
-            let scale = renderer.scale_factor;
-            let phys_x = px * scale;
-            let phys_y = py * scale;
-            let tab_bar_h = self.get_tab_bar_height();
-
-            let rects = workspace.compute_active_pane_rects(
-                renderer.config.width as f32,
-                renderer.config.height as f32,
-                tab_bar_h,
-            );
-
-            for (id, rect) in rects {
-                if rect.contains(phys_x, phys_y) {
-                    let cell_w = renderer.cell_width();
-                    let cell_h = renderer.cell_height();
-                    let col = ((phys_x - rect.x - renderer.padding_x).max(0.0) / cell_w).floor() as usize;
-                    let row = ((phys_y - rect.y - renderer.padding_y).max(0.0) / cell_h).floor() as usize;
-
-                    if let Some(t) = workspace.active_tab().and_then(|tab| tab.root.find_terminal(id)) {
-                        let max_col = t.grid().active().cols.saturating_sub(1);
-                        let max_row = t.grid().active().rows.saturating_sub(1);
-                        return Some((id, (row.min(max_row), col.min(max_col))));
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn update_ime_position(&self) {
-        if self.preferences_gui.is_open {
-            return;
-        }
-
-        if let (Some(window), Some(renderer), Some(workspace)) =
-            (&self.window, &self.renderer, &self.workspace)
-        {
-            if let Some(tab) = workspace.active_tab() {
-                if let Some(terminal) = tab.active_terminal() {
-                    let active = terminal.grid().active();
-                    let scale = renderer.scale_factor;
-                    let cell_w_logical = renderer.cell_width() / scale;
-                    let cell_h_logical = renderer.cell_height() / scale;
-                    let pad_x_logical = renderer.padding_x / scale;
-                    let pad_y_logical = renderer.padding_y / scale;
-
-                    let tab_bar_h = self.get_tab_bar_height() / scale;
-                    let rects = workspace.compute_active_pane_rects(
-                        renderer.config.width as f32,
-                        renderer.config.height as f32,
-                        self.get_tab_bar_height(),
-                    );
-
-                    let active_pane_id = tab.active_pane_id;
-                    let pane_offset = rects
-                        .iter()
-                        .find(|(id, _)| *id == active_pane_id)
-                        .map(|(_, r)| (r.x / scale, r.y / scale))
-                        .unwrap_or((0.0, tab_bar_h));
-
-                    let cur_x = pane_offset.0 + pad_x_logical + (active.cursor.col as f32 * cell_w_logical);
-                    let cur_y = pane_offset.1 + pad_y_logical + (active.cursor.row as f32 * cell_h_logical);
-
-                    window.set_ime_cursor_area(
-                        Position::Logical(LogicalPosition::new(cur_x as f64, (cur_y + cell_h_logical) as f64)),
-                        Size::Logical(LogicalSize::new(cell_w_logical as f64, cell_h_logical as f64)),
-                    );
-                }
-            }
-        }
-    }
-
-    fn copy_to_clipboard(&self) {
-        if let (Some(workspace), Some(clipboard)) = (&self.workspace, &self.clipboard) {
-            if let Some(tab) = workspace.active_tab() {
-                if let Some(terminal) = tab.active_terminal() {
-                    let text = terminal.grid().active().extract_selected_text();
-                    if !text.is_empty() {
-                        if let Ok(mut cb) = clipboard.lock() {
-                            let _ = cb.set_text(text);
-                            info!("Copied selected text to clipboard");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn paste_from_clipboard(&self) {
-        if let (Some(workspace), Some(clipboard)) = (&self.workspace, &self.clipboard) {
-            if let Some(tab) = workspace.active_tab() {
-                if let Some(terminal) = tab.active_terminal() {
-                    if let Ok(mut cb) = clipboard.lock() {
-                        if let Ok(text) = cb.get_text() {
-                            let mut bytes = Vec::new();
-                            if terminal.state.bracketed_paste {
-                                bytes.extend_from_slice(b"\x1b[200~");
-                                bytes.extend_from_slice(text.as_bytes());
-                                bytes.extend_from_slice(b"\x1b[201~");
-                            } else {
-                                bytes.extend_from_slice(text.as_bytes());
-                            }
-                            let _ = terminal.write_to_pty(&bytes);
-                            if let Some(window) = &self.window {
-                                window.request_redraw();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn sync_all_pane_sizes(&mut self) {
+    pub fn sync_all_pane_sizes(&mut self) {
         let tab_bar_h = self.get_tab_bar_height();
-        if let (Some(workspace), Some(renderer)) = (&mut self.workspace, &self.renderer) {
+        if let (Some(renderer), Some(workspace)) = (&self.renderer, &mut self.workspace) {
             workspace.sync_pane_sizes(
                 renderer.config.width as f32,
                 renderer.config.height as f32,
@@ -333,6 +246,133 @@ impl App {
             );
         }
     }
+
+    pub fn get_tab_bar_height(&self) -> f32 {
+        let tab_bar_style = self.config_manager.current_config.window.tab_bar_style.as_str();
+        let tab_count = self.workspace.as_ref().map(|w| w.tabs.len()).unwrap_or(0);
+        let scale = self.renderer.as_ref().map(|r| r.scale_factor).unwrap_or(1.0);
+
+        match tab_bar_style {
+            "never" => 0.0,
+            "always" => 28.0 * scale,
+            "auto" | _ => {
+                if tab_count > 1 {
+                    28.0 * scale
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+
+    fn update_ime_position(&self) {
+        if let (Some(window), Some(renderer), Some(workspace)) = (&self.window, &self.renderer, &self.workspace) {
+            if let Some(active_tab) = workspace.active_tab() {
+                if let Some(terminal) = active_tab.active_terminal() {
+                    let tab_bar_h = self.get_tab_bar_height();
+                    let pane_rects = workspace.compute_active_pane_rects(
+                        renderer.config.width as f32,
+                        renderer.config.height as f32,
+                        tab_bar_h,
+                    );
+
+                    for (id, rect) in &pane_rects {
+                        if *id == active_tab.active_pane_id {
+                            let cursor = &terminal.grid().active().cursor;
+                            let cell_w = renderer.cell_width();
+                            let cell_h = renderer.cell_height();
+
+                            let cursor_px = rect.x + renderer.padding_x + (cursor.col as f32 * cell_w);
+                            let cursor_py = rect.y + renderer.padding_y + (cursor.row as f32 * cell_h);
+
+                            let scale = renderer.scale_factor as f64;
+                            let logical_pos = LogicalPosition::new(cursor_px as f64 / scale, cursor_py as f64 / scale);
+                            let logical_size = LogicalSize::new(cell_w as f64 / scale, cell_h as f64 / scale);
+
+                            window.set_ime_cursor_area(
+                                Position::Logical(logical_pos),
+                                Size::Logical(logical_size),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn copy_to_clipboard(&self) {
+        if let Some(workspace) = &self.workspace {
+            if let Some(active_tab) = workspace.active_tab() {
+                if let Some(terminal) = active_tab.active_terminal() {
+                    let text = terminal.grid().active().extract_selected_text();
+                    if !text.is_empty() {
+                        if let Some(cb) = &self.clipboard {
+                            if let Ok(mut clipboard) = cb.lock() {
+                                let _ = clipboard.set_text(text);
+                                info!("Copied selected text to system clipboard");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn paste_from_clipboard(&self) {
+        if let Some(cb) = &self.clipboard {
+            if let Ok(mut clipboard) = cb.lock() {
+                if let Ok(text) = clipboard.get_text() {
+                    if !text.is_empty() {
+                        if let Some(workspace) = &self.workspace {
+                            if let Some(active_tab) = workspace.active_tab() {
+                                if let Some(terminal) = active_tab.active_terminal() {
+                                    let bracketed = terminal.state.bracketed_paste;
+                                    let payload = if bracketed {
+                                        format!("\x1b[200~{}\x1b[201~", text)
+                                    } else {
+                                        text
+                                    };
+                                    let _ = terminal.write_to_pty(payload.as_bytes());
+                                    if let Some(window) = &self.window {
+                                        window.request_redraw();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_pane_and_cell_at(&self, mouse_x: f32, mouse_y: f32) -> Option<(PaneId, usize, usize)> {
+        let (renderer, workspace) = (self.renderer.as_ref()?, self.workspace.as_ref()?);
+        let tab_bar_h = self.get_tab_bar_height();
+        let pane_rects = workspace.compute_active_pane_rects(
+            renderer.config.width as f32,
+            renderer.config.height as f32,
+            tab_bar_h,
+        );
+
+        for (id, rect) in pane_rects {
+            if rect.contains(mouse_x, mouse_y) {
+                let cell_w = renderer.cell_width();
+                let cell_h = renderer.cell_height();
+                let pad_x = renderer.padding_x;
+                let pad_y = renderer.padding_y;
+
+                let rel_x = (mouse_x - rect.x - pad_x).max(0.0);
+                let rel_y = (mouse_y - rect.y - pad_y).max(0.0);
+
+                let col = (rel_x / cell_w).floor() as usize;
+                let row = (rel_y / cell_h).floor() as usize;
+
+                return Some((id, row, col));
+            }
+        }
+        None
+    }
 }
 
 impl ApplicationHandler for App {
@@ -341,19 +381,21 @@ impl ApplicationHandler for App {
             return;
         }
 
-        info!("Creating main window and initializing GPU renderer with Workspace...");
+        let init_cols = self.config_manager.current_config.window.columns as f32;
+        let init_rows = self.config_manager.current_config.window.rows as f32;
         let font_size_pt = self.config_manager.current_config.font.size;
         let pad_x = self.config_manager.current_config.window.padding_x;
         let pad_y = self.config_manager.current_config.window.padding_y;
-        let init_cols = self.config_manager.current_config.window.columns.max(20) as f32;
-        let init_rows = self.config_manager.current_config.window.rows.max(5) as f32;
-
-        let est_w = (init_cols * (font_size_pt * 0.6) + pad_x * 2.0).ceil();
-        let est_h = (init_rows * (font_size_pt * 1.3) + pad_y * 2.0).ceil();
 
         let mut window_attrs = WindowAttributes::default()
             .with_title("skTerm")
-            .with_inner_size(LogicalSize::new(est_w as f64, est_h as f64));
+            .with_inner_size(LogicalSize::new(800.0, 500.0));
+
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            window_attrs = window_attrs.with_title_hidden(true).with_titlebar_transparent(true);
+        }
 
         match self.config_manager.current_config.window.decorations.as_str() {
             "none" => { window_attrs = window_attrs.with_decorations(false); }
@@ -393,23 +435,6 @@ impl ApplicationHandler for App {
             }
         };
 
-        let egui_state = egui_winit::State::new(
-            self.egui_ctx.clone(),
-            egui::viewport::ViewportId::ROOT,
-            &window,
-            Some(renderer.scale_factor),
-            None,
-            None,
-        );
-
-        let egui_renderer = egui_wgpu::Renderer::new(
-            &renderer.device,
-            renderer.config.format,
-            None,
-            1,
-            false,
-        );
-
         let scale = renderer.scale_factor;
         let cell_w_logical = renderer.cell_width() / scale;
         let cell_h_logical = renderer.cell_height() / scale;
@@ -437,31 +462,57 @@ impl ApplicationHandler for App {
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.workspace = Some(workspace);
-        self.egui_state = Some(egui_state);
-        self.egui_renderer = Some(egui_renderer);
 
         self.apply_theme_to_renderer();
         self.sync_all_pane_sizes();
-        info!("skTerm Window, Renderer, Workspace, and Preferences GUI initialized successfully!");
+        info!("skTerm Main Window, Renderer, and Workspace initialized successfully!");
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
-        // Forward event to egui if preferences modal is open
-        if self.preferences_gui.is_open {
-            if let (Some(egui_state), Some(window)) = (&mut self.egui_state, &self.window) {
-                let res = egui_state.on_window_event(window, &event);
-                if res.repaint {
-                    window.request_redraw();
-                }
-                if res.consumed {
-                    return;
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+        // 1. Route to Preferences Window if event belongs to it
+        if let Some(pref) = &mut self.preferences_window {
+            if pref.id() == window_id {
+                match event {
+                    WindowEvent::CloseRequested => {
+                        info!("Preferences Window closed.");
+                        self.preferences_window = None;
+                        return;
+                    }
+                    WindowEvent::Resized(new_size) => {
+                        pref.resize(new_size);
+                        pref.window.request_redraw();
+                        return;
+                    }
+                    WindowEvent::RedrawRequested => {
+                        let maybe_new_cfg = pref.render_frame(&self.config_manager);
+                        if let Some(new_cfg) = maybe_new_cfg {
+                            self.apply_config_live(&new_cfg);
+                        }
+                        return;
+                    }
+                    _ => {
+                        let res = pref.egui_state.on_window_event(&pref.window, &event);
+                        if res.repaint {
+                            pref.window.request_redraw();
+                        }
+                        if let Some(new_cfg) = pref.check_changed(&self.config_manager) {
+                            self.apply_config_live(&new_cfg);
+                        }
+                        return;
+                    }
                 }
             }
         }
 
+        // 2. Handle Main Terminal Window Events
         match event {
             WindowEvent::CloseRequested => {
                 info!("Close requested, exiting application.");
+                if self.pending_geometry_save {
+                    if let Ok(toml_str) = toml::to_string_pretty(&self.config_manager.current_config) {
+                        let _ = std::fs::write(&self.config_manager.path, toml_str);
+                    }
+                }
                 event_loop.exit();
             }
 
@@ -470,9 +521,6 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Ime(ime_event) => {
-                if self.preferences_gui.is_open {
-                    return;
-                }
                 match ime_event {
                     Ime::Commit(text) => {
                         if let Some(workspace) = &self.workspace {
@@ -509,12 +557,9 @@ impl ApplicationHandler for App {
                         let lower = ch.to_lowercase();
                         match lower.as_str() {
                             "," => {
-                                // Cmd+, / Ctrl+, -> Toggle In-App Preferences GUI Modal
-                                info!("Toggling Preferences GUI via shortcut Cmd+, / Ctrl+,");
-                                self.preferences_gui.toggle(&self.config_manager.current_config);
-                                if let Some(window) = &self.window {
-                                    window.request_redraw();
-                                }
+                                // Cmd+, / Ctrl+Shift+, -> Open Dedicated Preferences Window
+                                info!("Opening Native Preferences Window...");
+                                self.open_preferences_window(event_loop);
                                 return;
                             }
                             "=" | "+" => {
@@ -639,31 +684,28 @@ impl ApplicationHandler for App {
                                 }
                                 return;
                             }
-                            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
-                                if let Ok(num) = lower.parse::<usize>() {
-                                    if let Some(workspace) = &mut self.workspace {
-                                        workspace.select_tab(num - 1);
-                                        if let Some(window) = &self.window {
-                                            window.request_redraw();
+                            _ => {
+                                // Tab Direct Jump (Cmd+1..9)
+                                if let Ok(digit) = lower.parse::<usize>() {
+                                    if digit >= 1 && digit <= 9 {
+                                        if let Some(workspace) = &mut self.workspace {
+                                            workspace.select_tab(digit - 1);
+                                            if let Some(window) = &self.window {
+                                                window.request_redraw();
+                                            }
                                         }
+                                        return;
                                     }
                                 }
-                                return;
                             }
-                            _ => {}
                         }
                     }
                 }
 
-                // If Preferences is open, don't send keypresses to terminal
-                if self.preferences_gui.is_open {
-                    return;
-                }
-
-                // Send key to active terminal
+                // Send terminal bytes to active PTY
                 if let Some(workspace) = &self.workspace {
-                    if let Some(tab) = workspace.active_tab() {
-                        if let Some(terminal) = tab.active_terminal() {
+                    if let Some(active_tab) = workspace.active_tab() {
+                        if let Some(terminal) = active_tab.active_terminal() {
                             let app_cursor = terminal.state.application_cursor_keys;
                             if let Some(bytes) = encode_key_event(&event, self.modifiers, app_cursor) {
                                 let _ = terminal.write_to_pty(&bytes);
@@ -676,19 +718,53 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::Resized(physical_size) => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.resize(physical_size.width, physical_size.height);
+                    self.sync_all_pane_sizes();
+                    if let Some(workspace) = &self.workspace {
+                        if let Some(tab) = workspace.active_tab() {
+                            if let Some(term) = tab.active_terminal() {
+                                let new_cols = term.grid().active().cols as u16;
+                                let new_rows = term.grid().active().rows as u16;
+                                let cfg = &mut self.config_manager.current_config;
+                                if cfg.window.columns != new_cols || cfg.window.rows != new_rows {
+                                    cfg.window.columns = new_cols;
+                                    cfg.window.rows = new_rows;
+                                    self.pending_geometry_save = true;
+                                    self.last_resize_time = Some(Instant::now());
+                                }
+                            }
+                        }
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let Some(renderer) = &mut self.renderer {
+                    let _ = renderer.update_scale_factor(scale_factor as f32);
+                    self.sync_all_pane_sizes();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x as f32, position.y as f32);
-                if self.preferences_gui.is_open {
-                    return;
-                }
+                let (mx, my) = self.mouse_pos;
+
+                // Dragging Selection
                 if self.is_mouse_down {
-                    if let Some((pane_id, grid_pos)) = self.pixel_to_pane_grid(self.mouse_pos.0, self.mouse_pos.1) {
+                    if let Some((_pane_id, row, col)) = self.get_pane_and_cell_at(mx, my) {
                         if let Some(workspace) = &mut self.workspace {
                             if let Some(tab) = workspace.active_tab_mut() {
-                                if let Some(t) = tab.root.find_terminal_mut(pane_id) {
-                                    let active = t.grid_mut().active_mut();
-                                    if let Some(sel) = &mut active.selection {
-                                        sel.end = grid_pos;
+                                if let Some(terminal) = tab.active_terminal_mut() {
+                                    if let Some(sel) = &mut terminal.grid_mut().active_mut().selection {
+                                        sel.end = (row, col);
                                         if let Some(window) = &self.window {
                                             window.request_redraw();
                                         }
@@ -701,53 +777,52 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                if self.preferences_gui.is_open {
-                    return;
-                }
+                let (mx, my) = self.mouse_pos;
+                let tab_bar_h = self.get_tab_bar_height();
+
                 if button == MouseButton::Left {
                     if state == ElementState::Pressed {
                         self.is_mouse_down = true;
 
-                        // Check Tab Bar Click
-                        let scale = self.renderer.as_ref().map(|r| r.scale_factor).unwrap_or(1.0);
-                        let phys_y = self.mouse_pos.1 * scale;
-                        let tab_bar_h = self.get_tab_bar_height();
-
-                        if tab_bar_h > 0.0 && phys_y < tab_bar_h {
-                            let phys_x = self.mouse_pos.0 * scale;
-                            let tab_w = 140.0 * scale;
-                            let clicked_idx = (phys_x / tab_w).floor() as usize;
-                            if let Some(workspace) = &mut self.workspace {
-                                workspace.select_tab(clicked_idx);
-                                if let Some(window) = &self.window {
-                                    window.request_redraw();
+                        // Click on Tab Bar
+                        if tab_bar_h > 0.0 && my <= tab_bar_h {
+                            if let Some(renderer) = &self.renderer {
+                                let tab_w = 140.0 * renderer.scale_factor;
+                                let clicked_idx = (mx / tab_w).floor() as usize;
+                                if let Some(workspace) = &mut self.workspace {
+                                    if clicked_idx < workspace.tabs.len() {
+                                        workspace.select_tab(clicked_idx);
+                                        if let Some(window) = &self.window {
+                                            window.request_redraw();
+                                        }
+                                        return;
+                                    }
                                 }
                             }
-                            return;
                         }
 
-                        // Pane Click & Selection
-                        let now = Instant::now();
-                        if now.duration_since(self.last_click_time) < Duration::from_millis(400) {
-                            self.click_count += 1;
-                        } else {
-                            self.click_count = 1;
-                        }
-                        self.last_click_time = now;
-
-                        if let Some((pane_id, grid_pos)) = self.pixel_to_pane_grid(self.mouse_pos.0, self.mouse_pos.1) {
-                            let mode = match self.click_count {
-                                2 => SelectionMode::Word,
-                                3 => SelectionMode::Line,
-                                _ => SelectionMode::Simple,
-                            };
-
+                        // Click inside Terminal Pane
+                        if let Some((pane_id, row, col)) = self.get_pane_and_cell_at(mx, my) {
                             if let Some(workspace) = &mut self.workspace {
                                 if let Some(tab) = workspace.active_tab_mut() {
                                     tab.active_pane_id = pane_id;
-                                    if let Some(t) = tab.root.find_terminal_mut(pane_id) {
-                                        let active = t.grid_mut().active_mut();
-                                        active.selection = Some(Selection::new(grid_pos, grid_pos, mode));
+
+                                    let now = Instant::now();
+                                    if now.duration_since(self.last_click_time) < Duration::from_millis(400) {
+                                        self.click_count += 1;
+                                    } else {
+                                        self.click_count = 1;
+                                    }
+                                    self.last_click_time = now;
+
+                                    let mode = match self.click_count {
+                                        2 => SelectionMode::Word,
+                                        3 => SelectionMode::Line,
+                                        _ => SelectionMode::Simple,
+                                    };
+
+                                    if let Some(terminal) = tab.active_terminal_mut() {
+                                        terminal.grid_mut().active_mut().selection = Some(Selection::new((row, col), (row, col), mode));
                                     }
                                     if let Some(window) = &self.window {
                                         window.request_redraw();
@@ -764,19 +839,19 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.preferences_gui.is_open {
-                    return;
-                }
-                let scroll_lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as isize,
-                    MouseScrollDelta::PixelDelta(pos) => (pos.y / 20.0) as isize,
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as i32,
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        let scale = self.renderer.as_ref().map(|r| r.cell_height()).unwrap_or(20.0);
+                        (pos.y / scale as f64) as i32
+                    }
                 };
 
-                if let Some((pane_id, _)) = self.pixel_to_pane_grid(self.mouse_pos.0, self.mouse_pos.1) {
+                if lines != 0 {
                     if let Some(workspace) = &mut self.workspace {
                         if let Some(tab) = workspace.active_tab_mut() {
-                            if let Some(t) = tab.root.find_terminal_mut(pane_id) {
-                                t.grid_mut().active_mut().scroll_display(scroll_lines);
+                            if let Some(terminal) = tab.active_terminal_mut() {
+                                terminal.grid_mut().active_mut().scroll_display(lines as isize);
                                 if let Some(window) = &self.window {
                                     window.request_redraw();
                                 }
@@ -786,29 +861,9 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::Resized(physical_size) => {
-                let tab_bar_h = self.get_tab_bar_height();
-                if let (Some(renderer), Some(workspace)) = (&mut self.renderer, &mut self.workspace) {
-                    renderer.resize(physical_size.width, physical_size.height);
-                    workspace.sync_pane_sizes(
-                        physical_size.width as f32,
-                        physical_size.height as f32,
-                        renderer.cell_width(),
-                        renderer.cell_height(),
-                        renderer.padding_x,
-                        renderer.padding_y,
-                        tab_bar_h,
-                    );
-
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                }
-            }
-
             WindowEvent::RedrawRequested => {
                 let tab_bar_h = self.get_tab_bar_height();
-                if let (Some(renderer), Some(workspace), Some(window)) = (&mut self.renderer, &mut self.workspace, &self.window) {
+                if let (Some(renderer), Some(workspace), Some(_window)) = (&mut self.renderer, &mut self.workspace, &self.window) {
                     let _ = workspace.poll_all_ptys();
 
                     let tabs: Vec<TabItem> = workspace
@@ -843,46 +898,8 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    if self.preferences_gui.is_open {
-                        if let (Some(egui_state), Some(egui_renderer)) = (&mut self.egui_state, &mut self.egui_renderer) {
-                            let raw_input = egui_state.take_egui_input(window);
-                            let full_output = self.egui_ctx.run(raw_input, |ctx| {
-                                self.preferences_gui.render(ctx, &mut self.config_manager);
-                            });
-                            egui_state.handle_platform_output(window, full_output.platform_output);
-
-                            let shapes = full_output.shapes;
-                            let ppp = full_output.pixels_per_point;
-                            let clipped_primitives = self.egui_ctx.tessellate(shapes, ppp);
-                            let textures_delta = full_output.textures_delta;
-
-                            let screen_descriptor = egui_wgpu::ScreenDescriptor {
-                                size_in_pixels: [renderer.config.width, renderer.config.height],
-                                pixels_per_point: ppp,
-                            };
-
-                            let egui_overlay_fn = |dev: &wgpu::Device, q: &wgpu::Queue, v: &wgpu::TextureView, _cfg: &wgpu::SurfaceConfiguration| {
-                                crate::preferences_gui::render_egui_overlay(
-                                    egui_renderer,
-                                    dev,
-                                    q,
-                                    v,
-                                    &textures_delta,
-                                    &clipped_primitives,
-                                    &screen_descriptor,
-                                );
-                            };
-
-                            if let Err(e) = renderer.render_workspace_with_overlay(&tabs, &render_panes, tab_bar_h, Some(egui_overlay_fn)) {
-                                error!("Render error: {:?}", e);
-                            }
-                        } else {
-                            let _ = renderer.render_workspace(&tabs, &render_panes, tab_bar_h);
-                        }
-                    } else {
-                        if let Err(e) = renderer.render_workspace(&tabs, &render_panes, tab_bar_h) {
-                            error!("Render error: {:?}", e);
-                        }
+                    if let Err(e) = renderer.render_workspace(&tabs, &render_panes, tab_bar_h) {
+                        error!("Render error: {:?}", e);
                     }
 
                     if let Some(active_tab) = workspace.active_tab_mut() {
@@ -902,16 +919,28 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.config_manager.check_reload().is_some() {
-            info!("Applying hot-reloaded configuration to running app...");
-            let font_cfg = &self.config_manager.current_config.font;
-            if let Some(renderer) = &mut self.renderer {
-                let _ = renderer.update_font(&font_cfg.family, font_cfg.size, &font_cfg.fallback_families);
-            }
-            self.apply_theme_to_renderer();
-            self.sync_all_pane_sizes();
-            if let Some(window) = &self.window {
-                window.request_redraw();
+        let old_cfg = self.config_manager.current_config.clone();
+        if let Some(reloaded_cfg) = self.config_manager.check_reload() {
+            if old_cfg != *reloaded_cfg {
+                info!("Applying hot-reloaded configuration to running app...");
+                let font_changed = old_cfg.font.family != reloaded_cfg.font.family
+                    || (old_cfg.font.size - reloaded_cfg.font.size).abs() > 0.01
+                    || old_cfg.font.fallback_families != reloaded_cfg.font.fallback_families;
+
+                if font_changed {
+                    if let Some(renderer) = &mut self.renderer {
+                        let _ = renderer.update_font(
+                            &reloaded_cfg.font.family,
+                            reloaded_cfg.font.size,
+                            &reloaded_cfg.font.fallback_families,
+                        );
+                    }
+                }
+                self.apply_theme_to_renderer();
+                self.sync_all_pane_sizes();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
         }
 
@@ -943,6 +972,20 @@ impl ApplicationHandler for App {
             if has_output {
                 if let Some(window) = &self.window {
                     window.request_redraw();
+                }
+            }
+        } // close workspace block
+
+        if self.pending_geometry_save {
+            if let Some(last) = self.last_resize_time {
+                if last.elapsed() > Duration::from_millis(400) {
+                    self.pending_geometry_save = false;
+                    if let Ok(toml_str) = toml::to_string_pretty(&self.config_manager.current_config) {
+                        let path = self.config_manager.path.clone();
+                        std::thread::spawn(move || {
+                            let _ = std::fs::write(&path, toml_str);
+                        });
+                    }
                 }
             }
         }

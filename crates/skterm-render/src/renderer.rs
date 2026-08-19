@@ -79,6 +79,7 @@ pub struct TermRenderer {
     pub font_size_pt: f32,
     pub font_family: String,
     pub fallback_families: Vec<String>,
+    pub opacity: f32,
     pub image_sampler: wgpu::Sampler,
     pub image_cache: HashMap<u32, (wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
 }
@@ -190,9 +191,19 @@ impl TermRenderer {
             font_size_pt,
             font_family: font_family.to_string(),
             fallback_families: fallback_families.to_vec(),
+            opacity: 1.0,
             image_sampler,
             image_cache: HashMap::new(),
         })
+    }
+
+    pub fn update_padding(&mut self, pad_x: f32, pad_y: f32) {
+        self.padding_x = pad_x * self.scale_factor;
+        self.padding_y = pad_y * self.scale_factor;
+    }
+
+    pub fn update_opacity(&mut self, opacity: f32) {
+        self.opacity = opacity.clamp(0.05, 1.0);
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -313,6 +324,9 @@ impl TermRenderer {
         let baseline = self.atlas.baseline_offset;
 
         // 1. Full Screen Background
+        let mut full_bg = self.theme.default_bg;
+        full_bg[3] *= self.opacity;
+
         bg_instances.push(BgInstance {
             rect: [
                 0.0,
@@ -320,7 +334,7 @@ impl TermRenderer {
                 self.config.width as f32,
                 self.config.height as f32,
             ],
-            color: self.theme.default_bg,
+            color: full_bg,
         });
 
         // 2. Tab Bar

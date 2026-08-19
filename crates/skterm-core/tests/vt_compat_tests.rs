@@ -142,3 +142,30 @@ fn test_vt_sgr_full_palette() {
     let cell_rgb = term.grid().active().grid[0].cells[27];
     assert_eq!(cell_rgb.fg, Color::Rgb(123, 45, 67));
 }
+
+#[test]
+fn test_vt_zsh_prompt_sp_clear() {
+    // Simulate zsh PROMPT_SP behavior after clear command
+    // Terminal width is 20
+    let mut term = Terminal::new_headless(10, 20, 100);
+
+    // Fill entire line 0 with 20 characters: 1 '%' + 19 spaces
+    term.feed_bytes(b"%                   ");
+    assert_eq!(term.grid().active().cursor.col, 19);
+    assert_eq!(term.grid().active().cursor.pending_wrap, true);
+
+    // Carriage Return (\r) should move col back to 0 and RESET pending_wrap to false
+    term.feed_bytes(b"\r");
+    assert_eq!(term.grid().active().cursor.col, 0);
+    assert_eq!(term.grid().active().cursor.row, 0);
+    assert_eq!(term.grid().active().cursor.pending_wrap, false);
+
+    // Erase current line (\x1b[K) and print prompt
+    term.feed_bytes(b"\x1b[Kprompt$ ");
+    assert_eq!(term.grid().active().cursor.row, 0);
+    let cells = &term.grid().active().grid[0].cells;
+    let s: String = cells[0..8].iter().map(|c| c.c).collect();
+    assert_eq!(s, "prompt$ ");
+    let s_full: String = cells.iter().map(|c| c.c).collect();
+    assert!(!s_full.contains('%'));
+}

@@ -539,6 +539,7 @@ impl ScreenBuffer {
                     self.scrollback.clear();
                     self.images.clear();
                 }
+                self.cursor.pending_wrap = false;
             }
             _ => {}
         }
@@ -609,6 +610,11 @@ impl ScreenGrid {
 
     pub fn set_alternate(&mut self, alt: bool) {
         self.is_alternate = alt;
+    }
+
+    pub fn set_cursor_shape(&mut self, shape: CursorShape) {
+        self.primary.cursor.shape = shape;
+        self.alternate.cursor.shape = shape;
     }
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
