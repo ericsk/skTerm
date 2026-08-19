@@ -1,7 +1,7 @@
 # Session Handoff & 開發進度總表
 
 ## 1. 當前專案狀態 (Current Status)
-* **當前分支**：`refactor/macos-preferences-ui` (準備合併至 `main`)
+* **當前分支**：`main` (已完全整合並通過所有測試)
 * **當前階段**：**macOS HIG 偏好設定視窗重構、即時主題同步與純黑預設外觀 (macOS Sonoma HIG & Live Theming)**
 * **已完成項目**：
   - [x] `Phase 0 ~ Phase 6`: 核心終端機、GPU 渲染管線、輸入與 IME、多窗格分頁、Sixel/Kitty 圖像協定與發行打包已全數合併至 `main`。
