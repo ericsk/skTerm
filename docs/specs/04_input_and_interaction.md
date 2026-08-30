@@ -3,6 +3,8 @@
 ## 1. 鍵盤編碼系統 (Keyboard Encoding)
 - **標準 ANSI / VT100 / XTerm 模式**：
   - 方向鍵、功能鍵（F1–F12）、Home/End、PageUp/PageDown 的 CSI 跳脫碼生成。
+  - **Backtab / 反向 Tab 鍵 (`Shift + Tab`)**：依標準發送 `\x1b[Z`（CSI Z / Cursor Backward Tabulation），完整支援 Shell/TUI 反向補全與選項切換。
+  - **複合修飾鍵跳脫序列 (xterm Modifiers)**：支援 `Shift` (2)、`Alt` (3)、`Ctrl` (5) 及其組合修飾鍵對方向鍵與導航鍵的編碼（例如 `Shift+Up` -> `\x1b[1;2A`、`Ctrl+Left` -> `\x1b[1;5D` 跳詞）。
   - Backspace (ASCII 0x7F / 0x08) 與 Delete (CSI 3 ~) 處理。
 - **Kitty Keyboard Protocol 支援**：
   - 支援無歧義按鍵編碼、按鍵釋放（Key Release）與重複事件捕捉。

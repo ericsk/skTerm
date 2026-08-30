@@ -3,6 +3,25 @@
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
+/// Calculate xterm parameter code for modifier combinations.
+/// Shift = 2, Alt = 3, Shift+Alt = 4, Ctrl = 5, Shift+Ctrl = 6, Alt+Ctrl = 7, Shift+Alt+Ctrl = 8.
+fn modifier_param(modifiers: ModifiersState) -> Option<u8> {
+    let shift = modifiers.shift_key();
+    let alt = modifiers.alt_key();
+    let ctrl = modifiers.control_key();
+
+    match (shift, alt, ctrl) {
+        (true, false, false) => Some(2),
+        (false, true, false) => Some(3),
+        (true, true, false) => Some(4),
+        (false, false, true) => Some(5),
+        (true, false, true) => Some(6),
+        (false, true, true) => Some(7),
+        (true, true, true) => Some(8),
+        _ => None,
+    }
+}
+
 /// Encode key parameters into raw bytes to send to the child PTY.
 pub fn encode_key(
     logical_key: &Key,
@@ -28,46 +47,99 @@ pub fn encode_key(
         }
     }
 
+    let mod_code = modifier_param(modifiers);
+
     // 2. Named special keys
     match logical_key {
         Key::Named(NamedKey::Enter) => Some(vec![b'\r']),
-        Key::Named(NamedKey::Tab) => Some(vec![b'\t']),
+        Key::Named(NamedKey::Tab) => {
+            if modifiers.shift_key() {
+                // Standard DEC / xterm Cursor Backward Tabulation (Backtab / CBT)
+                Some(b"\x1b[Z".to_vec())
+            } else {
+                Some(vec![b'\t'])
+            }
+        }
         Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
         Key::Named(NamedKey::Escape) => Some(vec![0x1b]),
         Key::Named(NamedKey::ArrowUp) => {
-            if app_cursor_keys {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[1;{}A", m).into_bytes())
+            } else if app_cursor_keys {
                 Some(b"\x1bOA".to_vec())
             } else {
                 Some(b"\x1b[A".to_vec())
             }
         }
         Key::Named(NamedKey::ArrowDown) => {
-            if app_cursor_keys {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[1;{}B", m).into_bytes())
+            } else if app_cursor_keys {
                 Some(b"\x1bOB".to_vec())
             } else {
                 Some(b"\x1b[B".to_vec())
             }
         }
         Key::Named(NamedKey::ArrowRight) => {
-            if app_cursor_keys {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[1;{}C", m).into_bytes())
+            } else if app_cursor_keys {
                 Some(b"\x1bOC".to_vec())
             } else {
                 Some(b"\x1b[C".to_vec())
             }
         }
         Key::Named(NamedKey::ArrowLeft) => {
-            if app_cursor_keys {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[1;{}D", m).into_bytes())
+            } else if app_cursor_keys {
                 Some(b"\x1bOD".to_vec())
             } else {
                 Some(b"\x1b[D".to_vec())
             }
         }
-        Key::Named(NamedKey::Home) => Some(b"\x1b[H".to_vec()),
-        Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
-        Key::Named(NamedKey::PageUp) => Some(b"\x1b[5~".to_vec()),
-        Key::Named(NamedKey::PageDown) => Some(b"\x1b[6~".to_vec()),
-        Key::Named(NamedKey::Delete) => Some(b"\x1b[3~".to_vec()),
-        Key::Named(NamedKey::Insert) => Some(b"\x1b[2~".to_vec()),
+        Key::Named(NamedKey::Home) => {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[1;{}H", m).into_bytes())
+            } else {
+                Some(b"\x1b[H".to_vec())
+            }
+        }
+        Key::Named(NamedKey::End) => {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[1;{}F", m).into_bytes())
+            } else {
+                Some(b"\x1b[F".to_vec())
+            }
+        }
+        Key::Named(NamedKey::PageUp) => {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[5;{}~", m).into_bytes())
+            } else {
+                Some(b"\x1b[5~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::PageDown) => {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[6;{}~", m).into_bytes())
+            } else {
+                Some(b"\x1b[6~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::Delete) => {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[3;{}~", m).into_bytes())
+            } else {
+                Some(b"\x1b[3~".to_vec())
+            }
+        }
+        Key::Named(NamedKey::Insert) => {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[2;{}~", m).into_bytes())
+            } else {
+                Some(b"\x1b[2~".to_vec())
+            }
+        }
         Key::Named(NamedKey::F1) => Some(b"\x1bOP".to_vec()),
         Key::Named(NamedKey::F2) => Some(b"\x1bOQ".to_vec()),
         Key::Named(NamedKey::F3) => Some(b"\x1bOR".to_vec()),

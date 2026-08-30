@@ -20,9 +20,10 @@
     - 消除純切換主題時的 WGPU Shader 與字形 Atlas 重建卡頓。
     - 實作背景執行緒寫入 `config.toml`，消除磁碟 I/O 阻塞。
     - 加入回聲熱重載過濾 (`Echo Hot-Reload Filter`)，避免自動存檔引發連鎖卡頓。
-  - [x] **VT100 狀態機修復**：
-    - 實作延遲自動換行 (`pending_wrap`) 在 `\r` (Carriage Return) 與 `\x1b[2J`/`\x1b[3J` 清除畫面時的重置邏輯，徹底解決 zsh `PROMPT_SP` 執行 `clear` 後畫面頂部殘留 `%` 符號的問題。
-  - [x] 單元測試：全部 **32/32 PASS**（100% 成功，0 Warning，0 Error）。
+  - [x] **鍵盤編碼系統擴充 (Keyboard Encoding Enhancements)**：
+    - 完整支援 **`Shift + Tab`（Backtab）** 發送標準 ANSI/xterm 序列 **`\x1b[Z`**（CSI Z），支援 Shell/TUI 反向補全。
+    - 支援 `Shift`/`Alt`/`Ctrl` 複合修飾鍵對方向鍵與導航鍵的 xterm 參數編碼（如 `Ctrl + Left/Right` 跳詞）。
+  - [x] 單元測試：全部 **34/34 PASS**（100% 成功，0 Warning，0 Error）。
 
 ---
 

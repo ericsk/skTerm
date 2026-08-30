@@ -9,7 +9,7 @@
 - **跨平台 CI 自動化驗證 (GitHub Actions)**：
   - Matrix 矩陣涵蓋 **macOS (`macos-latest`)**、**Ubuntu Linux (`ubuntu-latest`)** 與 **Windows (`windows-latest`)**。
   - 整合字型光柵化跨平台路徑測試 (`test_cjk_rasterize`) 與 headless 容錯。
-  - 全數 32/32 單元與相容性測試於三大平台 100% 綠燈通過。
+  - 包含 Shift+Tab (Backtab `\x1b[Z`) 與修飾鍵跳脫碼驗證，全數 34/34 單元與相容性測試於三大平台 100% 綠燈通過。
 
 ---
 

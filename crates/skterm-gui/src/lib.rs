@@ -49,6 +49,37 @@ mod tests {
     }
 
     #[test]
+    fn test_key_encoding_shift_tab() {
+        let mut shift = ModifiersState::empty();
+        shift.insert(ModifiersState::SHIFT);
+
+        // Plain Tab -> 0x09
+        let tab = encode_key(&Key::Named(NamedKey::Tab), None, ElementState::Pressed, ModifiersState::empty(), false);
+        assert_eq!(tab, Some(vec![b'\t']));
+
+        // Shift + Tab -> \x1b[Z (Backtab)
+        let backtab = encode_key(&Key::Named(NamedKey::Tab), None, ElementState::Pressed, shift, false);
+        assert_eq!(backtab, Some(b"\x1b[Z".to_vec()));
+    }
+
+    #[test]
+    fn test_key_encoding_modified_keys() {
+        let mut shift = ModifiersState::empty();
+        shift.insert(ModifiersState::SHIFT);
+
+        let mut ctrl = ModifiersState::empty();
+        ctrl.insert(ModifiersState::CONTROL);
+
+        // Shift + Up -> \x1b[1;2A
+        let shift_up = encode_key(&Key::Named(NamedKey::ArrowUp), None, ElementState::Pressed, shift, false);
+        assert_eq!(shift_up, Some(b"\x1b[1;2A".to_vec()));
+
+        // Ctrl + Left -> \x1b[1;5D
+        let ctrl_left = encode_key(&Key::Named(NamedKey::ArrowLeft), None, ElementState::Pressed, ctrl, false);
+        assert_eq!(ctrl_left, Some(b"\x1b[1;5D".to_vec()));
+    }
+
+    #[test]
     fn test_full_config_parsing() {
         let toml_str = r##"
             [font]
