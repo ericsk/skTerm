@@ -14,6 +14,7 @@ jobs:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
@@ -26,7 +27,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libasound2-dev
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libasound2-dev fonts-noto-cjk fonts-dejavu-core
 
       - name: Run Tests
         run: cargo test --workspace --verbose
