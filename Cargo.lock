@@ -2336,6 +2336,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "notify",
+ "objc",
  "pollster",
  "serde",
  "skterm-core",

@@ -48,16 +48,21 @@ pub enum PaneNode {
 
 ---
 
-## 4. macOS Sonoma / Sequoia 原生感分頁列設計 (Native HIG Tab Bar)
-- **佈局幾何 (Geometry)**：
-  - 高度由 `28pt` 升級為標準 `36pt`，提供舒適的垂直排版與卡片膠囊呼吸感。
-  - **避讓 Traffic Lights (紅綠燈)**：macOS 下分頁自動自 `x = 78pt` 起算，保留左側安全邊距，徹底杜絕分頁與視窗控制按鈕重疊。
-  - **自適應分段懸浮膠囊 (Floating Segmented Tab Capsules)**：各分頁呈懸浮卡片質感，上下預留 4pt 外距，左右預留 4pt 間隔。
-- **視覺階層 (Visual Hierarchy)**：
-  - **Active Tab**：深雅卡片底色 + 頂部/側邊微光邊框 + 底部 2px macOS 活力藍指示條 (`#0A84FF`) + 亮白字體。
-  - **Inactive Tab**：半透明沉浸底色 + 次要灰文字。
-  - **底部分隔線**：1px 微光半透明細線區隔終端工作區。
-- **互動控制 (Interactivity)**：
-  - **關閉分頁 (`×` Close Button)**：各分頁右側配置精緻微型 `×` 按鈕，點選即時關閉。
-  - **新增分頁 (`+` New Tab Button)**：末端配置獨立圓角 `+` 按鈕，點選即時建立新分頁。
-  - **雙擊空白處**：雙擊 Tab Bar 空白區域快速建立新分頁。
+## 4. 平台原生分頁架構 (Platform-Native Tab Architecture)
+
+### 4.1 macOS 系統級 `NSWindow` 原生分頁 (路徑一)
+- **架構模型 (`TerminalSession`)**：
+  - 視窗架構全面重構為 `TerminalSession` 多視窗會話模型，每個 Session 擁有獨立的 `Window`、`TermRenderer`、`Workspace` 與 PTY。
+  - macOS 視窗配置相同的系統級標識符 `with_tabbing_identifier("skterm.tabs")`。
+  - 視窗啟動時透過 Cocoa Objective-C runtime 發送 `[NSWindow setTabbingMode:NSWindowTabbingModePreferred]`。
+  - 當建立第二個及後續分頁時，自動調用 `[parent addTabbedWindow:new_window ordered:NSWindowAbove]` 將新視窗合併入系統標籤列。
+- **100% 系統原生體驗**：
+  - 分頁列由 macOS 系統 WindowServer 渲染，具備原生毛玻璃透明效果（Vibrancy）與流暢切換動畫。
+  - **分頁自由拖曳抽離/合併**：支援使用滑鼠將分頁拖出獨立成為新視窗，或拖回吸附合併。
+  - **系統手勢與檢視**：支援 macOS 原生「顯示所有分頁 (Show All Tabs, `Cmd + Shift + \`)」縮圖檢視與右鍵選單。
+  - **純淨終端繪圖高度**：在 macOS 原生分頁模式下，畫布內部的 `get_tab_bar_height()` 回傳 `0.0`，終端網格百分之百佔據視窗所有可用像素，無需自繪避讓或刻印按鈕。
+
+### 4.2 Windows 平台原生準備架構
+- **雙模式分頁架構 (Dual-Mode Tab Model)**：
+  - 保留 `tab_bar_style` 與內建渲染支援，在 Windows / Linux 上提供符合現代視覺（如 Windows 11 Fluent Design）的內嵌懸浮膠囊分頁列。
+  - `App` 的多 Session 管理機制預留對接 Windows 原生 **WinUI 3 XAML Islands `TabView`** 或 **Windows Terminal Tab Control**，未來可直接透過 HWND 嵌入 Windows 原生標籤列。

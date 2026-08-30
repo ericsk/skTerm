@@ -20,10 +20,9 @@
     - 消除純切換主題時的 WGPU Shader 與字形 Atlas 重建卡頓。
     - 實作背景執行緒寫入 `config.toml`，消除磁碟 I/O 阻塞。
     - 加入回聲熱重載過濾 (`Echo Hot-Reload Filter`)，避免自動存檔引發連鎖卡頓。
-  - [x] **macOS 原生感分頁列重構 (Native HIG Tab Bar)**：
-    - 高度調整為 36pt，自動避讓左側 macOS 交通號誌（紅綠燈），杜絕按鈕重疊。
-    - 採用懸浮分段膠囊設計 (Floating Segmented Tab Capsules)，Active Tab 配備 macOS 活力藍 (`#0A84FF`) 指示線與微光邊框。
-    - 新增分頁關閉按鈕 (`×`) 與末端新建分頁按鈕 (`+`)，支援即時點擊與雙擊空白處新建分頁。
+  - [x] **平台原生分頁架構升級 (Platform-Native Tab Architecture)**：
+    - **macOS（路徑一）**：全套重構為 `TerminalSession` 多視窗會話模型，透過 Cocoa Objective-C runtime 深度整合 macOS 系統原生 **`NSWindow` Tabbing**（`NSWindowTabbingModePreferred` 與 `addTabbedWindow:ordered:`），享有 100% macOS 系統級毛玻璃、分頁拖曳抽離成獨立視窗/拖回合夥、縮圖檢視 (`Cmd+Shift+\`)，畫布內無需自繪避讓，終端保持 100% 純淨顯示高度。
+    - **Windows / Linux 準備**：保留內嵌分頁與多 Session 抽象層，預留未來透過 HWND 嵌入 WinUI 3 XAML Islands `TabView` 的擴充插槽。
   - [x] **鍵盤編碼系統擴充 (Keyboard Encoding Enhancements)**：
     - 完整支援 **`Shift + Tab`（Backtab）** 發送標準 ANSI/xterm 序列 **`\x1b[Z`**（CSI Z），支援 Shell/TUI 反向補全。
     - 支援 `Shift`/`Alt`/`Ctrl` 複合修飾鍵對方向鍵與導航鍵的 xterm 參數編碼（如 `Ctrl + Left/Right` 跳詞）。

@@ -22,3 +22,10 @@ serde = { workspace = true }
 toml = { workspace = true }
 notify = { workspace = true }
 arboard = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(cargo_clippy)'] }
+

@@ -1,4 +1,7 @@
-//! Main Application Event Loop, Window Handler, Tabs, Split Panes, Clipboard, CJK IME, and Native Preferences Window.
+//! Main Application Event Loop, Multi-Window Session Handler, Native macOS Tabbing,
+//! Split Panes, Clipboard, CJK IME, and Native Preferences Window.
+
+#![allow(unexpected_cfgs)]
 
 use crate::config::{parse_hex_color, Config, ConfigManager, Theme};
 use crate::input::encode_key_event;
@@ -7,6 +10,7 @@ use crate::preferences_window::PreferencesWindow;
 use arboard::Clipboard;
 use skterm_core::{PtySpawnOptions, Selection, SelectionMode};
 use skterm_render::{PaneRenderItem, RenderTheme, TabItem, TermRenderer};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -17,19 +21,153 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState};
 use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
-/// skTerm GUI Application instance.
-pub struct App {
-    pub config_manager: ConfigManager,
-    pub preferences_window: Option<PreferencesWindow>,
-    pub window: Option<Arc<Window>>,
-    pub renderer: Option<TermRenderer>,
-    pub workspace: Option<Workspace>,
-    pub clipboard: Option<Arc<Mutex<Clipboard>>>,
-    pub modifiers: ModifiersState,
+#[cfg(target_os = "macos")]
+fn get_nswindow(window: &Window) -> *mut objc::runtime::Object {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use objc::{msg_send, sel, sel_impl};
+    if let Ok(handle) = window.window_handle() {
+        if let RawWindowHandle::AppKit(appkit) = handle.as_raw() {
+            let view_ptr = appkit.ns_view.as_ptr();
+            let win_ptr: *mut objc::runtime::Object = unsafe {
+                msg_send![view_ptr as *mut objc::runtime::Object, window]
+            };
+            return win_ptr;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+/// Terminal Window Session representing an active window (or native macOS tab).
+pub struct TerminalSession {
+    pub window: Arc<Window>,
+    pub renderer: TermRenderer,
+    pub workspace: Workspace,
     pub mouse_pos: (f32, f32),
     pub is_mouse_down: bool,
     pub last_click_time: Instant,
     pub click_count: usize,
+}
+
+impl TerminalSession {
+    pub fn update_ime_position(&self, tab_bar_h: f32) {
+        if let Some(active_tab) = self.workspace.active_tab() {
+            if let Some(terminal) = active_tab.active_terminal() {
+                let pane_rects = self.workspace.compute_active_pane_rects(
+                    self.renderer.config.width as f32,
+                    self.renderer.config.height as f32,
+                    tab_bar_h,
+                );
+
+                for (id, rect) in &pane_rects {
+                    if *id == active_tab.active_pane_id {
+                        let cursor = &terminal.grid().active().cursor;
+                        let cell_w = self.renderer.cell_width();
+                        let cell_h = self.renderer.cell_height();
+
+                        let cursor_px = rect.x + self.renderer.padding_x + (cursor.col as f32 * cell_w);
+                        let cursor_py = rect.y + self.renderer.padding_y + (cursor.row as f32 * cell_h);
+
+                        let scale = self.renderer.scale_factor as f64;
+                        let logical_pos = LogicalPosition::new(cursor_px as f64 / scale, cursor_py as f64 / scale);
+                        let logical_size = LogicalSize::new(cell_w as f64 / scale, cell_h as f64 / scale);
+
+                        self.window.set_ime_cursor_area(
+                            Position::Logical(logical_pos),
+                            Size::Logical(logical_size),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn copy_to_clipboard(&self, clipboard: Option<&Arc<Mutex<Clipboard>>>) {
+        if let Some(active_tab) = self.workspace.active_tab() {
+            if let Some(terminal) = active_tab.active_terminal() {
+                let text = terminal.grid().active().extract_selected_text();
+                if !text.is_empty() {
+                    if let Some(cb) = clipboard {
+                        if let Ok(mut clip) = cb.lock() {
+                            let _ = clip.set_text(text);
+                            info!("Copied selected text to system clipboard");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn paste_from_clipboard(&self, clipboard: Option<&Arc<Mutex<Clipboard>>>) {
+        if let Some(cb) = clipboard {
+            if let Ok(mut clip) = cb.lock() {
+                if let Ok(text) = clip.get_text() {
+                    if !text.is_empty() {
+                        if let Some(active_tab) = self.workspace.active_tab() {
+                            if let Some(terminal) = active_tab.active_terminal() {
+                                let bracketed = terminal.state.bracketed_paste;
+                                let payload = if bracketed {
+                                    format!("\x1b[200~{}\x1b[201~", text)
+                                } else {
+                                    text
+                                };
+                                let _ = terminal.write_to_pty(payload.as_bytes());
+                                self.window.request_redraw();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn get_pane_and_cell_at(&self, mouse_x: f32, mouse_y: f32, tab_bar_h: f32) -> Option<(PaneId, usize, usize)> {
+        let pane_rects = self.workspace.compute_active_pane_rects(
+            self.renderer.config.width as f32,
+            self.renderer.config.height as f32,
+            tab_bar_h,
+        );
+
+        for (id, rect) in pane_rects {
+            if rect.contains(mouse_x, mouse_y) {
+                let cell_w = self.renderer.cell_width();
+                let cell_h = self.renderer.cell_height();
+                let pad_x = self.renderer.padding_x;
+                let pad_y = self.renderer.padding_y;
+
+                let rel_x = (mouse_x - rect.x - pad_x).max(0.0);
+                let rel_y = (mouse_y - rect.y - pad_y).max(0.0);
+
+                let col = (rel_x / cell_w).floor() as usize;
+                let row = (rel_y / cell_h).floor() as usize;
+
+                return Some((id, row, col));
+            }
+        }
+        None
+    }
+
+    pub fn sync_all_pane_sizes(&mut self, tab_bar_h: f32) {
+        self.workspace.sync_pane_sizes(
+            self.renderer.config.width as f32,
+            self.renderer.config.height as f32,
+            self.renderer.cell_width(),
+            self.renderer.cell_height(),
+            self.renderer.padding_x,
+            self.renderer.padding_y,
+            tab_bar_h,
+        );
+    }
+}
+
+/// skTerm GUI Application instance managing multiple native window sessions or native tabs.
+pub struct App {
+    pub config_manager: ConfigManager,
+    pub preferences_window: Option<PreferencesWindow>,
+    pub sessions: HashMap<WindowId, TerminalSession>,
+    pub active_session_id: Option<WindowId>,
+    pub clipboard: Option<Arc<Mutex<Clipboard>>>,
+    pub modifiers: ModifiersState,
     pub pending_geometry_save: bool,
     pub last_resize_time: Option<Instant>,
 }
@@ -55,15 +193,10 @@ impl App {
         Self {
             config_manager,
             preferences_window: None,
-            window: None,
-            renderer: None,
-            workspace: None,
+            sessions: HashMap::new(),
+            active_session_id: None,
             clipboard,
             modifiers: ModifiersState::default(),
-            mouse_pos: (0.0, 0.0),
-            is_mouse_down: false,
-            last_click_time: Instant::now(),
-            click_count: 0,
             pending_geometry_save: false,
             last_resize_time: None,
         }
@@ -94,77 +227,7 @@ impl App {
         }
     }
 
-    pub fn apply_config_live(&mut self, new_cfg: &Config) {
-        info!("Applying live configuration update to terminal...");
-        let old_font = self.config_manager.current_config.font.clone();
-        let font_changed = old_font.family != new_cfg.font.family
-            || (old_font.size - new_cfg.font.size).abs() > 0.01
-            || old_font.fallback_families != new_cfg.font.fallback_families;
-
-        self.config_manager.current_config = new_cfg.clone();
-
-        // 1. Update font (only if changed), padding, and opacity
-        if let Some(renderer) = &mut self.renderer {
-            if font_changed {
-                info!("Font settings changed, rebuilding WGPU glyph atlas...");
-                let _ = renderer.update_font(
-                    &new_cfg.font.family,
-                    new_cfg.font.size,
-                    &new_cfg.font.fallback_families,
-                );
-            }
-            renderer.update_padding(new_cfg.window.padding_x, new_cfg.window.padding_y);
-            renderer.update_opacity(new_cfg.window.opacity);
-        }
-
-        // 2. Update theme
-        self.apply_theme_to_renderer();
-
-        // 3. Update cursor shape
-        let cursor_shape = match new_cfg.cursor.shape.as_str() {
-            "beam" => skterm_core::CursorShape::Beam,
-            "underline" => skterm_core::CursorShape::Underline,
-            _ => skterm_core::CursorShape::Block,
-        };
-        if let Some(workspace) = &mut self.workspace {
-            workspace.update_cursor_shape(cursor_shape);
-        }
-
-        // 4. Sync workspace pane sizes to updated cell size & padding
-        self.sync_all_pane_sizes();
-
-        // 5. Request redraw on main window
-        if let Some(w) = &self.window {
-            w.request_redraw();
-        }
-
-        // 6. Auto-save to config.toml in background thread
-        if let Ok(toml_str) = toml::to_string_pretty(new_cfg) {
-            let path = self.config_manager.path.clone();
-            std::thread::spawn(move || {
-                let _ = std::fs::write(&path, toml_str);
-            });
-        }
-    }
-
-    fn build_pty_options(&self) -> PtySpawnOptions {
-        let term_cfg = &self.config_manager.current_config.terminal;
-        let (shell, args) = if let Some(s) = &term_cfg.shell {
-            (Some(s.program.clone()), s.args.clone())
-        } else {
-            (None, Vec::new())
-        };
-
-        PtySpawnOptions {
-            shell,
-            args,
-            cwd: term_cfg.working_directory.clone(),
-            term: Some(term_cfg.term.clone()),
-            env: term_cfg.env.clone(),
-        }
-    }
-
-    pub fn apply_theme_to_renderer(&mut self) {
+    pub fn build_render_theme(&self) -> RenderTheme {
         let config = &self.config_manager.current_config;
         let preset = Theme::get(&config.colors.theme);
         let mut render_theme = RenderTheme {
@@ -227,187 +290,110 @@ impl App {
             render_theme.ansi_palette = Some(pal);
         }
 
-        if let Some(renderer) = &mut self.renderer {
-            renderer.set_theme(render_theme);
-        }
+        render_theme
     }
 
-    pub fn sync_all_pane_sizes(&mut self) {
+    pub fn apply_config_live(&mut self, new_cfg: &Config) {
+        info!("Applying live configuration update to all terminal sessions...");
+        let old_font = self.config_manager.current_config.font.clone();
+        let font_changed = old_font.family != new_cfg.font.family
+            || (old_font.size - new_cfg.font.size).abs() > 0.01
+            || old_font.fallback_families != new_cfg.font.fallback_families;
+
+        self.config_manager.current_config = new_cfg.clone();
+        let render_theme = self.build_render_theme();
         let tab_bar_h = self.get_tab_bar_height();
-        if let (Some(renderer), Some(workspace)) = (&self.renderer, &mut self.workspace) {
-            workspace.sync_pane_sizes(
-                renderer.config.width as f32,
-                renderer.config.height as f32,
-                renderer.cell_width(),
-                renderer.cell_height(),
-                renderer.padding_x,
-                renderer.padding_y,
-                tab_bar_h,
-            );
+
+        let cursor_shape = match new_cfg.cursor.shape.as_str() {
+            "beam" => skterm_core::CursorShape::Beam,
+            "underline" => skterm_core::CursorShape::Underline,
+            _ => skterm_core::CursorShape::Block,
+        };
+
+        for session in self.sessions.values_mut() {
+            if font_changed {
+                let _ = session.renderer.update_font(
+                    &new_cfg.font.family,
+                    new_cfg.font.size,
+                    &new_cfg.font.fallback_families,
+                );
+            }
+            session.renderer.update_padding(new_cfg.window.padding_x, new_cfg.window.padding_y);
+            session.renderer.update_opacity(new_cfg.window.opacity);
+            session.renderer.set_theme(render_theme.clone());
+            session.workspace.update_cursor_shape(cursor_shape);
+            session.sync_all_pane_sizes(tab_bar_h);
+            session.window.request_redraw();
+        }
+
+        // Auto-save to config.toml in background thread
+        if let Ok(toml_str) = toml::to_string_pretty(new_cfg) {
+            let path = self.config_manager.path.clone();
+            std::thread::spawn(move || {
+                let _ = std::fs::write(&path, toml_str);
+            });
         }
     }
 
+    pub fn build_pty_options(&self) -> PtySpawnOptions {
+        let term_cfg = &self.config_manager.current_config.terminal;
+        let (shell, args) = if let Some(s) = &term_cfg.shell {
+            (Some(s.program.clone()), s.args.clone())
+        } else {
+            (None, Vec::new())
+        };
+
+        PtySpawnOptions {
+            shell,
+            args,
+            cwd: term_cfg.working_directory.clone(),
+            term: Some(term_cfg.term.clone()),
+            env: term_cfg.env.clone(),
+        }
+    }
+
+    /// On macOS, native tabs are hosted in the system titlebar, so the internal canvas tab bar height is 0.
+    /// On Windows/Linux, return the inline tab bar height if multiple tabs exist.
     pub fn get_tab_bar_height(&self) -> f32 {
-        let tab_bar_style = self.config_manager.current_config.window.tab_bar_style.as_str();
-        let tab_count = self.workspace.as_ref().map(|w| w.tabs.len()).unwrap_or(0);
-        let scale = self.renderer.as_ref().map(|r| r.scale_factor).unwrap_or(1.0);
-
-        match tab_bar_style {
-            "never" => 0.0,
-            "always" => 36.0 * scale,
-            "auto" | _ => {
-                if tab_count > 1 {
-                    36.0 * scale
-                } else {
-                    0.0
-                }
-            }
+        #[cfg(target_os = "macos")]
+        {
+            // 100% native macOS NSWindow Tabs! Terminal Grid keeps full window height.
+            0.0
         }
-    }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let tab_bar_style = self.config_manager.current_config.window.tab_bar_style.as_str();
+            let tab_count = self.active_session().map(|s| s.workspace.tabs.len()).unwrap_or(0);
+            let scale = self.active_session().map(|s| s.renderer.scale_factor).unwrap_or(1.0);
 
-    pub fn create_new_tab(&mut self) {
-        let pty_opts = self.build_pty_options();
-        let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
-        if let Some(workspace) = &mut self.workspace {
-            let _ = workspace.new_tab_with_options(24, 80, scrollback, pty_opts);
-        }
-        self.sync_all_pane_sizes();
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
-    }
-
-    pub fn close_tab_at(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
-        if let Some(workspace) = &mut self.workspace {
-            let all_closed = workspace.close_tab_at(idx);
-            if all_closed {
-                info!("All tabs closed via close button, exiting.");
-                event_loop.exit();
-                return;
-            }
-        }
-        self.sync_all_pane_sizes();
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
-    }
-
-    fn update_ime_position(&self) {
-        if let (Some(window), Some(renderer), Some(workspace)) = (&self.window, &self.renderer, &self.workspace) {
-            if let Some(active_tab) = workspace.active_tab() {
-                if let Some(terminal) = active_tab.active_terminal() {
-                    let tab_bar_h = self.get_tab_bar_height();
-                    let pane_rects = workspace.compute_active_pane_rects(
-                        renderer.config.width as f32,
-                        renderer.config.height as f32,
-                        tab_bar_h,
-                    );
-
-                    for (id, rect) in &pane_rects {
-                        if *id == active_tab.active_pane_id {
-                            let cursor = &terminal.grid().active().cursor;
-                            let cell_w = renderer.cell_width();
-                            let cell_h = renderer.cell_height();
-
-                            let cursor_px = rect.x + renderer.padding_x + (cursor.col as f32 * cell_w);
-                            let cursor_py = rect.y + renderer.padding_y + (cursor.row as f32 * cell_h);
-
-                            let scale = renderer.scale_factor as f64;
-                            let logical_pos = LogicalPosition::new(cursor_px as f64 / scale, cursor_py as f64 / scale);
-                            let logical_size = LogicalSize::new(cell_w as f64 / scale, cell_h as f64 / scale);
-
-                            window.set_ime_cursor_area(
-                                Position::Logical(logical_pos),
-                                Size::Logical(logical_size),
-                            );
-                            break;
-                        }
+            match tab_bar_style {
+                "never" => 0.0,
+                "always" => 36.0 * scale,
+                "auto" | _ => {
+                    if tab_count > 1 {
+                        36.0 * scale
+                    } else {
+                        0.0
                     }
                 }
             }
         }
     }
 
-    fn copy_to_clipboard(&self) {
-        if let Some(workspace) = &self.workspace {
-            if let Some(active_tab) = workspace.active_tab() {
-                if let Some(terminal) = active_tab.active_terminal() {
-                    let text = terminal.grid().active().extract_selected_text();
-                    if !text.is_empty() {
-                        if let Some(cb) = &self.clipboard {
-                            if let Ok(mut clipboard) = cb.lock() {
-                                let _ = clipboard.set_text(text);
-                                info!("Copied selected text to system clipboard");
-                            }
-                        }
-                    }
-                }
-            }
+    pub fn active_session(&self) -> Option<&TerminalSession> {
+        self.active_session_id.and_then(|id| self.sessions.get(&id))
+    }
+
+    pub fn active_session_mut(&mut self) -> Option<&mut TerminalSession> {
+        if let Some(id) = self.active_session_id {
+            self.sessions.get_mut(&id)
+        } else {
+            None
         }
     }
 
-    fn paste_from_clipboard(&self) {
-        if let Some(cb) = &self.clipboard {
-            if let Ok(mut clipboard) = cb.lock() {
-                if let Ok(text) = clipboard.get_text() {
-                    if !text.is_empty() {
-                        if let Some(workspace) = &self.workspace {
-                            if let Some(active_tab) = workspace.active_tab() {
-                                if let Some(terminal) = active_tab.active_terminal() {
-                                    let bracketed = terminal.state.bracketed_paste;
-                                    let payload = if bracketed {
-                                        format!("\x1b[200~{}\x1b[201~", text)
-                                    } else {
-                                        text
-                                    };
-                                    let _ = terminal.write_to_pty(payload.as_bytes());
-                                    if let Some(window) = &self.window {
-                                        window.request_redraw();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn get_pane_and_cell_at(&self, mouse_x: f32, mouse_y: f32) -> Option<(PaneId, usize, usize)> {
-        let (renderer, workspace) = (self.renderer.as_ref()?, self.workspace.as_ref()?);
-        let tab_bar_h = self.get_tab_bar_height();
-        let pane_rects = workspace.compute_active_pane_rects(
-            renderer.config.width as f32,
-            renderer.config.height as f32,
-            tab_bar_h,
-        );
-
-        for (id, rect) in pane_rects {
-            if rect.contains(mouse_x, mouse_y) {
-                let cell_w = renderer.cell_width();
-                let cell_h = renderer.cell_height();
-                let pad_x = renderer.padding_x;
-                let pad_y = renderer.padding_y;
-
-                let rel_x = (mouse_x - rect.x - pad_x).max(0.0);
-                let rel_y = (mouse_y - rect.y - pad_y).max(0.0);
-
-                let col = (rel_x / cell_w).floor() as usize;
-                let row = (rel_y / cell_h).floor() as usize;
-
-                return Some((id, row, col));
-            }
-        }
-        None
-    }
-}
-
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-
+    /// Create a new Terminal Session. On macOS, this window attaches as a native NSWindow tab!
+    pub fn create_terminal_session(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<WindowId> {
         let init_cols = self.config_manager.current_config.window.columns as f32;
         let init_rows = self.config_manager.current_config.window.rows as f32;
         let font_size_pt = self.config_manager.current_config.font.size;
@@ -421,7 +407,10 @@ impl ApplicationHandler for App {
         #[cfg(target_os = "macos")]
         {
             use winit::platform::macos::WindowAttributesExtMacOS;
-            window_attrs = window_attrs.with_title_hidden(true).with_titlebar_transparent(true);
+            window_attrs = window_attrs
+                .with_tabbing_identifier("skterm.tabs")
+                .with_title_hidden(true)
+                .with_titlebar_transparent(true);
         }
 
         match self.config_manager.current_config.window.decorations.as_str() {
@@ -430,37 +419,52 @@ impl ApplicationHandler for App {
             _ => {}
         }
 
-        let window = match event_loop.create_window(window_attrs) {
-            Ok(w) => {
-                w.set_ime_allowed(true);
-                match self.config_manager.current_config.window.startup_mode.as_str() {
-                    "maximized" => w.set_maximized(true),
-                    "fullscreen" => w.set_fullscreen(Some(Fullscreen::Borderless(None))),
-                    _ => {}
+        let window = Arc::new(event_loop.create_window(window_attrs)?);
+        window.set_ime_allowed(true);
+
+        match self.config_manager.current_config.window.startup_mode.as_str() {
+            "maximized" => window.set_maximized(true),
+            "fullscreen" => window.set_fullscreen(Some(Fullscreen::Borderless(None))),
+            _ => {}
+        }
+
+        // On macOS: Enable NSWindowTabbingModePreferred and merge with parent tabbed window
+        #[cfg(target_os = "macos")]
+        {
+            use objc::{msg_send, sel, sel_impl};
+
+            let new_ptr = get_nswindow(&window);
+            if !new_ptr.is_null() {
+                // NSWindowTabbingModePreferred = 2
+                let _: () = unsafe {
+                    msg_send![new_ptr, setTabbingMode: 2isize]
+                };
+            }
+
+            if let Some(active_id) = self.active_session_id {
+                if let Some(active_sess) = self.sessions.get(&active_id) {
+                    let parent_ptr = get_nswindow(&active_sess.window);
+                    if !parent_ptr.is_null() && !new_ptr.is_null() {
+                        // NSWindowAbove = 1
+                        let _: () = unsafe {
+                            msg_send![
+                                parent_ptr,
+                                addTabbedWindow: new_ptr
+                                ordered: 1isize
+                            ]
+                        };
+                    }
                 }
-                Arc::new(w)
             }
-            Err(e) => {
-                error!("Failed to create window: {:?}", e);
-                event_loop.exit();
-                return;
-            }
-        };
+        }
 
         let font_cfg = &self.config_manager.current_config.font;
-        let renderer = match pollster::block_on(TermRenderer::new_with_font(
+        let mut renderer = pollster::block_on(TermRenderer::new_with_font(
             window.clone(),
             font_size_pt,
             &font_cfg.family,
             &font_cfg.fallback_families,
-        )) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Failed to initialize wgpu renderer: {:?}", e);
-                event_loop.exit();
-                return;
-            }
-        };
+        ))?;
 
         let scale = renderer.scale_factor;
         let cell_w_logical = renderer.cell_width() / scale;
@@ -472,27 +476,53 @@ impl ApplicationHandler for App {
         let pty_opts = self.build_pty_options();
         let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
 
-        let workspace = match Workspace::new_with_options(
+        let mut workspace = Workspace::new_with_options(
             init_rows as usize,
             init_cols as usize,
             scrollback,
             pty_opts,
-        ) {
-            Ok(ws) => ws,
-            Err(e) => {
-                error!("Failed to initialize workspace: {:?}", e);
-                event_loop.exit();
-                return;
-            }
+        )?;
+
+        let render_theme = self.build_render_theme();
+        renderer.set_theme(render_theme);
+
+        let tab_bar_h = self.get_tab_bar_height();
+        workspace.sync_pane_sizes(
+            renderer.config.width as f32,
+            renderer.config.height as f32,
+            renderer.cell_width(),
+            renderer.cell_height(),
+            renderer.padding_x,
+            renderer.padding_y,
+            tab_bar_h,
+        );
+
+        let window_id = window.id();
+        let session = TerminalSession {
+            window: window.clone(),
+            renderer,
+            workspace,
+            mouse_pos: (0.0, 0.0),
+            is_mouse_down: false,
+            last_click_time: Instant::now(),
+            click_count: 0,
         };
 
-        self.window = Some(window);
-        self.renderer = Some(renderer);
-        self.workspace = Some(workspace);
+        self.sessions.insert(window_id, session);
+        self.active_session_id = Some(window_id);
+        info!("Initialized Terminal Window Session (ID: {:?})", window_id);
+        Ok(window_id)
+    }
+}
 
-        self.apply_theme_to_renderer();
-        self.sync_all_pane_sizes();
-        info!("skTerm Main Window, Renderer, and Workspace initialized successfully!");
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.sessions.is_empty() {
+            if let Err(e) = self.create_terminal_session(event_loop) {
+                error!("Failed to create initial terminal window: {:?}", e);
+                event_loop.exit();
+            }
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
@@ -531,41 +561,81 @@ impl ApplicationHandler for App {
             }
         }
 
-        // 2. Handle Main Terminal Window Events
+        // 2. Track Focused Window
+        if let WindowEvent::Focused(true) = event {
+            self.active_session_id = Some(window_id);
+        }
+
+        // 3. Handle Terminal Window Session Events
+        let tab_bar_h = self.get_tab_bar_height();
+
         match event {
             WindowEvent::CloseRequested => {
-                info!("Close requested, exiting application.");
-                if self.pending_geometry_save {
-                    if let Ok(toml_str) = toml::to_string_pretty(&self.config_manager.current_config) {
-                        let _ = std::fs::write(&self.config_manager.path, toml_str);
-                    }
+                info!("Terminal window close requested for {:?}", window_id);
+                self.sessions.remove(&window_id);
+                if self.sessions.is_empty() {
+                    info!("All terminal windows closed, exiting.");
+                    event_loop.exit();
+                } else if self.active_session_id == Some(window_id) {
+                    self.active_session_id = self.sessions.keys().next().copied();
                 }
-                event_loop.exit();
             }
 
-            WindowEvent::ModifiersChanged(new_mods) => {
-                self.modifiers = new_mods.state();
-            }
+            WindowEvent::Resized(physical_size) => {
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    session.renderer.resize(physical_size.width, physical_size.height);
+                    session.sync_all_pane_sizes(tab_bar_h);
 
-            WindowEvent::Ime(ime_event) => {
-                match ime_event {
-                    Ime::Commit(text) => {
-                        if let Some(workspace) = &self.workspace {
-                            if let Some(tab) = workspace.active_tab() {
-                                if let Some(terminal) = tab.active_terminal() {
-                                    let _ = terminal.write_to_pty(text.as_bytes());
-                                    if let Some(window) = &self.window {
-                                        window.request_redraw();
-                                    }
-                                }
+                    if let Some(active_tab) = session.workspace.active_tab() {
+                        if let Some(term) = active_tab.active_terminal() {
+                            let new_cols = term.grid().active().cols as u16;
+                            let new_rows = term.grid().active().rows as u16;
+                            let current_cols = self.config_manager.current_config.window.columns;
+                            let current_rows = self.config_manager.current_config.window.rows;
+                            if new_cols != current_cols || new_rows != current_rows {
+                                self.config_manager.current_config.window.columns = new_cols;
+                                self.config_manager.current_config.window.rows = new_rows;
+                                self.pending_geometry_save = true;
+                                self.last_resize_time = Some(Instant::now());
                             }
                         }
                     }
-                    _ => {}
+                    session.window.request_redraw();
                 }
             }
 
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    let _ = session.renderer.update_scale_factor(scale_factor as f32);
+                    session.sync_all_pane_sizes(tab_bar_h);
+                    session.window.request_redraw();
+                }
+            }
+
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                self.modifiers = new_modifiers.state();
+            }
+
+            WindowEvent::Ime(ime_event) => {
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    match ime_event {
+                        Ime::Commit(text) => {
+                            if let Some(tab) = session.workspace.active_tab_mut() {
+                                if let Some(term) = tab.active_terminal_mut() {
+                                    let _ = term.write_to_pty(text.as_bytes());
+                                    session.window.request_redraw();
+                                }
+                            }
+                        }
+                        Ime::Preedit(_text, _cursor) => {
+                            session.window.request_redraw();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            WindowEvent::KeyboardInput { ref event, .. } => {
                 if event.state != ElementState::Pressed {
                     return;
                 }
@@ -578,140 +648,132 @@ impl ApplicationHandler for App {
 
                 let is_shift = self.modifiers.shift_key();
 
-                // Handle Global skTerm Shortcuts
                 if is_cmd {
-                    if let Key::Character(ch) = &event.logical_key {
-                        let lower = ch.to_lowercase();
+                    if let Key::Character(ref s) = event.logical_key {
+                        let lower = s.to_lowercase();
                         match lower.as_str() {
                             "," => {
-                                // Cmd+, / Ctrl+Shift+, -> Open Dedicated Preferences Window
-                                info!("Opening Native Preferences Window...");
                                 self.open_preferences_window(event_loop);
                                 return;
                             }
-                            "=" | "+" => {
-                                // Zoom In Font Size
-                                if let Some(renderer) = &mut self.renderer {
-                                    let new_pt = renderer.font_size_pt + 1.0;
-                                    let _ = renderer.update_font_size(new_pt);
-                                }
-                                self.apply_theme_to_renderer();
-                                self.sync_all_pane_sizes();
-                                if let Some(window) = &self.window {
-                                    window.request_redraw();
-                                }
-                                return;
-                            }
-                            "-" | "_" => {
-                                // Zoom Out Font Size
-                                if let Some(renderer) = &mut self.renderer {
-                                    let new_pt = (renderer.font_size_pt - 1.0).max(8.0);
-                                    let _ = renderer.update_font_size(new_pt);
-                                }
-                                self.apply_theme_to_renderer();
-                                self.sync_all_pane_sizes();
-                                if let Some(window) = &self.window {
-                                    window.request_redraw();
-                                }
-                                return;
-                            }
-                            "0" => {
-                                // Reset Font Size
-                                let def_pt = self.config_manager.current_config.font.size;
-                                if let Some(renderer) = &mut self.renderer {
-                                    let _ = renderer.update_font_size(def_pt);
-                                }
-                                self.apply_theme_to_renderer();
-                                self.sync_all_pane_sizes();
-                                if let Some(window) = &self.window {
-                                    window.request_redraw();
-                                }
-                                return;
-                            }
                             "t" => {
-                                // New Tab: Cmd+T
-                                self.create_new_tab();
-                                return;
+                                // macOS Native Tab (or new window)
+                                #[cfg(target_os = "macos")]
+                                {
+                                    let _ = self.create_terminal_session(event_loop);
+                                    return;
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                {
+                                    let pty_opts = self.build_pty_options();
+                                    let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+                                    if let Some(session) = self.sessions.get_mut(&window_id) {
+                                        let _ = session.workspace.new_tab_with_options(24, 80, scrollback, pty_opts);
+                                        session.sync_all_pane_sizes(tab_bar_h);
+                                        session.window.request_redraw();
+                                    }
+                                    return;
+                                }
                             }
                             "w" => {
-                                // Close Tab/Pane: Cmd+W
-                                if let Some(workspace) = &mut self.workspace {
-                                    let all_closed = workspace.close_active_pane();
-                                    if all_closed {
-                                        info!("All tabs closed via shortcut, exiting.");
-                                        event_loop.exit();
-                                        return;
+                                // Close Pane or Window Session
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    let all_panes_closed = session.workspace.close_active_pane();
+                                    if all_panes_closed {
+                                        self.sessions.remove(&window_id);
+                                        if self.sessions.is_empty() {
+                                            event_loop.exit();
+                                        }
+                                    } else {
+                                        session.sync_all_pane_sizes(tab_bar_h);
+                                        session.window.request_redraw();
                                     }
-                                }
-                                self.sync_all_pane_sizes();
-                                if let Some(window) = &self.window {
-                                    window.request_redraw();
                                 }
                                 return;
                             }
                             "d" => {
-                                // Split Pane: Cmd+D (Left/Right) or Cmd+Shift+D (Top/Bottom)
-                                let dir = if is_shift { SplitDirection::Vertical } else { SplitDirection::Horizontal };
+                                // Split Panes: Cmd+D = Left/Right, Cmd+Shift+D = Top/Bottom
+                                let dir = if is_shift {
+                                    SplitDirection::Vertical
+                                } else {
+                                    SplitDirection::Horizontal
+                                };
                                 let pty_opts = self.build_pty_options();
                                 let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
-                                if let Some(workspace) = &mut self.workspace {
-                                    let _ = workspace.split_active_pane(dir, 24, 80, scrollback, pty_opts);
-                                }
-                                self.sync_all_pane_sizes();
-                                if let Some(window) = &self.window {
-                                    window.request_redraw();
-                                }
-                                return;
-                            }
-                            "c" => {
-                                self.copy_to_clipboard();
-                                return;
-                            }
-                            "v" => {
-                                self.paste_from_clipboard();
-                                return;
-                            }
-                            "]" => {
-                                // Next Tab / Next Pane
-                                if let Some(workspace) = &mut self.workspace {
-                                    if is_shift {
-                                        workspace.next_tab();
-                                    } else {
-                                        if let Some(tab) = workspace.active_tab_mut() {
-                                            tab.focus_next();
-                                        }
-                                    }
-                                    if let Some(window) = &self.window {
-                                        window.request_redraw();
-                                    }
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    let _ = session.workspace.split_active_pane(dir, 24, 80, scrollback, pty_opts);
+                                    session.sync_all_pane_sizes(tab_bar_h);
+                                    session.window.request_redraw();
                                 }
                                 return;
                             }
                             "[" => {
-                                // Prev Tab / Prev Pane
-                                if let Some(workspace) = &mut self.workspace {
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
                                     if is_shift {
-                                        workspace.prev_tab();
-                                    } else {
-                                        if let Some(tab) = workspace.active_tab_mut() {
-                                            tab.focus_prev();
-                                        }
+                                        session.workspace.prev_tab();
+                                    } else if let Some(tab) = session.workspace.active_tab_mut() {
+                                        tab.focus_prev();
                                     }
-                                    if let Some(window) = &self.window {
-                                        window.request_redraw();
+                                    session.window.request_redraw();
+                                }
+                                return;
+                            }
+                            "]" => {
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    if is_shift {
+                                        session.workspace.next_tab();
+                                    } else if let Some(tab) = session.workspace.active_tab_mut() {
+                                        tab.focus_next();
                                     }
+                                    session.window.request_redraw();
+                                }
+                                return;
+                            }
+                            "c" => {
+                                if let Some(session) = self.sessions.get(&window_id) {
+                                    session.copy_to_clipboard(self.clipboard.as_ref());
+                                }
+                                return;
+                            }
+                            "v" => {
+                                if let Some(session) = self.sessions.get(&window_id) {
+                                    session.paste_from_clipboard(self.clipboard.as_ref());
+                                }
+                                return;
+                            }
+                            "+" | "=" => {
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    let cur_pt = session.renderer.font_size_pt;
+                                    let _ = session.renderer.update_font_size(cur_pt + 1.0);
+                                    session.sync_all_pane_sizes(tab_bar_h);
+                                    session.window.request_redraw();
+                                }
+                                return;
+                            }
+                            "-" => {
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    let cur_pt = session.renderer.font_size_pt;
+                                    let _ = session.renderer.update_font_size((cur_pt - 1.0).max(8.0));
+                                    session.sync_all_pane_sizes(tab_bar_h);
+                                    session.window.request_redraw();
+                                }
+                                return;
+                            }
+                            "0" => {
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    let def_pt = self.config_manager.current_config.font.size;
+                                    let _ = session.renderer.update_font_size(def_pt);
+                                    session.sync_all_pane_sizes(tab_bar_h);
+                                    session.window.request_redraw();
                                 }
                                 return;
                             }
                             _ => {
-                                // Tab Direct Jump (Cmd+1..9)
                                 if let Ok(digit) = lower.parse::<usize>() {
-                                    if digit >= 1 && digit <= 9 {
-                                        if let Some(workspace) = &mut self.workspace {
-                                            workspace.select_tab(digit - 1);
-                                            if let Some(window) = &self.window {
-                                                window.request_redraw();
-                                            }
+                                    if (1..=9).contains(&digit) {
+                                        if let Some(session) = self.sessions.get_mut(&window_id) {
+                                            session.workspace.select_tab(digit - 1);
+                                            session.window.request_redraw();
                                         }
                                         return;
                                     }
@@ -721,72 +783,32 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // Send terminal bytes to active PTY
-                if let Some(workspace) = &self.workspace {
-                    if let Some(active_tab) = workspace.active_tab() {
-                        if let Some(terminal) = active_tab.active_terminal() {
-                            let app_cursor = terminal.state.application_cursor_keys;
-                            if let Some(bytes) = encode_key_event(&event, self.modifiers, app_cursor) {
-                                let _ = terminal.write_to_pty(&bytes);
-                                if let Some(window) = &self.window {
-                                    window.request_redraw();
-                                }
+                // Send Normal Key to PTY
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    if let Some(tab) = session.workspace.active_tab_mut() {
+                        if let Some(term) = tab.active_terminal_mut() {
+                            let app_cursor = term.state.application_cursor_keys;
+                            if let Some(bytes) = encode_key_event(event, self.modifiers, app_cursor) {
+                                let _ = term.write_to_pty(&bytes);
+                                session.window.request_redraw();
                             }
                         }
-                    }
-                }
-            }
-
-            WindowEvent::Resized(physical_size) => {
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.resize(physical_size.width, physical_size.height);
-                    self.sync_all_pane_sizes();
-                    if let Some(workspace) = &self.workspace {
-                        if let Some(tab) = workspace.active_tab() {
-                            if let Some(term) = tab.active_terminal() {
-                                let new_cols = term.grid().active().cols as u16;
-                                let new_rows = term.grid().active().rows as u16;
-                                let cfg = &mut self.config_manager.current_config;
-                                if cfg.window.columns != new_cols || cfg.window.rows != new_rows {
-                                    cfg.window.columns = new_cols;
-                                    cfg.window.rows = new_rows;
-                                    self.pending_geometry_save = true;
-                                    self.last_resize_time = Some(Instant::now());
-                                }
-                            }
-                        }
-                    }
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                }
-            }
-
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                if let Some(renderer) = &mut self.renderer {
-                    let _ = renderer.update_scale_factor(scale_factor as f32);
-                    self.sync_all_pane_sizes();
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
                     }
                 }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_pos = (position.x as f32, position.y as f32);
-                let (mx, my) = self.mouse_pos;
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    session.mouse_pos = (position.x as f32, position.y as f32);
+                    let (mx, my) = session.mouse_pos;
 
-                // Dragging Selection
-                if self.is_mouse_down {
-                    if let Some((_pane_id, row, col)) = self.get_pane_and_cell_at(mx, my) {
-                        if let Some(workspace) = &mut self.workspace {
-                            if let Some(tab) = workspace.active_tab_mut() {
-                                if let Some(terminal) = tab.active_terminal_mut() {
-                                    if let Some(sel) = &mut terminal.grid_mut().active_mut().selection {
+                    if session.is_mouse_down {
+                        if let Some((_pane_id, row, col)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
+                            if let Some(tab) = session.workspace.active_tab_mut() {
+                                if let Some(term) = tab.active_terminal_mut() {
+                                    if let Some(sel) = &mut term.grid_mut().active_mut().selection {
                                         sel.end = (row, col);
-                                        if let Some(window) = &self.window {
-                                            window.request_redraw();
-                                        }
+                                        session.window.request_redraw();
                                     }
                                 }
                             }
@@ -796,78 +818,82 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                let (mx, my) = self.mouse_pos;
-                let tab_bar_h = self.get_tab_bar_height();
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    let (mx, my) = session.mouse_pos;
 
-                if button == MouseButton::Left {
-                    if state == ElementState::Pressed {
-                        self.is_mouse_down = true;
+                    if button == MouseButton::Left {
+                        if state == ElementState::Pressed {
+                            session.is_mouse_down = true;
 
-                        // Click on Tab Bar
-                        if tab_bar_h > 0.0 && my <= tab_bar_h {
-                            if let (Some(renderer), Some(workspace)) = (&self.renderer, &mut self.workspace) {
-                                let screen_w = renderer.config.width as f32;
-                                let scale = renderer.scale_factor;
-                                let tabs_len = workspace.tabs.len();
-
-                                let start_x = if cfg!(target_os = "macos") { 78.0 * scale } else { 8.0 * scale };
+                            // Inline Tab Bar handling (Windows/Linux only)
+                            #[cfg(not(target_os = "macos"))]
+                            if tab_bar_h > 0.0 && my <= tab_bar_h {
+                                let scale = session.renderer.scale_factor;
+                                let tabs_len = session.workspace.tabs.len();
+                                let start_x = 8.0 * scale;
                                 let plus_btn_w = 24.0 * scale;
                                 let tab_gap = 4.0 * scale;
-                                let avail_w = (screen_w - start_x - plus_btn_w - 16.0 * scale).max(80.0);
+                                let avail_w = (session.renderer.config.width as f32 - start_x - plus_btn_w - 16.0 * scale).max(80.0);
                                 let total_gaps = (tabs_len.saturating_sub(1) as f32) * tab_gap;
                                 let tab_w = ((avail_w - total_gaps) / tabs_len as f32).clamp(75.0 * scale, 190.0 * scale);
                                 let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);
                                 let tab_y = (tab_bar_h - tab_h) / 2.0;
 
-                                // 1. Check New Tab "+" Button
+                                // Check "+" New Tab
                                 let last_tab_right = start_x + (tabs_len as f32 * (tab_w + tab_gap));
                                 let plus_btn_x = last_tab_right + 2.0 * scale;
                                 if mx >= plus_btn_x - 4.0 * scale && mx <= plus_btn_x + plus_btn_w + 6.0 * scale
                                     && my >= tab_y && my <= tab_y + tab_h
                                 {
-                                    self.create_new_tab();
+                                    let pty_opts = self.build_pty_options();
+                                    let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+                                    let _ = session.workspace.new_tab_with_options(24, 80, scrollback, pty_opts);
+                                    session.sync_all_pane_sizes(tab_bar_h);
+                                    session.window.request_redraw();
                                     return;
                                 }
 
-                                // 2. Check Tab capsules and "x" Close Buttons
+                                // Check Tabs & Close "x"
                                 for idx in 0..tabs_len {
                                     let tab_x = start_x + (idx as f32 * (tab_w + tab_gap));
                                     if mx >= tab_x && mx <= tab_x + tab_w && my >= tab_y && my <= tab_y + tab_h {
                                         let close_size = 14.0 * scale;
                                         let close_x = tab_x + tab_w - close_size - 6.0 * scale;
-
                                         if mx >= close_x - 4.0 * scale {
-                                            // Clicked Close "x"
-                                            self.close_tab_at(idx, event_loop);
-                                        } else {
-                                            // Clicked Tab capsule body
-                                            workspace.select_tab(idx);
-                                            if let Some(window) = &self.window {
-                                                window.request_redraw();
+                                            let all_closed = session.workspace.close_tab_at(idx);
+                                            if all_closed {
+                                                self.sessions.remove(&window_id);
+                                                if self.sessions.is_empty() {
+                                                    event_loop.exit();
+                                                }
+                                            } else {
+                                                session.sync_all_pane_sizes(tab_bar_h);
+                                                session.window.request_redraw();
                                             }
+                                        } else {
+                                            session.workspace.select_tab(idx);
+                                            session.window.request_redraw();
                                         }
                                         return;
                                     }
                                 }
+                                return;
                             }
-                            return;
-                        }
 
-                        // Click inside Terminal Pane
-                        if let Some((pane_id, row, col)) = self.get_pane_and_cell_at(mx, my) {
-                            if let Some(workspace) = &mut self.workspace {
-                                if let Some(tab) = workspace.active_tab_mut() {
+                            // Click inside Terminal Pane
+                            if let Some((pane_id, row, col)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
+                                if let Some(tab) = session.workspace.active_tab_mut() {
                                     tab.active_pane_id = pane_id;
 
                                     let now = Instant::now();
-                                    if now.duration_since(self.last_click_time) < Duration::from_millis(400) {
-                                        self.click_count += 1;
+                                    if now.duration_since(session.last_click_time) < Duration::from_millis(400) {
+                                        session.click_count += 1;
                                     } else {
-                                        self.click_count = 1;
+                                        session.click_count = 1;
                                     }
-                                    self.last_click_time = now;
+                                    session.last_click_time = now;
 
-                                    let mode = match self.click_count {
+                                    let mode = match session.click_count {
                                         2 => SelectionMode::Word,
                                         3 => SelectionMode::Line,
                                         _ => SelectionMode::Simple,
@@ -875,38 +901,34 @@ impl ApplicationHandler for App {
 
                                     if let Some(terminal) = tab.active_terminal_mut() {
                                         terminal.grid_mut().active_mut().selection = Some(Selection::new((row, col), (row, col), mode));
-                                    }
-                                    if let Some(window) = &self.window {
-                                        window.request_redraw();
+                                        session.window.request_redraw();
                                     }
                                 }
                             }
+                        } else {
+                            session.is_mouse_down = false;
                         }
-                    } else {
-                        self.is_mouse_down = false;
+                    } else if button == MouseButton::Right && state == ElementState::Pressed {
+                        session.paste_from_clipboard(self.clipboard.as_ref());
                     }
-                } else if button == MouseButton::Right && state == ElementState::Pressed {
-                    self.paste_from_clipboard();
                 }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as i32,
-                    MouseScrollDelta::PixelDelta(pos) => {
-                        let scale = self.renderer.as_ref().map(|r| r.cell_height()).unwrap_or(20.0);
-                        (pos.y / scale as f64) as i32
-                    }
-                };
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y as i32,
+                        MouseScrollDelta::PixelDelta(pos) => {
+                            let scale = session.renderer.cell_height();
+                            (pos.y / scale as f64) as i32
+                        }
+                    };
 
-                if lines != 0 {
-                    if let Some(workspace) = &mut self.workspace {
-                        if let Some(tab) = workspace.active_tab_mut() {
+                    if lines != 0 {
+                        if let Some(tab) = session.workspace.active_tab_mut() {
                             if let Some(terminal) = tab.active_terminal_mut() {
                                 terminal.grid_mut().active_mut().scroll_display(lines as isize);
-                                if let Some(window) = &self.window {
-                                    window.request_redraw();
-                                }
+                                session.window.request_redraw();
                             }
                         }
                     }
@@ -914,28 +936,24 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                let tab_bar_h = self.get_tab_bar_height();
-                if let (Some(renderer), Some(workspace), Some(_window)) = (&mut self.renderer, &mut self.workspace, &self.window) {
-                    let _ = workspace.poll_all_ptys();
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    session.update_ime_position(tab_bar_h);
 
-                    let tabs: Vec<TabItem> = workspace
-                        .tabs
-                        .iter()
-                        .enumerate()
-                        .map(|(i, t)| TabItem {
-                            title: t.title.clone(),
-                            is_active: i == workspace.active_tab_idx,
-                        })
-                        .collect();
+                    let tabs: Vec<TabItem> = session.workspace.tabs.iter().enumerate().map(|(idx, tab)| {
+                        TabItem {
+                            title: tab.title.clone(),
+                            is_active: idx == session.workspace.active_tab_idx,
+                        }
+                    }).collect();
 
-                    let pane_rects = workspace.compute_active_pane_rects(
-                        renderer.config.width as f32,
-                        renderer.config.height as f32,
+                    let pane_rects = session.workspace.compute_active_pane_rects(
+                        session.renderer.config.width as f32,
+                        session.renderer.config.height as f32,
                         tab_bar_h,
                     );
 
                     let mut render_panes = Vec::new();
-                    if let Some(active_tab) = workspace.active_tab() {
+                    if let Some(active_tab) = session.workspace.active_tab() {
                         for (id, rect) in &pane_rects {
                             if let Some(t) = active_tab.root.find_terminal(*id) {
                                 render_panes.push(PaneRenderItem {
@@ -950,19 +968,17 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    if let Err(e) = renderer.render_workspace(&tabs, &render_panes, tab_bar_h) {
-                        error!("Render error: {:?}", e);
+                    if let Err(e) = session.renderer.render_workspace(&tabs, &render_panes, tab_bar_h) {
+                        warn!("Render error on session {:?}: {:?}", window_id, e);
                     }
 
-                    if let Some(active_tab) = workspace.active_tab_mut() {
+                    if let Some(active_tab) = session.workspace.active_tab_mut() {
                         for (id, _) in &pane_rects {
                             if let Some(t) = active_tab.root.find_terminal_mut(*id) {
                                 t.grid_mut().clear_dirty();
                             }
                         }
                     }
-
-                    self.update_ime_position();
                 }
             }
 
@@ -971,63 +987,48 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // 1. Hot Reload Configuration
         let old_cfg = self.config_manager.current_config.clone();
-        if let Some(reloaded_cfg) = self.config_manager.check_reload() {
-            if old_cfg != *reloaded_cfg {
-                info!("Applying hot-reloaded configuration to running app...");
-                let font_changed = old_cfg.font.family != reloaded_cfg.font.family
-                    || (old_cfg.font.size - reloaded_cfg.font.size).abs() > 0.01
-                    || old_cfg.font.fallback_families != reloaded_cfg.font.fallback_families;
+        let reloaded = self.config_manager.check_reload().cloned();
+        if let Some(reloaded_cfg) = reloaded {
+            if old_cfg != reloaded_cfg {
+                info!("Config file modified on disk, applying live changes to all sessions...");
+                self.apply_config_live(&reloaded_cfg);
+            }
+        }
 
-                if font_changed {
-                    if let Some(renderer) = &mut self.renderer {
-                        let _ = renderer.update_font(
-                            &reloaded_cfg.font.family,
-                            reloaded_cfg.font.size,
-                            &reloaded_cfg.font.fallback_families,
-                        );
-                    }
+        // 2. Poll all sessions for PTY output and dead sessions
+        let tab_bar_h = self.get_tab_bar_height();
+        let mut dead_sessions = Vec::new();
+
+        for (id, session) in self.sessions.iter_mut() {
+            if session.workspace.has_dead_sessions() {
+                let all_dead = session.workspace.cleanup_dead_sessions();
+                if all_dead {
+                    dead_sessions.push(*id);
+                } else {
+                    session.sync_all_pane_sizes(tab_bar_h);
+                    session.window.request_redraw();
                 }
-                self.apply_theme_to_renderer();
-                self.sync_all_pane_sizes();
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+            } else {
+                let has_output = session.workspace.poll_all_ptys();
+                if has_output {
+                    session.window.request_redraw();
                 }
             }
         }
 
-        let tab_bar_h = self.get_tab_bar_height();
-        if let Some(workspace) = &mut self.workspace {
-            // Check for Terminated Shell Processes (e.g. exit / EOF)
-            if workspace.has_dead_sessions() {
-                let all_dead = workspace.cleanup_dead_sessions();
-                if all_dead {
-                    info!("All terminal sessions closed. Exiting skTerm.");
-                    event_loop.exit();
-                    return;
-                }
-                if let (Some(renderer), Some(window)) = (&self.renderer, &self.window) {
-                    workspace.sync_pane_sizes(
-                        renderer.config.width as f32,
-                        renderer.config.height as f32,
-                        renderer.cell_width(),
-                        renderer.cell_height(),
-                        renderer.padding_x,
-                        renderer.padding_y,
-                        tab_bar_h,
-                    );
-                    window.request_redraw();
-                }
-            }
+        for id in dead_sessions {
+            self.sessions.remove(&id);
+        }
 
-            let has_output = workspace.poll_all_ptys();
-            if has_output {
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
-        } // close workspace block
+        if self.sessions.is_empty() {
+            info!("All terminal sessions closed. Exiting skTerm.");
+            event_loop.exit();
+            return;
+        }
 
+        // 3. Debounced Auto-Save
         if self.pending_geometry_save {
             if let Some(last) = self.last_resize_time {
                 if last.elapsed() > Duration::from_millis(400) {
