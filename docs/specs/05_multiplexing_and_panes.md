@@ -45,3 +45,19 @@ pub enum PaneNode {
 - `tab_bar_style = "auto"`：當視窗內存在多於 1 個分頁時自動顯示標籤列，單一分頁時自動隱藏以最大化終端工作空間。
 - `tab_bar_style = "always"`：恆常顯示分頁標籤列。
 - `tab_bar_style = "never"`：恆常隱藏分頁標籤列。
+
+---
+
+## 4. macOS Sonoma / Sequoia 原生感分頁列設計 (Native HIG Tab Bar)
+- **佈局幾何 (Geometry)**：
+  - 高度由 `28pt` 升級為標準 `36pt`，提供舒適的垂直排版與卡片膠囊呼吸感。
+  - **避讓 Traffic Lights (紅綠燈)**：macOS 下分頁自動自 `x = 78pt` 起算，保留左側安全邊距，徹底杜絕分頁與視窗控制按鈕重疊。
+  - **自適應分段懸浮膠囊 (Floating Segmented Tab Capsules)**：各分頁呈懸浮卡片質感，上下預留 4pt 外距，左右預留 4pt 間隔。
+- **視覺階層 (Visual Hierarchy)**：
+  - **Active Tab**：深雅卡片底色 + 頂部/側邊微光邊框 + 底部 2px macOS 活力藍指示條 (`#0A84FF`) + 亮白字體。
+  - **Inactive Tab**：半透明沉浸底色 + 次要灰文字。
+  - **底部分隔線**：1px 微光半透明細線區隔終端工作區。
+- **互動控制 (Interactivity)**：
+  - **關閉分頁 (`×` Close Button)**：各分頁右側配置精緻微型 `×` 按鈕，點選即時關閉。
+  - **新增分頁 (`+` New Tab Button)**：末端配置獨立圓角 `+` 按鈕，點選即時建立新分頁。
+  - **雙擊空白處**：雙擊 Tab Bar 空白區域快速建立新分頁。

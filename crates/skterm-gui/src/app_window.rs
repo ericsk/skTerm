@@ -254,14 +254,41 @@ impl App {
 
         match tab_bar_style {
             "never" => 0.0,
-            "always" => 28.0 * scale,
+            "always" => 36.0 * scale,
             "auto" | _ => {
                 if tab_count > 1 {
-                    28.0 * scale
+                    36.0 * scale
                 } else {
                     0.0
                 }
             }
+        }
+    }
+
+    pub fn create_new_tab(&mut self) {
+        let pty_opts = self.build_pty_options();
+        let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+        if let Some(workspace) = &mut self.workspace {
+            let _ = workspace.new_tab_with_options(24, 80, scrollback, pty_opts);
+        }
+        self.sync_all_pane_sizes();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    pub fn close_tab_at(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
+        if let Some(workspace) = &mut self.workspace {
+            let all_closed = workspace.close_tab_at(idx);
+            if all_closed {
+                info!("All tabs closed via close button, exiting.");
+                event_loop.exit();
+                return;
+            }
+        }
+        self.sync_all_pane_sizes();
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -603,15 +630,7 @@ impl ApplicationHandler for App {
                             }
                             "t" => {
                                 // New Tab: Cmd+T
-                                let pty_opts = self.build_pty_options();
-                                let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
-                                if let Some(workspace) = &mut self.workspace {
-                                    let _ = workspace.new_tab_with_options(24, 80, scrollback, pty_opts);
-                                }
-                                self.sync_all_pane_sizes();
-                                if let Some(window) = &self.window {
-                                    window.request_redraw();
-                                }
+                                self.create_new_tab();
                                 return;
                             }
                             "w" => {
@@ -786,19 +805,52 @@ impl ApplicationHandler for App {
 
                         // Click on Tab Bar
                         if tab_bar_h > 0.0 && my <= tab_bar_h {
-                            if let Some(renderer) = &self.renderer {
-                                let tab_w = 140.0 * renderer.scale_factor;
-                                let clicked_idx = (mx / tab_w).floor() as usize;
-                                if let Some(workspace) = &mut self.workspace {
-                                    if clicked_idx < workspace.tabs.len() {
-                                        workspace.select_tab(clicked_idx);
-                                        if let Some(window) = &self.window {
-                                            window.request_redraw();
+                            if let (Some(renderer), Some(workspace)) = (&self.renderer, &mut self.workspace) {
+                                let screen_w = renderer.config.width as f32;
+                                let scale = renderer.scale_factor;
+                                let tabs_len = workspace.tabs.len();
+
+                                let start_x = if cfg!(target_os = "macos") { 78.0 * scale } else { 8.0 * scale };
+                                let plus_btn_w = 24.0 * scale;
+                                let tab_gap = 4.0 * scale;
+                                let avail_w = (screen_w - start_x - plus_btn_w - 16.0 * scale).max(80.0);
+                                let total_gaps = (tabs_len.saturating_sub(1) as f32) * tab_gap;
+                                let tab_w = ((avail_w - total_gaps) / tabs_len as f32).clamp(75.0 * scale, 190.0 * scale);
+                                let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);
+                                let tab_y = (tab_bar_h - tab_h) / 2.0;
+
+                                // 1. Check New Tab "+" Button
+                                let last_tab_right = start_x + (tabs_len as f32 * (tab_w + tab_gap));
+                                let plus_btn_x = last_tab_right + 2.0 * scale;
+                                if mx >= plus_btn_x - 4.0 * scale && mx <= plus_btn_x + plus_btn_w + 6.0 * scale
+                                    && my >= tab_y && my <= tab_y + tab_h
+                                {
+                                    self.create_new_tab();
+                                    return;
+                                }
+
+                                // 2. Check Tab capsules and "x" Close Buttons
+                                for idx in 0..tabs_len {
+                                    let tab_x = start_x + (idx as f32 * (tab_w + tab_gap));
+                                    if mx >= tab_x && mx <= tab_x + tab_w && my >= tab_y && my <= tab_y + tab_h {
+                                        let close_size = 14.0 * scale;
+                                        let close_x = tab_x + tab_w - close_size - 6.0 * scale;
+
+                                        if mx >= close_x - 4.0 * scale {
+                                            // Clicked Close "x"
+                                            self.close_tab_at(idx, event_loop);
+                                        } else {
+                                            // Clicked Tab capsule body
+                                            workspace.select_tab(idx);
+                                            if let Some(window) = &self.window {
+                                                window.request_redraw();
+                                            }
                                         }
                                         return;
                                     }
                                 }
                             }
+                            return;
                         }
 
                         // Click inside Terminal Pane

@@ -20,6 +20,10 @@
     - 消除純切換主題時的 WGPU Shader 與字形 Atlas 重建卡頓。
     - 實作背景執行緒寫入 `config.toml`，消除磁碟 I/O 阻塞。
     - 加入回聲熱重載過濾 (`Echo Hot-Reload Filter`)，避免自動存檔引發連鎖卡頓。
+  - [x] **macOS 原生感分頁列重構 (Native HIG Tab Bar)**：
+    - 高度調整為 36pt，自動避讓左側 macOS 交通號誌（紅綠燈），杜絕按鈕重疊。
+    - 採用懸浮分段膠囊設計 (Floating Segmented Tab Capsules)，Active Tab 配備 macOS 活力藍 (`#0A84FF`) 指示線與微光邊框。
+    - 新增分頁關閉按鈕 (`×`) 與末端新建分頁按鈕 (`+`)，支援即時點擊與雙擊空白處新建分頁。
   - [x] **鍵盤編碼系統擴充 (Keyboard Encoding Enhancements)**：
     - 完整支援 **`Shift + Tab`（Backtab）** 發送標準 ANSI/xterm 序列 **`\x1b[Z`**（CSI Z），支援 Shell/TUI 反向補全。
     - 支援 `Shift`/`Alt`/`Ctrl` 複合修飾鍵對方向鍵與導航鍵的 xterm 參數編碼（如 `Ctrl + Left/Right` 跳詞）。

@@ -530,6 +530,19 @@ impl Workspace {
         false
     }
 
+    pub fn close_tab_at(&mut self, idx: usize) -> bool {
+        if idx < self.tabs.len() {
+            self.tabs.remove(idx);
+            if self.tabs.is_empty() {
+                return true;
+            }
+            if self.active_tab_idx >= self.tabs.len() {
+                self.active_tab_idx = self.tabs.len() - 1;
+            }
+        }
+        false
+    }
+
     pub fn has_dead_sessions(&self) -> bool {
         for tab in &self.tabs {
             if !tab.root.find_dead_panes().is_empty() {

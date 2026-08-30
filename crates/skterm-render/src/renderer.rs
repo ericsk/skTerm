@@ -339,41 +339,101 @@ impl TermRenderer {
 
         // 2. Tab Bar
         if tab_bar_h > 0.0 && !tabs.is_empty() {
+            let screen_w = self.config.width as f32;
+            let scale = self.scale_factor;
+
+            // 2.1 Tab Bar Header Background (Deep translucent frosted bar)
             bg_instances.push(BgInstance {
-                rect: [0.0, 0.0, self.config.width as f32, tab_bar_h],
-                color: self.theme.tab_bar_bg,
+                rect: [0.0, 0.0, screen_w, tab_bar_h],
+                color: [0.06, 0.07, 0.09, 1.0],
             });
 
-            let tab_w = 140.0 * self.scale_factor;
+            // Bottom 1px subtle divider
+            bg_instances.push(BgInstance {
+                rect: [0.0, tab_bar_h - 1.0, screen_w, 1.0],
+                color: [0.18, 0.20, 0.26, 0.8],
+            });
+
+            // 2.2 Calculate Tab Capsule Geometry
+            let start_x = if cfg!(target_os = "macos") { 78.0 * scale } else { 8.0 * scale };
+            let plus_btn_w = 24.0 * scale;
+            let tab_gap = 4.0 * scale;
+            let avail_w = (screen_w - start_x - plus_btn_w - 16.0 * scale).max(80.0);
+            let total_gaps = (tabs.len().saturating_sub(1) as f32) * tab_gap;
+            let tab_w = ((avail_w - total_gaps) / tabs.len() as f32).clamp(75.0 * scale, 190.0 * scale);
+            let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);
+            let tab_y = (tab_bar_h - tab_h) / 2.0;
+
             for (idx, tab) in tabs.iter().enumerate() {
-                let tab_x = (idx as f32 * tab_w).min(self.config.width as f32 - tab_w);
-                let bg_color = if tab.is_active {
-                    self.theme.tab_active_bg
+                let tab_x = start_x + (idx as f32 * (tab_w + tab_gap));
+
+                if tab.is_active {
+                    // Active Tab: Floating Card Capsule with subtle border and Active Blue Indicator
+                    bg_instances.push(BgInstance {
+                        rect: [tab_x, tab_y, tab_w, tab_h],
+                        color: [0.15, 0.17, 0.23, 1.0],
+                    });
+                    // Top / Left / Right subtle border line
+                    bg_instances.push(BgInstance {
+                        rect: [tab_x, tab_y, tab_w, 1.0],
+                        color: [0.28, 0.32, 0.42, 0.8],
+                    });
+                    bg_instances.push(BgInstance {
+                        rect: [tab_x, tab_y, 1.0, tab_h],
+                        color: [0.28, 0.32, 0.42, 0.5],
+                    });
+                    bg_instances.push(BgInstance {
+                        rect: [tab_x + tab_w - 1.0, tab_y, 1.0, tab_h],
+                        color: [0.28, 0.32, 0.42, 0.5],
+                    });
+                    // Active Blue Indicator line at bottom of capsule (#0A84FF)
+                    bg_instances.push(BgInstance {
+                        rect: [tab_x + 3.0 * scale, tab_y + tab_h - 2.0, tab_w - 6.0 * scale, 2.0],
+                        color: [0.039, 0.518, 1.00, 1.0],
+                    });
                 } else {
-                    self.theme.tab_bar_bg
-                };
-                let fg_color = if tab.is_active {
-                    self.theme.tab_active_fg
-                } else {
-                    self.theme.tab_inactive_fg
-                };
+                    // Inactive Tab: Subtle dark capsule
+                    bg_instances.push(BgInstance {
+                        rect: [tab_x, tab_y, tab_w, tab_h],
+                        color: [0.09, 0.10, 0.13, 0.6],
+                    });
+                }
 
-                bg_instances.push(BgInstance {
-                    rect: [tab_x, 0.0, tab_w, tab_bar_h],
-                    color: bg_color,
-                });
+                // Close "x" button on right side of tab
+                let close_size = 12.0 * scale;
+                let close_x = tab_x + tab_w - close_size - 6.0 * scale;
+                let close_y = tab_y + (tab_h - close_size) / 2.0;
 
-                bg_instances.push(BgInstance {
-                    rect: [tab_x + tab_w - 1.0, 0.0, 1.0, tab_bar_h],
-                    color: self.theme.border_color,
-                });
+                if let Some(glyph_info) = self.atlas.get_or_insert_glyph(&self.queue, '×', false, false) {
+                    if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
+                        let draw_x = close_x + (close_size - glyph_info.size[0]) / 2.0;
+                        let draw_y = close_y + (close_size - glyph_info.size[1]) / 2.0;
+                        let close_color = if tab.is_active {
+                            [0.72, 0.76, 0.85, 0.9]
+                        } else {
+                            [0.45, 0.48, 0.55, 0.6]
+                        };
+                        glyph_instances.push(GlyphInstance {
+                            rect: [draw_x, draw_y, glyph_info.size[0], glyph_info.size[1]],
+                            uv: [glyph_info.uv_min[0], glyph_info.uv_min[1], glyph_info.uv_max[0], glyph_info.uv_max[1]],
+                            color: close_color,
+                        });
+                    }
+                }
 
-                let text_start_x = tab_x + 12.0 * self.scale_factor;
+                // Tab Title Text (Centered vertically)
+                let text_start_x = tab_x + 10.0 * scale;
+                let max_text_w = close_x - text_start_x - 4.0 * scale;
                 let text_y = (tab_bar_h - cell_h) / 2.0;
+                let text_color = if tab.is_active {
+                    [0.98, 0.98, 1.00, 1.0]
+                } else {
+                    [0.62, 0.65, 0.73, 1.0]
+                };
 
                 for (ch_idx, c) in tab.title.chars().enumerate() {
                     let gx = text_start_x + (ch_idx as f32 * cell_w);
-                    if gx + cell_w > tab_x + tab_w - 10.0 {
+                    if gx + cell_w > text_start_x + max_text_w {
                         break;
                     }
                     if let Some(glyph_info) = self.atlas.get_or_insert_glyph(&self.queue, c, false, false) {
@@ -388,17 +448,38 @@ impl TermRenderer {
                                     glyph_info.uv_max[0],
                                     glyph_info.uv_max[1],
                                 ],
-                                color: fg_color,
+                                color: text_color,
                             });
                         }
                     }
                 }
             }
 
+            // 2.3 New Tab "+" Button
+            let last_tab_right = start_x + (tabs.len() as f32 * (tab_w + tab_gap));
+            let plus_btn_x = last_tab_right + 2.0 * scale;
+            let plus_btn_y = tab_y + (tab_h - plus_btn_w) / 2.0;
+
             bg_instances.push(BgInstance {
-                rect: [0.0, tab_bar_h - 1.0, self.config.width as f32, 1.0],
-                color: self.theme.border_color,
+                rect: [plus_btn_x, plus_btn_y, plus_btn_w, plus_btn_w],
+                color: [0.12, 0.14, 0.18, 0.7],
             });
+            bg_instances.push(BgInstance {
+                rect: [plus_btn_x, plus_btn_y, plus_btn_w, 1.0],
+                color: [0.22, 0.25, 0.33, 0.6],
+            });
+
+            if let Some(glyph_info) = self.atlas.get_or_insert_glyph(&self.queue, '+', false, false) {
+                if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
+                    let draw_x = plus_btn_x + (plus_btn_w - glyph_info.size[0]) / 2.0;
+                    let draw_y = plus_btn_y + (plus_btn_w - glyph_info.size[1]) / 2.0;
+                    glyph_instances.push(GlyphInstance {
+                        rect: [draw_x, draw_y, glyph_info.size[0], glyph_info.size[1]],
+                        uv: [glyph_info.uv_min[0], glyph_info.uv_min[1], glyph_info.uv_max[0], glyph_info.uv_max[1]],
+                        color: [0.80, 0.84, 0.94, 0.9],
+                    });
+                }
+            }
         }
 
         // 3. Panes and Images
