@@ -33,16 +33,16 @@ pub struct RenderTheme {
 impl Default for RenderTheme {
     fn default() -> Self {
         Self {
-            default_fg: [0.80, 0.84, 0.96, 1.0],
-            default_bg: [0.12, 0.12, 0.18, 1.0],
-            cursor_color: [0.96, 0.88, 0.79, 0.8],
-            selection_color: [0.36, 0.39, 0.49, 0.45],
-            tab_bar_bg: [0.09, 0.09, 0.14, 1.0],
-            tab_active_bg: [0.12, 0.12, 0.18, 1.0],
-            tab_active_fg: [0.80, 0.84, 0.96, 1.0],
-            tab_inactive_fg: [0.50, 0.52, 0.60, 1.0],
-            border_color: [0.19, 0.20, 0.27, 1.0],
-            focused_border_color: [0.55, 0.65, 0.90, 1.0],
+            default_fg: [0.96, 0.96, 0.97, 1.0],
+            default_bg: [0.00, 0.00, 0.00, 1.0], // OLED Pure Black (#000000)
+            cursor_color: [0.039, 0.518, 1.00, 0.85],
+            selection_color: [0.18, 0.28, 0.45, 0.5],
+            tab_bar_bg: [0.00, 0.00, 0.00, 1.0],
+            tab_active_bg: [0.00, 0.00, 0.00, 1.0],
+            tab_active_fg: [0.96, 0.96, 0.97, 1.0],
+            tab_inactive_fg: [0.55, 0.58, 0.65, 1.0],
+            border_color: [0.20, 0.22, 0.28, 1.0],
+            focused_border_color: [0.039, 0.518, 1.00, 1.0],
             ansi_palette: None,
         }
     }
