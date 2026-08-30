@@ -9,21 +9,35 @@
 ### 設定項範例 (`config.toml`)
 ```toml
 [font]
-family = "JetBrains Mono"
-size = 14.0
+family = "Menlo"
+size = 16.0
 line_height = 1.2
 
 [window]
-opacity = 0.95
-blur = true
-padding = { x = 8.0, y = 8.0 }
+columns = 80
+rows = 24
+padding_x = 8.0
+padding_y = 8.0
+opacity = 1.0
+startup_mode = "normal"      # "normal" | "maximized" | "fullscreen"
+decorations = "full"         # "full" | "transparent" | "none"
+tab_bar_style = "auto"       # "auto" | "always" | "never"
+
+[terminal]
+term = "xterm-256color"
+scrollback_lines = 10000
+option_as_alt = "both"       # "both" | "only_left" | "only_right" | "none"
+bell = "visual"              # "visual" | "sound" | "none"
 
 [colors]
-theme = "pure-black" # "pure-black" | "catppuccin-mocha" | "tokyo-night" | "dracula" | "solarized-dark" | "nord" | "default-dark"
+theme = "pure-black"         # "pure-black" | "catppuccin-mocha" | "tokyo-night" | "dracula" | "solarized-dark" | "nord" | "default-dark"
+# foreground = "#F5F5F7"     # 自訂覆蓋值 (選填)
+# background = "#000000"
 
 [cursor]
-shape = "block" # "block" | "beam" | "underline"
+shape = "block"              # "block" | "beam" | "underline"
 blink = true
+blink_interval_ms = 500
 ```
 
 ---
