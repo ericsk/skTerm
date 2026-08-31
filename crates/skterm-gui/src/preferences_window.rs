@@ -399,17 +399,17 @@ impl PreferencesWindow {
         event_loop: &ActiveEventLoop,
         initial_config: &Config,
     ) -> anyhow::Result<Self> {
-        let mut window_attrs = WindowAttributes::default()
+        let window_attrs = WindowAttributes::default()
             .with_title("skTerm 偏好設定 (Preferences)")
             .with_inner_size(LogicalSize::new(Self::WINDOW_WIDTH, Self::WINDOW_HEIGHT))
             .with_min_inner_size(LogicalSize::new(660.0, 440.0))
             .with_resizable(true);
 
         #[cfg(target_os = "macos")]
-        {
+        let window_attrs = {
             use winit::platform::macos::WindowAttributesExtMacOS;
-            window_attrs = window_attrs.with_title_hidden(false);
-        }
+            window_attrs.with_title_hidden(false)
+        };
 
         let window = Arc::new(event_loop.create_window(window_attrs)?);
 

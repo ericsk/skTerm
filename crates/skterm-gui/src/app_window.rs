@@ -818,67 +818,98 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                if let Some(session) = self.sessions.get_mut(&window_id) {
-                    let (mx, my) = session.mouse_pos;
+                // Inline Tab Bar handling (Windows/Linux only)
+                #[cfg(not(target_os = "macos"))]
+                if button == MouseButton::Left && state == ElementState::Pressed && tab_bar_h > 0.0 {
+                    enum TabAction {
+                        NewTab,
+                        CloseTab(usize),
+                        SelectTab(usize),
+                    }
 
-                    if button == MouseButton::Left {
-                        if state == ElementState::Pressed {
-                            session.is_mouse_down = true;
+                    let mut action = None;
+                    if let Some(session) = self.sessions.get(&window_id) {
+                        let (mx, my) = session.mouse_pos;
+                        if my <= tab_bar_h {
+                            let scale = session.renderer.scale_factor;
+                            let tabs_len = session.workspace.tabs.len();
+                            let start_x = 8.0 * scale;
+                            let plus_btn_w = 24.0 * scale;
+                            let tab_gap = 4.0 * scale;
+                            let avail_w = (session.renderer.config.width as f32 - start_x - plus_btn_w - 16.0 * scale).max(80.0);
+                            let total_gaps = (tabs_len.saturating_sub(1) as f32) * tab_gap;
+                            let tab_w = ((avail_w - total_gaps) / tabs_len as f32).clamp(75.0 * scale, 190.0 * scale);
+                            let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);
+                            let tab_y = (tab_bar_h - tab_h) / 2.0;
 
-                            // Inline Tab Bar handling (Windows/Linux only)
-                            #[cfg(not(target_os = "macos"))]
-                            if tab_bar_h > 0.0 && my <= tab_bar_h {
-                                let scale = session.renderer.scale_factor;
-                                let tabs_len = session.workspace.tabs.len();
-                                let start_x = 8.0 * scale;
-                                let plus_btn_w = 24.0 * scale;
-                                let tab_gap = 4.0 * scale;
-                                let avail_w = (session.renderer.config.width as f32 - start_x - plus_btn_w - 16.0 * scale).max(80.0);
-                                let total_gaps = (tabs_len.saturating_sub(1) as f32) * tab_gap;
-                                let tab_w = ((avail_w - total_gaps) / tabs_len as f32).clamp(75.0 * scale, 190.0 * scale);
-                                let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);
-                                let tab_y = (tab_bar_h - tab_h) / 2.0;
-
-                                // Check "+" New Tab
-                                let last_tab_right = start_x + (tabs_len as f32 * (tab_w + tab_gap));
-                                let plus_btn_x = last_tab_right + 2.0 * scale;
-                                if mx >= plus_btn_x - 4.0 * scale && mx <= plus_btn_x + plus_btn_w + 6.0 * scale
-                                    && my >= tab_y && my <= tab_y + tab_h
-                                {
-                                    let pty_opts = self.build_pty_options();
-                                    let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
-                                    let _ = session.workspace.new_tab_with_options(24, 80, scrollback, pty_opts);
-                                    session.sync_all_pane_sizes(tab_bar_h);
-                                    session.window.request_redraw();
-                                    return;
-                                }
-
-                                // Check Tabs & Close "x"
+                            let last_tab_right = start_x + (tabs_len as f32 * (tab_w + tab_gap));
+                            let plus_btn_x = last_tab_right + 2.0 * scale;
+                            if mx >= plus_btn_x - 4.0 * scale && mx <= plus_btn_x + plus_btn_w + 6.0 * scale
+                                && my >= tab_y && my <= tab_y + tab_h
+                            {
+                                action = Some(TabAction::NewTab);
+                            } else {
                                 for idx in 0..tabs_len {
                                     let tab_x = start_x + (idx as f32 * (tab_w + tab_gap));
                                     if mx >= tab_x && mx <= tab_x + tab_w && my >= tab_y && my <= tab_y + tab_h {
                                         let close_size = 14.0 * scale;
                                         let close_x = tab_x + tab_w - close_size - 6.0 * scale;
                                         if mx >= close_x - 4.0 * scale {
-                                            let all_closed = session.workspace.close_tab_at(idx);
-                                            if all_closed {
-                                                self.sessions.remove(&window_id);
-                                                if self.sessions.is_empty() {
-                                                    event_loop.exit();
-                                                }
-                                            } else {
-                                                session.sync_all_pane_sizes(tab_bar_h);
-                                                session.window.request_redraw();
-                                            }
+                                            action = Some(TabAction::CloseTab(idx));
                                         } else {
-                                            session.workspace.select_tab(idx);
-                                            session.window.request_redraw();
+                                            action = Some(TabAction::SelectTab(idx));
                                         }
-                                        return;
+                                        break;
                                     }
                                 }
-                                return;
                             }
+                        }
+                    }
+
+                    if let Some(act) = action {
+                        match act {
+                            TabAction::NewTab => {
+                                let pty_opts = self.build_pty_options();
+                                let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    let _ = session.workspace.new_tab_with_options(24, 80, scrollback, pty_opts);
+                                    session.sync_all_pane_sizes(tab_bar_h);
+                                    session.window.request_redraw();
+                                }
+                            }
+                            TabAction::CloseTab(idx) => {
+                                let mut all_closed = false;
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    all_closed = session.workspace.close_tab_at(idx);
+                                    if !all_closed {
+                                        session.sync_all_pane_sizes(tab_bar_h);
+                                        session.window.request_redraw();
+                                    }
+                                }
+                                if all_closed {
+                                    self.sessions.remove(&window_id);
+                                    if self.sessions.is_empty() {
+                                        event_loop.exit();
+                                    }
+                                }
+                            }
+                            TabAction::SelectTab(idx) => {
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    session.workspace.select_tab(idx);
+                                    session.window.request_redraw();
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    let (mx, my) = session.mouse_pos;
+
+                    if button == MouseButton::Left {
+                        if state == ElementState::Pressed {
+                            session.is_mouse_down = true;
 
                             // Click inside Terminal Pane
                             if let Some((pane_id, row, col)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
