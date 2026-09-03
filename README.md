@@ -29,8 +29,12 @@
   - CJK 雙寬字元（Double-Width）與 Emoji 完美對齊排版。
 - 🪟 **多分頁與 BSP 空間分割窗格 (Tabs & Split Panes Multiplexing)**：
   - 內建二元空間分割樹（BSP Tree），支援任意深度的左右（垂直）與上下（水平）窗格動態切分。
-  - 多分頁標籤列（Tab Bar），多窗格焦點邊框高亮與獨立 PTY 執行個體。
+  - 支援滑鼠拖曳分割線（Splitter Dragging）、快捷鍵微調比例、一鍵等分尺寸與窗格全螢幕最大化縮放（Pane Zooming `[Z]`）。
+  - 多分頁標籤列（Tab Bar），支援分頁順序動態調整（Move Tab Left/Right）與獨立 PTY 執行個體。
   - 智慧 Session 偵測：輸入 `exit` 或按下 `Ctrl+D` 自動關閉窗格/分頁，全數關閉時安全結束程式。
+- 🔗 **智慧超連結與點擊互動 (Clickable Hyperlinks & URL Auto-detection)**：
+  - 支援標準 **OSC 8** 逸出碼超連結與終端輸出純文字 URL（`https://`, `http://`, `www.` 等）即時自動偵測。
+  - 按住 `Cmd` (macOS) 或 `Ctrl` (Linux/Windows) 懸停自動切換手型游標（Pointer），點擊直接以預設瀏覽器開啟。
 - 🖼️ **進階終端圖像協定 (Sixel & Kitty Graphics)**：
   - **DEC Sixel**：完整點陣光柵解碼與調色盤支援。
   - **Kitty Graphics Protocol**：支援 32-bit RGBA、24-bit RGB 與 PNG 圖像直接由 GPU 紋理管線渲染。
@@ -53,11 +57,17 @@
 | `Cmd + W` | `Ctrl + Shift + W` | **關閉當前窗格/分頁 (Close Pane/Tab)** |
 | `Cmd + D` | `Ctrl + Shift + D` | **垂直切分窗格 (左右分割)** |
 | `Cmd + Shift + D` | `Ctrl + Shift + H` | **水平切分窗格 (上下分割)** |
+| `Cmd + Shift + Enter` / `Z` | `Ctrl + Shift + Enter` | **窗格最大化 / 還原縮放 (Toggle Pane Zoom)** |
+| `Cmd + Option + =` | `Ctrl + Alt + =` | **等分所有窗格尺寸 (Equalize Panes)** |
+| `Cmd + Option + 方向鍵` | `Ctrl + Alt + 方向鍵` | **微調當前窗格分割比例 (Resize Pane Ratio)** |
+| `Cmd + Option + [` / `]` | `Ctrl + Alt + [` / `]` | **向前 / 向後移動當前分頁順序 (Move Tab Left/Right)** |
 | `Cmd + ]` / `Cmd + [` | `Ctrl + ]` / `Ctrl + [` | **切換焦點窗格 (Next/Prev Pane)** |
 | `Cmd + Shift + ]` / `[` | `Ctrl + Tab` / `Ctrl + Shift + Tab` | **切換分頁 (Next/Prev Tab)** |
 | `Cmd + 1` ~ `9` | `Ctrl + 1` ~ `9` | **直接切換至第 1 ~ 9 個分頁** |
 | `Cmd + C` | `Ctrl + Shift + C` | **複製選取文字至剪貼簿** |
 | `Cmd + V` | `Ctrl + Shift + V` | **貼上剪貼簿文字 (支援 Bracketed Paste)** |
+| `Cmd + 滑鼠左鍵點擊` | `Ctrl + 滑鼠左鍵點擊` | **直接點擊超連結 (OSC 8 / URL) 並在瀏覽器中開啟** |
+| `滑鼠拖曳分割線` | `滑鼠拖曳分割線` | **直覺拖曳調整任意窗格大小 (Splitter Dragging)** |
 | `Ctrl + D` | `Ctrl + D` | **發送 EOF 訊號 (登出/結束程式)** |
 | `Ctrl + C` | `Ctrl + C` | **發送 SIGINT 訊號 (中斷程式)** |
 | `滑鼠滾輪` | `滑鼠滾輪` | **流暢滾動檢視歷史緩衝區 (Scrollback)** |

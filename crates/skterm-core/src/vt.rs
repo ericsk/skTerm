@@ -33,6 +33,7 @@ pub struct TerminalState {
     pub bg: Color,
     pub flags: CellFlags,
     pub current_hyperlink: Option<Arc<String>>,
+    pub current_hyperlink_id: Option<u32>,
     pub title: String,
     pub application_cursor_keys: bool,
     pub bracketed_paste: bool,
@@ -51,6 +52,7 @@ impl TerminalState {
             bg: Color::DefaultBg,
             flags: CellFlags::empty(),
             current_hyperlink: None,
+            current_hyperlink_id: None,
             title: String::from("skTerm"),
             application_cursor_keys: false,
             bracketed_paste: false,
@@ -67,6 +69,7 @@ impl TerminalState {
         self.bg = Color::DefaultBg;
         self.flags = CellFlags::empty();
         self.current_hyperlink = None;
+        self.current_hyperlink_id = None;
     }
 
     fn save_cursor(&mut self) {
@@ -198,7 +201,8 @@ impl Perform for TerminalState {
         let fg = self.fg;
         let bg = self.bg;
         let flags = self.flags;
-        self.grid.active_mut().write_char(c, fg, bg, flags, None);
+        let hid = self.current_hyperlink_id;
+        self.grid.active_mut().write_char(c, fg, bg, flags, hid);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -290,8 +294,11 @@ impl Perform for TerminalState {
                 if params.len() >= 3 {
                     if let Ok(uri) = std::str::from_utf8(params[2]) {
                         if !uri.is_empty() {
+                            let hid = self.grid.register_hyperlink(uri);
+                            self.current_hyperlink_id = Some(hid);
                             self.current_hyperlink = Some(Arc::new(uri.to_string()));
                         } else {
+                            self.current_hyperlink_id = None;
                             self.current_hyperlink = None;
                         }
                     }

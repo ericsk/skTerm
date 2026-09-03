@@ -104,6 +104,28 @@ mod tests {
         let link_text: String = buf.grid[0].cells[0..11].iter().map(|c| c.c).collect();
         assert_eq!(link_text, "skTerm Link");
         assert!(term.state.current_hyperlink.is_none());
+
+        // Verify url_at returns the OSC 8 hyperlink on the linked cells
+        assert_eq!(term.url_at(0, 0), Some("https://github.com/ericsk/skTerm".to_string()));
+        assert_eq!(term.url_at(0, 5), Some("https://github.com/ericsk/skTerm".to_string()));
+        assert_eq!(term.url_at(0, 15), None);
+    }
+
+    #[test]
+    fn test_plain_text_url_detection() {
+        let mut term = Terminal::new_headless(24, 80, 100);
+        term.feed_bytes(b"Visit https://github.com/ericsk/skTerm for details. Also check www.rust-lang.org!\r\n");
+
+        // Hover over https://github.com/ericsk/skTerm
+        assert_eq!(term.url_at(0, 6), Some("https://github.com/ericsk/skTerm".to_string()));
+        assert_eq!(term.url_at(0, 10), Some("https://github.com/ericsk/skTerm".to_string()));
+        assert_eq!(term.url_at(0, 30), Some("https://github.com/ericsk/skTerm".to_string()));
+
+        // Hover over "Visit " -> None
+        assert_eq!(term.url_at(0, 2), None);
+
+        // Hover over www.rust-lang.org
+        assert_eq!(term.url_at(0, 65), Some("https://www.rust-lang.org".to_string()));
     }
 
     #[test]

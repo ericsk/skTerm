@@ -37,6 +37,23 @@ fn get_nswindow(window: &Window) -> *mut objc::runtime::Object {
     std::ptr::null_mut()
 }
 
+/// Open a URL using the default system browser in a cross-platform manner.
+pub fn open_url_in_browser(url: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn()?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
+    }
+    Ok(())
+}
+
 /// Terminal Window Session representing an active window (or native macOS tab).
 pub struct TerminalSession {
     pub window: Arc<Window>,
@@ -47,6 +64,7 @@ pub struct TerminalSession {
     pub last_click_time: Instant,
     pub click_count: usize,
     pub dragging_splitter: Option<(u32, SplitDirection, Rect)>,
+    pub hovered_url: Option<String>,
 }
 
 impl TerminalSession {
@@ -508,6 +526,7 @@ impl App {
             last_click_time: Instant::now(),
             click_count: 0,
             dragging_splitter: None,
+            hovered_url: None,
         };
 
         self.sessions.insert(window_id, session);
@@ -616,6 +635,21 @@ impl ApplicationHandler for App {
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
                 self.modifiers = new_modifiers.state();
+
+                #[cfg(target_os = "macos")]
+                let is_link_modifier = self.modifiers.super_key();
+                #[cfg(not(target_os = "macos"))]
+                let is_link_modifier = self.modifiers.control_key();
+
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    if session.dragging_splitter.is_none() {
+                        if is_link_modifier && session.hovered_url.is_some() {
+                            session.window.set_cursor(CursorIcon::Pointer);
+                        } else {
+                            session.window.set_cursor(CursorIcon::Default);
+                        }
+                    }
+                }
             }
 
             WindowEvent::Ime(ime_event) => {
@@ -896,17 +930,44 @@ impl ApplicationHandler for App {
                             }
                         }
                     } else {
-                        // 3. Hover testing for Splitters to change cursor icon
+                        // 3. Hover testing for Splitters and Hyperlinks to update cursor icon
                         let width = session.renderer.config.width as f32;
                         let height = session.renderer.config.height as f32;
                         let bounds = Rect::new(0.0, tab_bar_h, width, height - tab_bar_h);
+
+                        #[cfg(target_os = "macos")]
+                        let is_link_modifier = self.modifiers.super_key();
+                        #[cfg(not(target_os = "macos"))]
+                        let is_link_modifier = self.modifiers.control_key();
+
+                        let mut is_over_splitter = false;
                         if let Some(tab) = session.workspace.active_tab() {
                             if let Some(splitter) = tab.find_splitter_at(bounds, mx, my) {
+                                is_over_splitter = true;
                                 let icon = match splitter.direction {
                                     SplitDirection::Horizontal => CursorIcon::ColResize,
                                     SplitDirection::Vertical => CursorIcon::RowResize,
                                 };
                                 session.window.set_cursor(icon);
+                            }
+                        }
+
+                        if !is_over_splitter {
+                            // Check hyperlink under cursor
+                            let detected_url = if let Some((pane_id, row, col)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
+                                if let Some(tab) = session.workspace.active_tab() {
+                                    tab.root.find_terminal(pane_id).and_then(|t| t.url_at(row, col))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            session.hovered_url = detected_url;
+
+                            if is_link_modifier && session.hovered_url.is_some() {
+                                session.window.set_cursor(CursorIcon::Pointer);
                             } else {
                                 session.window.set_cursor(CursorIcon::Default);
                             }
@@ -1007,7 +1068,7 @@ impl ApplicationHandler for App {
 
                     if button == MouseButton::Left {
                         if state == ElementState::Pressed {
-                            // Check Splitter Hit Test First
+                            // 1. Check Splitter Hit Test First
                             let width = session.renderer.config.width as f32;
                             let height = session.renderer.config.height as f32;
                             let bounds = Rect::new(0.0, tab_bar_h, width, height - tab_bar_h);
@@ -1015,6 +1076,29 @@ impl ApplicationHandler for App {
                                 if let Some(splitter) = tab.find_splitter_at(bounds, mx, my) {
                                     session.dragging_splitter = Some((splitter.split_id, splitter.direction, splitter.parent_rect));
                                     return;
+                                }
+                            }
+
+                            // 2. Check Hyperlink Click (Cmd+Click on macOS, Ctrl+Click on Linux/Windows)
+                            #[cfg(target_os = "macos")]
+                            let is_link_modifier = self.modifiers.super_key();
+                            #[cfg(not(target_os = "macos"))]
+                            let is_link_modifier = self.modifiers.control_key();
+
+                            if is_link_modifier {
+                                if let Some((pane_id, row, col)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
+                                    if let Some(tab) = session.workspace.active_tab() {
+                                        if let Some(term) = tab.root.find_terminal(pane_id) {
+                                            if let Some(url) = term.url_at(row, col) {
+                                                info!("Clicked hyperlink, opening in default browser: {}", url);
+                                                if let Err(e) = open_url_in_browser(&url) {
+                                                    error!("Failed to open hyperlink: {:?}", e);
+                                                }
+                                                // Prevent text selection
+                                                return;
+                                            }
+                                        }
+                                    }
                                 }
                             }
 

@@ -129,4 +129,9 @@ impl Terminal {
     pub fn set_cursor_shape(&mut self, shape: CursorShape) {
         self.state.grid.set_cursor_shape(shape);
     }
+
+    /// Retrieve the URL at the given screen cell position (row, col).
+    pub fn url_at(&self, row: usize, col: usize) -> Option<String> {
+        self.state.grid.url_at(row, col)
+    }
 }

@@ -2,7 +2,8 @@
 
 use crate::graphics::GraphicImage;
 use bitflags::bitflags;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
 
 bitflags! {
@@ -578,6 +579,7 @@ pub struct ScreenGrid {
     pub alternate: ScreenBuffer,
     pub is_alternate: bool,
     pub next_hyperlink_id: u32,
+    pub hyperlinks: HashMap<u32, Arc<String>>,
     pub next_image_id: u32,
 }
 
@@ -588,8 +590,20 @@ impl ScreenGrid {
             alternate: ScreenBuffer::new(rows, cols, 0),
             is_alternate: false,
             next_hyperlink_id: 1,
+            hyperlinks: HashMap::new(),
             next_image_id: 1,
         }
+    }
+
+    pub fn register_hyperlink(&mut self, uri: &str) -> u32 {
+        let id = self.next_hyperlink_id;
+        self.next_hyperlink_id += 1;
+        self.hyperlinks.insert(id, Arc::new(uri.to_string()));
+        id
+    }
+
+    pub fn get_hyperlink(&self, id: u32) -> Option<&str> {
+        self.hyperlinks.get(&id).map(|s| s.as_str())
     }
 
     pub fn active(&self) -> &ScreenBuffer {
@@ -631,4 +645,104 @@ impl ScreenGrid {
             row.is_dirty = false;
         }
     }
+
+    /// Retrieve the URL at the given screen cell position (row, col).
+    /// Checks explicit OSC 8 hyperlinks first, then falls back to plain-text URL detection.
+    pub fn url_at(&self, row: usize, col: usize) -> Option<String> {
+        let display_row = self.active().get_visible_row(row)?;
+
+        // 1. Check explicit OSC 8 hyperlink on cell
+        if let Some(cell) = display_row.cells.get(col) {
+            if let Some(hid) = cell.hyperlink_id {
+                if let Some(uri) = self.get_hyperlink(hid) {
+                    return Some(uri.to_string());
+                }
+            }
+        }
+
+        // 2. Plain text auto-detection
+        detect_url_in_row(&display_row.cells, col)
+    }
+}
+
+/// Helper to detect URLs in a row of terminal cells at a target column.
+pub fn detect_url_in_row(cells: &[Cell], target_col: usize) -> Option<String> {
+    if target_col >= cells.len() {
+        return None;
+    }
+
+    let target_char = cells[target_col].c;
+    if target_char.is_whitespace() || target_char == '\0' {
+        return None;
+    }
+
+    let chars: Vec<char> = cells.iter().map(|c| c.c).collect();
+    let total_len = chars.len();
+    let row_str: String = chars.iter().collect();
+
+    let prefixes = [
+        "https://", "http://", "ftp://", "file://", "ssh://", "git://", "mailto:", "www.",
+    ];
+
+    for prefix in &prefixes {
+        let mut search_from = 0;
+        while let Some(start_idx) = row_str[search_from..].find(prefix) {
+            let actual_start = search_from + start_idx;
+            // Check word boundary before the prefix
+            if actual_start > 0 {
+                let prev_c = chars[actual_start - 1];
+                if prev_c.is_alphanumeric() || prev_c == '/' || prev_c == '.' {
+                    search_from = actual_start + prefix.len();
+                    continue;
+                }
+            }
+
+            // Find end of URL
+            let mut end_idx = actual_start + prefix.len();
+            while end_idx < total_len {
+                let c = chars[end_idx];
+                if c.is_whitespace()
+                    || c == '\0'
+                    || c == '"'
+                    || c == '\''
+                    || c == '`'
+                    || c == '<'
+                    || c == '>'
+                    || c == '^'
+                    || c == '{'
+                    || c == '}'
+                    || c == '|'
+                {
+                    break;
+                }
+                end_idx += 1;
+            }
+
+            // Trim trailing punctuation marks like '.', ',', ';', '!', '?'
+            while end_idx > actual_start {
+                let last_c = chars[end_idx - 1];
+                if last_c == '.' || last_c == ',' || last_c == ';' || last_c == '!' || last_c == '?' {
+                    end_idx -= 1;
+                } else if last_c == ')' && !chars[actual_start..end_idx].contains(&'(') {
+                    end_idx -= 1;
+                } else if last_c == ']' && !chars[actual_start..end_idx].contains(&'[') {
+                    end_idx -= 1;
+                } else {
+                    break;
+                }
+            }
+
+            if actual_start <= target_col && target_col < end_idx {
+                let mut url: String = chars[actual_start..end_idx].iter().collect();
+                if url.starts_with("www.") {
+                    url = format!("https://{}", url);
+                }
+                return Some(url);
+            }
+
+            search_from = actual_start + prefix.len();
+        }
+    }
+
+    None
 }
