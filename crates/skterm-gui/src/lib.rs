@@ -10,7 +10,7 @@ pub mod preferences_window;
 pub use app_window::App;
 pub use config::{default_config_template, parse_hex_color, Config, ConfigManager, Theme};
 pub use input::{encode_key, encode_key_event};
-pub use layout::{PaneId, PaneNode, Rect, SplitDirection, Tab, TabId, Workspace};
+pub use layout::{PaneId, PaneNode, Rect, SplitDirection, SplitterBar, Tab, TabId, Workspace};
 pub use preferences_gui::{PreferencesGui, PreferencesTab};
 pub use preferences_window::{PreferencesCategory, PreferencesWindow};
 
@@ -252,5 +252,80 @@ mod tests {
         let fonts = preferences_window::scan_available_monospace_fonts();
         // Even if empty on minimal CI container, it should safely return a Vec<String>
         assert!(fonts.len() <= 30);
+    }
+
+    #[test]
+    fn test_pane_zoom_and_restore() {
+        let mut ws = Workspace::new(24, 80).expect("Failed to create workspace");
+        ws.split_active_pane(SplitDirection::Horizontal, 24, 80, 1000, skterm_core::PtySpawnOptions::default())
+            .expect("Failed to split pane");
+
+        let rects_split = ws.compute_active_pane_rects(800.0, 600.0, 32.0);
+        assert_eq!(rects_split.len(), 2);
+
+        // Toggle Zoom on
+        let is_zoomed = ws.toggle_zoom_active_pane();
+        assert!(is_zoomed);
+        assert!(ws.is_active_tab_zoomed());
+
+        let rects_zoomed = ws.compute_active_pane_rects(800.0, 600.0, 32.0);
+        assert_eq!(rects_zoomed.len(), 1);
+        assert_eq!(rects_zoomed[0].1.width, 800.0);
+        assert_eq!(rects_zoomed[0].1.height, 568.0); // 600 - 32
+
+        // Toggle Zoom off
+        let unzoomed = ws.toggle_zoom_active_pane();
+        assert!(!unzoomed);
+        assert!(!ws.is_active_tab_zoomed());
+
+        let rects_restored = ws.compute_active_pane_rects(800.0, 600.0, 32.0);
+        assert_eq!(rects_restored.len(), 2);
+    }
+
+    #[test]
+    fn test_splitter_drag_and_resize() {
+        let mut ws = Workspace::new(24, 80).expect("Failed to create workspace");
+        ws.split_active_pane(SplitDirection::Horizontal, 24, 80, 1000, skterm_core::PtySpawnOptions::default())
+            .expect("Failed to split pane");
+
+        let tab = ws.active_tab().unwrap();
+        let bounds = Rect::new(0.0, 32.0, 800.0, 568.0);
+        let splitter = tab.find_splitter_at(bounds, 399.0, 100.0);
+        assert!(splitter.is_some());
+        let s = splitter.unwrap();
+        assert_eq!(s.direction, SplitDirection::Horizontal);
+
+        // Resize via set_split_ratio
+        let set_res = ws.set_split_ratio(s.split_id, 0.7);
+        assert!(set_res);
+
+        let rects = ws.compute_active_pane_rects(800.0, 600.0, 32.0);
+        assert!(rects[0].1.width > rects[1].1.width);
+
+        // Resize via keyboard adjust
+        let adj_res = ws.adjust_active_pane_ratio(-0.1);
+        assert!(adj_res);
+
+        // Equalize panes
+        ws.equalize_active_panes();
+        let rects_eq = ws.compute_active_pane_rects(800.0, 600.0, 32.0);
+        assert!((rects_eq[0].1.width - rects_eq[1].1.width).abs() < 2.0);
+    }
+
+    #[test]
+    fn test_tab_reordering_and_rename() {
+        let mut ws = Workspace::new(24, 80).expect("Failed to create workspace");
+        ws.new_tab(24, 80).expect("Failed to create tab 2");
+        ws.rename_active_tab("Development".to_string());
+        assert_eq!(ws.active_tab().unwrap().title, "Development");
+
+        assert_eq!(ws.active_tab_idx, 1);
+        assert!(ws.move_tab_left());
+        assert_eq!(ws.active_tab_idx, 0);
+        assert_eq!(ws.active_tab().unwrap().title, "Development");
+
+        assert!(ws.move_tab_right());
+        assert_eq!(ws.active_tab_idx, 1);
+        assert_eq!(ws.active_tab().unwrap().title, "Development");
     }
 }

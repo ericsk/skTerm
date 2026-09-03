@@ -5,7 +5,7 @@
 
 use crate::config::{parse_hex_color, Config, ConfigManager, Theme};
 use crate::input::encode_key_event;
-use crate::layout::{PaneId, SplitDirection, Workspace};
+use crate::layout::{PaneId, Rect, SplitDirection, Workspace};
 use crate::preferences_window::PreferencesWindow;
 use arboard::Clipboard;
 use skterm_core::{PtySpawnOptions, Selection, SelectionMode};
@@ -18,8 +18,8 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, Position, Size};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState};
-use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::window::{CursorIcon, Fullscreen, Window, WindowAttributes, WindowId};
 
 #[cfg(target_os = "macos")]
 fn get_nswindow(window: &Window) -> *mut objc::runtime::Object {
@@ -46,6 +46,7 @@ pub struct TerminalSession {
     pub is_mouse_down: bool,
     pub last_click_time: Instant,
     pub click_count: usize,
+    pub dragging_splitter: Option<(u32, SplitDirection, Rect)>,
 }
 
 impl TerminalSession {
@@ -506,6 +507,7 @@ impl App {
             is_mouse_down: false,
             last_click_time: Instant::now(),
             click_count: 0,
+            dragging_splitter: None,
         };
 
         self.sessions.insert(window_id, session);
@@ -649,12 +651,65 @@ impl ApplicationHandler for App {
                 let is_shift = self.modifiers.shift_key();
 
                 if is_cmd {
+                    // Check NamedKey first (Enter, Arrow keys)
+                    match event.logical_key {
+                        Key::Named(NamedKey::Enter) if is_shift => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                session.workspace.toggle_zoom_active_pane();
+                                session.sync_all_pane_sizes(tab_bar_h);
+                                session.window.request_redraw();
+                                return;
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowLeft) if self.modifiers.alt_key() => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                session.workspace.adjust_active_pane_ratio(-0.05);
+                                session.sync_all_pane_sizes(tab_bar_h);
+                                session.window.request_redraw();
+                                return;
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowRight) if self.modifiers.alt_key() => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                session.workspace.adjust_active_pane_ratio(0.05);
+                                session.sync_all_pane_sizes(tab_bar_h);
+                                session.window.request_redraw();
+                                return;
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowUp) if self.modifiers.alt_key() => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                session.workspace.adjust_active_pane_ratio(-0.05);
+                                session.sync_all_pane_sizes(tab_bar_h);
+                                session.window.request_redraw();
+                                return;
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowDown) if self.modifiers.alt_key() => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                session.workspace.adjust_active_pane_ratio(0.05);
+                                session.sync_all_pane_sizes(tab_bar_h);
+                                session.window.request_redraw();
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+
                     if let Key::Character(ref s) = event.logical_key {
                         let lower = s.to_lowercase();
                         match lower.as_str() {
                             "," => {
                                 self.open_preferences_window(event_loop);
                                 return;
+                            }
+                            "z" if is_shift => {
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    session.workspace.toggle_zoom_active_pane();
+                                    session.sync_all_pane_sizes(tab_bar_h);
+                                    session.window.request_redraw();
+                                    return;
+                                }
                             }
                             "t" => {
                                 // macOS Native Tab (or new window)
@@ -709,22 +764,28 @@ impl ApplicationHandler for App {
                             }
                             "[" => {
                                 if let Some(session) = self.sessions.get_mut(&window_id) {
-                                    if is_shift {
+                                    if self.modifiers.alt_key() {
+                                        session.workspace.move_tab_left();
+                                    } else if is_shift {
                                         session.workspace.prev_tab();
                                     } else if let Some(tab) = session.workspace.active_tab_mut() {
                                         tab.focus_prev();
                                     }
+                                    session.sync_all_pane_sizes(tab_bar_h);
                                     session.window.request_redraw();
                                 }
                                 return;
                             }
                             "]" => {
                                 if let Some(session) = self.sessions.get_mut(&window_id) {
-                                    if is_shift {
+                                    if self.modifiers.alt_key() {
+                                        session.workspace.move_tab_right();
+                                    } else if is_shift {
                                         session.workspace.next_tab();
                                     } else if let Some(tab) = session.workspace.active_tab_mut() {
                                         tab.focus_next();
                                     }
+                                    session.sync_all_pane_sizes(tab_bar_h);
                                     session.window.request_redraw();
                                 }
                                 return;
@@ -743,8 +804,12 @@ impl ApplicationHandler for App {
                             }
                             "+" | "=" => {
                                 if let Some(session) = self.sessions.get_mut(&window_id) {
-                                    let cur_pt = session.renderer.font_size_pt;
-                                    let _ = session.renderer.update_font_size(cur_pt + 1.0);
+                                    if self.modifiers.alt_key() {
+                                        session.workspace.equalize_active_panes();
+                                    } else {
+                                        let cur_pt = session.renderer.font_size_pt;
+                                        let _ = session.renderer.update_font_size(cur_pt + 1.0);
+                                    }
                                     session.sync_all_pane_sizes(tab_bar_h);
                                     session.window.request_redraw();
                                 }
@@ -802,6 +867,23 @@ impl ApplicationHandler for App {
                     session.mouse_pos = (position.x as f32, position.y as f32);
                     let (mx, my) = session.mouse_pos;
 
+                    // 1. Handling Splitter Dragging
+                    if let Some((split_id, direction, parent_rect)) = session.dragging_splitter {
+                        let new_ratio = match direction {
+                            SplitDirection::Horizontal => {
+                                ((mx - parent_rect.x) / parent_rect.width).clamp(0.05, 0.95)
+                            }
+                            SplitDirection::Vertical => {
+                                ((my - parent_rect.y) / parent_rect.height).clamp(0.05, 0.95)
+                            }
+                        };
+                        session.workspace.set_split_ratio(split_id, new_ratio);
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                        return;
+                    }
+
+                    // 2. Handling Text Selection Dragging
                     if session.is_mouse_down {
                         if let Some((_pane_id, row, col)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
                             if let Some(tab) = session.workspace.active_tab_mut() {
@@ -811,6 +893,22 @@ impl ApplicationHandler for App {
                                         session.window.request_redraw();
                                     }
                                 }
+                            }
+                        }
+                    } else {
+                        // 3. Hover testing for Splitters to change cursor icon
+                        let width = session.renderer.config.width as f32;
+                        let height = session.renderer.config.height as f32;
+                        let bounds = Rect::new(0.0, tab_bar_h, width, height - tab_bar_h);
+                        if let Some(tab) = session.workspace.active_tab() {
+                            if let Some(splitter) = tab.find_splitter_at(bounds, mx, my) {
+                                let icon = match splitter.direction {
+                                    SplitDirection::Horizontal => CursorIcon::ColResize,
+                                    SplitDirection::Vertical => CursorIcon::RowResize,
+                                };
+                                session.window.set_cursor(icon);
+                            } else {
+                                session.window.set_cursor(CursorIcon::Default);
                             }
                         }
                     }
@@ -909,6 +1007,17 @@ impl ApplicationHandler for App {
 
                     if button == MouseButton::Left {
                         if state == ElementState::Pressed {
+                            // Check Splitter Hit Test First
+                            let width = session.renderer.config.width as f32;
+                            let height = session.renderer.config.height as f32;
+                            let bounds = Rect::new(0.0, tab_bar_h, width, height - tab_bar_h);
+                            if let Some(tab) = session.workspace.active_tab() {
+                                if let Some(splitter) = tab.find_splitter_at(bounds, mx, my) {
+                                    session.dragging_splitter = Some((splitter.split_id, splitter.direction, splitter.parent_rect));
+                                    return;
+                                }
+                            }
+
                             session.is_mouse_down = true;
 
                             // Click inside Terminal Pane
@@ -938,6 +1047,11 @@ impl ApplicationHandler for App {
                             }
                         } else {
                             session.is_mouse_down = false;
+                            if session.dragging_splitter.is_some() {
+                                session.dragging_splitter = None;
+                                session.sync_all_pane_sizes(tab_bar_h);
+                                session.window.request_redraw();
+                            }
                         }
                     } else if button == MouseButton::Right && state == ElementState::Pressed {
                         session.paste_from_clipboard(self.clipboard.as_ref());
@@ -971,8 +1085,13 @@ impl ApplicationHandler for App {
                     session.update_ime_position(tab_bar_h);
 
                     let tabs: Vec<TabItem> = session.workspace.tabs.iter().enumerate().map(|(idx, tab)| {
+                        let title = if tab.is_zoomed() {
+                            format!("{} [Z]", tab.title)
+                        } else {
+                            tab.title.clone()
+                        };
                         TabItem {
-                            title: tab.title.clone(),
+                            title,
                             is_active: idx == session.workspace.active_tab_idx,
                         }
                     }).collect();

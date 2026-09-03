@@ -33,6 +33,16 @@ pub enum SplitDirection {
     Vertical,   // Split into Top and Bottom
 }
 
+/// Information about a draggable splitter bar between two pane regions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SplitterBar {
+    pub split_id: u32,
+    pub direction: SplitDirection,
+    pub bar_rect: Rect,
+    pub parent_rect: Rect,
+    pub ratio: f32,
+}
+
 /// Node in the Binary Space Partitioning (BSP) pane tree.
 pub enum PaneNode {
     Leaf {
@@ -40,6 +50,7 @@ pub enum PaneNode {
         terminal: Terminal,
     },
     Split {
+        id: u32,
         direction: SplitDirection,
         ratio: f32,
         first: Box<PaneNode>,
@@ -124,6 +135,7 @@ impl PaneNode {
         direction: SplitDirection,
         new_id: PaneId,
         new_terminal: Terminal,
+        split_id: u32,
     ) -> bool {
         match self {
             PaneNode::Leaf { id, terminal } => {
@@ -135,6 +147,7 @@ impl PaneNode {
                     );
 
                     *self = PaneNode::Split {
+                        id: split_id,
                         direction,
                         ratio: 0.5,
                         first: Box::new(PaneNode::Leaf {
@@ -152,10 +165,10 @@ impl PaneNode {
                 }
             }
             PaneNode::Split { first, second, .. } => {
-                if first.split_pane(target_id, direction, new_id, new_terminal.clone_dummy()) {
+                if first.split_pane(target_id, direction, new_id, new_terminal.clone_dummy(), split_id) {
                     true
                 } else {
-                    second.split_pane(target_id, direction, new_id, new_terminal)
+                    second.split_pane(target_id, direction, new_id, new_terminal, split_id)
                 }
             }
         }
@@ -171,6 +184,7 @@ impl PaneNode {
                 }
             }
             PaneNode::Split {
+                id,
                 direction,
                 ratio,
                 first,
@@ -181,6 +195,7 @@ impl PaneNode {
                     if let Some(f) = new_first {
                         (
                             Some(Box::new(PaneNode::Split {
+                                id,
                                 direction,
                                 ratio,
                                 first: f,
@@ -197,6 +212,7 @@ impl PaneNode {
                         if let Some(s) = new_second {
                             (
                                 Some(Box::new(PaneNode::Split {
+                                    id,
                                     direction,
                                     ratio,
                                     first: new_first.unwrap(),
@@ -210,6 +226,7 @@ impl PaneNode {
                     } else {
                         (
                             Some(Box::new(PaneNode::Split {
+                                id,
                                 direction,
                                 ratio,
                                 first: new_first.unwrap(),
@@ -233,6 +250,7 @@ impl PaneNode {
                 ratio,
                 first,
                 second,
+                ..
             } => {
                 let sep_size = 2.0;
                 match direction {
@@ -252,6 +270,98 @@ impl PaneNode {
                         first.compute_layout(r1, out);
                         second.compute_layout(r2, out);
                     }
+                }
+            }
+        }
+    }
+
+    pub fn compute_splitters(&self, rect: Rect, out: &mut Vec<SplitterBar>) {
+        if let PaneNode::Split { id, direction, ratio, first, second } = self {
+            let sep_size = 2.0;
+            match direction {
+                SplitDirection::Horizontal => {
+                    let w1 = ((rect.width - sep_size) * ratio).floor().max(10.0);
+                    let w2 = (rect.width - w1 - sep_size).max(10.0);
+                    let bar_rect = Rect::new(rect.x + w1, rect.y, sep_size, rect.height);
+                    out.push(SplitterBar {
+                        split_id: *id,
+                        direction: *direction,
+                        bar_rect,
+                        parent_rect: rect,
+                        ratio: *ratio,
+                    });
+                    let r1 = Rect::new(rect.x, rect.y, w1, rect.height);
+                    let r2 = Rect::new(rect.x + w1 + sep_size, rect.y, w2, rect.height);
+                    first.compute_splitters(r1, out);
+                    second.compute_splitters(r2, out);
+                }
+                SplitDirection::Vertical => {
+                    let h1 = ((rect.height - sep_size) * ratio).floor().max(10.0);
+                    let h2 = (rect.height - h1 - sep_size).max(10.0);
+                    let bar_rect = Rect::new(rect.x, rect.y + h1, rect.width, sep_size);
+                    out.push(SplitterBar {
+                        split_id: *id,
+                        direction: *direction,
+                        bar_rect,
+                        parent_rect: rect,
+                        ratio: *ratio,
+                    });
+                    let r1 = Rect::new(rect.x, rect.y, rect.width, h1);
+                    let r2 = Rect::new(rect.x, rect.y + h1 + sep_size, rect.width, h2);
+                    first.compute_splitters(r1, out);
+                    second.compute_splitters(r2, out);
+                }
+            }
+        }
+    }
+
+    pub fn set_split_ratio(&mut self, target_id: u32, new_ratio: f32) -> bool {
+        match self {
+            PaneNode::Leaf { .. } => false,
+            PaneNode::Split { id, ratio, first, second, .. } => {
+                if *id == target_id {
+                    *ratio = new_ratio.clamp(0.05, 0.95);
+                    true
+                } else {
+                    first.set_split_ratio(target_id, new_ratio) || second.set_split_ratio(target_id, new_ratio)
+                }
+            }
+        }
+    }
+
+    pub fn equalize_ratios(&mut self) {
+        if let PaneNode::Split { ratio, first, second, .. } = self {
+            *ratio = 0.5;
+            first.equalize_ratios();
+            second.equalize_ratios();
+        }
+    }
+
+    pub fn adjust_pane_ratio(&mut self, target_pane_id: PaneId, delta: f32) -> bool {
+        match self {
+            PaneNode::Leaf { .. } => false,
+            PaneNode::Split { ratio, first, second, .. } => {
+                let in_first = first.all_leaf_ids().contains(&target_pane_id);
+                let in_second = second.all_leaf_ids().contains(&target_pane_id);
+
+                if in_first && in_second {
+                    first.adjust_pane_ratio(target_pane_id, delta) || second.adjust_pane_ratio(target_pane_id, delta)
+                } else if in_first {
+                    if first.adjust_pane_ratio(target_pane_id, delta) {
+                        true
+                    } else {
+                        *ratio = (*ratio + delta).clamp(0.05, 0.95);
+                        true
+                    }
+                } else if in_second {
+                    if second.adjust_pane_ratio(target_pane_id, delta) {
+                        true
+                    } else {
+                        *ratio = (*ratio - delta).clamp(0.05, 0.95);
+                        true
+                    }
+                } else {
+                    false
                 }
             }
         }
@@ -297,6 +407,8 @@ pub struct Tab {
     pub title: String,
     pub root: PaneNode,
     pub active_pane_id: PaneId,
+    pub zoomed_pane_id: Option<PaneId>,
+    pub next_split_id: u32,
 }
 
 impl Tab {
@@ -319,6 +431,8 @@ impl Tab {
             title,
             root: PaneNode::Leaf { id: pane_id, terminal },
             active_pane_id: pane_id,
+            zoomed_pane_id: None,
+            next_split_id: 1,
         })
     }
 
@@ -352,13 +466,21 @@ impl Tab {
         let new_id = *next_pane_id;
         *next_pane_id += 1;
 
+        let split_id = self.next_split_id;
+        self.next_split_id += 1;
+
         let new_terminal = Terminal::new_with_options(rows, cols, scrollback_lines, options)?;
-        self.root.split_pane(self.active_pane_id, direction, new_id, new_terminal);
+        self.root.split_pane(self.active_pane_id, direction, new_id, new_terminal, split_id);
         self.active_pane_id = new_id;
+        self.zoomed_pane_id = None;
         Ok(new_id)
     }
 
     pub fn close_pane_by_id(&mut self, target: PaneId) -> bool {
+        if self.zoomed_pane_id == Some(target) {
+            self.zoomed_pane_id = None;
+        }
+
         let root = std::mem::replace(
             &mut self.root,
             PaneNode::Leaf {
@@ -410,6 +532,64 @@ impl Tab {
             let prev_pos = if pos == 0 { leaves.len() - 1 } else { pos - 1 };
             self.active_pane_id = leaves[prev_pos];
         }
+    }
+
+    pub fn toggle_zoom(&mut self) -> bool {
+        if self.zoomed_pane_id.is_some() {
+            self.zoomed_pane_id = None;
+            false
+        } else {
+            self.zoomed_pane_id = Some(self.active_pane_id);
+            true
+        }
+    }
+
+    pub fn is_zoomed(&self) -> bool {
+        self.zoomed_pane_id.is_some()
+    }
+
+    pub fn find_splitter_at(&self, bounds: Rect, px: f32, py: f32) -> Option<SplitterBar> {
+        if self.is_zoomed() {
+            return None;
+        }
+        let mut splitters = Vec::new();
+        self.root.compute_splitters(bounds, &mut splitters);
+        let hit_margin = 5.0; // 5px margin on each side of the splitter line
+        for s in splitters {
+            match s.direction {
+                SplitDirection::Horizontal => {
+                    if px >= (s.bar_rect.x - hit_margin)
+                        && px <= (s.bar_rect.x + s.bar_rect.width + hit_margin)
+                        && py >= s.bar_rect.y
+                        && py <= (s.bar_rect.y + s.bar_rect.height)
+                    {
+                        return Some(s);
+                    }
+                }
+                SplitDirection::Vertical => {
+                    if py >= (s.bar_rect.y - hit_margin)
+                        && py <= (s.bar_rect.y + s.bar_rect.height + hit_margin)
+                        && px >= s.bar_rect.x
+                        && px <= (s.bar_rect.x + s.bar_rect.width)
+                    {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn set_split_ratio(&mut self, split_id: u32, ratio: f32) -> bool {
+        self.root.set_split_ratio(split_id, ratio)
+    }
+
+    pub fn adjust_pane_ratio(&mut self, pane_id: PaneId, delta: f32) -> bool {
+        self.root.adjust_pane_ratio(pane_id, delta)
+    }
+
+    pub fn equalize_panes(&mut self) {
+        self.root.equalize_ratios();
     }
 }
 
@@ -590,6 +770,67 @@ impl Workspace {
         }
     }
 
+    pub fn toggle_zoom_active_pane(&mut self) -> bool {
+        if let Some(tab) = self.active_tab_mut() {
+            tab.toggle_zoom()
+        } else {
+            false
+        }
+    }
+
+    pub fn is_active_tab_zoomed(&self) -> bool {
+        self.active_tab().map_or(false, |t| t.is_zoomed())
+    }
+
+    pub fn set_split_ratio(&mut self, split_id: u32, ratio: f32) -> bool {
+        if let Some(tab) = self.active_tab_mut() {
+            tab.set_split_ratio(split_id, ratio)
+        } else {
+            false
+        }
+    }
+
+    pub fn adjust_active_pane_ratio(&mut self, delta: f32) -> bool {
+        if let Some(tab) = self.active_tab_mut() {
+            let active_id = tab.active_pane_id;
+            tab.adjust_pane_ratio(active_id, delta)
+        } else {
+            false
+        }
+    }
+
+    pub fn equalize_active_panes(&mut self) {
+        if let Some(tab) = self.active_tab_mut() {
+            tab.equalize_panes();
+        }
+    }
+
+    pub fn move_tab_left(&mut self) -> bool {
+        if self.active_tab_idx > 0 && self.tabs.len() > 1 {
+            self.tabs.swap(self.active_tab_idx, self.active_tab_idx - 1);
+            self.active_tab_idx -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn move_tab_right(&mut self) -> bool {
+        if self.active_tab_idx + 1 < self.tabs.len() {
+            self.tabs.swap(self.active_tab_idx, self.active_tab_idx + 1);
+            self.active_tab_idx += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn rename_active_tab(&mut self, new_title: String) {
+        if let Some(tab) = self.active_tab_mut() {
+            tab.title = new_title;
+        }
+    }
+
     pub fn poll_all_ptys(&mut self) -> bool {
         let mut any_data = false;
         for tab in &mut self.tabs {
@@ -604,6 +845,12 @@ impl Workspace {
         let mut rects = Vec::new();
         if let Some(tab) = self.active_tab() {
             let bounds = Rect::new(0.0, tab_bar_h, screen_w, screen_h - tab_bar_h);
+            if let Some(zid) = tab.zoomed_pane_id {
+                if tab.root.find_terminal(zid).is_some() {
+                    rects.push((zid, bounds));
+                    return rects;
+                }
+            }
             tab.root.compute_layout(bounds, &mut rects);
         }
         rects
