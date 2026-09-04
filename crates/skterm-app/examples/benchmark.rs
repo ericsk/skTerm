@@ -31,7 +31,10 @@ fn main() {
     let mb_per_sec = mb / seconds;
     let lines_per_sec = total_lines as f64 / seconds;
 
-    println!("Processed {} lines ({:.2} MB) in {:.3}s", total_lines, mb, seconds);
+    println!(
+        "Processed {} lines ({:.2} MB) in {:.3}s",
+        total_lines, mb, seconds
+    );
     println!("Throughput: {:.2} MB/s", mb_per_sec);
     println!("Line Rate:  {:.0} lines/second", lines_per_sec);
     println!("Benchmark Completed Successfully!");

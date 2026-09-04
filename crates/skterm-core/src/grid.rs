@@ -20,6 +20,7 @@ bitflags! {
         const STRIKETHROUGH     = 1 << 7;
         const WIDE_CHAR         = 1 << 8;
         const WIDE_CHAR_SPACER  = 1 << 9;
+        const WRAP_SPACER       = 1 << 10;
     }
 }
 
@@ -113,6 +114,25 @@ impl Row {
     pub fn resize(&mut self, cols: usize) {
         self.cells.resize(cols, Cell::default());
         self.is_dirty = true;
+    }
+
+    /// Returns the number of cells up to the last non-default cell.
+    /// If the row is marked as wrapped, it conceptually occupies all cells.
+    pub fn content_len(&self) -> usize {
+        if self.is_wrapped {
+            self.cells.len()
+        } else {
+            self.cells
+                .iter()
+                .rposition(|c| {
+                    c.c != ' '
+                        || c.bg != Color::DefaultBg
+                        || c.flags != CellFlags::empty()
+                        || c.hyperlink_id.is_some()
+                })
+                .map(|idx| idx + 1)
+                .unwrap_or(0)
+        }
     }
 
     pub fn clear(&mut self, bg: Color) {
@@ -272,6 +292,51 @@ impl ScreenBuffer {
             return;
         }
 
+        if new_cols != self.cols {
+            self.reflow(new_rows, new_cols);
+        } else {
+            self.resize_height_only(new_rows);
+        }
+    }
+
+    /// Resize when only the number of rows changes (cols remains the same).
+    pub fn resize_height_only(&mut self, new_rows: usize) {
+        if new_rows > self.rows {
+            let diff = new_rows - self.rows;
+            for _ in 0..diff {
+                if let Some(old_row) = self.scrollback.pop_back() {
+                    self.grid.insert(0, old_row);
+                } else {
+                    self.grid.push(Row::new(self.cols));
+                }
+            }
+        } else if new_rows < self.rows {
+            let diff = self.rows - new_rows;
+            for _ in 0..diff {
+                let removed = self.grid.remove(0);
+                if self.max_scrollback > 0 {
+                    if self.scrollback.len() >= self.max_scrollback {
+                        self.scrollback.pop_front();
+                    }
+                    self.scrollback.push_back(removed);
+                }
+            }
+        }
+
+        self.rows = new_rows;
+        self.scroll_region = (0, new_rows.saturating_sub(1));
+        self.cursor.row = self.cursor.row.min(new_rows.saturating_sub(1));
+        self.cursor.col = self.cursor.col.min(self.cols.saturating_sub(1));
+        self.cursor.pending_wrap = false;
+        self.selection = None;
+    }
+
+    /// Resize without reflow (truncate/pad cells), suitable for Alternate Screen Buffer.
+    pub fn resize_no_reflow(&mut self, new_rows: usize, new_cols: usize) {
+        if new_rows == 0 || new_cols == 0 {
+            return;
+        }
+
         for row in &mut self.grid {
             row.resize(new_cols);
         }
@@ -305,12 +370,260 @@ impl ScreenBuffer {
         self.cursor.row = self.cursor.row.min(new_rows.saturating_sub(1));
         self.cursor.col = self.cursor.col.min(new_cols.saturating_sub(1));
         self.cursor.pending_wrap = false;
+        self.selection = None;
+    }
+
+    /// Full buffer reflow for column width changes (split panes, window resizing).
+    pub fn reflow(&mut self, new_rows: usize, new_cols: usize) {
+        let total_scrollback = self.scrollback.len();
+        let total_rows = total_scrollback + self.grid.len();
+        let cursor_abs_row =
+            total_scrollback + self.cursor.row.min(self.grid.len().saturating_sub(1));
+        let cursor_col = self.cursor.col;
+
+        let mut last_needed_row = cursor_abs_row;
+        for idx in (cursor_abs_row + 1..total_rows).rev() {
+            let row = &self.grid[idx - total_scrollback];
+            if row.content_len() > 0 || row.is_wrapped {
+                last_needed_row = idx;
+                break;
+            }
+        }
+
+        struct LogicalLine {
+            cells: Vec<Cell>,
+            is_wrapped: bool,
+            cursor_offset: Option<usize>,
+        }
+
+        let mut logical_lines: Vec<LogicalLine> = Vec::new();
+        let mut current_line: Option<LogicalLine> = None;
+        let mut grid_start_logical: Option<(usize, usize)> = None;
+
+        for abs_row in 0..=last_needed_row {
+            if abs_row == total_scrollback {
+                let line_idx = logical_lines.len();
+                let cell_idx = current_line.as_ref().map(|l| l.cells.len()).unwrap_or(0);
+                grid_start_logical = Some((line_idx, cell_idx));
+            }
+
+            let row = if abs_row < total_scrollback {
+                &self.scrollback[abs_row]
+            } else {
+                &self.grid[abs_row - total_scrollback]
+            };
+
+            let has_cursor = abs_row == cursor_abs_row;
+            let len = if row.is_wrapped {
+                row.cells.len()
+            } else {
+                row.content_len()
+            };
+
+            let mut cursor_offset_in_row = None;
+            let mut row_cells: Vec<Cell> = Vec::with_capacity(len);
+            for (c_idx, cell) in row.cells[..len].iter().enumerate() {
+                if has_cursor && c_idx == cursor_col {
+                    cursor_offset_in_row = Some(row_cells.len());
+                }
+                if !cell.flags.contains(CellFlags::WRAP_SPACER) {
+                    row_cells.push(*cell);
+                }
+            }
+            if has_cursor && cursor_offset_in_row.is_none() {
+                cursor_offset_in_row = Some(row_cells.len());
+            }
+
+            if let Some(mut cur) = current_line.take() {
+                let base_offset = cur.cells.len();
+                if let Some(off) = cursor_offset_in_row {
+                    if cur.cursor_offset.is_none() {
+                        cur.cursor_offset = Some(base_offset + off);
+                    }
+                }
+                cur.cells.extend(row_cells);
+                cur.is_wrapped = row.is_wrapped;
+
+                if row.is_wrapped {
+                    current_line = Some(cur);
+                } else {
+                    logical_lines.push(cur);
+                }
+            } else {
+                let line = LogicalLine {
+                    cells: row_cells,
+                    is_wrapped: row.is_wrapped,
+                    cursor_offset: cursor_offset_in_row,
+                };
+                if row.is_wrapped {
+                    current_line = Some(line);
+                } else {
+                    logical_lines.push(line);
+                }
+            }
+        }
+
+        if let Some(cur) = current_line {
+            logical_lines.push(cur);
+        }
+
+        if logical_lines.is_empty() {
+            logical_lines.push(LogicalLine {
+                cells: Vec::new(),
+                is_wrapped: false,
+                cursor_offset: Some(0),
+            });
+        }
+
+        let mut new_physical_rows: Vec<Row> = Vec::new();
+        let mut new_cursor: Option<(usize, usize)> = None;
+        let mut first_new_grid_row: Option<usize> = None;
+
+        for (line_idx, line) in logical_lines.iter().enumerate() {
+            let total_cells = line.cells.len();
+
+            if total_cells == 0 {
+                let row_idx = new_physical_rows.len();
+                if first_new_grid_row.is_none() {
+                    if let Some((g_line, _)) = grid_start_logical {
+                        if line_idx >= g_line {
+                            first_new_grid_row = Some(row_idx);
+                        }
+                    }
+                }
+                if line.cursor_offset.is_some() && new_cursor.is_none() {
+                    new_cursor = Some((row_idx, 0));
+                }
+                new_physical_rows.push(Row::new(new_cols));
+                continue;
+            }
+
+            let mut i = 0;
+            while i < total_cells {
+                let row_idx = new_physical_rows.len();
+                if first_new_grid_row.is_none() {
+                    if let Some((g_line, g_cell)) = grid_start_logical {
+                        if line_idx > g_line || (line_idx == g_line && i >= g_cell) {
+                            first_new_grid_row = Some(row_idx);
+                        }
+                    }
+                }
+
+                let mut row = Row::new(new_cols);
+                let mut col = 0;
+
+                while col < new_cols && i < total_cells {
+                    let cell = line.cells[i];
+
+                    if line.cursor_offset == Some(i) && new_cursor.is_none() {
+                        new_cursor = Some((row_idx, col));
+                    }
+
+                    if cell.flags.contains(CellFlags::WIDE_CHAR) && col + 1 >= new_cols {
+                        row.cells[col].flags.insert(CellFlags::WRAP_SPACER);
+                        break;
+                    }
+
+                    row.cells[col] = cell;
+                    col += 1;
+                    i += 1;
+
+                    if cell.flags.contains(CellFlags::WIDE_CHAR)
+                        && i < total_cells
+                        && line.cells[i].flags.contains(CellFlags::WIDE_CHAR_SPACER)
+                    {
+                        if line.cursor_offset == Some(i) && new_cursor.is_none() {
+                            new_cursor = Some((row_idx, col));
+                        }
+                        if col < new_cols {
+                            row.cells[col] = line.cells[i];
+                            col += 1;
+                        }
+                        i += 1;
+                    }
+                }
+
+                if line.cursor_offset == Some(i) && new_cursor.is_none() {
+                    new_cursor = Some((row_idx, col.min(new_cols.saturating_sub(1))));
+                }
+
+                let is_last_chunk = i >= total_cells;
+                row.is_wrapped = if is_last_chunk { line.is_wrapped } else { true };
+                new_physical_rows.push(row);
+            }
+
+            if line.cursor_offset.is_some() && new_cursor.is_none() {
+                let last_idx = new_physical_rows.len().saturating_sub(1);
+                let last_col = new_physical_rows[last_idx]
+                    .content_len()
+                    .min(new_cols.saturating_sub(1));
+                new_cursor = Some((last_idx, last_col));
+            }
+        }
+
+        let total_new = new_physical_rows.len();
+        let (cursor_row_abs, cursor_col_final) =
+            new_cursor.unwrap_or((total_new.saturating_sub(1), 0));
+        let first_grid_row = first_new_grid_row.unwrap_or(0).min(cursor_row_abs);
+        let grid_content_count = total_new.saturating_sub(first_grid_row);
+
+        if grid_content_count <= new_rows {
+            let mut scrollback_rows: VecDeque<Row> =
+                new_physical_rows.drain(..first_grid_row).collect();
+            self.grid = new_physical_rows;
+            while self.grid.len() < new_rows {
+                self.grid.push(Row::new(new_cols));
+            }
+
+            if self.max_scrollback > 0 {
+                while scrollback_rows.len() > self.max_scrollback {
+                    scrollback_rows.pop_front();
+                }
+            } else {
+                scrollback_rows.clear();
+            }
+            self.scrollback = scrollback_rows;
+
+            self.cursor.row = (cursor_row_abs - first_grid_row).min(new_rows.saturating_sub(1));
+            self.cursor.col = cursor_col_final.min(new_cols.saturating_sub(1));
+        } else {
+            let split_point = total_new - new_rows;
+            let mut scrollback_rows: VecDeque<Row> =
+                new_physical_rows.drain(..split_point).collect();
+            self.grid = new_physical_rows;
+
+            if self.max_scrollback > 0 {
+                while scrollback_rows.len() > self.max_scrollback {
+                    scrollback_rows.pop_front();
+                }
+            } else {
+                scrollback_rows.clear();
+            }
+            self.scrollback = scrollback_rows;
+
+            if cursor_row_abs >= split_point {
+                self.cursor.row = (cursor_row_abs - split_point).min(new_rows.saturating_sub(1));
+            } else {
+                self.cursor.row = 0;
+            }
+            self.cursor.col = cursor_col_final.min(new_cols.saturating_sub(1));
+        }
+
+        self.rows = new_rows;
+        self.cols = new_cols;
+        self.scroll_region = (0, new_rows.saturating_sub(1));
+        self.cursor.pending_wrap = false;
+        self.scroll_offset = 0;
+        self.selection = None;
     }
 
     pub fn scroll_display(&mut self, delta: isize) {
         let max_scroll = self.scrollback.len();
         if delta < 0 {
-            self.scroll_offset = self.scroll_offset.saturating_add((-delta) as usize).min(max_scroll);
+            self.scroll_offset = self
+                .scroll_offset
+                .saturating_add((-delta) as usize)
+                .min(max_scroll);
         } else {
             self.scroll_offset = self.scroll_offset.saturating_sub(delta as usize);
         }
@@ -347,7 +660,11 @@ impl ScreenBuffer {
         for r_idx in start.0..=end.0 {
             if let Some(row) = self.get_visible_row(r_idx) {
                 let col_start = if r_idx == start.0 { start.1 } else { 0 };
-                let col_end = if r_idx == end.0 { end.1.min(row.cells.len().saturating_sub(1)) } else { row.cells.len().saturating_sub(1) };
+                let col_end = if r_idx == end.0 {
+                    end.1.min(row.cells.len().saturating_sub(1))
+                } else {
+                    row.cells.len().saturating_sub(1)
+                };
 
                 let mut line_str = String::new();
                 for c_idx in col_start..=col_end {
@@ -456,7 +773,14 @@ impl ScreenBuffer {
         }
     }
 
-    pub fn write_char(&mut self, c: char, fg: Color, bg: Color, flags: CellFlags, hyperlink_id: Option<u32>) {
+    pub fn write_char(
+        &mut self,
+        c: char,
+        fg: Color,
+        bg: Color,
+        flags: CellFlags,
+        hyperlink_id: Option<u32>,
+    ) {
         let char_width = UnicodeWidthChar::width(c).unwrap_or(1);
         if char_width == 0 {
             return;
@@ -469,6 +793,9 @@ impl ScreenBuffer {
 
         if char_width == 2 && self.cursor.col + 1 >= self.cols {
             self.grid[self.cursor.row].cells[self.cursor.col].reset();
+            self.grid[self.cursor.row].cells[self.cursor.col]
+                .flags
+                .insert(CellFlags::WRAP_SPACER);
             self.grid[self.cursor.row].is_wrapped = true;
             self.newline();
         }
@@ -633,7 +960,7 @@ impl ScreenGrid {
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.primary.resize(rows, cols);
-        self.alternate.resize(rows, cols);
+        self.alternate.resize_no_reflow(rows, cols);
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -721,11 +1048,10 @@ pub fn detect_url_in_row(cells: &[Cell], target_col: usize) -> Option<String> {
             // Trim trailing punctuation marks like '.', ',', ';', '!', '?'
             while end_idx > actual_start {
                 let last_c = chars[end_idx - 1];
-                if last_c == '.' || last_c == ',' || last_c == ';' || last_c == '!' || last_c == '?' {
-                    end_idx -= 1;
-                } else if last_c == ')' && !chars[actual_start..end_idx].contains(&'(') {
-                    end_idx -= 1;
-                } else if last_c == ']' && !chars[actual_start..end_idx].contains(&'[') {
+                if matches!(last_c, '.' | ',' | ';' | '!' | '?')
+                    || (last_c == ')' && !chars[actual_start..end_idx].contains(&'('))
+                    || (last_c == ']' && !chars[actual_start..end_idx].contains(&'['))
+                {
                     end_idx -= 1;
                 } else {
                     break;

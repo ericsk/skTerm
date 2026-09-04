@@ -92,13 +92,11 @@ impl ImageInstance {
         VertexBufferLayout {
             array_stride: std::mem::size_of::<ImageInstance>() as wgpu::BufferAddress,
             step_mode: VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-            ],
+            attributes: &[wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x4,
+            }],
         }
     }
 }
@@ -380,12 +378,7 @@ pub fn color_to_rgba(color: Color, is_bg: bool) -> [f32; 4] {
     match color {
         Color::DefaultFg => [0.85, 0.85, 0.90, 1.0],
         Color::DefaultBg => [0.10, 0.10, 0.15, 1.0],
-        Color::Rgb(r, g, b) => [
-            r as f32 / 255.0,
-            g as f32 / 255.0,
-            b as f32 / 255.0,
-            1.0,
-        ],
+        Color::Rgb(r, g, b) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0],
         Color::Named(named) => named_color_to_rgba(named),
         Color::Indexed(idx) => indexed_color_to_rgba(idx, is_bg),
     }

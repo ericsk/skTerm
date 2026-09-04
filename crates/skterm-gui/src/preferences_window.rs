@@ -4,7 +4,8 @@
 
 use crate::config::{Config, ConfigManager, ShellConfig};
 use egui::{
-    Align, Color32, Context, CornerRadius, Frame, Layout, Margin, RichText, Sense, Stroke, Ui, Visuals,
+    Align, Color32, Context, CornerRadius, Frame, Layout, Margin, RichText, Sense, Stroke, Ui,
+    Visuals,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -56,9 +57,17 @@ impl<'a> InsetCardBuilder<'a> {
 
         self.ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new(label).color(Color32::from_rgb(230, 234, 242)).size(13.5));
+                ui.label(
+                    RichText::new(label)
+                        .color(Color32::from_rgb(230, 234, 242))
+                        .size(13.5),
+                );
                 if let Some(sub) = subtitle {
-                    ui.label(RichText::new(sub).color(Color32::from_rgb(135, 142, 160)).size(11.0));
+                    ui.label(
+                        RichText::new(sub)
+                            .color(Color32::from_rgb(135, 142, 160))
+                            .size(11.0),
+                    );
                 }
             });
 
@@ -115,7 +124,8 @@ pub fn render_macos_toggle_switch(ui: &mut Ui, value: &mut bool) -> bool {
         Color32::from_rgb(55, 58, 74)
     };
 
-    ui.painter().rect_filled(rect, CornerRadius::same(11), bg_color);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(11), bg_color);
 
     let knob_radius = 8.5;
     let knob_x = if *value {
@@ -131,7 +141,8 @@ pub fn render_macos_toggle_switch(ui: &mut Ui, value: &mut bool) -> bool {
         knob_radius,
         Color32::from_black_alpha(90),
     );
-    ui.painter().circle_filled(knob_center, knob_radius, Color32::WHITE);
+    ui.painter()
+        .circle_filled(knob_center, knob_radius, Color32::WHITE);
 
     if resp.clicked() {
         *value = !*value;
@@ -173,7 +184,10 @@ pub fn render_macos_segmented_control<T: PartialEq + Copy>(
                     };
 
                     let btn = egui::Button::new(
-                        RichText::new(*opt_label).color(text_col).size(12.0).strong(),
+                        RichText::new(*opt_label)
+                            .color(text_col)
+                            .size(12.0)
+                            .strong(),
                     )
                     .fill(bg_col)
                     .stroke(stroke)
@@ -269,18 +283,27 @@ pub fn render_macos_keyboard_badge(ui: &mut Ui, text: &str) {
 
 pub fn render_color_row(ui: &mut Ui, label: &str, hex_val: &mut String) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(Color32::from_rgb(230, 234, 242)).size(13.5));
+        ui.label(
+            RichText::new(label)
+                .color(Color32::from_rgb(230, 234, 242))
+                .size(13.5),
+        );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if !hex_val.is_empty() {
-                if ui.button("✖").on_hover_text("重設為預設值").clicked() {
-                    hex_val.clear();
-                }
+            if !hex_val.is_empty() && ui.button("✖").on_hover_text("重設為預設值").clicked()
+            {
+                hex_val.clear();
             }
 
-            let mut current_col = parse_hex_color(hex_val).unwrap_or(Color32::from_rgb(100, 100, 120));
+            let mut current_col =
+                parse_hex_color(hex_val).unwrap_or(Color32::from_rgb(100, 100, 120));
             let resp = ui.color_edit_button_srgba(&mut current_col);
             if resp.changed() {
-                *hex_val = format!("#{:02x}{:02x}{:02x}", current_col.r(), current_col.g(), current_col.b());
+                *hex_val = format!(
+                    "#{:02x}{:02x}{:02x}",
+                    current_col.r(),
+                    current_col.g(),
+                    current_col.b()
+                );
             }
 
             ui.add(
@@ -299,17 +322,21 @@ pub fn render_color_row_with_presets(
     presets: &[(&str, Color32, &str)],
 ) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(Color32::from_rgb(230, 234, 242)).size(13.5));
+        ui.label(
+            RichText::new(label)
+                .color(Color32::from_rgb(230, 234, 242))
+                .size(13.5),
+        );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if !hex_val.is_empty() {
-                if ui.button("✖").on_hover_text("重設為預設值").clicked() {
-                    hex_val.clear();
-                }
+            if !hex_val.is_empty() && ui.button("✖").on_hover_text("重設為預設值").clicked()
+            {
+                hex_val.clear();
             }
 
             for (code, col, tooltip) in presets.iter().rev() {
                 ui.push_id(code, |ui| {
-                    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::new(17.0, 17.0), Sense::click());
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::Vec2::new(17.0, 17.0), Sense::click());
                     let stroke = if *hex_val == *code {
                         Stroke::new(2.0, Color32::from_rgb(10, 132, 255))
                     } else if resp.hovered() {
@@ -326,10 +353,16 @@ pub fn render_color_row_with_presets(
                 });
             }
 
-            let mut current_col = parse_hex_color(hex_val).unwrap_or(Color32::from_rgb(100, 100, 120));
+            let mut current_col =
+                parse_hex_color(hex_val).unwrap_or(Color32::from_rgb(100, 100, 120));
             let resp = ui.color_edit_button_srgba(&mut current_col);
             if resp.changed() {
-                *hex_val = format!("#{:02x}{:02x}{:02x}", current_col.r(), current_col.g(), current_col.b());
+                *hex_val = format!(
+                    "#{:02x}{:02x}{:02x}",
+                    current_col.r(),
+                    current_col.g(),
+                    current_col.b()
+                );
             }
 
             ui.add(
@@ -423,7 +456,9 @@ impl PreferencesWindow {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or_else(|| anyhow::anyhow!("Failed to find suitable GPU adapter for Preferences"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Failed to find suitable GPU adapter for Preferences")
+            })?;
 
         let (device, queue) = adapter
             .request_device(
@@ -601,7 +636,11 @@ impl PreferencesWindow {
             self.shell_program = String::new();
             self.shell_args = String::new();
         }
-        self.working_directory = config.terminal.working_directory.clone().unwrap_or_default();
+        self.working_directory = config
+            .terminal
+            .working_directory
+            .clone()
+            .unwrap_or_default();
         self.scrollback_lines = config.terminal.scrollback_lines;
         self.option_as_alt = config.terminal.option_as_alt.clone();
         self.bell = config.terminal.bell.clone();
@@ -627,14 +666,34 @@ impl PreferencesWindow {
         cfg.window.tab_bar_style = self.tab_bar_style.clone();
 
         cfg.colors.theme = self.theme.clone();
-        cfg.colors.foreground = if self.fg_override.trim().is_empty() { None } else { Some(self.fg_override.trim().to_string()) };
-        cfg.colors.background = if self.bg_override.trim().is_empty() { None } else { Some(self.bg_override.trim().to_string()) };
-        cfg.colors.cursor = if self.cursor_override.trim().is_empty() { None } else { Some(self.cursor_override.trim().to_string()) };
-        cfg.colors.selection = if self.selection_override.trim().is_empty() { None } else { Some(self.selection_override.trim().to_string()) };
+        cfg.colors.foreground = if self.fg_override.trim().is_empty() {
+            None
+        } else {
+            Some(self.fg_override.trim().to_string())
+        };
+        cfg.colors.background = if self.bg_override.trim().is_empty() {
+            None
+        } else {
+            Some(self.bg_override.trim().to_string())
+        };
+        cfg.colors.cursor = if self.cursor_override.trim().is_empty() {
+            None
+        } else {
+            Some(self.cursor_override.trim().to_string())
+        };
+        cfg.colors.selection = if self.selection_override.trim().is_empty() {
+            None
+        } else {
+            Some(self.selection_override.trim().to_string())
+        };
 
         cfg.terminal.term = self.term.clone();
         if self.custom_shell_enabled && !self.shell_program.trim().is_empty() {
-            let args: Vec<String> = self.shell_args.split_whitespace().map(|s| s.to_string()).collect();
+            let args: Vec<String> = self
+                .shell_args
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
             cfg.terminal.shell = Some(ShellConfig {
                 program: self.shell_program.trim().to_string(),
                 args,
@@ -643,7 +702,11 @@ impl PreferencesWindow {
             cfg.terminal.shell = None;
         }
 
-        cfg.terminal.working_directory = if self.working_directory.trim().is_empty() { None } else { Some(self.working_directory.trim().to_string()) };
+        cfg.terminal.working_directory = if self.working_directory.trim().is_empty() {
+            None
+        } else {
+            Some(self.working_directory.trim().to_string())
+        };
         cfg.terminal.scrollback_lines = self.scrollback_lines;
         cfg.terminal.option_as_alt = self.option_as_alt.clone();
         cfg.terminal.bell = self.bell.clone();
@@ -674,9 +737,19 @@ impl PreferencesWindow {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             // macOS green status dot + title
-                            let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(9.0, 9.0), Sense::hover());
-                            ui.painter().circle_filled(rect.center(), 4.5, Color32::from_rgb(48, 209, 88));
-                            ui.label(RichText::new("skTerm 設定").size(15.0).strong().color(Color32::WHITE));
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::Vec2::new(9.0, 9.0), Sense::hover());
+                            ui.painter().circle_filled(
+                                rect.center(),
+                                4.5,
+                                Color32::from_rgb(48, 209, 88),
+                            );
+                            ui.label(
+                                RichText::new("skTerm 設定")
+                                    .size(15.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            );
                         });
 
                         ui.add_space(4.0);
@@ -688,11 +761,36 @@ impl PreferencesWindow {
 
                         ui.add_space(16.0);
 
-                        self.render_sidebar_item(ui, PreferencesCategory::Appearance, "🔤 外觀與字型", "Appearance");
-                        self.render_sidebar_item(ui, PreferencesCategory::Colors, "🎨 色彩與主題", "Colors");
-                        self.render_sidebar_item(ui, PreferencesCategory::Terminal, "🖥️ 終端與 Shell", "Terminal");
-                        self.render_sidebar_item(ui, PreferencesCategory::Cursor, "🖱️ 游標與動態", "Cursor");
-                        self.render_sidebar_item(ui, PreferencesCategory::Keybindings, "⌨️ 快捷鍵指南", "Keybindings");
+                        self.render_sidebar_item(
+                            ui,
+                            PreferencesCategory::Appearance,
+                            "🔤 外觀與字型",
+                            "Appearance",
+                        );
+                        self.render_sidebar_item(
+                            ui,
+                            PreferencesCategory::Colors,
+                            "🎨 色彩與主題",
+                            "Colors",
+                        );
+                        self.render_sidebar_item(
+                            ui,
+                            PreferencesCategory::Terminal,
+                            "🖥️ 終端與 Shell",
+                            "Terminal",
+                        );
+                        self.render_sidebar_item(
+                            ui,
+                            PreferencesCategory::Cursor,
+                            "🖱️ 游標與動態",
+                            "Cursor",
+                        );
+                        self.render_sidebar_item(
+                            ui,
+                            PreferencesCategory::Keybindings,
+                            "⌨️ 快捷鍵指南",
+                            "Keybindings",
+                        );
                     });
 
                     // Bottom docked actions in Sidebar
@@ -707,7 +805,7 @@ impl PreferencesWindow {
                             .on_hover_text("在系統文字編輯器開啟 TOML 檔案")
                             .clicked()
                         {
-                            let _ = config_manager.open_in_editor();
+                            config_manager.open_in_editor();
                         }
                         ui.add_space(4.0);
                         if ui
@@ -760,31 +858,43 @@ impl PreferencesWindow {
                 });
         });
 
-        self.egui_state.handle_platform_output(&self.window, full_output.platform_output);
+        self.egui_state
+            .handle_platform_output(&self.window, full_output.platform_output);
 
         // Render to GPU surface
         let output = match self.surface.get_current_texture() {
             Ok(t) => t,
             Err(e) => {
                 info!("Surface error in preferences window: {:?}", e);
-                return if changed { Some(self.to_config(&config_manager.current_config)) } else { None };
+                return if changed {
+                    Some(self.to_config(&config_manager.current_config))
+                } else {
+                    None
+                };
             }
         };
 
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("pref_encoder"),
-        });
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pref_encoder"),
+            });
 
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point: self.window.scale_factor() as f32,
         };
 
-        let clipped_primitives = self.egui_ctx.tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
+        let clipped_primitives = self
+            .egui_ctx
+            .tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
 
         for (id, delta) in full_output.textures_delta.set {
-            self.egui_renderer.update_texture(&self.device, &self.queue, id, &delta);
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, id, &delta);
         }
 
         self.egui_renderer.update_buffers(
@@ -796,22 +906,30 @@ impl PreferencesWindow {
         );
 
         {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("pref_render_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.11, g: 0.11, b: 0.15, a: 1.0 }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            }).forget_lifetime();
+            let mut render_pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("pref_render_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.11,
+                                g: 0.11,
+                                b: 0.15,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                .forget_lifetime();
 
-            self.egui_renderer.render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+            self.egui_renderer
+                .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
         }
 
         for id in full_output.textures_delta.free {
@@ -824,7 +942,13 @@ impl PreferencesWindow {
         self.check_changed(config_manager)
     }
 
-    fn render_sidebar_item(&mut self, ui: &mut Ui, cat: PreferencesCategory, label: &str, _sub: &str) {
+    fn render_sidebar_item(
+        &mut self,
+        ui: &mut Ui,
+        cat: PreferencesCategory,
+        label: &str,
+        _sub: &str,
+    ) {
         let is_selected = self.active_category == cat;
         let bg_color = if is_selected {
             Color32::from_rgb(50, 60, 85)
@@ -902,17 +1026,29 @@ impl PreferencesWindow {
                 },
             );
 
-            b.row("自訂字型名稱", Some("直接輸入字型家族名稱"), |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.font_family).desired_width(180.0));
-            });
+            b.row(
+                "自訂字型名稱",
+                Some("直接輸入字型家族名稱"),
+                |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.font_family).desired_width(180.0));
+                },
+            );
 
             b.row("字型大小 (Font Size)", Some("以 pt 為單位"), |ui| {
-                ui.add(egui::Slider::new(&mut self.font_size, 9.0..=36.0).suffix(" pt").step_by(0.5));
+                ui.add(
+                    egui::Slider::new(&mut self.font_size, 9.0..=36.0)
+                        .suffix(" pt")
+                        .step_by(0.5),
+                );
             });
 
-            b.row("行高倍率 (Line Height)", Some("1.0 為緊湊，1.2 為標準舒適"), |ui| {
-                ui.add(egui::Slider::new(&mut self.line_height, 1.0..=2.0).step_by(0.05));
-            });
+            b.row(
+                "行高倍率 (Line Height)",
+                Some("1.0 為緊湊，1.2 為標準舒適"),
+                |ui| {
+                    ui.add(egui::Slider::new(&mut self.line_height, 1.0..=2.0).step_by(0.05));
+                },
+            );
         });
 
         render_inset_card(ui, "視窗幾何與邊距 (Window & Layout)", |b| {
@@ -920,9 +1056,17 @@ impl PreferencesWindow {
                 "預設終端大小",
                 Some("啟動時初始網格行列數 (列 × 行)"),
                 |ui| {
-                    ui.add(egui::DragValue::new(&mut self.columns).range(40..=400).prefix("W: "));
+                    ui.add(
+                        egui::DragValue::new(&mut self.columns)
+                            .range(40..=400)
+                            .prefix("W: "),
+                    );
                     ui.label("×");
-                    ui.add(egui::DragValue::new(&mut self.rows).range(10..=200).prefix("H: "));
+                    ui.add(
+                        egui::DragValue::new(&mut self.rows)
+                            .range(10..=200)
+                            .prefix("H: "),
+                    );
                 },
             );
 
@@ -930,8 +1074,16 @@ impl PreferencesWindow {
                 "內距 (Padding)",
                 Some("文字四周保留空白像素"),
                 |ui| {
-                    ui.add(egui::Slider::new(&mut self.padding_x, 0.0..=40.0).suffix(" pt").prefix("X: "));
-                    ui.add(egui::Slider::new(&mut self.padding_y, 0.0..=40.0).suffix(" pt").prefix("Y: "));
+                    ui.add(
+                        egui::Slider::new(&mut self.padding_x, 0.0..=40.0)
+                            .suffix(" pt")
+                            .prefix("X: "),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.padding_y, 0.0..=40.0)
+                            .suffix(" pt")
+                            .prefix("Y: "),
+                    );
                 },
             );
 
@@ -1097,30 +1249,38 @@ impl PreferencesWindow {
         });
 
         render_inset_card(ui, "自訂背景與文字顏色 (Custom Overrides)", |b| {
-            b.row("背景底色 (Background)", Some("一鍵黑底或點調色盤自訂"), |ui| {
-                render_color_row_with_presets(
-                    ui,
-                    "",
-                    &mut self.bg_override,
-                    &[
-                        ("#000000", Color32::from_rgb(0, 0, 0), "OLED 純黑"),
-                        ("#0a0a0e", Color32::from_rgb(10, 10, 14), "深墨黑"),
-                        ("#18181f", Color32::from_rgb(24, 24, 31), "藏青黑"),
-                    ],
-                );
-            });
-            b.row("前景文字色 (Foreground)", Some("一鍵白/綠/黃或點調色盤自訂"), |ui| {
-                render_color_row_with_presets(
-                    ui,
-                    "",
-                    &mut self.fg_override,
-                    &[
-                        ("#f5f5f7", Color32::from_rgb(245, 245, 247), "亮白"),
-                        ("#30d158", Color32::from_rgb(48, 209, 88), "駭客綠"),
-                        ("#ff9f0a", Color32::from_rgb(255, 159, 10), "琥珀黃"),
-                    ],
-                );
-            });
+            b.row(
+                "背景底色 (Background)",
+                Some("一鍵黑底或點調色盤自訂"),
+                |ui| {
+                    render_color_row_with_presets(
+                        ui,
+                        "",
+                        &mut self.bg_override,
+                        &[
+                            ("#000000", Color32::from_rgb(0, 0, 0), "OLED 純黑"),
+                            ("#0a0a0e", Color32::from_rgb(10, 10, 14), "深墨黑"),
+                            ("#18181f", Color32::from_rgb(24, 24, 31), "藏青黑"),
+                        ],
+                    );
+                },
+            );
+            b.row(
+                "前景文字色 (Foreground)",
+                Some("一鍵白/綠/黃或點調色盤自訂"),
+                |ui| {
+                    render_color_row_with_presets(
+                        ui,
+                        "",
+                        &mut self.fg_override,
+                        &[
+                            ("#f5f5f7", Color32::from_rgb(245, 245, 247), "亮白"),
+                            ("#30d158", Color32::from_rgb(48, 209, 88), "駭客綠"),
+                            ("#ff9f0a", Color32::from_rgb(255, 159, 10), "琥珀黃"),
+                        ],
+                    );
+                },
+            );
             b.row("游標顏色 (Cursor)", Some("游標方塊顏色"), |ui| {
                 render_color_row_with_presets(
                     ui,
@@ -1133,30 +1293,42 @@ impl PreferencesWindow {
                     ],
                 );
             });
-            b.row("選取文字底色 (Selection)", Some("滑鼠選取範圍底色"), |ui| {
-                render_color_row_with_presets(
-                    ui,
-                    "",
-                    &mut self.selection_override,
-                    &[
-                        ("#2a4b7c", Color32::from_rgb(42, 75, 124), "經典藍選取"),
-                        ("#383844", Color32::from_rgb(56, 56, 68), "柔和灰選取"),
-                    ],
-                );
-            });
+            b.row(
+                "選取文字底色 (Selection)",
+                Some("滑鼠選取範圍底色"),
+                |ui| {
+                    render_color_row_with_presets(
+                        ui,
+                        "",
+                        &mut self.selection_override,
+                        &[
+                            ("#2a4b7c", Color32::from_rgb(42, 75, 124), "經典藍選取"),
+                            ("#383844", Color32::from_rgb(56, 56, 68), "柔和灰選取"),
+                        ],
+                    );
+                },
+            );
         });
     }
 
     // 3. Terminal & Shell Tab View
     fn render_terminal_view(&mut self, ui: &mut Ui) {
         render_inset_card(ui, "Shell 與啟動環境 (Shell & Environment)", |b| {
-            b.row("TERM 模擬器代碼", Some("環境變數 $TERM 預設值"), |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.term).desired_width(140.0));
-            });
+            b.row(
+                "TERM 模擬器代碼",
+                Some("環境變數 $TERM 預設值"),
+                |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.term).desired_width(140.0));
+                },
+            );
 
-            b.row("指定自訂 Shell 程式", Some("覆蓋系統預設 $SHELL"), |ui| {
-                render_macos_toggle_switch(ui, &mut self.custom_shell_enabled);
-            });
+            b.row(
+                "指定自訂 Shell 程式",
+                Some("覆蓋系統預設 $SHELL"),
+                |ui| {
+                    render_macos_toggle_switch(ui, &mut self.custom_shell_enabled);
+                },
+            );
 
             if self.custom_shell_enabled {
                 b.row("執行檔路徑", None, |ui| {
@@ -1176,13 +1348,17 @@ impl PreferencesWindow {
                 });
             }
 
-            b.row("初始工作目錄 (CWD)", Some("終端啟動預設路徑"), |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.working_directory)
-                        .hint_text("預設使用者家目錄 (~/)")
-                        .desired_width(180.0),
-                );
-            });
+            b.row(
+                "初始工作目錄 (CWD)",
+                Some("終端啟動預設路徑"),
+                |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.working_directory)
+                            .hint_text("預設使用者家目錄 (~/)")
+                            .desired_width(180.0),
+                    );
+                },
+            );
         });
 
         render_inset_card(ui, "緩衝區與操作行為 (Buffer & Interaction)", |b| {
@@ -1284,7 +1460,11 @@ impl PreferencesWindow {
                 ("新增分頁 (New Tab)", &["⌘", "T"], &["Ctrl", "Shift", "T"]),
                 ("關閉分頁 / 窗格", &["⌘", "W"], &["Ctrl", "Shift", "W"]),
                 ("左右垂直切分窗格", &["⌘", "D"], &["Ctrl", "Shift", "D"]),
-                ("上下水平切分窗格", &["⌘", "⇧", "D"], &["Ctrl", "Shift", "H"]),
+                (
+                    "上下水平切分窗格",
+                    &["⌘", "⇧", "D"],
+                    &["Ctrl", "Shift", "H"],
+                ),
                 ("字型放大", &["⌘", "="], &["Ctrl", "="]),
                 ("字型縮小", &["⌘", "-"], &["Ctrl", "-"]),
                 ("字型重設預設大小", &["⌘", "0"], &["Ctrl", "0"]),
@@ -1299,12 +1479,20 @@ impl PreferencesWindow {
             for (desc, mac_keys, win_keys) in shortcuts {
                 b.row(desc, None, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("macOS:").color(Color32::from_rgb(135, 142, 160)).size(11.0));
+                        ui.label(
+                            RichText::new("macOS:")
+                                .color(Color32::from_rgb(135, 142, 160))
+                                .size(11.0),
+                        );
                         for k in *mac_keys {
                             render_macos_keyboard_badge(ui, k);
                         }
                         ui.add_space(8.0);
-                        ui.label(RichText::new("Linux/Win:").color(Color32::from_rgb(110, 115, 130)).size(10.5));
+                        ui.label(
+                            RichText::new("Linux/Win:")
+                                .color(Color32::from_rgb(110, 115, 130))
+                                .size(10.5),
+                        );
                         for k in *win_keys {
                             render_macos_keyboard_badge(ui, k);
                         }
@@ -1378,10 +1566,12 @@ pub fn scan_available_monospace_fonts() -> Vec<String> {
                         if ext_l == "ttf" || ext_l == "otf" || ext_l == "ttc" {
                             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                                 let stem_l = stem.to_lowercase();
-                                if stem_l.contains("mono") || stem_l.contains("nerd") || stem_l.contains("code") {
-                                    if !fonts.contains(&stem.to_string()) {
-                                        fonts.push(stem.to_string());
-                                    }
+                                if (stem_l.contains("mono")
+                                    || stem_l.contains("nerd")
+                                    || stem_l.contains("code"))
+                                    && !fonts.contains(&stem.to_string())
+                                {
+                                    fonts.push(stem.to_string());
                                 }
                             }
                         }

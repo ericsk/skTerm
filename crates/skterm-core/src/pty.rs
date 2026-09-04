@@ -78,7 +78,9 @@ impl PtyProcess {
         if let Some(dir) = options.cwd {
             // Expand ~ if needed
             let expanded_dir = if dir.starts_with('~') {
-                if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+                if let Some(home) =
+                    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+                {
                     let mut path = std::path::PathBuf::from(home);
                     if dir.len() > 1 {
                         path.push(dir.trim_start_matches("~/").trim_start_matches("~\\"));
@@ -158,7 +160,10 @@ impl PtyProcess {
 
     /// Write user input bytes into the PTY.
     pub fn write_all(&self, data: &[u8]) -> anyhow::Result<()> {
-        let mut writer = self.writer.lock().map_err(|e| anyhow::anyhow!("Writer lock poisoned: {:?}", e))?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Writer lock poisoned: {:?}", e))?;
         writer.write_all(data)?;
         writer.flush()?;
         Ok(())

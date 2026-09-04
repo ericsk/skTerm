@@ -114,9 +114,21 @@ impl SixelDecoder {
                     } else if nums.len() >= 5 && nums[1] == 2 {
                         // RGB definition: #reg;2;r;g;b (percentage 0..100 or 0..255)
                         let reg = nums[0] as u16;
-                        let r = if nums[2] <= 100 { (nums[2] * 255 / 100) as u8 } else { nums[2] as u8 };
-                        let g = if nums[3] <= 100 { (nums[3] * 255 / 100) as u8 } else { nums[3] as u8 };
-                        let b_val = if nums[4] <= 100 { (nums[4] * 255 / 100) as u8 } else { nums[4] as u8 };
+                        let r = if nums[2] <= 100 {
+                            (nums[2] * 255 / 100) as u8
+                        } else {
+                            nums[2] as u8
+                        };
+                        let g = if nums[3] <= 100 {
+                            (nums[3] * 255 / 100) as u8
+                        } else {
+                            nums[3] as u8
+                        };
+                        let b_val = if nums[4] <= 100 {
+                            (nums[4] * 255 / 100) as u8
+                        } else {
+                            nums[4] as u8
+                        };
                         self.color_table.insert(reg, [r, g, b_val, 255]);
                         self.current_color = reg;
                     }
@@ -135,7 +147,11 @@ impl SixelDecoder {
                         i += 1;
                         if (63..=126).contains(&char_byte) {
                             let sixel_val = char_byte - 63;
-                            let color = self.color_table.get(&self.current_color).copied().unwrap_or([255, 255, 255, 255]);
+                            let color = self
+                                .color_table
+                                .get(&self.current_color)
+                                .copied()
+                                .unwrap_or([255, 255, 255, 255]);
                             for _ in 0..count {
                                 for bit in 0..6 {
                                     if (sixel_val & (1 << bit)) != 0 {
@@ -176,7 +192,11 @@ impl SixelDecoder {
                 63..=126 => {
                     // Sixel data character
                     let sixel_val = b - 63;
-                    let color = self.color_table.get(&self.current_color).copied().unwrap_or([255, 255, 255, 255]);
+                    let color = self
+                        .color_table
+                        .get(&self.current_color)
+                        .copied()
+                        .unwrap_or([255, 255, 255, 255]);
                     for bit in 0..6 {
                         if (sixel_val & (1 << bit)) != 0 {
                             let px = self.cur_x;
@@ -246,7 +266,8 @@ impl KittyGraphicsParser {
         for pair in pairs {
             let kv: Vec<&str> = pair.splitn(2, '=').collect();
             if kv.len() == 2 {
-                self.current_params.insert(kv[0].to_string(), kv[1].to_string());
+                self.current_params
+                    .insert(kv[0].to_string(), kv[1].to_string());
             }
         }
 
@@ -256,15 +277,35 @@ impl KittyGraphicsParser {
             }
         }
 
-        let is_more = self.current_params.get("m").map(|v| v == "1").unwrap_or(false);
+        let is_more = self
+            .current_params
+            .get("m")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         if is_more {
             return None; // Wait for further chunks
         }
 
-        let format = self.current_params.get("f").cloned().unwrap_or_else(|| "32".to_string());
-        let width = self.current_params.get("s").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
-        let height = self.current_params.get("v").and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
-        let z_index = self.current_params.get("z").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+        let format = self
+            .current_params
+            .get("f")
+            .cloned()
+            .unwrap_or_else(|| "32".to_string());
+        let width = self
+            .current_params
+            .get("s")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let height = self
+            .current_params
+            .get("v")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let z_index = self
+            .current_params
+            .get("z")
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(0);
 
         let data = std::mem::take(&mut self.chunk_buffer);
         self.current_params.clear();

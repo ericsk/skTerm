@@ -38,7 +38,13 @@ mod tests {
     fn test_theme_color_overrides() {
         use skterm_core::Color;
         let theme = RenderTheme::default();
-        assert_eq!(color_to_rgba_themed(Color::DefaultFg, false, &theme), theme.default_fg);
-        assert_eq!(color_to_rgba_themed(Color::DefaultBg, true, &theme), theme.default_bg);
+        assert_eq!(
+            color_to_rgba_themed(Color::DefaultFg, false, &theme),
+            theme.default_fg
+        );
+        assert_eq!(
+            color_to_rgba_themed(Color::DefaultBg, true, &theme),
+            theme.default_bg
+        );
     }
 }

@@ -23,14 +23,13 @@ use winit::window::{CursorIcon, Fullscreen, Window, WindowAttributes, WindowId};
 
 #[cfg(target_os = "macos")]
 fn get_nswindow(window: &Window) -> *mut objc::runtime::Object {
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use objc::{msg_send, sel, sel_impl};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     if let Ok(handle) = window.window_handle() {
         if let RawWindowHandle::AppKit(appkit) = handle.as_raw() {
             let view_ptr = appkit.ns_view.as_ptr();
-            let win_ptr: *mut objc::runtime::Object = unsafe {
-                msg_send![view_ptr as *mut objc::runtime::Object, window]
-            };
+            let win_ptr: *mut objc::runtime::Object =
+                unsafe { msg_send![view_ptr as *mut objc::runtime::Object, window] };
             return win_ptr;
         }
     }
@@ -45,7 +44,9 @@ pub fn open_url_in_browser(url: &str) -> anyhow::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn()?;
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()?;
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -83,12 +84,18 @@ impl TerminalSession {
                         let cell_w = self.renderer.cell_width();
                         let cell_h = self.renderer.cell_height();
 
-                        let cursor_px = rect.x + self.renderer.padding_x + (cursor.col as f32 * cell_w);
-                        let cursor_py = rect.y + self.renderer.padding_y + (cursor.row as f32 * cell_h);
+                        let cursor_px =
+                            rect.x + self.renderer.padding_x + (cursor.col as f32 * cell_w);
+                        let cursor_py =
+                            rect.y + self.renderer.padding_y + (cursor.row as f32 * cell_h);
 
                         let scale = self.renderer.scale_factor as f64;
-                        let logical_pos = LogicalPosition::new(cursor_px as f64 / scale, cursor_py as f64 / scale);
-                        let logical_size = LogicalSize::new(cell_w as f64 / scale, cell_h as f64 / scale);
+                        let logical_pos = LogicalPosition::new(
+                            cursor_px as f64 / scale,
+                            cursor_py as f64 / scale,
+                        );
+                        let logical_size =
+                            LogicalSize::new(cell_w as f64 / scale, cell_h as f64 / scale);
 
                         self.window.set_ime_cursor_area(
                             Position::Logical(logical_pos),
@@ -140,7 +147,12 @@ impl TerminalSession {
         }
     }
 
-    pub fn get_pane_and_cell_at(&self, mouse_x: f32, mouse_y: f32, tab_bar_h: f32) -> Option<(PaneId, usize, usize)> {
+    pub fn get_pane_and_cell_at(
+        &self,
+        mouse_x: f32,
+        mouse_y: f32,
+        tab_bar_h: f32,
+    ) -> Option<(PaneId, usize, usize)> {
         let pane_rects = self.workspace.compute_active_pane_rects(
             self.renderer.config.width as f32,
             self.renderer.config.height as f32,
@@ -223,7 +235,9 @@ impl App {
 
     pub fn run(mut self) -> anyhow::Result<()> {
         let event_loop = EventLoop::new()?;
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(16),
+        ));
         event_loop.run_app(&mut self)?;
         Ok(())
     }
@@ -235,7 +249,10 @@ impl App {
             return;
         }
 
-        match pollster::block_on(PreferencesWindow::create(event_loop, &self.config_manager.current_config)) {
+        match pollster::block_on(PreferencesWindow::create(
+            event_loop,
+            &self.config_manager.current_config,
+        )) {
             Ok(pref) => {
                 info!("Opened dedicated Preferences Window (ID: {:?})", pref.id());
                 self.preferences_window = Some(pref);
@@ -254,10 +271,20 @@ impl App {
             default_bg: preset.background,
             cursor_color: preset.cursor,
             selection_color: preset.selection,
-            tab_bar_bg: [preset.background[0] * 0.85, preset.background[1] * 0.85, preset.background[2] * 0.85, 1.0],
+            tab_bar_bg: [
+                preset.background[0] * 0.85,
+                preset.background[1] * 0.85,
+                preset.background[2] * 0.85,
+                1.0,
+            ],
             tab_active_bg: preset.background,
             tab_active_fg: preset.foreground,
-            tab_inactive_fg: [preset.foreground[0] * 0.6, preset.foreground[1] * 0.6, preset.foreground[2] * 0.6, 1.0],
+            tab_inactive_fg: [
+                preset.foreground[0] * 0.6,
+                preset.foreground[1] * 0.6,
+                preset.foreground[2] * 0.6,
+                1.0,
+            ],
             border_color: [0.3, 0.3, 0.35, 1.0],
             focused_border_color: [0.5, 0.7, 1.0, 1.0],
             ansi_palette: Some(preset.palette),
@@ -289,22 +316,90 @@ impl App {
         if let Some(palette_cfg) = &config.colors.palette {
             let mut pal = preset.palette;
 
-            if let Some(c) = palette_cfg.black.as_ref().and_then(|h| parse_hex_color(h)) { pal[0] = c; }
-            if let Some(c) = palette_cfg.red.as_ref().and_then(|h| parse_hex_color(h)) { pal[1] = c; }
-            if let Some(c) = palette_cfg.green.as_ref().and_then(|h| parse_hex_color(h)) { pal[2] = c; }
-            if let Some(c) = palette_cfg.yellow.as_ref().and_then(|h| parse_hex_color(h)) { pal[3] = c; }
-            if let Some(c) = palette_cfg.blue.as_ref().and_then(|h| parse_hex_color(h)) { pal[4] = c; }
-            if let Some(c) = palette_cfg.magenta.as_ref().and_then(|h| parse_hex_color(h)) { pal[5] = c; }
-            if let Some(c) = palette_cfg.cyan.as_ref().and_then(|h| parse_hex_color(h)) { pal[6] = c; }
-            if let Some(c) = palette_cfg.white.as_ref().and_then(|h| parse_hex_color(h)) { pal[7] = c; }
-            if let Some(c) = palette_cfg.bright_black.as_ref().and_then(|h| parse_hex_color(h)) { pal[8] = c; }
-            if let Some(c) = palette_cfg.bright_red.as_ref().and_then(|h| parse_hex_color(h)) { pal[9] = c; }
-            if let Some(c) = palette_cfg.bright_green.as_ref().and_then(|h| parse_hex_color(h)) { pal[10] = c; }
-            if let Some(c) = palette_cfg.bright_yellow.as_ref().and_then(|h| parse_hex_color(h)) { pal[11] = c; }
-            if let Some(c) = palette_cfg.bright_blue.as_ref().and_then(|h| parse_hex_color(h)) { pal[12] = c; }
-            if let Some(c) = palette_cfg.bright_magenta.as_ref().and_then(|h| parse_hex_color(h)) { pal[13] = c; }
-            if let Some(c) = palette_cfg.bright_cyan.as_ref().and_then(|h| parse_hex_color(h)) { pal[14] = c; }
-            if let Some(c) = palette_cfg.bright_white.as_ref().and_then(|h| parse_hex_color(h)) { pal[15] = c; }
+            if let Some(c) = palette_cfg.black.as_ref().and_then(|h| parse_hex_color(h)) {
+                pal[0] = c;
+            }
+            if let Some(c) = palette_cfg.red.as_ref().and_then(|h| parse_hex_color(h)) {
+                pal[1] = c;
+            }
+            if let Some(c) = palette_cfg.green.as_ref().and_then(|h| parse_hex_color(h)) {
+                pal[2] = c;
+            }
+            if let Some(c) = palette_cfg.yellow.as_ref().and_then(|h| parse_hex_color(h)) {
+                pal[3] = c;
+            }
+            if let Some(c) = palette_cfg.blue.as_ref().and_then(|h| parse_hex_color(h)) {
+                pal[4] = c;
+            }
+            if let Some(c) = palette_cfg
+                .magenta
+                .as_ref()
+                .and_then(|h| parse_hex_color(h))
+            {
+                pal[5] = c;
+            }
+            if let Some(c) = palette_cfg.cyan.as_ref().and_then(|h| parse_hex_color(h)) {
+                pal[6] = c;
+            }
+            if let Some(c) = palette_cfg.white.as_ref().and_then(|h| parse_hex_color(h)) {
+                pal[7] = c;
+            }
+            if let Some(c) = palette_cfg
+                .bright_black
+                .as_ref()
+                .and_then(|h| parse_hex_color(h))
+            {
+                pal[8] = c;
+            }
+            if let Some(c) = palette_cfg
+                .bright_red
+                .as_ref()
+                .and_then(|h| parse_hex_color(h))
+            {
+                pal[9] = c;
+            }
+            if let Some(c) = palette_cfg
+                .bright_green
+                .as_ref()
+                .and_then(|h| parse_hex_color(h))
+            {
+                pal[10] = c;
+            }
+            if let Some(c) = palette_cfg
+                .bright_yellow
+                .as_ref()
+                .and_then(|h| parse_hex_color(h))
+            {
+                pal[11] = c;
+            }
+            if let Some(c) = palette_cfg
+                .bright_blue
+                .as_ref()
+                .and_then(|h| parse_hex_color(h))
+            {
+                pal[12] = c;
+            }
+            if let Some(c) = palette_cfg
+                .bright_magenta
+                .as_ref()
+                .and_then(|h| parse_hex_color(h))
+            {
+                pal[13] = c;
+            }
+            if let Some(c) = palette_cfg
+                .bright_cyan
+                .as_ref()
+                .and_then(|h| parse_hex_color(h))
+            {
+                pal[14] = c;
+            }
+            if let Some(c) = palette_cfg
+                .bright_white
+                .as_ref()
+                .and_then(|h| parse_hex_color(h))
+            {
+                pal[15] = c;
+            }
 
             render_theme.ansi_palette = Some(pal);
         }
@@ -337,9 +432,11 @@ impl App {
                     &new_cfg.font.fallback_families,
                 );
             }
-            session.renderer.update_padding(new_cfg.window.padding_x, new_cfg.window.padding_y);
+            session
+                .renderer
+                .update_padding(new_cfg.window.padding_x, new_cfg.window.padding_y);
             session.renderer.update_opacity(new_cfg.window.opacity);
-            session.renderer.set_theme(render_theme.clone());
+            session.renderer.set_theme(render_theme);
             session.workspace.update_cursor_shape(cursor_shape);
             session.sync_all_pane_sizes(tab_bar_h);
             session.window.request_redraw();
@@ -381,9 +478,20 @@ impl App {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let tab_bar_style = self.config_manager.current_config.window.tab_bar_style.as_str();
-            let tab_count = self.active_session().map(|s| s.workspace.tabs.len()).unwrap_or(0);
-            let scale = self.active_session().map(|s| s.renderer.scale_factor).unwrap_or(1.0);
+            let tab_bar_style = self
+                .config_manager
+                .current_config
+                .window
+                .tab_bar_style
+                .as_str();
+            let tab_count = self
+                .active_session()
+                .map(|s| s.workspace.tabs.len())
+                .unwrap_or(0);
+            let scale = self
+                .active_session()
+                .map(|s| s.renderer.scale_factor)
+                .unwrap_or(1.0);
 
             match tab_bar_style {
                 "never" => 0.0,
@@ -412,7 +520,10 @@ impl App {
     }
 
     /// Create a new Terminal Session. On macOS, this window attaches as a native NSWindow tab!
-    pub fn create_terminal_session(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<WindowId> {
+    pub fn create_terminal_session(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+    ) -> anyhow::Result<WindowId> {
         let init_cols = self.config_manager.current_config.window.columns as f32;
         let init_rows = self.config_manager.current_config.window.rows as f32;
         let font_size_pt = self.config_manager.current_config.font.size;
@@ -432,16 +543,32 @@ impl App {
                 .with_titlebar_transparent(true);
         }
 
-        match self.config_manager.current_config.window.decorations.as_str() {
-            "none" => { window_attrs = window_attrs.with_decorations(false); }
-            "transparent" => { window_attrs = window_attrs.with_transparent(true); }
+        match self
+            .config_manager
+            .current_config
+            .window
+            .decorations
+            .as_str()
+        {
+            "none" => {
+                window_attrs = window_attrs.with_decorations(false);
+            }
+            "transparent" => {
+                window_attrs = window_attrs.with_transparent(true);
+            }
             _ => {}
         }
 
         let window = Arc::new(event_loop.create_window(window_attrs)?);
         window.set_ime_allowed(true);
 
-        match self.config_manager.current_config.window.startup_mode.as_str() {
+        match self
+            .config_manager
+            .current_config
+            .window
+            .startup_mode
+            .as_str()
+        {
             "maximized" => window.set_maximized(true),
             "fullscreen" => window.set_fullscreen(Some(Fullscreen::Borderless(None))),
             _ => {}
@@ -455,9 +582,7 @@ impl App {
             let new_ptr = get_nswindow(&window);
             if !new_ptr.is_null() {
                 // NSWindowTabbingModePreferred = 2
-                let _: () = unsafe {
-                    msg_send![new_ptr, setTabbingMode: 2isize]
-                };
+                let _: () = unsafe { msg_send![new_ptr, setTabbingMode: 2isize] };
             }
 
             if let Some(active_id) = self.active_session_id {
@@ -490,7 +615,10 @@ impl App {
         let cell_h_logical = renderer.cell_height() / scale;
         let target_logical_w = (init_cols * cell_w_logical + pad_x * 2.0).ceil();
         let target_logical_h = (init_rows * cell_h_logical + pad_y * 2.0).ceil();
-        let _ = window.request_inner_size(LogicalSize::new(target_logical_w as f64, target_logical_h as f64));
+        let _ = window.request_inner_size(LogicalSize::new(
+            target_logical_w as f64,
+            target_logical_h as f64,
+        ));
 
         let pty_opts = self.build_pty_options();
         let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
@@ -546,7 +674,12 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
         // 1. Route to Preferences Window if event belongs to it
         if let Some(pref) = &mut self.preferences_window {
             if pref.id() == window_id {
@@ -604,7 +737,9 @@ impl ApplicationHandler for App {
 
             WindowEvent::Resized(physical_size) => {
                 if let Some(session) = self.sessions.get_mut(&window_id) {
-                    session.renderer.resize(physical_size.width, physical_size.height);
+                    session
+                        .renderer
+                        .resize(physical_size.width, physical_size.height);
                     session.sync_all_pane_sizes(tab_bar_h);
 
                     if let Some(active_tab) = session.workspace.active_tab() {
@@ -755,9 +890,15 @@ impl ApplicationHandler for App {
                                 #[cfg(not(target_os = "macos"))]
                                 {
                                     let pty_opts = self.build_pty_options();
-                                    let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+                                    let scrollback = self
+                                        .config_manager
+                                        .current_config
+                                        .terminal
+                                        .scrollback_lines;
                                     if let Some(session) = self.sessions.get_mut(&window_id) {
-                                        let _ = session.workspace.new_tab_with_options(24, 80, scrollback, pty_opts);
+                                        let _ = session
+                                            .workspace
+                                            .new_tab_with_options(24, 80, scrollback, pty_opts);
                                         session.sync_all_pane_sizes(tab_bar_h);
                                         session.window.request_redraw();
                                     }
@@ -788,9 +929,12 @@ impl ApplicationHandler for App {
                                     SplitDirection::Horizontal
                                 };
                                 let pty_opts = self.build_pty_options();
-                                let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+                                let scrollback =
+                                    self.config_manager.current_config.terminal.scrollback_lines;
                                 if let Some(session) = self.sessions.get_mut(&window_id) {
-                                    let _ = session.workspace.split_active_pane(dir, 24, 80, scrollback, pty_opts);
+                                    let _ = session
+                                        .workspace
+                                        .split_active_pane(dir, 24, 80, scrollback, pty_opts);
                                     session.sync_all_pane_sizes(tab_bar_h);
                                     session.window.request_redraw();
                                 }
@@ -852,7 +996,8 @@ impl ApplicationHandler for App {
                             "-" => {
                                 if let Some(session) = self.sessions.get_mut(&window_id) {
                                     let cur_pt = session.renderer.font_size_pt;
-                                    let _ = session.renderer.update_font_size((cur_pt - 1.0).max(8.0));
+                                    let _ =
+                                        session.renderer.update_font_size((cur_pt - 1.0).max(8.0));
                                     session.sync_all_pane_sizes(tab_bar_h);
                                     session.window.request_redraw();
                                 }
@@ -887,7 +1032,8 @@ impl ApplicationHandler for App {
                     if let Some(tab) = session.workspace.active_tab_mut() {
                         if let Some(term) = tab.active_terminal_mut() {
                             let app_cursor = term.state.application_cursor_keys;
-                            if let Some(bytes) = encode_key_event(event, self.modifiers, app_cursor) {
+                            if let Some(bytes) = encode_key_event(event, self.modifiers, app_cursor)
+                            {
                                 let _ = term.write_to_pty(&bytes);
                                 session.window.request_redraw();
                             }
@@ -919,7 +1065,9 @@ impl ApplicationHandler for App {
 
                     // 2. Handling Text Selection Dragging
                     if session.is_mouse_down {
-                        if let Some((_pane_id, row, col)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
+                        if let Some((_pane_id, row, col)) =
+                            session.get_pane_and_cell_at(mx, my, tab_bar_h)
+                        {
                             if let Some(tab) = session.workspace.active_tab_mut() {
                                 if let Some(term) = tab.active_terminal_mut() {
                                     if let Some(sel) = &mut term.grid_mut().active_mut().selection {
@@ -954,9 +1102,13 @@ impl ApplicationHandler for App {
 
                         if !is_over_splitter {
                             // Check hyperlink under cursor
-                            let detected_url = if let Some((pane_id, row, col)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
+                            let detected_url = if let Some((pane_id, row, col)) =
+                                session.get_pane_and_cell_at(mx, my, tab_bar_h)
+                            {
                                 if let Some(tab) = session.workspace.active_tab() {
-                                    tab.root.find_terminal(pane_id).and_then(|t| t.url_at(row, col))
+                                    tab.root
+                                        .find_terminal(pane_id)
+                                        .and_then(|t| t.url_at(row, col))
                                 } else {
                                     None
                                 }
@@ -979,7 +1131,8 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 // Inline Tab Bar handling (Windows/Linux only)
                 #[cfg(not(target_os = "macos"))]
-                if button == MouseButton::Left && state == ElementState::Pressed && tab_bar_h > 0.0 {
+                if button == MouseButton::Left && state == ElementState::Pressed && tab_bar_h > 0.0
+                {
                     enum TabAction {
                         NewTab,
                         CloseTab(usize),
@@ -995,22 +1148,33 @@ impl ApplicationHandler for App {
                             let start_x = 8.0 * scale;
                             let plus_btn_w = 24.0 * scale;
                             let tab_gap = 4.0 * scale;
-                            let avail_w = (session.renderer.config.width as f32 - start_x - plus_btn_w - 16.0 * scale).max(80.0);
+                            let avail_w = (session.renderer.config.width as f32
+                                - start_x
+                                - plus_btn_w
+                                - 16.0 * scale)
+                                .max(80.0);
                             let total_gaps = (tabs_len.saturating_sub(1) as f32) * tab_gap;
-                            let tab_w = ((avail_w - total_gaps) / tabs_len as f32).clamp(75.0 * scale, 190.0 * scale);
+                            let tab_w = ((avail_w - total_gaps) / tabs_len as f32)
+                                .clamp(75.0 * scale, 190.0 * scale);
                             let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);
                             let tab_y = (tab_bar_h - tab_h) / 2.0;
 
                             let last_tab_right = start_x + (tabs_len as f32 * (tab_w + tab_gap));
                             let plus_btn_x = last_tab_right + 2.0 * scale;
-                            if mx >= plus_btn_x - 4.0 * scale && mx <= plus_btn_x + plus_btn_w + 6.0 * scale
-                                && my >= tab_y && my <= tab_y + tab_h
+                            if mx >= plus_btn_x - 4.0 * scale
+                                && mx <= plus_btn_x + plus_btn_w + 6.0 * scale
+                                && my >= tab_y
+                                && my <= tab_y + tab_h
                             {
                                 action = Some(TabAction::NewTab);
                             } else {
                                 for idx in 0..tabs_len {
                                     let tab_x = start_x + (idx as f32 * (tab_w + tab_gap));
-                                    if mx >= tab_x && mx <= tab_x + tab_w && my >= tab_y && my <= tab_y + tab_h {
+                                    if mx >= tab_x
+                                        && mx <= tab_x + tab_w
+                                        && my >= tab_y
+                                        && my <= tab_y + tab_h
+                                    {
                                         let close_size = 14.0 * scale;
                                         let close_x = tab_x + tab_w - close_size - 6.0 * scale;
                                         if mx >= close_x - 4.0 * scale {
@@ -1029,9 +1193,12 @@ impl ApplicationHandler for App {
                         match act {
                             TabAction::NewTab => {
                                 let pty_opts = self.build_pty_options();
-                                let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+                                let scrollback =
+                                    self.config_manager.current_config.terminal.scrollback_lines;
                                 if let Some(session) = self.sessions.get_mut(&window_id) {
-                                    let _ = session.workspace.new_tab_with_options(24, 80, scrollback, pty_opts);
+                                    let _ = session
+                                        .workspace
+                                        .new_tab_with_options(24, 80, scrollback, pty_opts);
                                     session.sync_all_pane_sizes(tab_bar_h);
                                     session.window.request_redraw();
                                 }
@@ -1074,7 +1241,11 @@ impl ApplicationHandler for App {
                             let bounds = Rect::new(0.0, tab_bar_h, width, height - tab_bar_h);
                             if let Some(tab) = session.workspace.active_tab() {
                                 if let Some(splitter) = tab.find_splitter_at(bounds, mx, my) {
-                                    session.dragging_splitter = Some((splitter.split_id, splitter.direction, splitter.parent_rect));
+                                    session.dragging_splitter = Some((
+                                        splitter.split_id,
+                                        splitter.direction,
+                                        splitter.parent_rect,
+                                    ));
                                     return;
                                 }
                             }
@@ -1086,7 +1257,9 @@ impl ApplicationHandler for App {
                             let is_link_modifier = self.modifiers.control_key();
 
                             if is_link_modifier {
-                                if let Some((pane_id, row, col)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
+                                if let Some((pane_id, row, col)) =
+                                    session.get_pane_and_cell_at(mx, my, tab_bar_h)
+                                {
                                     if let Some(tab) = session.workspace.active_tab() {
                                         if let Some(term) = tab.root.find_terminal(pane_id) {
                                             if let Some(url) = term.url_at(row, col) {
@@ -1105,12 +1278,16 @@ impl ApplicationHandler for App {
                             session.is_mouse_down = true;
 
                             // Click inside Terminal Pane
-                            if let Some((pane_id, row, col)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
+                            if let Some((pane_id, row, col)) =
+                                session.get_pane_and_cell_at(mx, my, tab_bar_h)
+                            {
                                 if let Some(tab) = session.workspace.active_tab_mut() {
                                     tab.active_pane_id = pane_id;
 
                                     let now = Instant::now();
-                                    if now.duration_since(session.last_click_time) < Duration::from_millis(400) {
+                                    if now.duration_since(session.last_click_time)
+                                        < Duration::from_millis(400)
+                                    {
                                         session.click_count += 1;
                                     } else {
                                         session.click_count = 1;
@@ -1124,7 +1301,8 @@ impl ApplicationHandler for App {
                                     };
 
                                     if let Some(terminal) = tab.active_terminal_mut() {
-                                        terminal.grid_mut().active_mut().selection = Some(Selection::new((row, col), (row, col), mode));
+                                        terminal.grid_mut().active_mut().selection =
+                                            Some(Selection::new((row, col), (row, col), mode));
                                         session.window.request_redraw();
                                     }
                                 }
@@ -1156,7 +1334,10 @@ impl ApplicationHandler for App {
                     if lines != 0 {
                         if let Some(tab) = session.workspace.active_tab_mut() {
                             if let Some(terminal) = tab.active_terminal_mut() {
-                                terminal.grid_mut().active_mut().scroll_display(lines as isize);
+                                terminal
+                                    .grid_mut()
+                                    .active_mut()
+                                    .scroll_display(lines as isize);
                                 session.window.request_redraw();
                             }
                         }
@@ -1168,17 +1349,23 @@ impl ApplicationHandler for App {
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     session.update_ime_position(tab_bar_h);
 
-                    let tabs: Vec<TabItem> = session.workspace.tabs.iter().enumerate().map(|(idx, tab)| {
-                        let title = if tab.is_zoomed() {
-                            format!("{} [Z]", tab.title)
-                        } else {
-                            tab.title.clone()
-                        };
-                        TabItem {
-                            title,
-                            is_active: idx == session.workspace.active_tab_idx,
-                        }
-                    }).collect();
+                    let tabs: Vec<TabItem> = session
+                        .workspace
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, tab)| {
+                            let title = if tab.is_zoomed() {
+                                format!("{} [Z]", tab.title)
+                            } else {
+                                tab.title.clone()
+                            };
+                            TabItem {
+                                title,
+                                is_active: idx == session.workspace.active_tab_idx,
+                            }
+                        })
+                        .collect();
 
                     let pane_rects = session.workspace.compute_active_pane_rects(
                         session.renderer.config.width as f32,
@@ -1202,7 +1389,11 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    if let Err(e) = session.renderer.render_workspace(&tabs, &render_panes, tab_bar_h) {
+                    if let Err(e) =
+                        session
+                            .renderer
+                            .render_workspace(&tabs, &render_panes, tab_bar_h)
+                    {
                         warn!("Render error on session {:?}: {:?}", window_id, e);
                     }
 
@@ -1267,7 +1458,9 @@ impl ApplicationHandler for App {
             if let Some(last) = self.last_resize_time {
                 if last.elapsed() > Duration::from_millis(400) {
                     self.pending_geometry_save = false;
-                    if let Ok(toml_str) = toml::to_string_pretty(&self.config_manager.current_config) {
+                    if let Ok(toml_str) =
+                        toml::to_string_pretty(&self.config_manager.current_config)
+                    {
                         let path = self.config_manager.path.clone();
                         std::thread::spawn(move || {
                             let _ = std::fs::write(&path, toml_str);

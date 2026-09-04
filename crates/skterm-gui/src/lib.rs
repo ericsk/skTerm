@@ -32,10 +32,22 @@ mod tests {
 
     #[test]
     fn test_key_encoding_enter_and_backspace() {
-        let enter = encode_key(&Key::Named(NamedKey::Enter), None, ElementState::Pressed, ModifiersState::empty(), false);
+        let enter = encode_key(
+            &Key::Named(NamedKey::Enter),
+            None,
+            ElementState::Pressed,
+            ModifiersState::empty(),
+            false,
+        );
         assert_eq!(enter, Some(vec![b'\r']));
 
-        let backspace = encode_key(&Key::Named(NamedKey::Backspace), None, ElementState::Pressed, ModifiersState::empty(), false);
+        let backspace = encode_key(
+            &Key::Named(NamedKey::Backspace),
+            None,
+            ElementState::Pressed,
+            ModifiersState::empty(),
+            false,
+        );
         assert_eq!(backspace, Some(vec![0x7f]));
     }
 
@@ -44,7 +56,13 @@ mod tests {
         let mut ctrl = ModifiersState::empty();
         ctrl.insert(ModifiersState::CONTROL);
 
-        let ctrl_c = encode_key(&Key::Character("c".into()), None, ElementState::Pressed, ctrl, false);
+        let ctrl_c = encode_key(
+            &Key::Character("c".into()),
+            None,
+            ElementState::Pressed,
+            ctrl,
+            false,
+        );
         assert_eq!(ctrl_c, Some(vec![0x03]));
     }
 
@@ -54,11 +72,23 @@ mod tests {
         shift.insert(ModifiersState::SHIFT);
 
         // Plain Tab -> 0x09
-        let tab = encode_key(&Key::Named(NamedKey::Tab), None, ElementState::Pressed, ModifiersState::empty(), false);
+        let tab = encode_key(
+            &Key::Named(NamedKey::Tab),
+            None,
+            ElementState::Pressed,
+            ModifiersState::empty(),
+            false,
+        );
         assert_eq!(tab, Some(vec![b'\t']));
 
         // Shift + Tab -> \x1b[Z (Backtab)
-        let backtab = encode_key(&Key::Named(NamedKey::Tab), None, ElementState::Pressed, shift, false);
+        let backtab = encode_key(
+            &Key::Named(NamedKey::Tab),
+            None,
+            ElementState::Pressed,
+            shift,
+            false,
+        );
         assert_eq!(backtab, Some(b"\x1b[Z".to_vec()));
     }
 
@@ -71,11 +101,23 @@ mod tests {
         ctrl.insert(ModifiersState::CONTROL);
 
         // Shift + Up -> \x1b[1;2A
-        let shift_up = encode_key(&Key::Named(NamedKey::ArrowUp), None, ElementState::Pressed, shift, false);
+        let shift_up = encode_key(
+            &Key::Named(NamedKey::ArrowUp),
+            None,
+            ElementState::Pressed,
+            shift,
+            false,
+        );
         assert_eq!(shift_up, Some(b"\x1b[1;2A".to_vec()));
 
         // Ctrl + Left -> \x1b[1;5D
-        let ctrl_left = encode_key(&Key::Named(NamedKey::ArrowLeft), None, ElementState::Pressed, ctrl, false);
+        let ctrl_left = encode_key(
+            &Key::Named(NamedKey::ArrowLeft),
+            None,
+            ElementState::Pressed,
+            ctrl,
+            false,
+        );
         assert_eq!(ctrl_left, Some(b"\x1b[1;5D".to_vec()));
     }
 
@@ -149,7 +191,10 @@ mod tests {
 
         assert_eq!(cfg.colors.theme, "dracula");
         assert_eq!(cfg.colors.foreground.as_deref(), Some("#f8f8f2"));
-        assert_eq!(cfg.colors.palette.as_ref().unwrap().red.as_deref(), Some("#ff5555"));
+        assert_eq!(
+            cfg.colors.palette.as_ref().unwrap().red.as_deref(),
+            Some("#ff5555")
+        );
 
         assert_eq!(cfg.cursor.shape, "underline");
         assert_eq!(cfg.cursor.blink_interval_ms, 400);
@@ -159,7 +204,10 @@ mod tests {
     fn test_parse_hex_color() {
         assert_eq!(parse_hex_color("#ffffff"), Some([1.0, 1.0, 1.0, 1.0]));
         assert_eq!(parse_hex_color("000000"), Some([0.0, 0.0, 0.0, 1.0]));
-        assert_eq!(parse_hex_color("#ff000080"), Some([1.0, 0.0, 0.0, 128.0 / 255.0]));
+        assert_eq!(
+            parse_hex_color("#ff000080"),
+            Some([1.0, 0.0, 0.0, 128.0 / 255.0])
+        );
         assert_eq!(parse_hex_color("invalid"), None);
     }
 
@@ -167,7 +215,10 @@ mod tests {
     fn test_default_config_template_validity() {
         let template = default_config_template();
         let cfg: Result<Config, _> = toml::from_str(template);
-        assert!(cfg.is_ok(), "default_config_template should parse as a valid Config");
+        assert!(
+            cfg.is_ok(),
+            "default_config_template should parse as a valid Config"
+        );
     }
 
     #[test]
@@ -200,7 +251,13 @@ mod tests {
         assert_eq!(ws.active_tab_idx, 1);
 
         // Test Pane Splitting in Active Tab
-        let split_res = ws.split_active_pane(SplitDirection::Horizontal, 24, 80, 1000, skterm_core::PtySpawnOptions::default());
+        let split_res = ws.split_active_pane(
+            SplitDirection::Horizontal,
+            24,
+            80,
+            1000,
+            skterm_core::PtySpawnOptions::default(),
+        );
         assert!(split_res.is_ok());
 
         let rects = ws.compute_active_pane_rects(800.0, 600.0, 32.0);
@@ -257,8 +314,14 @@ mod tests {
     #[test]
     fn test_pane_zoom_and_restore() {
         let mut ws = Workspace::new(24, 80).expect("Failed to create workspace");
-        ws.split_active_pane(SplitDirection::Horizontal, 24, 80, 1000, skterm_core::PtySpawnOptions::default())
-            .expect("Failed to split pane");
+        ws.split_active_pane(
+            SplitDirection::Horizontal,
+            24,
+            80,
+            1000,
+            skterm_core::PtySpawnOptions::default(),
+        )
+        .expect("Failed to split pane");
 
         let rects_split = ws.compute_active_pane_rects(800.0, 600.0, 32.0);
         assert_eq!(rects_split.len(), 2);
@@ -285,8 +348,14 @@ mod tests {
     #[test]
     fn test_splitter_drag_and_resize() {
         let mut ws = Workspace::new(24, 80).expect("Failed to create workspace");
-        ws.split_active_pane(SplitDirection::Horizontal, 24, 80, 1000, skterm_core::PtySpawnOptions::default())
-            .expect("Failed to split pane");
+        ws.split_active_pane(
+            SplitDirection::Horizontal,
+            24,
+            80,
+            1000,
+            skterm_core::PtySpawnOptions::default(),
+        )
+        .expect("Failed to split pane");
 
         let tab = ws.active_tab().unwrap();
         let bounds = Rect::new(0.0, 32.0, 800.0, 568.0);

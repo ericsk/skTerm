@@ -8,9 +8,9 @@ use std::sync::Arc;
 use tracing::info;
 use wgpu::{
     Backends, CompositeAlphaMode, Device, DeviceDescriptor, Extent3d, Features, Instance,
-    InstanceDescriptor, Limits, Origin3d, PowerPreference, PresentMode, Queue, RequestAdapterOptions,
-    Surface, SurfaceConfiguration, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
-    TextureDimension, TextureFormat, TextureUsages,
+    InstanceDescriptor, Limits, Origin3d, PowerPreference, PresentMode, Queue,
+    RequestAdapterOptions, Surface, SurfaceConfiguration, TexelCopyBufferLayout,
+    TexelCopyTextureInfo, TextureAspect, TextureDimension, TextureFormat, TextureUsages,
 };
 use winit::window::Window;
 
@@ -283,7 +283,12 @@ impl TermRenderer {
         panes: &[PaneRenderItem],
         tab_bar_h: f32,
     ) -> anyhow::Result<()> {
-        self.render_workspace_with_overlay(tabs, panes, tab_bar_h, None::<fn(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration)>)
+        self.render_workspace_with_overlay(
+            tabs,
+            panes,
+            tab_bar_h,
+            None::<fn(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration)>,
+        )
     }
 
     /// Render workspace with optional custom overlay (e.g. egui UI).
@@ -355,12 +360,17 @@ impl TermRenderer {
             });
 
             // 2.2 Calculate Tab Capsule Geometry
-            let start_x = if cfg!(target_os = "macos") { 78.0 * scale } else { 8.0 * scale };
+            let start_x = if cfg!(target_os = "macos") {
+                78.0 * scale
+            } else {
+                8.0 * scale
+            };
             let plus_btn_w = 24.0 * scale;
             let tab_gap = 4.0 * scale;
             let avail_w = (screen_w - start_x - plus_btn_w - 16.0 * scale).max(80.0);
             let total_gaps = (tabs.len().saturating_sub(1) as f32) * tab_gap;
-            let tab_w = ((avail_w - total_gaps) / tabs.len() as f32).clamp(75.0 * scale, 190.0 * scale);
+            let tab_w =
+                ((avail_w - total_gaps) / tabs.len() as f32).clamp(75.0 * scale, 190.0 * scale);
             let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);
             let tab_y = (tab_bar_h - tab_h) / 2.0;
 
@@ -388,7 +398,12 @@ impl TermRenderer {
                     });
                     // Active Blue Indicator line at bottom of capsule (#0A84FF)
                     bg_instances.push(BgInstance {
-                        rect: [tab_x + 3.0 * scale, tab_y + tab_h - 2.0, tab_w - 6.0 * scale, 2.0],
+                        rect: [
+                            tab_x + 3.0 * scale,
+                            tab_y + tab_h - 2.0,
+                            tab_w - 6.0 * scale,
+                            2.0,
+                        ],
                         color: [0.039, 0.518, 1.00, 1.0],
                     });
                 } else {
@@ -404,7 +419,10 @@ impl TermRenderer {
                 let close_x = tab_x + tab_w - close_size - 6.0 * scale;
                 let close_y = tab_y + (tab_h - close_size) / 2.0;
 
-                if let Some(glyph_info) = self.atlas.get_or_insert_glyph(&self.queue, '×', false, false) {
+                if let Some(glyph_info) =
+                    self.atlas
+                        .get_or_insert_glyph(&self.queue, '×', false, false)
+                {
                     if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
                         let draw_x = close_x + (close_size - glyph_info.size[0]) / 2.0;
                         let draw_y = close_y + (close_size - glyph_info.size[1]) / 2.0;
@@ -415,7 +433,12 @@ impl TermRenderer {
                         };
                         glyph_instances.push(GlyphInstance {
                             rect: [draw_x, draw_y, glyph_info.size[0], glyph_info.size[1]],
-                            uv: [glyph_info.uv_min[0], glyph_info.uv_min[1], glyph_info.uv_max[0], glyph_info.uv_max[1]],
+                            uv: [
+                                glyph_info.uv_min[0],
+                                glyph_info.uv_min[1],
+                                glyph_info.uv_max[0],
+                                glyph_info.uv_max[1],
+                            ],
                             color: close_color,
                         });
                     }
@@ -436,10 +459,13 @@ impl TermRenderer {
                     if gx + cell_w > text_start_x + max_text_w {
                         break;
                     }
-                    if let Some(glyph_info) = self.atlas.get_or_insert_glyph(&self.queue, c, false, false) {
+                    if let Some(glyph_info) =
+                        self.atlas.get_or_insert_glyph(&self.queue, c, false, false)
+                    {
                         if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
                             let draw_x = gx + glyph_info.offset[0];
-                            let draw_y = text_y + baseline - glyph_info.offset[1] - glyph_info.size[1];
+                            let draw_y =
+                                text_y + baseline - glyph_info.offset[1] - glyph_info.size[1];
                             glyph_instances.push(GlyphInstance {
                                 rect: [draw_x, draw_y, glyph_info.size[0], glyph_info.size[1]],
                                 uv: [
@@ -469,13 +495,21 @@ impl TermRenderer {
                 color: [0.22, 0.25, 0.33, 0.6],
             });
 
-            if let Some(glyph_info) = self.atlas.get_or_insert_glyph(&self.queue, '+', false, false) {
+            if let Some(glyph_info) = self
+                .atlas
+                .get_or_insert_glyph(&self.queue, '+', false, false)
+            {
                 if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
                     let draw_x = plus_btn_x + (plus_btn_w - glyph_info.size[0]) / 2.0;
                     let draw_y = plus_btn_y + (plus_btn_w - glyph_info.size[1]) / 2.0;
                     glyph_instances.push(GlyphInstance {
                         rect: [draw_x, draw_y, glyph_info.size[0], glyph_info.size[1]],
-                        uv: [glyph_info.uv_min[0], glyph_info.uv_min[1], glyph_info.uv_max[0], glyph_info.uv_max[1]],
+                        uv: [
+                            glyph_info.uv_min[0],
+                            glyph_info.uv_min[1],
+                            glyph_info.uv_max[0],
+                            glyph_info.uv_max[1],
+                        ],
                         color: [0.80, 0.84, 0.94, 0.9],
                     });
                 }
@@ -523,7 +557,8 @@ impl TermRenderer {
 
             // Sixel / Kitty Images in this pane
             for img in &active_buf.images {
-                if !self.image_cache.contains_key(&img.id) && img.width_px > 0 && img.height_px > 0 {
+                if !self.image_cache.contains_key(&img.id) && img.width_px > 0 && img.height_px > 0
+                {
                     let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                         label: Some(&format!("skterm_image_{}", img.id)),
                         size: Extent3d {
@@ -640,17 +675,31 @@ impl TermRenderer {
                             });
                         }
 
-                        if cell.c != ' ' && cell.c != '\0' && !cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                        if cell.c != ' '
+                            && cell.c != '\0'
+                            && !cell.flags.contains(CellFlags::WIDE_CHAR_SPACER)
+                        {
                             let is_bold = cell.flags.contains(CellFlags::BOLD);
                             let is_italic = cell.flags.contains(CellFlags::ITALIC);
 
-                            if let Some(glyph_info) = self.atlas.get_or_insert_glyph(&self.queue, cell.c, is_bold, is_italic) {
+                            if let Some(glyph_info) = self.atlas.get_or_insert_glyph(
+                                &self.queue,
+                                cell.c,
+                                is_bold,
+                                is_italic,
+                            ) {
                                 if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
                                     let glyph_x = x + glyph_info.offset[0];
-                                    let glyph_y = y + baseline - glyph_info.offset[1] - glyph_info.size[1];
+                                    let glyph_y =
+                                        y + baseline - glyph_info.offset[1] - glyph_info.size[1];
 
                                     glyph_instances.push(GlyphInstance {
-                                        rect: [glyph_x, glyph_y, glyph_info.size[0], glyph_info.size[1]],
+                                        rect: [
+                                            glyph_x,
+                                            glyph_y,
+                                            glyph_info.size[0],
+                                            glyph_info.size[1],
+                                        ],
                                         uv: [
                                             glyph_info.uv_min[0],
                                             glyph_info.uv_min[1],
@@ -675,7 +724,12 @@ impl TermRenderer {
                     let (cx, cy, cw, ch) = match active_buf.cursor.shape {
                         CursorShape::Block => (cur_x, cur_y, cell_w, cell_h),
                         CursorShape::Beam => (cur_x, cur_y, 2.0 * self.scale_factor, cell_h),
-                        CursorShape::Underline => (cur_x, cur_y + cell_h - 2.0 * self.scale_factor, cell_w, 2.0 * self.scale_factor),
+                        CursorShape::Underline => (
+                            cur_x,
+                            cur_y + cell_h - 2.0 * self.scale_factor,
+                            cell_w,
+                            2.0 * self.scale_factor,
+                        ),
                     };
 
                     bg_instances.push(BgInstance {

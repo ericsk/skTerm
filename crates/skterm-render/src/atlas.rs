@@ -118,13 +118,14 @@ impl GlyphAtlas {
         });
 
         // Load configured font chain
-        let (regular_font, bold_font, italic_font, fallback_fonts) = if let Some(data) = custom_font_data {
-            let font = Font::from_bytes(data, FontSettings::default())
-                .map_err(|e| anyhow::anyhow!("Failed to parse custom font: {}", e))?;
-            (font, None, None, Vec::new())
-        } else {
-            load_configured_font_chain(font_family, fallback_families)
-        };
+        let (regular_font, bold_font, italic_font, fallback_fonts) =
+            if let Some(data) = custom_font_data {
+                let font = Font::from_bytes(data, FontSettings::default())
+                    .map_err(|e| anyhow::anyhow!("Failed to parse custom font: {}", e))?;
+                (font, None, None, Vec::new())
+            } else {
+                load_configured_font_chain(font_family, fallback_families)
+            };
 
         // Compute metrics for cell dimensions
         let regular_metrics = regular_font.metrics('M', font_size);
@@ -139,7 +140,11 @@ impl GlyphAtlas {
 
         info!(
             "Font Engine Loaded: family='{}', size={}, cell_w={}, cell_h={}, fallbacks_count={}",
-            font_family, font_size, cell_width, cell_height, fallback_fonts.len()
+            font_family,
+            font_size,
+            cell_width,
+            cell_height,
+            fallback_fonts.len()
         );
 
         Ok(Self {
@@ -342,7 +347,10 @@ impl GlyphAtlas {
 }
 
 fn clean_name(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
 }
 
 /// Search user and system font directories for a font family name.

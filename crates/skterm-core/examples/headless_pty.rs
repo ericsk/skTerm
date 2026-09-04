@@ -31,7 +31,9 @@ fn main() -> anyhow::Result<()> {
     println!("------------------------------------------------------------");
 
     println!("Sending command: 'echo \"\\033[31;1mRed Bold Text\\033[0m \\033[38;2;0;255;128mTrueColor Text\\033[0m\"'...");
-    term.write_to_pty(b"echo \"\x1b[31;1mRed Bold Text\x1b[0m \x1b[38;2;0;255;128mTrueColor Text\x1b[0m\"\n")?;
+    term.write_to_pty(
+        b"echo \"\x1b[31;1mRed Bold Text\x1b[0m \x1b[38;2;0;255;128mTrueColor Text\x1b[0m\"\n",
+    )?;
 
     thread::sleep(Duration::from_millis(300));
     term.poll_pty();
@@ -45,6 +47,9 @@ fn main() -> anyhow::Result<()> {
     }
     println!("------------------------------------------------------------");
 
-    println!("Demo completed successfully! Child shell is alive: {}", term.is_alive());
+    println!(
+        "Demo completed successfully! Child shell is alive: {}",
+        term.is_alive()
+    );
     Ok(())
 }

@@ -267,7 +267,10 @@ impl Perform for TerminalState {
                     z_index: 0,
                 };
 
-                info!("Decoded Sixel image: {}x{} px (cells: {}x{})", w_px, h_px, w_cells, h_cells);
+                info!(
+                    "Decoded Sixel image: {}x{} px (cells: {}x{})",
+                    w_px, h_px, w_cells, h_cells
+                );
                 self.grid.active_mut().add_image(img);
 
                 // Advance cursor down below the image
@@ -307,8 +310,8 @@ impl Perform for TerminalState {
             _ => {
                 // Check Kitty Graphics via OSC or APC
                 if let Ok(cmd) = std::str::from_utf8(params[0]) {
-                    if cmd.starts_with('G') {
-                        if let Some((w, h, rgba, z)) = self.kitty_parser.parse_command(&cmd[1..]) {
+                    if let Some(cmd_args) = cmd.strip_prefix('G') {
+                        if let Some((w, h, rgba, z)) = self.kitty_parser.parse_command(cmd_args) {
                             let id = self.grid.next_image_id;
                             self.grid.next_image_id += 1;
 
@@ -338,13 +341,7 @@ impl Perform for TerminalState {
         }
     }
 
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let is_private = intermediates.first() == Some(&b'?');
         let mut first_param = 0;
         if let Some(param) = params.iter().next() {
@@ -361,46 +358,82 @@ impl Perform for TerminalState {
                 let mut iter = params.iter();
                 if let Some(p) = iter.next() {
                     if let Some(&r) = p.first() {
-                        if r > 0 { row = r; }
+                        if r > 0 {
+                            row = r;
+                        }
                     }
                 }
                 if let Some(p) = iter.next() {
                     if let Some(&c) = p.first() {
-                        if c > 0 { col = c; }
+                        if c > 0 {
+                            col = c;
+                        }
                     }
                 }
-                self.grid.active_mut().move_cursor((row as usize) - 1, (col as usize) - 1);
+                self.grid
+                    .active_mut()
+                    .move_cursor((row as usize) - 1, (col as usize) - 1);
             }
-            'A' => self.grid.active_mut().move_up((first_param as usize).max(1)),
-            'B' => self.grid.active_mut().move_down((first_param as usize).max(1)),
-            'C' => self.grid.active_mut().move_forward((first_param as usize).max(1)),
-            'D' => self.grid.active_mut().move_backward((first_param as usize).max(1)),
+            'A' => self
+                .grid
+                .active_mut()
+                .move_up((first_param as usize).max(1)),
+            'B' => self
+                .grid
+                .active_mut()
+                .move_down((first_param as usize).max(1)),
+            'C' => self
+                .grid
+                .active_mut()
+                .move_forward((first_param as usize).max(1)),
+            'D' => self
+                .grid
+                .active_mut()
+                .move_backward((first_param as usize).max(1)),
             'G' => {
                 let col = (first_param as usize).max(1) - 1;
-                self.grid.active_mut().cursor.col = col.min(self.grid.active().cols.saturating_sub(1));
+                self.grid.active_mut().cursor.col =
+                    col.min(self.grid.active().cols.saturating_sub(1));
                 self.grid.active_mut().cursor.pending_wrap = false;
             }
             'd' => {
                 let row = (first_param as usize).max(1) - 1;
-                self.grid.active_mut().cursor.row = row.min(self.grid.active().rows.saturating_sub(1));
+                self.grid.active_mut().cursor.row =
+                    row.min(self.grid.active().rows.saturating_sub(1));
                 self.grid.active_mut().cursor.pending_wrap = false;
             }
-            'J' => self.grid.active_mut().erase_in_display(first_param as usize, self.bg),
-            'K' => self.grid.active_mut().erase_in_line(first_param as usize, self.bg),
-            'S' => self.grid.active_mut().scroll_up((first_param as usize).max(1)),
-            'T' => self.grid.active_mut().scroll_down((first_param as usize).max(1)),
+            'J' => self
+                .grid
+                .active_mut()
+                .erase_in_display(first_param as usize, self.bg),
+            'K' => self
+                .grid
+                .active_mut()
+                .erase_in_line(first_param as usize, self.bg),
+            'S' => self
+                .grid
+                .active_mut()
+                .scroll_up((first_param as usize).max(1)),
+            'T' => self
+                .grid
+                .active_mut()
+                .scroll_down((first_param as usize).max(1)),
             'r' => {
                 let mut top = 1;
                 let mut bottom = self.grid.active().rows;
                 let mut iter = params.iter();
                 if let Some(p) = iter.next() {
                     if let Some(&t) = p.first() {
-                        if t > 0 { top = t as usize; }
+                        if t > 0 {
+                            top = t as usize;
+                        }
                     }
                 }
                 if let Some(p) = iter.next() {
                     if let Some(&b) = p.first() {
-                        if b > 0 { bottom = b as usize; }
+                        if b > 0 {
+                            bottom = b as usize;
+                        }
                     }
                 }
                 if top < bottom && bottom <= self.grid.active().rows {

@@ -33,13 +33,25 @@ fn test_cjk_rasterize() {
             if let Ok(font) = Font::from_bytes(bytes.as_slice(), FontSettings::default()) {
                 let (metrics, bitmap) = font.rasterize('A', 14.0);
                 if metrics.width > 0 && !bitmap.is_empty() {
-                    println!("SUCCESS: Font {}: 'A' w={}, h={}, len={}", path, metrics.width, metrics.height, bitmap.len());
+                    println!(
+                        "SUCCESS: Font {}: 'A' w={}, h={}, len={}",
+                        path,
+                        metrics.width,
+                        metrics.height,
+                        bitmap.len()
+                    );
                     tested_any_font = true;
                 }
 
                 let (cjk_metrics, cjk_bitmap) = font.rasterize('中', 14.0);
                 if cjk_metrics.width > 0 && !cjk_bitmap.is_empty() {
-                    println!("SUCCESS: Font {}: '中' w={}, h={}, len={}", path, cjk_metrics.width, cjk_metrics.height, cjk_bitmap.len());
+                    println!(
+                        "SUCCESS: Font {}: '中' w={}, h={}, len={}",
+                        path,
+                        cjk_metrics.width,
+                        cjk_metrics.height,
+                        cjk_bitmap.len()
+                    );
                 }
                 break;
             }

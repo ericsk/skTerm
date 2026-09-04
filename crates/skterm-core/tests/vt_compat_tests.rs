@@ -62,7 +62,11 @@ fn test_vt_erase_operations() {
 
     // EL 0: Erase from cursor to end of line \x1b[K
     term.feed_bytes(b"\x1b[3;10H\x1b[0K");
-    let row2: String = term.grid().active().grid[2].cells.iter().map(|c| c.c).collect();
+    let row2: String = term.grid().active().grid[2]
+        .cells
+        .iter()
+        .map(|c| c.c)
+        .collect();
     assert_eq!(&row2[0..9], "XXXXXXXXX");
     assert_eq!(&row2[9..20], "           ");
 
@@ -103,9 +107,9 @@ fn test_vt_dec_private_modes() {
 
     // DECTCEM: Hide / Show Cursor \x1b[?25l / \x1b[?25h
     term.feed_bytes(b"\x1b[?25l");
-    assert_eq!(term.grid().active().cursor.visible, false);
+    assert!(!term.grid().active().cursor.visible);
     term.feed_bytes(b"\x1b[?25h");
-    assert_eq!(term.grid().active().cursor.visible, true);
+    assert!(term.grid().active().cursor.visible);
 
     // Bracketed Paste: \x1b[?2004h / \x1b[?2004l
     term.feed_bytes(b"\x1b[?2004h");
@@ -152,13 +156,13 @@ fn test_vt_zsh_prompt_sp_clear() {
     // Fill entire line 0 with 20 characters: 1 '%' + 19 spaces
     term.feed_bytes(b"%                   ");
     assert_eq!(term.grid().active().cursor.col, 19);
-    assert_eq!(term.grid().active().cursor.pending_wrap, true);
+    assert!(term.grid().active().cursor.pending_wrap);
 
     // Carriage Return (\r) should move col back to 0 and RESET pending_wrap to false
     term.feed_bytes(b"\r");
     assert_eq!(term.grid().active().cursor.col, 0);
     assert_eq!(term.grid().active().cursor.row, 0);
-    assert_eq!(term.grid().active().cursor.pending_wrap, false);
+    assert!(!term.grid().active().cursor.pending_wrap);
 
     // Erase current line (\x1b[K) and print prompt
     term.feed_bytes(b"\x1b[Kprompt$ ");

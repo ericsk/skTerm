@@ -200,14 +200,34 @@ impl PreferencesGui {
         cfg.window.tab_bar_style = self.tab_bar_style.clone();
 
         cfg.colors.theme = self.theme.clone();
-        cfg.colors.foreground = if self.fg_override.trim().is_empty() { None } else { Some(self.fg_override.trim().to_string()) };
-        cfg.colors.background = if self.bg_override.trim().is_empty() { None } else { Some(self.bg_override.trim().to_string()) };
-        cfg.colors.cursor = if self.cursor_override.trim().is_empty() { None } else { Some(self.cursor_override.trim().to_string()) };
-        cfg.colors.selection = if self.selection_override.trim().is_empty() { None } else { Some(self.selection_override.trim().to_string()) };
+        cfg.colors.foreground = if self.fg_override.trim().is_empty() {
+            None
+        } else {
+            Some(self.fg_override.trim().to_string())
+        };
+        cfg.colors.background = if self.bg_override.trim().is_empty() {
+            None
+        } else {
+            Some(self.bg_override.trim().to_string())
+        };
+        cfg.colors.cursor = if self.cursor_override.trim().is_empty() {
+            None
+        } else {
+            Some(self.cursor_override.trim().to_string())
+        };
+        cfg.colors.selection = if self.selection_override.trim().is_empty() {
+            None
+        } else {
+            Some(self.selection_override.trim().to_string())
+        };
 
         cfg.terminal.term = self.term.clone();
         if self.custom_shell_enabled && !self.shell_program.trim().is_empty() {
-            let args = self.shell_args.split_whitespace().map(|s| s.to_string()).collect();
+            let args = self
+                .shell_args
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
             cfg.terminal.shell = Some(ShellConfig {
                 program: self.shell_program.trim().to_string(),
                 args,
@@ -215,7 +235,11 @@ impl PreferencesGui {
         } else {
             cfg.terminal.shell = None;
         }
-        cfg.terminal.working_directory = if self.working_directory.trim().is_empty() { None } else { Some(self.working_directory.trim().to_string()) };
+        cfg.terminal.working_directory = if self.working_directory.trim().is_empty() {
+            None
+        } else {
+            Some(self.working_directory.trim().to_string())
+        };
         cfg.terminal.scrollback_lines = self.scrollback_lines;
         cfg.terminal.option_as_alt = self.option_as_alt.clone();
         cfg.terminal.bell = self.bell.clone();
@@ -243,61 +267,77 @@ impl PreferencesGui {
 
         let mut is_open = self.is_open;
 
-        Window::new(RichText::new("⚙ skTerm 偏好設定 (Preferences)").heading().color(Color32::WHITE))
-            .open(&mut is_open)
-            .collapsible(false)
-            .resizable(true)
-            .default_size(Vec2::new(580.0, 480.0))
-            .min_size(Vec2::new(480.0, 380.0))
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.active_tab, PreferencesTab::Appearance, " 外觀與字型 ");
-                    ui.selectable_value(&mut self.active_tab, PreferencesTab::Colors, " 色彩與主題 ");
-                    ui.selectable_value(&mut self.active_tab, PreferencesTab::Terminal, " 終端與 Shell ");
-                    ui.selectable_value(&mut self.active_tab, PreferencesTab::Cursor, " 游標與動態 ");
+        Window::new(
+            RichText::new("⚙ skTerm 偏好設定 (Preferences)")
+                .heading()
+                .color(Color32::WHITE),
+        )
+        .open(&mut is_open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size(Vec2::new(580.0, 480.0))
+        .min_size(Vec2::new(480.0, 380.0))
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    PreferencesTab::Appearance,
+                    " 外觀與字型 ",
+                );
+                ui.selectable_value(&mut self.active_tab, PreferencesTab::Colors, " 色彩與主題 ");
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    PreferencesTab::Terminal,
+                    " 終端與 Shell ",
+                );
+                ui.selectable_value(&mut self.active_tab, PreferencesTab::Cursor, " 游標與動態 ");
+            });
+
+            ui.separator();
+
+            egui::ScrollArea::vertical()
+                .max_height(340.0)
+                .show(ui, |ui| match self.active_tab {
+                    PreferencesTab::Appearance => self.render_appearance_tab(ui),
+                    PreferencesTab::Colors => self.render_colors_tab(ui),
+                    PreferencesTab::Terminal => self.render_terminal_tab(ui),
+                    PreferencesTab::Cursor => self.render_cursor_tab(ui),
                 });
 
-                ui.separator();
+            ui.separator();
 
-                egui::ScrollArea::vertical()
-                    .max_height(340.0)
-                    .show(ui, |ui| {
-                        match self.active_tab {
-                            PreferencesTab::Appearance => self.render_appearance_tab(ui),
-                            PreferencesTab::Colors => self.render_colors_tab(ui),
-                            PreferencesTab::Terminal => self.render_terminal_tab(ui),
-                            PreferencesTab::Cursor => self.render_cursor_tab(ui),
-                        }
-                    });
-
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new("💾 儲存並套用 (Save & Apply)").strong()).clicked() {
-                        let new_cfg = self.to_config(&config_manager.current_config);
-                        if let Ok(toml_str) = toml::to_string_pretty(&new_cfg) {
-                            let _ = fs::write(&config_manager.path, toml_str);
-                            config_manager.current_config = new_cfg;
-                            info!("Saved preferences directly from GUI to {:?}", config_manager.path);
-                        }
-                        self.is_open = false;
+            ui.horizontal(|ui| {
+                if ui
+                    .button(RichText::new("💾 儲存並套用 (Save & Apply)").strong())
+                    .clicked()
+                {
+                    let new_cfg = self.to_config(&config_manager.current_config);
+                    if let Ok(toml_str) = toml::to_string_pretty(&new_cfg) {
+                        let _ = fs::write(&config_manager.path, toml_str);
+                        config_manager.current_config = new_cfg;
+                        info!(
+                            "Saved preferences directly from GUI to {:?}",
+                            config_manager.path
+                        );
                     }
+                    self.is_open = false;
+                }
 
-                    if ui.button("❌ 取消 (Cancel)").clicked() {
-                        self.is_open = false;
+                if ui.button("❌ 取消 (Cancel)").clicked() {
+                    self.is_open = false;
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("📝 開啟 config.toml").clicked() {
+                        config_manager.open_in_editor();
                     }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("📝 開啟 config.toml").clicked() {
-                            config_manager.open_in_editor();
-                        }
-                        if ui.button("🔄 重設為預設值").clicked() {
-                            self.load_from_config(&Config::default());
-                        }
-                    });
+                    if ui.button("🔄 重設為預設值").clicked() {
+                        self.load_from_config(&Config::default());
+                    }
                 });
             });
+        });
 
         self.is_open = is_open;
     }
@@ -359,79 +399,111 @@ impl PreferencesGui {
                 },
             );
 
-            b.row("自訂字型名稱", Some("直接輸入字型家族名稱"), |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.font_family).desired_width(160.0));
-            });
+            b.row(
+                "自訂字型名稱",
+                Some("直接輸入字型家族名稱"),
+                |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.font_family).desired_width(160.0));
+                },
+            );
 
             b.row("字型大小 (Size pt)", Some("以 pt 為單位"), |ui| {
                 ui.add(egui::Slider::new(&mut self.font_size, 9.0..=32.0).suffix(" pt"));
             });
 
-            b.row("行高倍率 (Line Height)", Some("1.0 為緊湊，1.2 為標準舒適"), |ui| {
-                ui.add(egui::Slider::new(&mut self.line_height, 1.0..=2.0).step_by(0.05));
-            });
-        });
-
-        crate::preferences_window::render_inset_card(ui, "視窗幾何與邊距 (Window & Layout)", |b| {
             b.row(
-                "預設終端大小",
-                Some("啟動時初始網格行列數 (列 × 行)"),
+                "行高倍率 (Line Height)",
+                Some("1.0 為緊湊，1.2 為標準舒適"),
                 |ui| {
-                    ui.add(egui::DragValue::new(&mut self.columns).range(40..=240).prefix("W: "));
-                    ui.label("×");
-                    ui.add(egui::DragValue::new(&mut self.rows).range(10..=100).prefix("H: "));
-                },
-            );
-
-            b.row(
-                "內距 (Padding X / Y)",
-                Some("文字四周保留空白像素"),
-                |ui| {
-                    ui.add(egui::Slider::new(&mut self.padding_x, 0.0..=40.0).suffix(" pt").prefix("X: "));
-                    ui.add(egui::Slider::new(&mut self.padding_y, 0.0..=40.0).suffix(" pt").prefix("Y: "));
-                },
-            );
-
-            b.row(
-                "背景不透明度 (Opacity)",
-                Some("1.0 為完全不透明，搭配毛玻璃"),
-                |ui| {
-                    ui.add(egui::Slider::new(&mut self.opacity, 0.2..=1.0).step_by(0.05));
-                },
-            );
-
-            b.row(
-                "啟動模式 (Startup Mode)",
-                Some("應用程式啟動時視窗狀態"),
-                |ui| {
-                    let mut cur = self.startup_mode.as_str();
-                    let opts = [
-                        ("normal", "一般視窗"),
-                        ("maximized", "最大化"),
-                        ("fullscreen", "全螢幕"),
-                    ];
-                    if crate::preferences_window::render_macos_segmented_control(ui, &mut cur, &opts) {
-                        self.startup_mode = cur.to_string();
-                    }
-                },
-            );
-
-            b.row(
-                "分頁列顯示 (Tab Bar)",
-                Some("控制多分頁標籤列何時出現"),
-                |ui| {
-                    let mut cur = self.tab_bar_style.as_str();
-                    let opts = [
-                        ("auto", "自動隱藏"),
-                        ("always", "恆常顯示"),
-                        ("never", "永不顯示"),
-                    ];
-                    if crate::preferences_window::render_macos_segmented_control(ui, &mut cur, &opts) {
-                        self.tab_bar_style = cur.to_string();
-                    }
+                    ui.add(egui::Slider::new(&mut self.line_height, 1.0..=2.0).step_by(0.05));
                 },
             );
         });
+
+        crate::preferences_window::render_inset_card(
+            ui,
+            "視窗幾何與邊距 (Window & Layout)",
+            |b| {
+                b.row(
+                    "預設終端大小",
+                    Some("啟動時初始網格行列數 (列 × 行)"),
+                    |ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.columns)
+                                .range(40..=240)
+                                .prefix("W: "),
+                        );
+                        ui.label("×");
+                        ui.add(
+                            egui::DragValue::new(&mut self.rows)
+                                .range(10..=100)
+                                .prefix("H: "),
+                        );
+                    },
+                );
+
+                b.row(
+                    "內距 (Padding X / Y)",
+                    Some("文字四周保留空白像素"),
+                    |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.padding_x, 0.0..=40.0)
+                                .suffix(" pt")
+                                .prefix("X: "),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.padding_y, 0.0..=40.0)
+                                .suffix(" pt")
+                                .prefix("Y: "),
+                        );
+                    },
+                );
+
+                b.row(
+                    "背景不透明度 (Opacity)",
+                    Some("1.0 為完全不透明，搭配毛玻璃"),
+                    |ui| {
+                        ui.add(egui::Slider::new(&mut self.opacity, 0.2..=1.0).step_by(0.05));
+                    },
+                );
+
+                b.row(
+                    "啟動模式 (Startup Mode)",
+                    Some("應用程式啟動時視窗狀態"),
+                    |ui| {
+                        let mut cur = self.startup_mode.as_str();
+                        let opts = [
+                            ("normal", "一般視窗"),
+                            ("maximized", "最大化"),
+                            ("fullscreen", "全螢幕"),
+                        ];
+                        if crate::preferences_window::render_macos_segmented_control(
+                            ui, &mut cur, &opts,
+                        ) {
+                            self.startup_mode = cur.to_string();
+                        }
+                    },
+                );
+
+                b.row(
+                    "分頁列顯示 (Tab Bar)",
+                    Some("控制多分頁標籤列何時出現"),
+                    |ui| {
+                        let mut cur = self.tab_bar_style.as_str();
+                        let opts = [
+                            ("auto", "自動隱藏"),
+                            ("always", "恆常顯示"),
+                            ("never", "永不顯示"),
+                        ];
+                        if crate::preferences_window::render_macos_segmented_control(
+                            ui, &mut cur, &opts,
+                        ) {
+                            self.tab_bar_style = cur.to_string();
+                        }
+                    },
+                );
+            },
+        );
     }
 
     fn render_colors_tab(&mut self, ui: &mut Ui) {
@@ -552,131 +624,201 @@ impl PreferencesGui {
             );
         });
 
-        crate::preferences_window::render_inset_card(ui, "自訂色彩覆蓋 (Color Overrides)", |b| {
-            b.row("前景文字色 (Foreground)", Some("留空則繼承主題預設值"), |ui| {
-                crate::preferences_window::render_color_row(ui, "", &mut self.fg_override);
-            });
-            b.row("背景底色 (Background)", Some("留空則繼承主題預設值"), |ui| {
-                crate::preferences_window::render_color_row(ui, "", &mut self.bg_override);
-            });
-            b.row("游標顏色 (Cursor)", Some("留空則繼承主題預設值"), |ui| {
-                crate::preferences_window::render_color_row(ui, "", &mut self.cursor_override);
-            });
-            b.row("選取文字底色 (Selection)", Some("留空則繼承主題預設值"), |ui| {
-                crate::preferences_window::render_color_row(ui, "", &mut self.selection_override);
-            });
-        });
+        crate::preferences_window::render_inset_card(
+            ui,
+            "自訂色彩覆蓋 (Color Overrides)",
+            |b| {
+                b.row(
+                    "前景文字色 (Foreground)",
+                    Some("留空則繼承主題預設值"),
+                    |ui| {
+                        crate::preferences_window::render_color_row(ui, "", &mut self.fg_override);
+                    },
+                );
+                b.row(
+                    "背景底色 (Background)",
+                    Some("留空則繼承主題預設值"),
+                    |ui| {
+                        crate::preferences_window::render_color_row(ui, "", &mut self.bg_override);
+                    },
+                );
+                b.row(
+                    "游標顏色 (Cursor)",
+                    Some("留空則繼承主題預設值"),
+                    |ui| {
+                        crate::preferences_window::render_color_row(
+                            ui,
+                            "",
+                            &mut self.cursor_override,
+                        );
+                    },
+                );
+                b.row(
+                    "選取文字底色 (Selection)",
+                    Some("留空則繼承主題預設值"),
+                    |ui| {
+                        crate::preferences_window::render_color_row(
+                            ui,
+                            "",
+                            &mut self.selection_override,
+                        );
+                    },
+                );
+            },
+        );
     }
 
     fn render_terminal_tab(&mut self, ui: &mut Ui) {
-        crate::preferences_window::render_inset_card(ui, "模擬器與環境 (Terminal & Environment)", |b| {
-            b.row("TERM 變數", Some("環境變數 $TERM 預設值"), |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.term).desired_width(140.0));
-            });
-
-            b.row(
-                "指定自訂 Shell 程式",
-                Some("預設使用系統 $SHELL"),
-                |ui| {
-                    crate::preferences_window::render_macos_toggle_switch(ui, &mut self.custom_shell_enabled);
-                },
-            );
-
-            if self.custom_shell_enabled {
-                b.row("Shell 執行檔路徑", None, |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.shell_program).hint_text("/bin/zsh"));
+        crate::preferences_window::render_inset_card(
+            ui,
+            "模擬器與環境 (Terminal & Environment)",
+            |b| {
+                b.row("TERM 變數", Some("環境變數 $TERM 預設值"), |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.term).desired_width(140.0));
                 });
 
-                b.row("啟動參數 (Args)", None, |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.shell_args).hint_text("--login"));
-                });
-            }
+                b.row(
+                    "指定自訂 Shell 程式",
+                    Some("預設使用系統 $SHELL"),
+                    |ui| {
+                        crate::preferences_window::render_macos_toggle_switch(
+                            ui,
+                            &mut self.custom_shell_enabled,
+                        );
+                    },
+                );
 
-            b.row("初始工作目錄", Some("終端啟動預設路徑"), |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.working_directory).hint_text("預設使用者家目錄 (~/)"));
-            });
-        });
+                if self.custom_shell_enabled {
+                    b.row("Shell 執行檔路徑", None, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.shell_program)
+                                .hint_text("/bin/zsh"),
+                        );
+                    });
 
-        crate::preferences_window::render_inset_card(ui, "緩衝區與操作行為 (Buffer & Interaction)", |b| {
-            b.row(
-                "滾動歷史行數 (Scrollback)",
-                Some("保留向上捲動緩衝行數"),
-                |ui| {
-                    ui.add(egui::Slider::new(&mut self.scrollback_lines, 1000..=50000).step_by(1000.0));
-                },
-            );
+                    b.row("啟動參數 (Args)", None, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.shell_args).hint_text("--login"),
+                        );
+                    });
+                }
 
-            b.row(
-                "macOS Option 鍵 (Meta)",
-                Some("是否傳遞 Meta (Esc+) 序列"),
-                |ui| {
-                    let mut cur = self.option_as_alt.as_str();
-                    let opts = [
-                        ("both", "左右 Option 均作 Meta"),
-                        ("only_left", "僅左 Option"),
-                        ("only_right", "僅右 Option"),
-                        ("none", "不轉換"),
-                    ];
-                    if crate::preferences_window::render_macos_segmented_control(ui, &mut cur, &opts) {
-                        self.option_as_alt = cur.to_string();
-                    }
-                },
-            );
+                b.row(
+                    "初始工作目錄",
+                    Some("終端啟動預設路徑"),
+                    |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.working_directory)
+                                .hint_text("預設使用者家目錄 (~/)"),
+                        );
+                    },
+                );
+            },
+        );
 
-            b.row(
-                "終端鈴聲模式 (Bell)",
-                Some("遇警示訊號時回饋方式"),
-                |ui| {
-                    let mut cur = self.bell.as_str();
-                    let opts = [
-                        ("visual", "視覺閃爍"),
-                        ("sound", "系統聲音"),
-                        ("none", "靜音"),
-                    ];
-                    if crate::preferences_window::render_macos_segmented_control(ui, &mut cur, &opts) {
-                        self.bell = cur.to_string();
-                    }
-                },
-            );
-        });
+        crate::preferences_window::render_inset_card(
+            ui,
+            "緩衝區與操作行為 (Buffer & Interaction)",
+            |b| {
+                b.row(
+                    "滾動歷史行數 (Scrollback)",
+                    Some("保留向上捲動緩衝行數"),
+                    |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.scrollback_lines, 1000..=50000)
+                                .step_by(1000.0),
+                        );
+                    },
+                );
+
+                b.row(
+                    "macOS Option 鍵 (Meta)",
+                    Some("是否傳遞 Meta (Esc+) 序列"),
+                    |ui| {
+                        let mut cur = self.option_as_alt.as_str();
+                        let opts = [
+                            ("both", "左右 Option 均作 Meta"),
+                            ("only_left", "僅左 Option"),
+                            ("only_right", "僅右 Option"),
+                            ("none", "不轉換"),
+                        ];
+                        if crate::preferences_window::render_macos_segmented_control(
+                            ui, &mut cur, &opts,
+                        ) {
+                            self.option_as_alt = cur.to_string();
+                        }
+                    },
+                );
+
+                b.row(
+                    "終端鈴聲模式 (Bell)",
+                    Some("遇警示訊號時回饋方式"),
+                    |ui| {
+                        let mut cur = self.bell.as_str();
+                        let opts = [
+                            ("visual", "視覺閃爍"),
+                            ("sound", "系統聲音"),
+                            ("none", "靜音"),
+                        ];
+                        if crate::preferences_window::render_macos_segmented_control(
+                            ui, &mut cur, &opts,
+                        ) {
+                            self.bell = cur.to_string();
+                        }
+                    },
+                );
+            },
+        );
     }
 
     fn render_cursor_tab(&mut self, ui: &mut Ui) {
-        crate::preferences_window::render_inset_card(ui, "游標樣式與動態 (Cursor Style)", |b| {
-            b.row(
-                "游標形狀 (Shape)",
-                Some("終端游標幾何外觀"),
-                |ui| {
-                    let mut cur = self.cursor_shape.as_str();
-                    let opts = [
-                        ("block", "方塊 (Block █)"),
-                        ("beam", "直條 (Beam ❘)"),
-                        ("underline", "底線 (Underline _)"),
-                    ];
-                    if crate::preferences_window::render_macos_segmented_control(ui, &mut cur, &opts) {
-                        self.cursor_shape = cur.to_string();
-                    }
-                },
-            );
-
-            b.row(
-                "游標閃爍 (Blink)",
-                Some("開啟游標平滑呼吸動畫"),
-                |ui| {
-                    crate::preferences_window::render_macos_toggle_switch(ui, &mut self.cursor_blink);
-                },
-            );
-
-            if self.cursor_blink {
+        crate::preferences_window::render_inset_card(
+            ui,
+            "游標樣式與動態 (Cursor Style)",
+            |b| {
                 b.row(
-                    "閃爍頻率 (Interval)",
-                    Some("游標閃爍頻率毫秒"),
+                    "游標形狀 (Shape)",
+                    Some("終端游標幾何外觀"),
                     |ui| {
-                        ui.add(egui::Slider::new(&mut self.blink_interval_ms, 200..=1000).suffix(" ms"));
+                        let mut cur = self.cursor_shape.as_str();
+                        let opts = [
+                            ("block", "方塊 (Block █)"),
+                            ("beam", "直條 (Beam ❘)"),
+                            ("underline", "底線 (Underline _)"),
+                        ];
+                        if crate::preferences_window::render_macos_segmented_control(
+                            ui, &mut cur, &opts,
+                        ) {
+                            self.cursor_shape = cur.to_string();
+                        }
                     },
                 );
-            }
-        });
+
+                b.row(
+                    "游標閃爍 (Blink)",
+                    Some("開啟游標平滑呼吸動畫"),
+                    |ui| {
+                        crate::preferences_window::render_macos_toggle_switch(
+                            ui,
+                            &mut self.cursor_blink,
+                        );
+                    },
+                );
+
+                if self.cursor_blink {
+                    b.row(
+                        "閃爍頻率 (Interval)",
+                        Some("游標閃爍頻率毫秒"),
+                        |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut self.blink_interval_ms, 200..=1000)
+                                    .suffix(" ms"),
+                            );
+                        },
+                    );
+                }
+            },
+        );
     }
 }
 
@@ -698,23 +840,31 @@ pub fn render_egui_overlay(
         label: Some("egui_command_encoder"),
     });
 
-    egui_renderer.update_buffers(device, queue, &mut encoder, clipped_primitives, screen_descriptor);
+    egui_renderer.update_buffers(
+        device,
+        queue,
+        &mut encoder,
+        clipped_primitives,
+        screen_descriptor,
+    );
 
     {
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("egui_render_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        }).forget_lifetime();
+        let mut render_pass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui_render_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            })
+            .forget_lifetime();
 
         egui_renderer.render(&mut render_pass, clipped_primitives, screen_descriptor);
     }

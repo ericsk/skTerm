@@ -18,7 +18,12 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     pub fn contains(&self, px: f32, py: f32) -> bool {
@@ -44,6 +49,7 @@ pub struct SplitterBar {
 }
 
 /// Node in the Binary Space Partitioning (BSP) pane tree.
+#[allow(clippy::large_enum_variant)]
 pub enum PaneNode {
     Leaf {
         id: PaneId,
@@ -68,9 +74,9 @@ impl PaneNode {
                     None
                 }
             }
-            PaneNode::Split { first, second, .. } => {
-                first.find_terminal(target_id).or_else(|| second.find_terminal(target_id))
-            }
+            PaneNode::Split { first, second, .. } => first
+                .find_terminal(target_id)
+                .or_else(|| second.find_terminal(target_id)),
         }
     }
 
@@ -141,10 +147,7 @@ impl PaneNode {
             PaneNode::Leaf { id, terminal } => {
                 if *id == target_id {
                     let old_id = *id;
-                    let old_terminal = std::mem::replace(
-                        terminal,
-                        Terminal::new_headless(1, 1, 0),
-                    );
+                    let old_terminal = std::mem::replace(terminal, Terminal::new_headless(1, 1, 0));
 
                     *self = PaneNode::Split {
                         id: split_id,
@@ -165,7 +168,13 @@ impl PaneNode {
                 }
             }
             PaneNode::Split { first, second, .. } => {
-                if first.split_pane(target_id, direction, new_id, new_terminal.clone_dummy(), split_id) {
+                if first.split_pane(
+                    target_id,
+                    direction,
+                    new_id,
+                    new_terminal.clone_dummy(),
+                    split_id,
+                ) {
                     true
                 } else {
                     second.split_pane(target_id, direction, new_id, new_terminal, split_id)
@@ -276,7 +285,14 @@ impl PaneNode {
     }
 
     pub fn compute_splitters(&self, rect: Rect, out: &mut Vec<SplitterBar>) {
-        if let PaneNode::Split { id, direction, ratio, first, second } = self {
+        if let PaneNode::Split {
+            id,
+            direction,
+            ratio,
+            first,
+            second,
+        } = self
+        {
             let sep_size = 2.0;
             match direction {
                 SplitDirection::Horizontal => {
@@ -318,19 +334,32 @@ impl PaneNode {
     pub fn set_split_ratio(&mut self, target_id: u32, new_ratio: f32) -> bool {
         match self {
             PaneNode::Leaf { .. } => false,
-            PaneNode::Split { id, ratio, first, second, .. } => {
+            PaneNode::Split {
+                id,
+                ratio,
+                first,
+                second,
+                ..
+            } => {
                 if *id == target_id {
                     *ratio = new_ratio.clamp(0.05, 0.95);
                     true
                 } else {
-                    first.set_split_ratio(target_id, new_ratio) || second.set_split_ratio(target_id, new_ratio)
+                    first.set_split_ratio(target_id, new_ratio)
+                        || second.set_split_ratio(target_id, new_ratio)
                 }
             }
         }
     }
 
     pub fn equalize_ratios(&mut self) {
-        if let PaneNode::Split { ratio, first, second, .. } = self {
+        if let PaneNode::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } = self
+        {
             *ratio = 0.5;
             first.equalize_ratios();
             second.equalize_ratios();
@@ -340,12 +369,18 @@ impl PaneNode {
     pub fn adjust_pane_ratio(&mut self, target_pane_id: PaneId, delta: f32) -> bool {
         match self {
             PaneNode::Leaf { .. } => false,
-            PaneNode::Split { ratio, first, second, .. } => {
+            PaneNode::Split {
+                ratio,
+                first,
+                second,
+                ..
+            } => {
                 let in_first = first.all_leaf_ids().contains(&target_pane_id);
                 let in_second = second.all_leaf_ids().contains(&target_pane_id);
 
                 if in_first && in_second {
-                    first.adjust_pane_ratio(target_pane_id, delta) || second.adjust_pane_ratio(target_pane_id, delta)
+                    first.adjust_pane_ratio(target_pane_id, delta)
+                        || second.adjust_pane_ratio(target_pane_id, delta)
                 } else if in_first {
                     if first.adjust_pane_ratio(target_pane_id, delta) {
                         true
@@ -412,8 +447,22 @@ pub struct Tab {
 }
 
 impl Tab {
-    pub fn new(id: TabId, title: String, rows: usize, cols: usize, pane_id: PaneId) -> anyhow::Result<Self> {
-        Self::new_with_options(id, title, rows, cols, pane_id, 10000, PtySpawnOptions::default())
+    pub fn new(
+        id: TabId,
+        title: String,
+        rows: usize,
+        cols: usize,
+        pane_id: PaneId,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_options(
+            id,
+            title,
+            rows,
+            cols,
+            pane_id,
+            10000,
+            PtySpawnOptions::default(),
+        )
     }
 
     pub fn new_with_options(
@@ -429,7 +478,10 @@ impl Tab {
         Ok(Self {
             id,
             title,
-            root: PaneNode::Leaf { id: pane_id, terminal },
+            root: PaneNode::Leaf {
+                id: pane_id,
+                terminal,
+            },
             active_pane_id: pane_id,
             zoomed_pane_id: None,
             next_split_id: 1,
@@ -451,7 +503,14 @@ impl Tab {
         rows: usize,
         cols: usize,
     ) -> anyhow::Result<PaneId> {
-        self.split_active_with_options(direction, next_pane_id, rows, cols, 10000, PtySpawnOptions::default())
+        self.split_active_with_options(
+            direction,
+            next_pane_id,
+            rows,
+            cols,
+            10000,
+            PtySpawnOptions::default(),
+        )
     }
 
     pub fn split_active_with_options(
@@ -470,7 +529,13 @@ impl Tab {
         self.next_split_id += 1;
 
         let new_terminal = Terminal::new_with_options(rows, cols, scrollback_lines, options)?;
-        self.root.split_pane(self.active_pane_id, direction, new_id, new_terminal, split_id);
+        self.root.split_pane(
+            self.active_pane_id,
+            direction,
+            new_id,
+            new_terminal,
+            split_id,
+        );
         self.active_pane_id = new_id;
         self.zoomed_pane_id = None;
         Ok(new_id)
@@ -684,7 +749,14 @@ impl Workspace {
     ) -> anyhow::Result<PaneId> {
         let mut next_id = self.next_pane_id;
         let res = if let Some(tab) = self.active_tab_mut() {
-            tab.split_active_with_options(direction, &mut next_id, rows, cols, scrollback_lines, options)
+            tab.split_active_with_options(
+                direction,
+                &mut next_id,
+                rows,
+                cols,
+                scrollback_lines,
+                options,
+            )
         } else {
             Err(anyhow::anyhow!("No active tab in workspace"))
         };
@@ -779,7 +851,7 @@ impl Workspace {
     }
 
     pub fn is_active_tab_zoomed(&self) -> bool {
-        self.active_tab().map_or(false, |t| t.is_zoomed())
+        self.active_tab().is_some_and(|t| t.is_zoomed())
     }
 
     pub fn set_split_ratio(&mut self, split_id: u32, ratio: f32) -> bool {
@@ -841,7 +913,12 @@ impl Workspace {
         any_data
     }
 
-    pub fn compute_active_pane_rects(&self, screen_w: f32, screen_h: f32, tab_bar_h: f32) -> Vec<(PaneId, Rect)> {
+    pub fn compute_active_pane_rects(
+        &self,
+        screen_w: f32,
+        screen_h: f32,
+        tab_bar_h: f32,
+    ) -> Vec<(PaneId, Rect)> {
         let mut rects = Vec::new();
         if let Some(tab) = self.active_tab() {
             let bounds = Rect::new(0.0, tab_bar_h, screen_w, screen_h - tab_bar_h);
@@ -856,6 +933,7 @@ impl Workspace {
         rects
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn sync_pane_sizes(
         &mut self,
         screen_w: f32,
