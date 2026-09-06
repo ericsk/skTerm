@@ -456,7 +456,11 @@ impl App {
         let (shell, args) = if let Some(s) = &term_cfg.shell {
             (Some(s.program.clone()), s.args.clone())
         } else {
-            (None, Vec::new())
+            #[cfg(target_os = "macos")]
+            let default_args = vec!["-l".to_string()];
+            #[cfg(not(target_os = "macos"))]
+            let default_args = Vec::new();
+            (None, default_args)
         };
 
         PtySpawnOptions {

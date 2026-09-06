@@ -69,15 +69,24 @@ impl PtyProcess {
 
         let pair = pty_system.openpty(size)?;
         let shell_path = options.shell.unwrap_or_else(default_shell);
-
         let mut cmd = CommandBuilder::new(&shell_path);
+
+        #[cfg(target_os = "macos")]
+        if options.args.is_empty() {
+            cmd.arg("-l");
+        } else {
+            for arg in &options.args {
+                cmd.arg(arg);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         for arg in &options.args {
             cmd.arg(arg);
         }
 
-        if let Some(dir) = options.cwd {
+        let target_dir = if let Some(dir) = options.cwd {
             // Expand ~ if needed
-            let expanded_dir = if dir.starts_with('~') {
+            if dir.starts_with('~') {
                 if let Some(home) =
                     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
                 {
@@ -85,20 +94,66 @@ impl PtyProcess {
                     if dir.len() > 1 {
                         path.push(dir.trim_start_matches("~/").trim_start_matches("~\\"));
                     }
-                    path.to_string_lossy().to_string()
+                    Some(path.to_string_lossy().to_string())
                 } else {
-                    dir
+                    Some(dir)
                 }
             } else {
-                dir
-            };
-            cmd.cwd(expanded_dir);
+                Some(dir)
+            }
+        } else {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|h| h.to_string_lossy().to_string())
+        };
+
+        if let Some(dir) = target_dir {
+            cmd.cwd(dir);
         }
 
         // Set terminal environment variables
         let term_name = options.term.unwrap_or_else(|| "xterm-256color".to_string());
         cmd.env("TERM", term_name);
         cmd.env("COLORTERM", "truecolor");
+
+        // Ensure UTF-8 locale environment variables are set if missing
+        if std::env::var_os("LANG").is_none() {
+            cmd.env("LANG", "en_US.UTF-8");
+        }
+        if std::env::var_os("LC_ALL").is_none() {
+            cmd.env("LC_ALL", "en_US.UTF-8");
+        }
+
+        // On macOS, if PATH only has minimal system paths (typical when launched via Finder/LaunchServices),
+        // enrich PATH with common tool locations (/usr/local/bin, /opt/homebrew/bin, $HOME/homebrew/bin, $HOME/.cargo/bin)
+        #[cfg(target_os = "macos")]
+        {
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            let mut paths: Vec<std::path::PathBuf> = std::env::split_paths(&current_path).collect();
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+
+            let candidates = [
+                Some(std::path::PathBuf::from("/opt/homebrew/bin")),
+                Some(std::path::PathBuf::from("/usr/local/bin")),
+                home.as_ref().map(|h| h.join("homebrew/bin")),
+                home.as_ref().map(|h| h.join(".cargo/bin")),
+                home.as_ref().map(|h| h.join(".local/bin")),
+            ];
+
+            let mut modified = false;
+            for candidate in candidates.into_iter().flatten() {
+                if candidate.is_dir() && !paths.contains(&candidate) {
+                    paths.insert(0, candidate);
+                    modified = true;
+                }
+            }
+
+            if modified {
+                if let Ok(new_path) = std::env::join_paths(paths) {
+                    cmd.env("PATH", new_path);
+                }
+            }
+        }
 
         // Custom environment variables
         for (k, v) in options.env {

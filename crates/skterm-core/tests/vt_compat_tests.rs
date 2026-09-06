@@ -173,3 +173,46 @@ fn test_vt_zsh_prompt_sp_clear() {
     let s_full: String = cells.iter().map(|c| c.c).collect();
     assert!(!s_full.contains('%'));
 }
+
+#[test]
+fn test_vt_prompt_line_preservation_on_resize() {
+    let mut term = Terminal::new_headless(10, 80, 100);
+
+    // Line 0: Multiline prompt ruler (e.g. 50 characters) ending with \r\n
+    term.feed_bytes(b"=== Home Directory Status Ruler Line 1234567890 ===\r\n");
+    // Line 1: Input line with cursor
+    term.feed_bytes(b"> ");
+
+    assert_eq!(term.grid().active().cursor.row, 1);
+    assert_eq!(term.grid().active().cursor.col, 2);
+    assert!(!term.grid().active().grid[0].is_wrapped);
+    assert!(!term.grid().active().grid[1].is_wrapped);
+
+    // Resize to 40 cols (narrower than 50 chars)
+    term.resize(10, 40).unwrap();
+
+    // The hard line should stay at row 0 without wrapping and without displacing cursor row
+    assert_eq!(term.grid().active().cursor.row, 1);
+    assert_eq!(term.grid().active().cursor.col, 2);
+    assert!(!term.grid().active().grid[0].is_wrapped);
+    assert!(!term.grid().active().grid[1].is_wrapped);
+
+    // Shell receives SIGWINCH and moves up 1 line to repaint prompt
+    term.feed_bytes(b"\x1b[1A\r\x1b[K=== Narrow Prompt Ruler 12345 ===\r\n\x1b[K> ");
+
+    assert_eq!(term.grid().active().cursor.row, 1);
+    assert_eq!(term.grid().active().cursor.col, 2);
+
+    let row0: String = term.grid().active().grid[0].cells[0..33].iter().map(|c| c.c).collect();
+    assert_eq!(row0, "=== Narrow Prompt Ruler 12345 ===");
+
+    // Resize back to 80 cols
+    term.resize(10, 80).unwrap();
+    assert_eq!(term.grid().active().cursor.row, 1);
+
+    // Shell repaints on 80 cols
+    term.feed_bytes(b"\x1b[1A\r\x1b[K=== Wide Prompt Ruler Restored 1234567890 ===\r\n\x1b[K> ");
+    let row0_wide: String = term.grid().active().grid[0].cells[0..45].iter().map(|c| c.c).collect();
+    assert_eq!(row0_wide, "=== Wide Prompt Ruler Restored 1234567890 ===");
+}
+

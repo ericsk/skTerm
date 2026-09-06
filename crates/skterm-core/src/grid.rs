@@ -394,6 +394,7 @@ impl ScreenBuffer {
             cells: Vec<Cell>,
             is_wrapped: bool,
             cursor_offset: Option<usize>,
+            was_soft_wrapped: bool,
         }
 
         let mut logical_lines: Vec<LogicalLine> = Vec::new();
@@ -416,6 +417,8 @@ impl ScreenBuffer {
             let has_cursor = abs_row == cursor_abs_row;
             let len = if row.is_wrapped {
                 row.cells.len()
+            } else if has_cursor {
+                row.content_len().max(cursor_col).min(row.cells.len())
             } else {
                 row.content_len()
             };
@@ -443,6 +446,7 @@ impl ScreenBuffer {
                 }
                 cur.cells.extend(row_cells);
                 cur.is_wrapped = row.is_wrapped;
+                cur.was_soft_wrapped = true;
 
                 if row.is_wrapped {
                     current_line = Some(cur);
@@ -454,6 +458,7 @@ impl ScreenBuffer {
                     cells: row_cells,
                     is_wrapped: row.is_wrapped,
                     cursor_offset: cursor_offset_in_row,
+                    was_soft_wrapped: row.is_wrapped,
                 };
                 if row.is_wrapped {
                     current_line = Some(line);
@@ -472,6 +477,7 @@ impl ScreenBuffer {
                 cells: Vec::new(),
                 is_wrapped: false,
                 cursor_offset: Some(0),
+                was_soft_wrapped: false,
             });
         }
 
@@ -495,6 +501,35 @@ impl ScreenBuffer {
                     new_cursor = Some((row_idx, 0));
                 }
                 new_physical_rows.push(Row::new(new_cols));
+                continue;
+            }
+
+            let in_grid = if let Some((g_line, _)) = grid_start_logical {
+                line_idx >= g_line
+            } else {
+                false
+            };
+
+            if in_grid && !line.was_soft_wrapped {
+                let row_idx = new_physical_rows.len();
+                if first_new_grid_row.is_none() {
+                    first_new_grid_row = Some(row_idx);
+                }
+
+                let mut row = Row::new(new_cols);
+                let copy_len = total_cells.min(new_cols);
+                for c in 0..copy_len {
+                    row.cells[c] = line.cells[c];
+                    if line.cursor_offset == Some(c) && new_cursor.is_none() {
+                        new_cursor = Some((row_idx, c));
+                    }
+                }
+                if line.cursor_offset.is_some() && new_cursor.is_none() {
+                    let cur_c = line.cursor_offset.unwrap().min(new_cols.saturating_sub(1));
+                    new_cursor = Some((row_idx, cur_c));
+                }
+                row.is_wrapped = false;
+                new_physical_rows.push(row);
                 continue;
             }
 
