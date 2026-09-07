@@ -2335,6 +2335,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "image",
  "notify",
  "objc",
  "pollster",

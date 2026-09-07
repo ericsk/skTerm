@@ -371,6 +371,24 @@ impl TerminalPipeline {
             }]),
         );
     }
+
+    pub fn ensure_bg_capacity(&mut self, device: &Device, required: usize) {
+        if required > self.max_instances {
+            self.max_instances = (required * 2).max(Self::INITIAL_MAX_INSTANCES);
+            self.bg_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("skterm_bg_instance_buffer"),
+                size: (self.max_instances * std::mem::size_of::<BgInstance>()) as u64,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.glyph_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("skterm_glyph_instance_buffer"),
+                size: (self.max_instances * std::mem::size_of::<GlyphInstance>()) as u64,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+    }
 }
 
 /// Convert Color to [r, g, b, a] f32

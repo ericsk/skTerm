@@ -1,6 +1,7 @@
 //! `skterm-render`: wgpu-based GPU text & quad rendering pipeline, glyph atlas, and shaders.
 
 pub mod atlas;
+pub mod box_drawing;
 pub mod pipeline;
 pub mod renderer;
 pub mod shader;

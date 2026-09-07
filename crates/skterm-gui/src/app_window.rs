@@ -130,19 +130,55 @@ impl TerminalSession {
     pub fn paste_from_clipboard(&self, clipboard: Option<&Arc<Mutex<Clipboard>>>) {
         if let Some(cb) = clipboard {
             if let Ok(mut clip) = cb.lock() {
-                if let Ok(text) = clip.get_text() {
+                let text_to_paste = if let Ok(text) = clip.get_text() {
                     if !text.is_empty() {
-                        if let Some(active_tab) = self.workspace.active_tab() {
-                            if let Some(terminal) = active_tab.active_terminal() {
-                                let bracketed = terminal.state.bracketed_paste;
-                                let payload = if bracketed {
-                                    format!("\x1b[200~{}\x1b[201~", text)
-                                } else {
-                                    text
-                                };
-                                let _ = terminal.write_to_pty(payload.as_bytes());
-                                self.window.request_redraw();
-                            }
+                        Some(text)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let final_text = if let Some(text) = text_to_paste {
+                    Some(text)
+                } else if let Ok(img_data) = clip.get_image() {
+                    // Save clipboard image to system temp directory as PNG and paste file path
+                    if let Some(rgba_img) = image::RgbaImage::from_raw(
+                        img_data.width as u32,
+                        img_data.height as u32,
+                        img_data.bytes.into_owned(),
+                    ) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default();
+                        let filename =
+                            format!("clipboard-{}-{:08X}.png", now.as_secs(), now.subsec_nanos());
+                        let temp_path = std::env::temp_dir().join(filename);
+                        if rgba_img.save(&temp_path).is_ok() {
+                            info!("Saved clipboard image to {:?}", temp_path);
+                            Some(temp_path.to_string_lossy().into_owned())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(text) = final_text {
+                    if let Some(active_tab) = self.workspace.active_tab() {
+                        if let Some(terminal) = active_tab.active_terminal() {
+                            let bracketed = terminal.state.bracketed_paste;
+                            let payload = if bracketed {
+                                format!("\x1b[200~{}\x1b[201~", text)
+                            } else {
+                                text
+                            };
+                            let _ = terminal.write_to_pty(payload.as_bytes());
+                            self.window.request_redraw();
                         }
                     }
                 }

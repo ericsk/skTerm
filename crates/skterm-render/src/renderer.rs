@@ -1,6 +1,7 @@
 //! Main Terminal Renderer combining wgpu Device, Queue, Surface, Atlas, Graphics Images, and Pipelines.
 
 use crate::atlas::GlyphAtlas;
+use crate::box_drawing::draw_custom_block_or_box_char;
 use crate::pipeline::{color_to_rgba, BgInstance, GlyphInstance, ImageInstance, TerminalPipeline};
 use skterm_core::{CellFlags, Color, CursorShape, ScreenGrid};
 use std::collections::HashMap;
@@ -983,6 +984,19 @@ impl TermRenderer {
                             && cell.c != '\0'
                             && !cell.flags.contains(CellFlags::WIDE_CHAR_SPACER)
                         {
+                            // Procedural gap-free rendering for Unicode Block Elements and Box Drawing
+                            if draw_custom_block_or_box_char(
+                                cell.c,
+                                x,
+                                y,
+                                cell_w,
+                                cell_h,
+                                fg_rgba,
+                                &mut bg_instances,
+                            ) {
+                                continue;
+                            }
+
                             let is_bold = cell.flags.contains(CellFlags::BOLD);
                             let is_italic = cell.flags.contains(CellFlags::ITALIC);
 
@@ -1045,6 +1059,10 @@ impl TermRenderer {
         }
 
         // Upload instances to GPU buffers
+        let required_capacity = bg_instances.len().max(glyph_instances.len());
+        self.pipeline
+            .ensure_bg_capacity(&self.device, required_capacity);
+
         if !bg_instances.is_empty() {
             self.queue.write_buffer(
                 &self.pipeline.bg_instance_buffer,
