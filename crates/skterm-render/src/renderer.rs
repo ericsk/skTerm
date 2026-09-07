@@ -64,6 +64,19 @@ pub struct TabItem {
     pub is_active: bool,
 }
 
+/// Render descriptor for an AI Agent item in the left sidebar
+#[derive(Debug, Clone)]
+pub struct AgentSidebarItem {
+    pub tab_id: u32,
+    pub pane_id: u32,
+    pub agent_name: String,
+    pub project_name: String,
+    pub location_label: String,
+    pub title_summary: String,
+    pub is_active_output: bool,
+    pub is_focused: bool,
+}
+
 pub struct TermRenderer {
     pub window: Arc<Window>,
     pub surface: Surface<'static>,
@@ -276,6 +289,49 @@ impl TermRenderer {
         self.atlas.cell_height
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_line(
+        &mut self,
+        glyph_instances: &mut Vec<GlyphInstance>,
+        text: &str,
+        x: f32,
+        y: f32,
+        max_w: f32,
+        color: [f32; 4],
+        is_bold: bool,
+    ) {
+        let cell_w = self.atlas.cell_width;
+        let baseline = self.atlas.baseline_offset;
+        let mut cur_x = x;
+        for c in text.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as f32 * cell_w;
+            if cur_x + cw > x + max_w {
+                break;
+            }
+            if let Some(glyph_info) = self.atlas.get_or_insert_glyph(&self.queue, c, is_bold, false)
+            {
+                if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
+                    glyph_instances.push(GlyphInstance {
+                        rect: [
+                            cur_x + glyph_info.offset[0],
+                            y + baseline - glyph_info.offset[1] - glyph_info.size[1],
+                            glyph_info.size[0],
+                            glyph_info.size[1],
+                        ],
+                        uv: [
+                            glyph_info.uv_min[0],
+                            glyph_info.uv_min[1],
+                            glyph_info.uv_max[0],
+                            glyph_info.uv_max[1],
+                        ],
+                        color,
+                    });
+                }
+            }
+            cur_x += cw;
+        }
+    }
+
     /// Render tabs, split panes, graphic images (Sixel/Kitty), separators, and text grids
     pub fn render_workspace(
         &mut self,
@@ -283,10 +339,13 @@ impl TermRenderer {
         panes: &[PaneRenderItem],
         tab_bar_h: f32,
     ) -> anyhow::Result<()> {
-        self.render_workspace_with_overlay(
+        self.render_workspace_with_sidebar(
             tabs,
             panes,
             tab_bar_h,
+            false,
+            0.0,
+            &[],
             None::<fn(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration)>,
         )
     }
@@ -297,6 +356,24 @@ impl TermRenderer {
         tabs: &[TabItem],
         panes: &[PaneRenderItem],
         tab_bar_h: f32,
+        overlay_fn: Option<F>,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration),
+    {
+        self.render_workspace_with_sidebar(tabs, panes, tab_bar_h, false, 0.0, &[], overlay_fn)
+    }
+
+    /// Render workspace with AI Agents Sidebar and optional overlay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_workspace_with_sidebar<F>(
+        &mut self,
+        tabs: &[TabItem],
+        panes: &[PaneRenderItem],
+        tab_bar_h: f32,
+        sidebar_open: bool,
+        sidebar_w: f32,
+        agents: &[AgentSidebarItem],
         overlay_fn: Option<F>,
     ) -> anyhow::Result<()>
     where
@@ -327,26 +404,21 @@ impl TermRenderer {
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
         let baseline = self.atlas.baseline_offset;
+        let scale = self.scale_factor;
+        let screen_w = self.config.width as f32;
+        let screen_h = self.config.height as f32;
 
         // 1. Full Screen Background
         let mut full_bg = self.theme.default_bg;
         full_bg[3] *= self.opacity;
 
         bg_instances.push(BgInstance {
-            rect: [
-                0.0,
-                0.0,
-                self.config.width as f32,
-                self.config.height as f32,
-            ],
+            rect: [0.0, 0.0, screen_w, screen_h],
             color: full_bg,
         });
 
         // 2. Tab Bar
         if tab_bar_h > 0.0 && !tabs.is_empty() {
-            let screen_w = self.config.width as f32;
-            let scale = self.scale_factor;
-
             // 2.1 Tab Bar Header Background (Deep translucent frosted bar)
             bg_instances.push(BgInstance {
                 rect: [0.0, 0.0, screen_w, tab_bar_h],
@@ -359,12 +431,50 @@ impl TermRenderer {
                 color: [0.18, 0.20, 0.26, 0.8],
             });
 
-            // 2.2 Calculate Tab Capsule Geometry
-            let start_x = if cfg!(target_os = "macos") {
+            // 2.1.5 AI Sidebar Toggle Button on the left (after macOS window controls)
+            let base_x = if cfg!(target_os = "macos") {
                 78.0 * scale
             } else {
                 8.0 * scale
             };
+            let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);
+            let tab_y = (tab_bar_h - tab_h) / 2.0;
+            let ai_btn_w = 34.0 * scale;
+
+            let ai_btn_bg = if sidebar_open {
+                [0.08, 0.38, 0.78, 0.95]
+            } else if !agents.is_empty() {
+                [0.12, 0.24, 0.42, 0.85]
+            } else {
+                [0.12, 0.14, 0.18, 0.7]
+            };
+            bg_instances.push(BgInstance {
+                rect: [base_x, tab_y, ai_btn_w, tab_h],
+                color: ai_btn_bg,
+            });
+            bg_instances.push(BgInstance {
+                rect: [base_x, tab_y, ai_btn_w, 1.0],
+                color: [0.28, 0.35, 0.48, 0.8],
+            });
+            let ai_label = if agents.is_empty() {
+                "AI".to_string()
+            } else {
+                format!("AI{}", agents.len())
+            };
+            let ai_text_x = base_x + (ai_btn_w - (ai_label.len() as f32 * cell_w)) / 2.0;
+            let ai_text_y = (tab_bar_h - cell_h) / 2.0;
+            self.draw_text_line(
+                &mut glyph_instances,
+                &ai_label,
+                ai_text_x,
+                ai_text_y,
+                ai_btn_w,
+                [0.95, 0.97, 1.0, 1.0],
+                true,
+            );
+
+            // 2.2 Calculate Tab Capsule Geometry
+            let start_x = base_x + ai_btn_w + 6.0 * scale;
             let plus_btn_w = 24.0 * scale;
             let tab_gap = 4.0 * scale;
             let avail_w = (screen_w - start_x - plus_btn_w - 16.0 * scale).max(80.0);
@@ -512,6 +622,200 @@ impl TermRenderer {
                         ],
                         color: [0.80, 0.84, 0.94, 0.9],
                     });
+                }
+            }
+        }
+
+        // 2.5 AI Agents Sidebar Panel
+        if sidebar_open && sidebar_w > 0.0 {
+            let panel_y = tab_bar_h;
+            let panel_h = (screen_h - tab_bar_h).max(0.0);
+
+            // Sidebar background
+            bg_instances.push(BgInstance {
+                rect: [0.0, panel_y, sidebar_w, panel_h],
+                color: [0.04, 0.05, 0.07, 0.98],
+            });
+            // Right border divider line
+            bg_instances.push(BgInstance {
+                rect: [sidebar_w - 1.0, panel_y, 1.0, panel_h],
+                color: [0.18, 0.20, 0.26, 0.9],
+            });
+
+            // Header section
+            let header_top = panel_y;
+            let header_h = 38.0 * scale;
+            bg_instances.push(BgInstance {
+                rect: [0.0, header_top + header_h - 1.0, sidebar_w, 1.0],
+                color: [0.15, 0.17, 0.22, 0.8],
+            });
+
+            let header_title = format!("AGENTS ({})", agents.len());
+            self.draw_text_line(
+                &mut glyph_instances,
+                &header_title,
+                12.0 * scale,
+                header_top + (header_h - cell_h) / 2.0,
+                sidebar_w - 78.0 * scale,
+                [0.75, 0.80, 0.90, 1.0],
+                true,
+            );
+
+            // "+ New" button in sidebar header
+            let new_btn_w = 56.0 * scale;
+            let new_btn_h = 22.0 * scale;
+            let new_btn_x = sidebar_w - new_btn_w - 10.0 * scale;
+            let new_btn_y = header_top + (header_h - new_btn_h) / 2.0;
+            bg_instances.push(BgInstance {
+                rect: [new_btn_x, new_btn_y, new_btn_w, new_btn_h],
+                color: [0.10, 0.36, 0.72, 0.9],
+            });
+            let new_label = "+ New";
+            let new_label_x = new_btn_x + (new_btn_w - (new_label.len() as f32 * cell_w)) / 2.0;
+            self.draw_text_line(
+                &mut glyph_instances,
+                new_label,
+                new_label_x,
+                new_btn_y + (new_btn_h - cell_h) / 2.0,
+                new_btn_w,
+                [0.98, 0.98, 1.0, 1.0],
+                true,
+            );
+
+            // Agent Cards List
+            let card_h = 66.0 * scale;
+            let card_gap = 6.0 * scale;
+            let list_start_y = header_top + header_h + 8.0 * scale;
+            let card_x = 8.0 * scale;
+            let card_w = (sidebar_w - 16.0 * scale).max(20.0);
+
+            if agents.is_empty() {
+                self.draw_text_line(
+                    &mut glyph_instances,
+                    "No active CLI agents",
+                    12.0 * scale,
+                    list_start_y + 12.0 * scale,
+                    card_w - 8.0 * scale,
+                    [0.50, 0.54, 0.62, 0.9],
+                    false,
+                );
+                self.draw_text_line(
+                    &mut glyph_instances,
+                    "Click '+ New' to spawn",
+                    12.0 * scale,
+                    list_start_y + 12.0 * scale + cell_h + 4.0 * scale,
+                    card_w - 8.0 * scale,
+                    [0.42, 0.46, 0.54, 0.85],
+                    false,
+                );
+            } else {
+                for (idx, item) in agents.iter().enumerate() {
+                    let cy = list_start_y + idx as f32 * (card_h + card_gap);
+                    if cy + card_h > screen_h {
+                        break;
+                    }
+
+                    let card_bg = if item.is_focused {
+                        [0.13, 0.21, 0.34, 0.95]
+                    } else {
+                        [0.09, 0.11, 0.15, 0.9]
+                    };
+                    bg_instances.push(BgInstance {
+                        rect: [card_x, cy, card_w, card_h],
+                        color: card_bg,
+                    });
+
+                    // Border
+                    let border_col = if item.is_focused {
+                        [0.039, 0.518, 1.00, 0.9]
+                    } else {
+                        [0.20, 0.23, 0.30, 0.6]
+                    };
+                    bg_instances.push(BgInstance {
+                        rect: [card_x, cy, card_w, 1.0],
+                        color: border_col,
+                    });
+                    bg_instances.push(BgInstance {
+                        rect: [card_x, cy + card_h - 1.0, card_w, 1.0],
+                        color: border_col,
+                    });
+
+                    // Left active accent bar
+                    if item.is_focused {
+                        bg_instances.push(BgInstance {
+                            rect: [card_x, cy, 3.0 * scale, card_h],
+                            color: [0.039, 0.518, 1.00, 1.0],
+                        });
+                    }
+
+                    // Status dot (Green = Active/Thinking, Yellow = Waiting/Idle)
+                    let dot_size = 7.0 * scale;
+                    let dot_x = card_x + 10.0 * scale;
+                    let dot_y = cy + 9.0 * scale + (cell_h - dot_size) / 2.0;
+                    let dot_color = if item.is_active_output {
+                        [0.18, 0.88, 0.46, 1.0]
+                    } else {
+                        [0.96, 0.76, 0.22, 1.0]
+                    };
+                    bg_instances.push(BgInstance {
+                        rect: [dot_x, dot_y, dot_size, dot_size],
+                        color: dot_color,
+                    });
+
+                    // Line 1: Agent Name + Location label
+                    let text_x = dot_x + dot_size + 6.0 * scale;
+                    let loc_w = (item.location_label.len() as f32 * cell_w) + 8.0 * scale;
+                    self.draw_text_line(
+                        &mut glyph_instances,
+                        &item.agent_name,
+                        text_x,
+                        cy + 6.0 * scale,
+                        (card_w - (text_x - card_x) - loc_w).max(20.0),
+                        [0.98, 0.98, 1.0, 1.0],
+                        true,
+                    );
+                    self.draw_text_line(
+                        &mut glyph_instances,
+                        &item.location_label,
+                        card_x + card_w - loc_w + 2.0 * scale,
+                        cy + 6.0 * scale,
+                        loc_w,
+                        [0.65, 0.75, 0.90, 0.9],
+                        false,
+                    );
+
+                    // Line 2: Project / Directory Name
+                    let proj_label = format!("▸ {}", item.project_name);
+                    self.draw_text_line(
+                        &mut glyph_instances,
+                        &proj_label,
+                        card_x + 10.0 * scale,
+                        cy + 24.0 * scale,
+                        card_w - 16.0 * scale,
+                        [0.45, 0.82, 0.96, 0.95],
+                        false,
+                    );
+
+                    // Line 3: Status / Title Summary
+                    let status_prefix = if item.is_active_output {
+                        "Running"
+                    } else {
+                        "Idle"
+                    };
+                    let summary_line = if item.title_summary.is_empty() {
+                        status_prefix.to_string()
+                    } else {
+                        format!("{} • {}", status_prefix, item.title_summary)
+                    };
+                    self.draw_text_line(
+                        &mut glyph_instances,
+                        &summary_line,
+                        card_x + 10.0 * scale,
+                        cy + 42.0 * scale,
+                        card_w - 16.0 * scale,
+                        [0.60, 0.64, 0.73, 0.9],
+                        false,
+                    );
                 }
             }
         }

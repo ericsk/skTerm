@@ -26,7 +26,13 @@
   - [x] **鍵盤編碼系統擴充 (Keyboard Encoding Enhancements)**：
     - 完整支援 **`Shift + Tab`（Backtab）** 發送標準 ANSI/xterm 序列 **`\x1b[Z`**（CSI Z），支援 Shell/TUI 反向補全。
     - 支援 `Shift`/`Alt`/`Ctrl` 複合修飾鍵對方向鍵與導航鍵的 xterm 參數編碼（如 `Ctrl + Left/Right` 跳詞）。
-  - [x] 單元測試：全部 **34/34 PASS**（100% 成功，0 Warning，0 Error）。
+  - [x] **macOS 系統捲動連動與觸控板平滑捲動 (macOS Natural Scrolling & Smooth Trackpad Scroll)**：
+    - 修正 `ScreenBuffer::scroll_display` 方向邏輯，與 macOS「自然捲動 (Natural Scrolling)」設定一致。
+    - 加入 `scroll_pixel_accumulator` 累積 `MouseScrollDelta::PixelDelta` 次像素位移，支援觸控板與 Magic Mouse 平滑捲動。
+    - 支援 Alternate Screen 與 Mouse Reporting（`vim`、`tmux`、`less`、`htop`）滾輪事件自動轉發。
+  - [x] **全域 AI Agent 側邊欄架構 (Global AI Agent Sidebar)**：
+    - 側邊欄開關狀態 (`App::sidebar_open`) 提升至視窗群組層級（高於分頁與窗格），開新分頁自動同步顯示且支援跨分頁掃描與點擊跳轉。
+  - [x] 單元測試與相容性測試：全部 **45/45 PASS**（100% 成功，0 Warning，0 Error）。
 
 ---
 

@@ -10,6 +10,7 @@ pub struct Terminal {
     pub state: TerminalState,
     parser: Parser,
     pty: Option<PtyProcess>,
+    pub last_output_time: std::time::Instant,
 }
 
 impl Terminal {
@@ -48,6 +49,7 @@ impl Terminal {
             state,
             parser,
             pty: Some(pty),
+            last_output_time: std::time::Instant::now(),
         })
     }
 
@@ -57,6 +59,7 @@ impl Terminal {
             state: TerminalState::new(rows, cols, max_scrollback),
             parser: Parser::new(),
             pty: None,
+            last_output_time: std::time::Instant::now(),
         }
     }
 
@@ -82,6 +85,7 @@ impl Terminal {
             return false;
         }
 
+        self.last_output_time = std::time::Instant::now();
         for chunk in chunks {
             self.parser.advance(&mut self.state, &chunk);
         }
@@ -96,6 +100,16 @@ impl Terminal {
     /// Alias to is_child_alive.
     pub fn is_alive(&self) -> bool {
         self.is_child_alive()
+    }
+
+    /// Return the OS process ID of the attached shell process.
+    pub fn process_id(&self) -> Option<u32> {
+        self.pty.as_ref().and_then(|p| p.process_id())
+    }
+
+    /// Return true if the terminal has received output within the last 1.5 seconds (Active / Thinking).
+    pub fn is_active_output(&self) -> bool {
+        self.last_output_time.elapsed() < std::time::Duration::from_millis(1500)
     }
 
     /// Write user input directly to the PTY process.

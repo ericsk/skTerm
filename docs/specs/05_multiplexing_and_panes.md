@@ -66,3 +66,12 @@ pub enum PaneNode {
 - **雙模式分頁架構 (Dual-Mode Tab Model)**：
   - 保留 `tab_bar_style` 與內建渲染支援，在 Windows / Linux 上提供符合現代視覺（如 Windows 11 Fluent Design）的內嵌懸浮膠囊分頁列。
   - `App` 的多 Session 管理機制預留對接 Windows 原生 **WinUI 3 XAML Islands `TabView`** 或 **Windows Terminal Tab Control**，未來可直接透過 HWND 嵌入 Windows 原生標籤列。
+
+---
+
+## 5. 全域 AI Agent 側邊欄架構 (Global AI Agent Sidebar)
+- **層級高於分頁與窗格 (`App::sidebar_open`)**：
+  - 側邊欄開關狀態隸屬於最頂層 `App` 結構（而非單一 `Workspace`），確保開啟新分頁 (`Cmd + T`) 時自動繼承側邊欄顯示狀態，且在任何分頁切換開關時（`Cmd + Shift + A` 或頂部按鈕）同步更新所有分頁佈局與窗格尺寸。
+- **跨分頁 Agent 自動發現與導覽 (`App::scan_all_ai_agents`)**：
+  - 透過 `ProcessTreeCache` 跨所有 `TerminalSession`、分頁與窗格掃描正在執行的 AI Agent 實例（如 Antigravity CLI、Claude Code、Gemini CLI、Jetski），自動標示全域位置標籤（如 `T1•#1`、`T2•#1`）。
+  - 點擊側邊欄 Agent 卡片時，若目標 Agent 位於其他 macOS 原生分頁，自動透過 `[NSWindow makeKeyAndOrderFront:]` 切換至目標分頁視窗並聚焦該窗格。

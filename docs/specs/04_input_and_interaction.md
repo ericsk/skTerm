@@ -24,3 +24,14 @@
 - **OSC 8 超連結**：
   - 滑鼠懸停（Hover）顯示下劃線與連結網址提示。
   - `Cmd / Ctrl + Click` 自動調用系統預設瀏覽器開啟網址。
+
+---
+
+## 3. 滑鼠滾輪與 macOS 系統捲動連動 (Mouse Wheel & macOS Natural Scrolling Sync)
+- **系統方向自動連動 (Natural Scrolling Sync)**：
+  - `ScreenBuffer::scroll_display` 與 `winit::event::MouseScrollDelta` 遵循 macOS AppKit / 系統「自然捲動 (Natural Scrolling)」設定：`delta > 0` 向上捲動檢視歷史紀錄 (`scrollback`)，`delta < 0` 向下捲動回到目前提示字元。
+- **觸控板與 Magic Mouse 像素級平滑累積 (`scroll_pixel_accumulator`)**：
+  - 針對 macOS 觸控板高頻發送的微幅 `MouseScrollDelta::PixelDelta` 事件，於 `TerminalSession` 累積未滿單一字元高度 (`cell_height`) 的像素位移，消除慢速與平滑滑動時因整數截斷造成的失靈問題。
+- **Alternate Screen 與 Mouse Reporting 自動轉發**：
+  - 當 TUI 程式（如 `vim`、`tmux`、`htop`）啟用滑鼠回報協定 (`MouseProtocol::Normal` / `ButtonEvent` / `AnyEvent`) 時，自動將滾輪事件編碼為 SGR (`\x1b[<64;col;rowM` / `\x1b[<65;col;rowM`) 或 X10 格式發送至 PTY。
+  - 當處於 Alternate Screen 且未開啟滑鼠回報（如 `less`、`man`）時，自動將滾輪事件轉換為上下方向鍵（`\x1b[A`/`\x1b[B` 或 `\x1bOA`/`\x1bOB`）傳送至 PTY。

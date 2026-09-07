@@ -252,6 +252,15 @@ impl PtyProcess {
             false
         }
     }
+
+    /// Return the OS process ID of the spawned shell/child process.
+    pub fn process_id(&self) -> Option<u32> {
+        if let Ok(child) = self.child.lock() {
+            child.process_id()
+        } else {
+            None
+        }
+    }
 }
 
 /// Detect default system shell path based on platform and environment.

@@ -216,3 +216,93 @@ fn test_vt_prompt_line_preservation_on_resize() {
     assert_eq!(row0_wide, "=== Wide Prompt Ruler Restored 1234567890 ===");
 }
 
+#[test]
+fn test_vt_dch_delete_char_on_backspace_in_middle() {
+    let mut term = Terminal::new_headless(10, 20, 100);
+
+    // User types "abcdef"
+    term.feed_bytes(b"abcdef");
+    assert_eq!(term.grid().active().cursor.col, 6);
+
+    // User moves cursor left 2 times (cursor now at 'e', col 4)
+    term.feed_bytes(b"\x1b[2D");
+    assert_eq!(term.grid().active().cursor.col, 4);
+
+    // User presses backspace to delete 'd': CLI sends \x08 (BS) + \x1b[P (DCH - Delete 1 char)
+    term.feed_bytes(b"\x08\x1b[P");
+    assert_eq!(term.grid().active().cursor.col, 3);
+
+    let line: String = term.grid().active().grid[0].cells[0..6]
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(line, "abcef ");
+}
+
+#[test]
+fn test_vt_ich_insert_char_and_irm_mode() {
+    let mut term = Terminal::new_headless(10, 20, 100);
+
+    // User types "abef"
+    term.feed_bytes(b"abef");
+    // Move left 2 to 'e' (col 2)
+    term.feed_bytes(b"\x1b[2D");
+
+    // Insert 2 blank chars using ICH (\x1b[2@) and type "cd"
+    term.feed_bytes(b"\x1b[2@cd");
+    let line: String = term.grid().active().grid[0].cells[0..6]
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(line, "abcdef");
+
+    // Test Insert Mode (IRM - \x1b[4h / \x1b[4l) at col 4
+    term.feed_bytes(b"\x1b[4hXY\x1b[4l");
+    let line2: String = term.grid().active().grid[0].cells[0..8]
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(line2, "abcdXYef");
+}
+
+#[test]
+fn test_vt_cjk_wide_char_overwrite_and_backspace() {
+    use skterm_core::CellFlags;
+    let mut term = Terminal::new_headless(10, 20, 100);
+
+    // Type "你好世界" (cols 0..8)
+    term.feed_bytes("你好世界".as_bytes());
+    assert_eq!(term.grid().active().cursor.col, 8);
+
+    // Move cursor left to '界' (col 6), then press backspace to delete '世' (cols 4..6)
+    // CLI moves cursor to col 4 (\x1b[5G) and sends DCH 2 (\x1b[2P)
+    term.feed_bytes(b"\x1b[5G\x1b[2P");
+
+    let cells = &term.grid().active().grid[0].cells;
+    assert_eq!(cells[0].c, '你');
+    assert!(cells[0].flags.contains(CellFlags::WIDE_CHAR));
+    assert!(cells[1].flags.contains(CellFlags::WIDE_CHAR_SPACER));
+
+    assert_eq!(cells[2].c, '好');
+    assert!(cells[2].flags.contains(CellFlags::WIDE_CHAR));
+    assert!(cells[3].flags.contains(CellFlags::WIDE_CHAR_SPACER));
+
+    assert_eq!(cells[4].c, '界');
+    assert!(cells[4].flags.contains(CellFlags::WIDE_CHAR));
+    assert!(cells[5].flags.contains(CellFlags::WIDE_CHAR_SPACER));
+
+    assert_eq!(cells[6].c, ' ');
+    assert!(!cells[6].flags.contains(CellFlags::WIDE_CHAR));
+    assert!(!cells[6].flags.contains(CellFlags::WIDE_CHAR_SPACER));
+
+    // Now test overwriting the right half of a wide char (col 1) with an ASCII char 'A'
+    term.feed_bytes(b"\x1b[2GA");
+    let cells = &term.grid().active().grid[0].cells;
+    // Left half of '你' at col 0 must have been cleared to ' ' with no WIDE_CHAR flag
+    assert_eq!(cells[0].c, ' ');
+    assert!(!cells[0].flags.contains(CellFlags::WIDE_CHAR));
+    assert_eq!(cells[1].c, 'A');
+    assert!(!cells[1].flags.contains(CellFlags::WIDE_CHAR_SPACER));
+}
+
+

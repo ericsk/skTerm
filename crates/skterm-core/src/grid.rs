@@ -654,13 +654,13 @@ impl ScreenBuffer {
 
     pub fn scroll_display(&mut self, delta: isize) {
         let max_scroll = self.scrollback.len();
-        if delta < 0 {
+        if delta > 0 {
             self.scroll_offset = self
                 .scroll_offset
-                .saturating_add((-delta) as usize)
+                .saturating_add(delta as usize)
                 .min(max_scroll);
         } else {
-            self.scroll_offset = self.scroll_offset.saturating_sub(delta as usize);
+            self.scroll_offset = self.scroll_offset.saturating_sub((-delta) as usize);
         }
     }
 
@@ -808,6 +808,48 @@ impl ScreenBuffer {
         }
     }
 
+    /// Clean up any wide characters that would be split across the boundaries of `[start_col, end_col)`.
+    /// - If `start_col` is the right half (`WIDE_CHAR_SPACER`) of a wide character at `start_col - 1`,
+    ///   clear `start_col - 1`.
+    /// - If `end_col` is the right half (`WIDE_CHAR_SPACER`) of a wide character at `end_col - 1`,
+    ///   clear `end_col`.
+    pub fn clear_split_wide_chars(&mut self, row: usize, start_col: usize, end_col: usize) {
+        if row >= self.rows {
+            return;
+        }
+        if start_col < self.cols
+            && self.grid[row].cells[start_col]
+                .flags
+                .contains(CellFlags::WIDE_CHAR_SPACER)
+        {
+            if start_col > 0 {
+                self.grid[row].cells[start_col - 1].c = ' ';
+                self.grid[row].cells[start_col - 1]
+                    .flags
+                    .remove(CellFlags::WIDE_CHAR);
+            }
+            self.grid[row].cells[start_col]
+                .flags
+                .remove(CellFlags::WIDE_CHAR_SPACER);
+        }
+        if end_col < self.cols
+            && self.grid[row].cells[end_col]
+                .flags
+                .contains(CellFlags::WIDE_CHAR_SPACER)
+        {
+            if end_col > 0 {
+                self.grid[row].cells[end_col - 1].c = ' ';
+                self.grid[row].cells[end_col - 1]
+                    .flags
+                    .remove(CellFlags::WIDE_CHAR);
+            }
+            self.grid[row].cells[end_col].c = ' ';
+            self.grid[row].cells[end_col]
+                .flags
+                .remove(CellFlags::WIDE_CHAR_SPACER);
+        }
+    }
+
     pub fn write_char(
         &mut self,
         c: char,
@@ -827,6 +869,7 @@ impl ScreenBuffer {
         }
 
         if char_width == 2 && self.cursor.col + 1 >= self.cols {
+            self.clear_split_wide_chars(self.cursor.row, self.cursor.col, self.cols);
             self.grid[self.cursor.row].cells[self.cursor.col].reset();
             self.grid[self.cursor.row].cells[self.cursor.col]
                 .flags
@@ -837,6 +880,8 @@ impl ScreenBuffer {
 
         let cur_row = self.cursor.row;
         let cur_col = self.cursor.col;
+
+        self.clear_split_wide_chars(cur_row, cur_col, cur_col + char_width);
 
         let mut actual_flags = flags;
         if char_width == 2 {
@@ -868,11 +913,116 @@ impl ScreenBuffer {
         }
     }
 
+    /// Delete `n` characters at the cursor position on the current line (DCH - CSI P).
+    /// Characters to the right shift left by `n` columns, and blank cells fill from the right.
+    pub fn delete_chars(&mut self, n: usize, bg: Color) {
+        let cur_row = self.cursor.row;
+        let cur_col = self.cursor.col;
+        if cur_col >= self.cols || n == 0 {
+            return;
+        }
+        let count = n.min(self.cols - cur_col);
+
+        self.clear_split_wide_chars(cur_row, cur_col, cur_col + count);
+
+        let row = &mut self.grid[cur_row];
+        for c in cur_col..self.cols {
+            if c + count < self.cols {
+                row.cells[c] = row.cells[c + count];
+            } else {
+                row.cells[c].reset();
+                row.cells[c].bg = bg;
+            }
+        }
+        row.is_dirty = true;
+    }
+
+    /// Insert `n` blank characters at the cursor position on the current line (ICH - CSI @).
+    /// Existing characters from the cursor position shift right by `n` columns.
+    pub fn insert_chars(&mut self, n: usize, bg: Color) {
+        let cur_row = self.cursor.row;
+        let cur_col = self.cursor.col;
+        if cur_col >= self.cols || n == 0 {
+            return;
+        }
+        let count = n.min(self.cols - cur_col);
+
+        self.clear_split_wide_chars(cur_row, cur_col, cur_col);
+
+        let row = &mut self.grid[cur_row];
+        for c in (cur_col + count..self.cols).rev() {
+            row.cells[c] = row.cells[c - count];
+        }
+        for c in cur_col..cur_col + count {
+            row.cells[c].reset();
+            row.cells[c].bg = bg;
+        }
+        if row.cells[self.cols - 1].flags.contains(CellFlags::WIDE_CHAR) {
+            row.cells[self.cols - 1].reset();
+            row.cells[self.cols - 1].bg = bg;
+        }
+        row.is_dirty = true;
+    }
+
+    /// Erase `n` characters starting at the cursor position without moving cursor (ECH - CSI X).
+    pub fn erase_chars(&mut self, n: usize, bg: Color) {
+        let cur_row = self.cursor.row;
+        let cur_col = self.cursor.col;
+        if cur_col >= self.cols || n == 0 {
+            return;
+        }
+        let end_col = (cur_col + n).min(self.cols);
+
+        self.clear_split_wide_chars(cur_row, cur_col, end_col);
+
+        let row = &mut self.grid[cur_row];
+        for c in cur_col..end_col {
+            row.cells[c].reset();
+            row.cells[c].bg = bg;
+        }
+        row.is_dirty = true;
+    }
+
+    /// Insert `n` blank lines at the cursor row within the scroll region (IL - CSI L).
+    pub fn insert_lines(&mut self, n: usize, bg: Color) {
+        let (top, bottom) = self.scroll_region;
+        let cur_row = self.cursor.row;
+        if cur_row < top || cur_row > bottom {
+            return;
+        }
+        let count = n.min(bottom - cur_row + 1);
+        for _ in 0..count {
+            self.grid.remove(bottom);
+            let mut new_row = Row::new(self.cols);
+            new_row.clear(bg);
+            self.grid.insert(cur_row, new_row);
+        }
+        self.cursor.pending_wrap = false;
+    }
+
+    /// Delete `n` lines at the cursor row within the scroll region (DL - CSI M).
+    pub fn delete_lines(&mut self, n: usize, bg: Color) {
+        let (top, bottom) = self.scroll_region;
+        let cur_row = self.cursor.row;
+        if cur_row < top || cur_row > bottom {
+            return;
+        }
+        let count = n.min(bottom - cur_row + 1);
+        for _ in 0..count {
+            self.grid.remove(cur_row);
+            let mut new_row = Row::new(self.cols);
+            new_row.clear(bg);
+            self.grid.insert(bottom, new_row);
+        }
+        self.cursor.pending_wrap = false;
+    }
+
     pub fn erase_in_display(&mut self, mode: usize, bg: Color) {
         match mode {
             0 => {
                 let cur_row = self.cursor.row;
                 let cur_col = self.cursor.col;
+                self.clear_split_wide_chars(cur_row, cur_col, self.cols);
                 for c in cur_col..self.cols {
                     self.grid[cur_row].cells[c].reset();
                     self.grid[cur_row].cells[c].bg = bg;
@@ -888,7 +1038,9 @@ impl ScreenBuffer {
                 for r in 0..cur_row {
                     self.grid[r].clear(bg);
                 }
-                for c in 0..=cur_col.min(self.cols.saturating_sub(1)) {
+                let end = cur_col.min(self.cols.saturating_sub(1));
+                self.clear_split_wide_chars(cur_row, 0, end + 1);
+                for c in 0..=end {
                     self.grid[cur_row].cells[c].reset();
                     self.grid[cur_row].cells[c].bg = bg;
                 }
@@ -913,6 +1065,7 @@ impl ScreenBuffer {
         let cur_col = self.cursor.col;
         match mode {
             0 => {
+                self.clear_split_wide_chars(cur_row, cur_col, self.cols);
                 for c in cur_col..self.cols {
                     self.grid[cur_row].cells[c].reset();
                     self.grid[cur_row].cells[c].bg = bg;
@@ -920,7 +1073,9 @@ impl ScreenBuffer {
                 self.grid[cur_row].is_dirty = true;
             }
             1 => {
-                for c in 0..=cur_col.min(self.cols.saturating_sub(1)) {
+                let end = cur_col.min(self.cols.saturating_sub(1));
+                self.clear_split_wide_chars(cur_row, 0, end + 1);
+                for c in 0..=end {
                     self.grid[cur_row].cells[c].reset();
                     self.grid[cur_row].cells[c].bg = bg;
                 }

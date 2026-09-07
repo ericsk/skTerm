@@ -42,6 +42,7 @@ pub struct TerminalState {
     pub in_sixel: bool,
     pub sixel_buffer: Vec<u8>,
     pub kitty_parser: KittyGraphicsParser,
+    pub insert_mode: bool,
 }
 
 impl TerminalState {
@@ -61,6 +62,7 @@ impl TerminalState {
             in_sixel: false,
             sixel_buffer: Vec::new(),
             kitty_parser: KittyGraphicsParser::new(),
+            insert_mode: false,
         }
     }
 
@@ -202,6 +204,12 @@ impl Perform for TerminalState {
         let bg = self.bg;
         let flags = self.flags;
         let hid = self.current_hyperlink_id;
+        if self.insert_mode {
+            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+            if w > 0 {
+                self.grid.active_mut().insert_chars(w, bg);
+            }
+        }
         self.grid.active_mut().write_char(c, fg, bg, flags, hid);
     }
 
@@ -390,6 +398,16 @@ impl Perform for TerminalState {
                 .grid
                 .active_mut()
                 .move_backward((first_param as usize).max(1)),
+            'E' => {
+                let active = self.grid.active_mut();
+                active.move_down((first_param as usize).max(1));
+                active.cursor.col = 0;
+            }
+            'F' => {
+                let active = self.grid.active_mut();
+                active.move_up((first_param as usize).max(1));
+                active.cursor.col = 0;
+            }
             'G' => {
                 let col = (first_param as usize).max(1) - 1;
                 self.grid.active_mut().cursor.col =
@@ -402,6 +420,26 @@ impl Perform for TerminalState {
                     row.min(self.grid.active().rows.saturating_sub(1));
                 self.grid.active_mut().cursor.pending_wrap = false;
             }
+            '@' => self
+                .grid
+                .active_mut()
+                .insert_chars((first_param as usize).max(1), self.bg),
+            'P' => self
+                .grid
+                .active_mut()
+                .delete_chars((first_param as usize).max(1), self.bg),
+            'X' => self
+                .grid
+                .active_mut()
+                .erase_chars((first_param as usize).max(1), self.bg),
+            'L' => self
+                .grid
+                .active_mut()
+                .insert_lines((first_param as usize).max(1), self.bg),
+            'M' => self
+                .grid
+                .active_mut()
+                .delete_lines((first_param as usize).max(1), self.bg),
             'J' => self
                 .grid
                 .active_mut()
@@ -418,6 +456,8 @@ impl Perform for TerminalState {
                 .grid
                 .active_mut()
                 .scroll_down((first_param as usize).max(1)),
+            's' if !is_private && intermediates.is_empty() => self.save_cursor(),
+            'u' if !is_private && intermediates.is_empty() => self.restore_cursor(),
             'r' => {
                 let mut top = 1;
                 let mut bottom = self.grid.active().rows;
@@ -462,6 +502,8 @@ impl Perform for TerminalState {
                                 1006 => self.mouse_format = MouseFormat::Sgr,
                                 _ => {}
                             }
+                        } else if mode == 4 {
+                            self.insert_mode = true;
                         }
                     }
                 }
@@ -483,6 +525,8 @@ impl Perform for TerminalState {
                                 1006 => self.mouse_format = MouseFormat::X10,
                                 _ => {}
                             }
+                        } else if mode == 4 {
+                            self.insert_mode = false;
                         }
                     }
                 }

@@ -105,6 +105,16 @@ impl PaneNode {
         ids
     }
 
+    pub fn collect_leaves<'a>(&'a self, out: &mut Vec<(PaneId, &'a Terminal)>) {
+        match self {
+            PaneNode::Leaf { id, terminal } => out.push((*id, terminal)),
+            PaneNode::Split { first, second, .. } => {
+                first.collect_leaves(out);
+                second.collect_leaves(out);
+            }
+        }
+    }
+
     fn collect_leaf_ids(&self, out: &mut Vec<PaneId>) {
         match self {
             PaneNode::Leaf { id, .. } => out.push(*id),
@@ -662,6 +672,8 @@ impl Tab {
 pub struct Workspace {
     pub tabs: Vec<Tab>,
     pub active_tab_idx: usize,
+    pub sidebar_open: bool,
+    pub sidebar_width: f32,
     next_tab_id: u32,
     next_pane_id: u32,
 }
@@ -695,6 +707,8 @@ impl Workspace {
         Ok(Self {
             tabs: vec![initial_tab],
             active_tab_idx: 0,
+            sidebar_open: false,
+            sidebar_width: 220.0,
             next_tab_id,
             next_pane_id,
         })
@@ -913,15 +927,45 @@ impl Workspace {
         any_data
     }
 
+    pub fn content_bounds(
+        &self,
+        screen_w: f32,
+        screen_h: f32,
+        tab_bar_h: f32,
+        scale_factor: f32,
+    ) -> Rect {
+        let sidebar_px = if self.sidebar_open {
+            self.sidebar_width * scale_factor
+        } else {
+            0.0
+        };
+        Rect::new(
+            sidebar_px,
+            tab_bar_h,
+            (screen_w - sidebar_px).max(0.0),
+            (screen_h - tab_bar_h).max(0.0),
+        )
+    }
+
     pub fn compute_active_pane_rects(
         &self,
         screen_w: f32,
         screen_h: f32,
         tab_bar_h: f32,
     ) -> Vec<(PaneId, Rect)> {
+        self.compute_active_pane_rects_with_scale(screen_w, screen_h, tab_bar_h, 1.0)
+    }
+
+    pub fn compute_active_pane_rects_with_scale(
+        &self,
+        screen_w: f32,
+        screen_h: f32,
+        tab_bar_h: f32,
+        scale_factor: f32,
+    ) -> Vec<(PaneId, Rect)> {
         let mut rects = Vec::new();
         if let Some(tab) = self.active_tab() {
-            let bounds = Rect::new(0.0, tab_bar_h, screen_w, screen_h - tab_bar_h);
+            let bounds = self.content_bounds(screen_w, screen_h, tab_bar_h, scale_factor);
             if let Some(zid) = tab.zoomed_pane_id {
                 if tab.root.find_terminal(zid).is_some() {
                     rects.push((zid, bounds));
@@ -944,7 +988,25 @@ impl Workspace {
         pad_y: f32,
         tab_bar_h: f32,
     ) {
-        let rects = self.compute_active_pane_rects(screen_w, screen_h, tab_bar_h);
+        self.sync_pane_sizes_with_scale(
+            screen_w, screen_h, cell_w, cell_h, pad_x, pad_y, tab_bar_h, 1.0,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_pane_sizes_with_scale(
+        &mut self,
+        screen_w: f32,
+        screen_h: f32,
+        cell_w: f32,
+        cell_h: f32,
+        pad_x: f32,
+        pad_y: f32,
+        tab_bar_h: f32,
+        scale_factor: f32,
+    ) {
+        let rects =
+            self.compute_active_pane_rects_with_scale(screen_w, screen_h, tab_bar_h, scale_factor);
         if let Some(tab) = self.active_tab_mut() {
             for (id, rect) in rects {
                 if let Some(terminal) = tab.root.find_terminal_mut(id) {
@@ -963,5 +1025,213 @@ impl Workspace {
         for tab in &mut self.tabs {
             tab.root.update_cursor_shape(shape);
         }
+    }
+
+    /// Scan all tabs and panes to find running AI Agent CLI instances.
+    pub fn scan_ai_agents(
+        &self,
+        cache: &mut ProcessTreeCache,
+    ) -> Vec<skterm_render::AgentSidebarItem> {
+        cache.refresh_if_needed();
+        let mut items = Vec::new();
+
+        for (tab_idx, tab) in self.tabs.iter().enumerate() {
+            let mut leaves = Vec::new();
+            tab.root.collect_leaves(&mut leaves);
+
+            for (pane_id, terminal) in leaves {
+                let mut found_agent: Option<(u32, String)> = None;
+
+                if let Some(shell_pid) = terminal.process_id() {
+                    if let Some((agent_pid, name)) = cache.find_agent_descendant(shell_pid) {
+                        found_agent = Some((agent_pid, name.to_string()));
+                    }
+                }
+
+                if found_agent.is_none() {
+                    let title_lower = terminal.state.title.to_lowercase();
+                    if title_lower.contains("jetski") {
+                        let pid = terminal.process_id().unwrap_or(0);
+                        found_agent = Some((pid, "Jetski".to_string()));
+                    } else if title_lower.contains("antigravity") || title_lower.contains("agy") {
+                        let pid = terminal.process_id().unwrap_or(0);
+                        found_agent = Some((pid, "Antigravity CLI".to_string()));
+                    } else if title_lower.contains("claude") {
+                        let pid = terminal.process_id().unwrap_or(0);
+                        found_agent = Some((pid, "Claude Code".to_string()));
+                    } else if title_lower.contains("gemini") {
+                        let pid = terminal.process_id().unwrap_or(0);
+                        found_agent = Some((pid, "Gemini CLI".to_string()));
+                    }
+                }
+
+                if let Some((agent_pid, agent_name)) = found_agent {
+                    let project_name = if agent_pid > 0 {
+                        cache.get_project_name(agent_pid)
+                    } else if let Some(spid) = terminal.process_id() {
+                        cache.get_project_name(spid)
+                    } else {
+                        "workspace".to_string()
+                    };
+
+                    let location_label = format!("T{}•#{}", tab_idx + 1, pane_id);
+                    let title_summary = if terminal.state.title != "skTerm"
+                        && !terminal.state.title.is_empty()
+                    {
+                        terminal.state.title.clone()
+                    } else {
+                        String::new()
+                    };
+
+                    let is_focused =
+                        tab_idx == self.active_tab_idx && tab.active_pane_id == pane_id;
+
+                    items.push(skterm_render::AgentSidebarItem {
+                        tab_id: tab.id,
+                        pane_id,
+                        agent_name,
+                        project_name,
+                        location_label,
+                        title_summary,
+                        is_active_output: terminal.is_active_output(),
+                        is_focused,
+                    });
+                }
+            }
+        }
+
+        items
+    }
+}
+
+/// Cached system process tree and CWD lookups for low-overhead AI Agent discovery.
+pub struct ProcessTreeCache {
+    last_refresh: Option<std::time::Instant>,
+    children_map: std::collections::HashMap<u32, Vec<(u32, String)>>,
+    cwd_cache: std::collections::HashMap<u32, String>,
+}
+
+impl Default for ProcessTreeCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProcessTreeCache {
+    pub fn new() -> Self {
+        Self {
+            last_refresh: None,
+            children_map: std::collections::HashMap::new(),
+            cwd_cache: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn refresh_if_needed(&mut self) {
+        if let Some(last) = self.last_refresh {
+            if last.elapsed() < std::time::Duration::from_millis(1200) {
+                return;
+            }
+        }
+        self.last_refresh = Some(std::time::Instant::now());
+        self.children_map.clear();
+
+        #[cfg(unix)]
+        {
+            if let Ok(output) = std::process::Command::new("ps")
+                .args(["-ax", "-o", "pid=,ppid=,args="])
+                .output()
+            {
+                if let Ok(text) = String::from_utf8(output.stdout) {
+                    for line in text.lines() {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 3 {
+                            if let (Ok(pid), Ok(ppid)) =
+                                (parts[0].parse::<u32>(), parts[1].parse::<u32>())
+                            {
+                                let cmd_line = parts[2..].join(" ").to_lowercase();
+                                self.children_map
+                                    .entry(ppid)
+                                    .or_default()
+                                    .push((pid, cmd_line));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn match_agent_command(cmd_line: &str) -> Option<&'static str> {
+        for token in cmd_line.split_whitespace() {
+            let base = std::path::Path::new(token)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(token);
+            if base == "jetski" {
+                return Some("Jetski");
+            } else if base == "agy" || base == "antigravity" {
+                return Some("Antigravity CLI");
+            } else if base == "claude" {
+                return Some("Claude Code");
+            } else if base == "gemini" {
+                return Some("Gemini CLI");
+            } else if base == "aider" {
+                return Some("Aider");
+            } else if base == "codex" {
+                return Some("Codex CLI");
+            }
+        }
+        None
+    }
+
+    /// Search descendant processes of `root_pid` for a known AI Agent CLI.
+    pub fn find_agent_descendant(&self, root_pid: u32) -> Option<(u32, &'static str)> {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(root_pid);
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(root_pid);
+
+        while let Some(curr_pid) = queue.pop_front() {
+            if let Some(children) = self.children_map.get(&curr_pid) {
+                for (child_pid, cmd_line) in children {
+                    if !visited.insert(*child_pid) {
+                        continue;
+                    }
+                    if let Some(agent_name) = Self::match_agent_command(cmd_line) {
+                        return Some((*child_pid, agent_name));
+                    }
+                    queue.push_back(*child_pid);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_project_name(&mut self, pid: u32) -> String {
+        if let Some(cached) = self.cwd_cache.get(&pid) {
+            return cached.clone();
+        }
+        #[cfg(unix)]
+        {
+            if let Ok(output) = std::process::Command::new("lsof")
+                .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+                .output()
+            {
+                if let Ok(text) = String::from_utf8(output.stdout) {
+                    for line in text.lines() {
+                        if let Some(path_str) = line.strip_prefix('n') {
+                            let name = std::path::Path::new(path_str)
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(path_str)
+                                .to_string();
+                            self.cwd_cache.insert(pid, name.clone());
+                            return name;
+                        }
+                    }
+                }
+            }
+        }
+        "workspace".to_string()
     }
 }

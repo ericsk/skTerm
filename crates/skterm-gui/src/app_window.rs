@@ -60,22 +60,25 @@ pub struct TerminalSession {
     pub window: Arc<Window>,
     pub renderer: TermRenderer,
     pub workspace: Workspace,
+    pub process_cache: crate::layout::ProcessTreeCache,
     pub mouse_pos: (f32, f32),
     pub is_mouse_down: bool,
     pub last_click_time: Instant,
     pub click_count: usize,
     pub dragging_splitter: Option<(u32, SplitDirection, Rect)>,
     pub hovered_url: Option<String>,
+    pub scroll_pixel_accumulator: f64,
 }
 
 impl TerminalSession {
     pub fn update_ime_position(&self, tab_bar_h: f32) {
         if let Some(active_tab) = self.workspace.active_tab() {
             if let Some(terminal) = active_tab.active_terminal() {
-                let pane_rects = self.workspace.compute_active_pane_rects(
+                let pane_rects = self.workspace.compute_active_pane_rects_with_scale(
                     self.renderer.config.width as f32,
                     self.renderer.config.height as f32,
                     tab_bar_h,
+                    self.renderer.scale_factor,
                 );
 
                 for (id, rect) in &pane_rects {
@@ -153,10 +156,11 @@ impl TerminalSession {
         mouse_y: f32,
         tab_bar_h: f32,
     ) -> Option<(PaneId, usize, usize)> {
-        let pane_rects = self.workspace.compute_active_pane_rects(
+        let pane_rects = self.workspace.compute_active_pane_rects_with_scale(
             self.renderer.config.width as f32,
             self.renderer.config.height as f32,
             tab_bar_h,
+            self.renderer.scale_factor,
         );
 
         for (id, rect) in pane_rects {
@@ -179,7 +183,7 @@ impl TerminalSession {
     }
 
     pub fn sync_all_pane_sizes(&mut self, tab_bar_h: f32) {
-        self.workspace.sync_pane_sizes(
+        self.workspace.sync_pane_sizes_with_scale(
             self.renderer.config.width as f32,
             self.renderer.config.height as f32,
             self.renderer.cell_width(),
@@ -187,6 +191,7 @@ impl TerminalSession {
             self.renderer.padding_x,
             self.renderer.padding_y,
             tab_bar_h,
+            self.renderer.scale_factor,
         );
     }
 }
@@ -196,7 +201,9 @@ pub struct App {
     pub config_manager: ConfigManager,
     pub preferences_window: Option<PreferencesWindow>,
     pub sessions: HashMap<WindowId, TerminalSession>,
+    pub session_order: Vec<WindowId>,
     pub active_session_id: Option<WindowId>,
+    pub sidebar_open: bool,
     pub clipboard: Option<Arc<Mutex<Clipboard>>>,
     pub modifiers: ModifiersState,
     pub pending_geometry_save: bool,
@@ -225,12 +232,49 @@ impl App {
             config_manager,
             preferences_window: None,
             sessions: HashMap::new(),
+            session_order: Vec::new(),
             active_session_id: None,
+            sidebar_open: false,
             clipboard,
             modifiers: ModifiersState::default(),
             pending_geometry_save: false,
             last_resize_time: None,
         }
+    }
+
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar_open = !self.sidebar_open;
+        let tab_bar_h = self.get_tab_bar_height();
+        for session in self.sessions.values_mut() {
+            session.workspace.sidebar_open = self.sidebar_open;
+            session.sync_all_pane_sizes(tab_bar_h);
+            session.window.request_redraw();
+        }
+    }
+
+    pub fn scan_all_ai_agents(&mut self) -> Vec<(WindowId, skterm_render::AgentSidebarItem)> {
+        let mut all_agents = Vec::new();
+        let active_wid = self.active_session_id;
+        let session_ids = self.session_order.clone();
+
+        for (s_idx, wid) in session_ids.iter().enumerate() {
+            if let Some(session) = self.sessions.get_mut(wid) {
+                let mut agents = session
+                    .workspace
+                    .scan_ai_agents(&mut session.process_cache);
+                for agent in &mut agents {
+                    if session_ids.len() > 1 {
+                        agent.location_label = format!("T{}•#{}", s_idx + 1, agent.pane_id);
+                    }
+                    if Some(*wid) != active_wid {
+                        agent.is_focused = false;
+                    }
+                    all_agents.push((*wid, agent.clone()));
+                }
+            }
+        }
+
+        all_agents
     }
 
     pub fn run(mut self) -> anyhow::Result<()> {
@@ -633,6 +677,7 @@ impl App {
             scrollback,
             pty_opts,
         )?;
+        workspace.sidebar_open = self.sidebar_open;
 
         let render_theme = self.build_render_theme();
         renderer.set_theme(render_theme);
@@ -653,15 +698,18 @@ impl App {
             window: window.clone(),
             renderer,
             workspace,
+            process_cache: crate::layout::ProcessTreeCache::new(),
             mouse_pos: (0.0, 0.0),
             is_mouse_down: false,
             last_click_time: Instant::now(),
             click_count: 0,
             dragging_splitter: None,
             hovered_url: None,
+            scroll_pixel_accumulator: 0.0,
         };
 
         self.sessions.insert(window_id, session);
+        self.session_order.push(window_id);
         self.active_session_id = Some(window_id);
         info!("Initialized Terminal Window Session (ID: {:?})", window_id);
         Ok(window_id)
@@ -731,6 +779,7 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => {
                 info!("Terminal window close requested for {:?}", window_id);
                 self.sessions.remove(&window_id);
+                self.session_order.retain(|&id| id != window_id);
                 if self.sessions.is_empty() {
                     info!("All terminal windows closed, exiting.");
                     event_loop.exit();
@@ -884,6 +933,10 @@ impl ApplicationHandler for App {
                                     return;
                                 }
                             }
+                            "a" if is_shift => {
+                                self.toggle_sidebar();
+                                return;
+                            }
                             "t" => {
                                 // macOS Native Tab (or new window)
                                 #[cfg(target_os = "macos")]
@@ -915,6 +968,7 @@ impl ApplicationHandler for App {
                                     let all_panes_closed = session.workspace.close_active_pane();
                                     if all_panes_closed {
                                         self.sessions.remove(&window_id);
+                                        self.session_order.retain(|&id| id != window_id);
                                         if self.sessions.is_empty() {
                                             event_loop.exit();
                                         }
@@ -1218,6 +1272,7 @@ impl ApplicationHandler for App {
                                 }
                                 if all_closed {
                                     self.sessions.remove(&window_id);
+                                    self.session_order.retain(|&id| id != window_id);
                                     if self.sessions.is_empty() {
                                         event_loop.exit();
                                     }
@@ -1234,15 +1289,149 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                let pty_opts = self.build_pty_options();
+                let scrollback = self
+                    .config_manager
+                    .current_config
+                    .terminal
+                    .scrollback_lines;
+
+                let mut toggle_sidebar_clicked = false;
+                let mut clicked_agent_idx: Option<usize> = None;
+
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     let (mx, my) = session.mouse_pos;
 
                     if button == MouseButton::Left {
                         if state == ElementState::Pressed {
+                            let scale = session.renderer.scale_factor;
+
+                            // 0. Check AI Sidebar Toggle Button click (in Tab Bar)
+                            if tab_bar_h > 0.0 && my <= tab_bar_h {
+                                let base_x = if cfg!(target_os = "macos") {
+                                    78.0 * scale
+                                } else {
+                                    8.0 * scale
+                                };
+                                let ai_btn_w = 34.0 * scale;
+                                if mx >= base_x && mx <= base_x + ai_btn_w {
+                                    toggle_sidebar_clicked = true;
+                                }
+                            }
+
+                            // 0.5 Check AI Sidebar Panel click when open
+                            if !toggle_sidebar_clicked && session.workspace.sidebar_open {
+                                let sidebar_px = session.workspace.sidebar_width * scale;
+                                if mx <= sidebar_px && my >= tab_bar_h {
+                                    let header_top = tab_bar_h;
+                                    let header_h = 38.0 * scale;
+
+                                    // Check "+ New" button click
+                                    let new_btn_w = 56.0 * scale;
+                                    let new_btn_h = 22.0 * scale;
+                                    let new_btn_x = sidebar_px - new_btn_w - 10.0 * scale;
+                                    let new_btn_y = header_top + (header_h - new_btn_h) / 2.0;
+                                    if mx >= new_btn_x
+                                        && mx <= new_btn_x + new_btn_w
+                                        && my >= new_btn_y
+                                        && my <= new_btn_y + new_btn_h
+                                    {
+                                        let _ = session.workspace.split_active_pane(
+                                            SplitDirection::Horizontal,
+                                            24,
+                                            80,
+                                            scrollback,
+                                            pty_opts,
+                                        );
+                                        session.sync_all_pane_sizes(tab_bar_h);
+                                        if let Some(tab) = session.workspace.active_tab_mut() {
+                                            if let Some(term) = tab.active_terminal_mut() {
+                                                let _ = term.write_to_pty(b"agy\r");
+                                            }
+                                        }
+                                        session.window.request_redraw();
+                                        return;
+                                    }
+
+                                    // Check Agent Card click
+                                    let card_h = 66.0 * scale;
+                                    let card_gap = 6.0 * scale;
+                                    let list_start_y = header_top + header_h + 8.0 * scale;
+                                    if my >= list_start_y {
+                                        let idx = ((my - list_start_y) / (card_h + card_gap))
+                                            .floor()
+                                            as usize;
+                                        clicked_agent_idx = Some(idx);
+                                    } else {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if toggle_sidebar_clicked {
+                    self.toggle_sidebar();
+                    return;
+                }
+
+                if let Some(idx) = clicked_agent_idx {
+                    let all_agents = self.scan_all_ai_agents();
+                    if let Some((target_wid, agent)) = all_agents.get(idx).cloned() {
+                        self.active_session_id = Some(target_wid);
+                        if let Some(target_session) = self.sessions.get_mut(&target_wid) {
+                            if target_wid != window_id {
+                                target_session.window.focus_window();
+                                #[cfg(target_os = "macos")]
+                                {
+                                    let ns_win = get_nswindow(&target_session.window);
+                                    if !ns_win.is_null() {
+                                        use objc::{msg_send, sel, sel_impl};
+                                        let _: () = unsafe {
+                                            msg_send![
+                                                ns_win,
+                                                makeKeyAndOrderFront: std::ptr::null::<objc::runtime::Object>()
+                                            ]
+                                        };
+                                    }
+                                }
+                            }
+                            if let Some(t_pos) = target_session
+                                .workspace
+                                .tabs
+                                .iter()
+                                .position(|t| t.id == agent.tab_id)
+                            {
+                                target_session.workspace.select_tab(t_pos);
+                            }
+                            if let Some(tab) = target_session.workspace.active_tab_mut() {
+                                tab.active_pane_id = agent.pane_id;
+                                if tab.zoomed_pane_id.is_some()
+                                    && tab.zoomed_pane_id != Some(agent.pane_id)
+                                {
+                                    tab.zoomed_pane_id = Some(agent.pane_id);
+                                }
+                            }
+                            target_session.window.request_redraw();
+                        }
+                    }
+                    return;
+                }
+
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    let (mx, my) = session.mouse_pos;
+
+                    if button == MouseButton::Left {
+                        if state == ElementState::Pressed {
+                            let scale = session.renderer.scale_factor;
+
                             // 1. Check Splitter Hit Test First
                             let width = session.renderer.config.width as f32;
                             let height = session.renderer.config.height as f32;
-                            let bounds = Rect::new(0.0, tab_bar_h, width, height - tab_bar_h);
+                            let bounds = session
+                                .workspace
+                                .content_bounds(width, height, tab_bar_h, scale);
                             if let Some(tab) = session.workspace.active_tab() {
                                 if let Some(splitter) = tab.find_splitter_at(bounds, mx, my) {
                                     session.dragging_splitter = Some((
@@ -1328,21 +1517,76 @@ impl ApplicationHandler for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     let lines = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y as i32,
+                        MouseScrollDelta::LineDelta(_, y) => {
+                            session.scroll_pixel_accumulator = 0.0;
+                            y as i32
+                        }
                         MouseScrollDelta::PixelDelta(pos) => {
-                            let scale = session.renderer.cell_height();
-                            (pos.y / scale as f64) as i32
+                            let scale = session.renderer.cell_height().max(1.0) as f64;
+                            session.scroll_pixel_accumulator += pos.y;
+                            let lines = (session.scroll_pixel_accumulator / scale) as i32;
+                            session.scroll_pixel_accumulator -= lines as f64 * scale;
+                            lines
                         }
                     };
 
                     if lines != 0 {
+                        let (mx, my) = session.mouse_pos;
+                        let cell_pos = session
+                            .get_pane_and_cell_at(mx, my, tab_bar_h)
+                            .map(|(_, row, col)| (row + 1, col + 1))
+                            .unwrap_or((1, 1));
+
                         if let Some(tab) = session.workspace.active_tab_mut() {
                             if let Some(terminal) = tab.active_terminal_mut() {
-                                terminal
-                                    .grid_mut()
-                                    .active_mut()
-                                    .scroll_display(lines as isize);
-                                session.window.request_redraw();
+                                if terminal.state.mouse_protocol
+                                    != skterm_core::vt::MouseProtocol::None
+                                {
+                                    let button = if lines > 0 { 64 } else { 65 };
+                                    let (row, col) = cell_pos;
+                                    let mut payload = Vec::new();
+                                    for _ in 0..lines.unsigned_abs() {
+                                        if terminal.state.mouse_format
+                                            == skterm_core::vt::MouseFormat::Sgr
+                                        {
+                                            payload.extend_from_slice(
+                                                format!("\x1b[<{};{};{}M", button, col, row)
+                                                    .as_bytes(),
+                                            );
+                                        } else {
+                                            let cb = (button + 32) as u8;
+                                            let cx = (col.min(223) + 32) as u8;
+                                            let cy = (row.min(223) + 32) as u8;
+                                            payload.extend_from_slice(&[
+                                                0x1b, b'[', b'M', cb, cx, cy,
+                                            ]);
+                                        }
+                                    }
+                                    let _ = terminal.write_to_pty(&payload);
+                                } else if terminal.grid().is_alternate {
+                                    let seq: &[u8] = if lines > 0 {
+                                        if terminal.state.application_cursor_keys {
+                                            b"\x1bOA"
+                                        } else {
+                                            b"\x1b[A"
+                                        }
+                                    } else if terminal.state.application_cursor_keys {
+                                        b"\x1bOB"
+                                    } else {
+                                        b"\x1b[B"
+                                    };
+                                    let mut payload = Vec::new();
+                                    for _ in 0..lines.unsigned_abs() {
+                                        payload.extend_from_slice(seq);
+                                    }
+                                    let _ = terminal.write_to_pty(&payload);
+                                } else {
+                                    terminal
+                                        .grid_mut()
+                                        .active_mut()
+                                        .scroll_display(lines as isize);
+                                    session.window.request_redraw();
+                                }
                             }
                         }
                     }
@@ -1350,6 +1594,12 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                let agents: Vec<skterm_render::AgentSidebarItem> = self
+                    .scan_all_ai_agents()
+                    .into_iter()
+                    .map(|(_, a)| a)
+                    .collect();
+
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     session.update_ime_position(tab_bar_h);
 
@@ -1371,10 +1621,11 @@ impl ApplicationHandler for App {
                         })
                         .collect();
 
-                    let pane_rects = session.workspace.compute_active_pane_rects(
+                    let pane_rects = session.workspace.compute_active_pane_rects_with_scale(
                         session.renderer.config.width as f32,
                         session.renderer.config.height as f32,
                         tab_bar_h,
+                        session.renderer.scale_factor,
                     );
 
                     let mut render_panes = Vec::new();
@@ -1393,11 +1644,28 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    if let Err(e) =
-                        session
-                            .renderer
-                            .render_workspace(&tabs, &render_panes, tab_bar_h)
-                    {
+                    let sidebar_px = if session.workspace.sidebar_open {
+                        session.workspace.sidebar_width * session.renderer.scale_factor
+                    } else {
+                        0.0
+                    };
+
+                    if let Err(e) = session.renderer.render_workspace_with_sidebar(
+                        &tabs,
+                        &render_panes,
+                        tab_bar_h,
+                        session.workspace.sidebar_open,
+                        sidebar_px,
+                        &agents,
+                        None::<
+                            fn(
+                                &wgpu::Device,
+                                &wgpu::Queue,
+                                &wgpu::TextureView,
+                                &wgpu::SurfaceConfiguration,
+                            ),
+                        >,
+                    ) {
                         warn!("Render error on session {:?}: {:?}", window_id, e);
                     }
 
@@ -1449,6 +1717,7 @@ impl ApplicationHandler for App {
 
         for id in dead_sessions {
             self.sessions.remove(&id);
+            self.session_order.retain(|&wid| wid != id);
         }
 
         if self.sessions.is_empty() {

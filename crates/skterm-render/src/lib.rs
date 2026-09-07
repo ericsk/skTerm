@@ -7,7 +7,9 @@ pub mod shader;
 
 pub use atlas::{GlyphAtlas, GlyphInfo, GlyphKey};
 pub use pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
-pub use renderer::{color_to_rgba_themed, PaneRenderItem, RenderTheme, TabItem, TermRenderer};
+pub use renderer::{
+    color_to_rgba_themed, AgentSidebarItem, PaneRenderItem, RenderTheme, TabItem, TermRenderer,
+};
 
 /// skterm-render version and basic info
 pub fn render_info() -> &'static str {
