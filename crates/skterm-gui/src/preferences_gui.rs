@@ -544,11 +544,11 @@ impl PreferencesGui {
                                     };
 
                                     let stroke = if is_selected {
-                                        egui::Stroke::new(1.8, Color32::from_rgb(10, 132, 255))
+                                        egui::Stroke::new(1.8_f32, Color32::from_rgb(10, 132, 255))
                                     } else if hover {
-                                        egui::Stroke::new(1.0, Color32::from_rgb(75, 82, 108))
+                                        egui::Stroke::new(1.0_f32, Color32::from_rgb(75, 82, 108))
                                     } else {
-                                        egui::Stroke::new(1.0, Color32::from_rgb(48, 51, 68))
+                                        egui::Stroke::new(1.0_f32, Color32::from_rgb(48, 51, 68))
                                     };
 
                                     ui.painter().rect(
@@ -599,7 +599,7 @@ impl PreferencesGui {
                                         ui.painter().circle_stroke(
                                             egui::pos2(dot_x, dot_y),
                                             4.0,
-                                            egui::Stroke::new(0.5, Color32::from_white_alpha(70)),
+                                            egui::Stroke::new(0.5_f32, Color32::from_white_alpha(70)),
                                         );
                                     }
 

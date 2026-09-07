@@ -48,7 +48,7 @@ impl<'a> InsetCardBuilder<'a> {
             let end_pos = min_pos + egui::vec2(avail_w, 0.0);
             self.ui.painter().line_segment(
                 [min_pos, end_pos],
-                Stroke::new(1.0, Color32::from_rgb(46, 49, 63)),
+                Stroke::new(1.0_f32, Color32::from_rgb(46, 49, 63)),
             );
             self.ui.add_space(8.0);
         } else {
@@ -96,7 +96,7 @@ where
 
     Frame::new()
         .fill(Color32::from_rgb(34, 36, 48))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(52, 55, 72)))
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(52, 55, 72)))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(16, 12))
         .show(ui, |ui| {
@@ -162,7 +162,7 @@ pub fn render_macos_segmented_control<T: PartialEq + Copy>(
 
     Frame::new()
         .fill(Color32::from_rgb(25, 27, 36))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(46, 49, 64)))
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(46, 49, 64)))
         .corner_radius(CornerRadius::same(7))
         .inner_margin(Margin::symmetric(3, 3))
         .show(ui, |ui| {
@@ -173,7 +173,7 @@ pub fn render_macos_segmented_control<T: PartialEq + Copy>(
                         (
                             Color32::from_rgb(58, 62, 82),
                             Color32::WHITE,
-                            Stroke::new(1.0, Color32::from_rgb(82, 87, 112)),
+                            Stroke::new(1.0_f32, Color32::from_rgb(82, 87, 112)),
                         )
                     } else {
                         (
@@ -258,7 +258,7 @@ pub fn render_theme_color_preview(ui: &mut Ui, theme: &str) {
             ui.painter().circle_stroke(
                 rect.center(),
                 7.0,
-                Stroke::new(1.0, Color32::from_black_alpha(100)),
+                Stroke::new(1.0_f32, Color32::from_black_alpha(100)),
             );
         }
     });
@@ -268,7 +268,7 @@ pub fn render_theme_color_preview(ui: &mut Ui, theme: &str) {
 pub fn render_macos_keyboard_badge(ui: &mut Ui, text: &str) {
     Frame::new()
         .fill(Color32::from_rgb(42, 45, 58))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(68, 72, 92)))
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(68, 72, 92)))
         .corner_radius(CornerRadius::same(5))
         .inner_margin(Margin::symmetric(7, 3))
         .show(ui, |ui| {
@@ -338,11 +338,11 @@ pub fn render_color_row_with_presets(
                     let (rect, resp) =
                         ui.allocate_exact_size(egui::Vec2::new(17.0, 17.0), Sense::click());
                     let stroke = if *hex_val == *code {
-                        Stroke::new(2.0, Color32::from_rgb(10, 132, 255))
+                        Stroke::new(2.0_f32, Color32::from_rgb(10, 132, 255))
                     } else if resp.hovered() {
-                        Stroke::new(1.3, Color32::WHITE)
+                        Stroke::new(1.3_f32, Color32::WHITE)
                     } else {
-                        Stroke::new(0.8, Color32::from_white_alpha(90))
+                        Stroke::new(0.8_f32, Color32::from_white_alpha(90))
                     };
                     ui.painter().circle_filled(rect.center(), 6.5, *col);
                     ui.painter().circle_stroke(rect.center(), 6.5, stroke);
@@ -827,7 +827,7 @@ impl PreferencesWindow {
                         );
                         ui.painter().line_segment(
                             [divider_rect.left_center(), divider_rect.right_center()],
-                            Stroke::new(1.0, Color32::from_rgb(42, 45, 60)),
+                            Stroke::new(1.0_f32, Color32::from_rgb(42, 45, 60)),
                         );
                         ui.add_space(8.0);
                     });
@@ -1168,11 +1168,11 @@ impl PreferencesWindow {
                                     };
 
                                     let stroke = if is_selected {
-                                        Stroke::new(1.8, Color32::from_rgb(10, 132, 255))
+                                        Stroke::new(1.8_f32, Color32::from_rgb(10, 132, 255))
                                     } else if hover {
-                                        Stroke::new(1.0, Color32::from_rgb(75, 82, 108))
+                                        Stroke::new(1.0_f32, Color32::from_rgb(75, 82, 108))
                                     } else {
-                                        Stroke::new(1.0, Color32::from_rgb(48, 51, 68))
+                                        Stroke::new(1.0_f32, Color32::from_rgb(48, 51, 68))
                                     };
 
                                     ui.painter().rect(
@@ -1223,7 +1223,7 @@ impl PreferencesWindow {
                                         ui.painter().circle_stroke(
                                             egui::pos2(dot_x, dot_y),
                                             4.5,
-                                            Stroke::new(0.6, Color32::from_white_alpha(70)),
+                                            Stroke::new(0.6_f32, Color32::from_white_alpha(70)),
                                         );
                                     }
 

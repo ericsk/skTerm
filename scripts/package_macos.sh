@@ -47,4 +47,8 @@ cat << 'PLIST' > "${CONTENTS_DIR}/Info.plist"
 </plist>
 PLIST
 
+# Ad-hoc sign bundle for local execution
+echo "=== Signing macOS App Bundle ==="
+codesign --force --deep --sign - "${BUNDLE_DIR}"
+
 echo "Successfully built macOS App Bundle at ${BUNDLE_DIR}"
