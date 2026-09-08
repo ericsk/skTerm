@@ -9,7 +9,7 @@ pub mod vt;
 pub use graphics::{GraphicImage, KittyGraphicsParser, SixelDecoder};
 pub use grid::{
     Cell, CellFlags, Color, Cursor, CursorShape, NamedColor, Row, ScreenBuffer, ScreenGrid,
-    Selection, SelectionMode,
+    SearchMatch, Selection, SelectionMode,
 };
 pub use pty::{PtyEvent, PtyProcess, PtySpawnOptions};
 pub use terminal::Terminal;
@@ -316,5 +316,56 @@ mod tests {
             .map(|c| c.c)
             .collect();
         assert_eq!(current_line_text, "$ my-command");
+    }
+
+    #[test]
+    fn test_osc7_working_directory() {
+        let mut term = Terminal::new_headless(24, 80, 100);
+        term.feed_bytes(b"\x1b]7;file://macbook.local/Users/ericsk/Projects/skTerm\x07");
+        assert_eq!(
+            term.state.current_working_directory.as_deref(),
+            Some("/Users/ericsk/Projects/skTerm")
+        );
+    }
+
+    #[test]
+    fn test_clear_scrollback_and_screen() {
+        let mut term = Terminal::new_headless(5, 80, 100);
+        for i in 0..10 {
+            term.feed_bytes(format!("Line {}\r\n", i).as_bytes());
+        }
+        assert!(!term.grid().active().scrollback.is_empty());
+
+        term.grid_mut().active_mut().clear_scrollback_and_screen();
+        assert!(term.grid().active().scrollback.is_empty());
+        assert_eq!(term.grid().active().cursor.row, 0);
+        assert_eq!(term.grid().active().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_word_and_line_selection() {
+        let mut term = Terminal::new_headless(5, 80, 100);
+        term.feed_bytes(b"hello /usr/local/bin/skterm world\r\n");
+
+        // Double click inside path `/usr/local/bin/skterm` (e.g., col 10)
+        term.grid_mut().active_mut().select_word_at(0, 10);
+        let selected = term.grid().active().extract_selected_text();
+        assert_eq!(selected, "/usr/local/bin/skterm");
+
+        // Triple click selects entire line
+        term.grid_mut().active_mut().select_line_at(0);
+        let line_selected = term.grid().active().extract_selected_text();
+        assert!(line_selected.starts_with("hello /usr/local/bin/skterm world"));
+    }
+
+    #[test]
+    fn test_scrollback_and_screen_search() {
+        let mut term = Terminal::new_headless(5, 80, 100);
+        for i in 0..8 {
+            term.feed_bytes(format!("Log entry #{} with TargetKeyword\r\n", i).as_bytes());
+        }
+        let matches = term.grid().active().search("targetkeyword");
+        assert_eq!(matches.len(), 8);
+        assert_eq!(matches[0].start_col, 18);
     }
 }

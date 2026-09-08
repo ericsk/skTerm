@@ -2,7 +2,7 @@
 
 use fontdue::{Font, FontSettings};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::{info, warn};
 use wgpu::{
     Extent3d, Origin3d, Queue, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
@@ -62,7 +62,7 @@ impl GlyphAtlas {
 
     pub fn new_with_family(
         device: &wgpu::Device,
-        queue: &Queue,
+        _queue: &Queue,
         font_size: f32,
         font_family: &str,
         fallback_families: &[String],
@@ -82,28 +82,6 @@ impl GlyphAtlas {
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
-
-        // Initialize atlas texture with zero bytes
-        let empty_data = vec![0u8; (Self::ATLAS_SIZE * Self::ATLAS_SIZE) as usize];
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            &empty_data,
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(Self::ATLAS_SIZE),
-                rows_per_image: Some(Self::ATLAS_SIZE),
-            },
-            Extent3d {
-                width: Self::ATLAS_SIZE,
-                height: Self::ATLAS_SIZE,
-                depth_or_array_layers: 1,
-            },
-        );
 
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -353,72 +331,90 @@ fn clean_name(s: &str) -> String {
         .to_lowercase()
 }
 
-/// Search user and system font directories for a font family name.
-pub fn find_font_file(query: &str) -> Option<(Vec<u8>, PathBuf)> {
+static FONT_FILE_INDEX: std::sync::OnceLock<Vec<(PathBuf, String)>> = std::sync::OnceLock::new();
+
+fn get_cached_font_index() -> &'static [(PathBuf, String)] {
+    FONT_FILE_INDEX.get_or_init(|| {
+        let mut search_dirs = Vec::new();
+        if let Ok(home) = std::env::var("HOME") {
+            let home_path = PathBuf::from(home);
+            search_dirs.push(home_path.join("Library/Fonts"));
+            search_dirs.push(home_path.join(".local/share/fonts"));
+            search_dirs.push(home_path.join(".fonts"));
+        }
+        if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+            search_dirs.push(PathBuf::from(appdata).join("Microsoft\\Windows\\Fonts"));
+        }
+        search_dirs.push(PathBuf::from("/Library/Fonts"));
+        search_dirs.push(PathBuf::from("/System/Library/Fonts"));
+        search_dirs.push(PathBuf::from("/System/Library/Fonts/Supplemental"));
+        search_dirs.push(PathBuf::from("/usr/share/fonts"));
+        search_dirs.push(PathBuf::from("/usr/local/share/fonts"));
+        search_dirs.push(PathBuf::from("C:\\Windows\\Fonts"));
+
+        let mut files = Vec::new();
+        for dir in search_dirs {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                            let ext_lower = ext.to_lowercase();
+                            if ext_lower == "ttf" || ext_lower == "ttc" || ext_lower == "otf" {
+                                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                                    let clean = clean_name(file_name);
+                                    files.push((path, clean));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        files
+    })
+}
+
+/// Search user and system font directories for a font family name, returning the parsed Font.
+pub fn find_font_file(query: &str) -> Option<(Font, PathBuf)> {
     let clean_q = clean_name(query);
     if clean_q.is_empty() {
         return None;
     }
 
-    let mut search_dirs = Vec::new();
-
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = PathBuf::from(home);
-        search_dirs.push(home_path.join("Library/Fonts"));
-        search_dirs.push(home_path.join(".local/share/fonts"));
-        search_dirs.push(home_path.join(".fonts"));
-    }
-    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-        search_dirs.push(PathBuf::from(appdata).join("Microsoft\\Windows\\Fonts"));
-    }
-
-    search_dirs.push(PathBuf::from("/Library/Fonts"));
-    search_dirs.push(PathBuf::from("/System/Library/Fonts"));
-    search_dirs.push(PathBuf::from("/System/Library/Fonts/Supplemental"));
-    search_dirs.push(PathBuf::from("/usr/share/fonts"));
-    search_dirs.push(PathBuf::from("/usr/local/share/fonts"));
-    search_dirs.push(PathBuf::from("C:\\Windows\\Fonts"));
-
-    for dir in search_dirs {
-        if dir.exists() {
-            if let Some(res) = scan_dir_for_font(&dir, &clean_q) {
-                return Some(res);
-            }
-        }
-    }
-    None
-}
-
-fn scan_dir_for_font(dir: &Path, clean_q: &str) -> Option<(Vec<u8>, PathBuf)> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut files = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let ext_lower = ext.to_lowercase();
-                if ext_lower == "ttf" || ext_lower == "ttc" || ext_lower == "otf" {
-                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                        let clean = clean_name(file_name);
-                        files.push((path, clean));
-                    }
+    // Fast-path direct lookup for standard system monospace fonts (avoids any directory scan on startup)
+    let direct_candidates: &[(&str, &str)] = &[
+        ("menlo", "/System/Library/Fonts/Menlo.ttc"),
+        ("monaco", "/System/Library/Fonts/Monaco.ttf"),
+        ("sfmono", "/System/Library/Fonts/SFMono-Regular.otf"),
+        ("dejavusansmono", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"),
+        ("consolas", "C:\\Windows\\Fonts\\consola.ttf"),
+    ];
+    for (name, path_str) in direct_candidates {
+        if clean_q == *name {
+            let path = PathBuf::from(path_str);
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                    return Some((font, path));
                 }
             }
         }
     }
 
-    // 1. Direct contains match (e.g. "notosansmnerdfontmono")
-    for (path, clean_f) in &files {
-        if clean_f.contains(clean_q) {
+    let files = get_cached_font_index();
+
+    // 1. Direct contains match
+    for (path, clean_f) in files {
+        if clean_f.contains(&clean_q) {
             if let Ok(bytes) = std::fs::read(path) {
-                if Font::from_bytes(bytes.as_slice(), FontSettings::default()).is_ok() {
-                    return Some((bytes, path.clone()));
+                if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                    return Some((font, path.clone()));
                 }
             }
         }
     }
 
-    // 2. Multi-token fallback match (e.g. "noto mono" matching "notosansmnerdfontmono" or "notosanstc")
+    // 2. Multi-token fallback match
     let tokens: Vec<&str> = if clean_q.contains("noto") && clean_q.contains("mono") {
         vec!["noto", "mono"]
     } else if clean_q.contains("noto") && clean_q.contains("nerd") {
@@ -430,11 +426,11 @@ fn scan_dir_for_font(dir: &Path, clean_q: &str) -> Option<(Vec<u8>, PathBuf)> {
     };
 
     if !tokens.is_empty() {
-        for (path, clean_f) in &files {
+        for (path, clean_f) in files {
             if tokens.iter().all(|t| clean_f.contains(t)) {
                 if let Ok(bytes) = std::fs::read(path) {
-                    if Font::from_bytes(bytes.as_slice(), FontSettings::default()).is_ok() {
-                        return Some((bytes, path.clone()));
+                    if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                        return Some((font, path.clone()));
                     }
                 }
             }
@@ -451,7 +447,6 @@ pub fn load_configured_font_chain(
 ) -> (Font, Option<Font>, Option<Font>, Vec<Font>) {
     let mut queries = Vec::new();
 
-    // Comma-separated entries in family string
     for token in family_str.split(',') {
         let t = token.trim();
         if !t.is_empty() {
@@ -459,7 +454,6 @@ pub fn load_configured_font_chain(
         }
     }
 
-    // Additional fallback families
     for f in fallback_families {
         let t = f.trim();
         if !t.is_empty() && !queries.contains(&t.to_string()) {
@@ -473,25 +467,26 @@ pub fn load_configured_font_chain(
     let mut fallback_fonts: Vec<Font> = Vec::new();
 
     for q in &queries {
-        if let Some((bytes, path)) = find_font_file(q) {
-            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
-                if primary_font.is_none() {
-                    info!("Found primary font match for '{}': {:?}", q, path);
-                    primary_font = Some(font);
+        if let Some((font, path)) = find_font_file(q) {
+            if primary_font.is_none() {
+                info!("Found primary font match for '{}': {:?}", q, path);
+                primary_font = Some(font);
 
-                    // Try finding bold/italic variants
+                // Only query bold/italic variants if not a single-file TTC like Menlo
+                let clean_q = clean_name(q);
+                if clean_q != "menlo" && clean_q != "monaco" {
                     let bold_query = format!("{}Bold", q);
-                    if let Some((b_bytes, _)) = find_font_file(&bold_query) {
-                        bold_font = Font::from_bytes(b_bytes, FontSettings::default()).ok();
+                    if let Some((b_font, _)) = find_font_file(&bold_query) {
+                        bold_font = Some(b_font);
                     }
                     let italic_query = format!("{}Italic", q);
-                    if let Some((i_bytes, _)) = find_font_file(&italic_query) {
-                        italic_font = Font::from_bytes(i_bytes, FontSettings::default()).ok();
+                    if let Some((i_font, _)) = find_font_file(&italic_query) {
+                        italic_font = Some(i_font);
                     }
-                } else {
-                    info!("Found fallback font match for '{}': {:?}", q, path);
-                    fallback_fonts.push(font);
                 }
+            } else {
+                info!("Found fallback font match for '{}': {:?}", q, path);
+                fallback_fonts.push(font);
             }
         }
     }

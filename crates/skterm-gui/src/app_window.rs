@@ -68,9 +68,74 @@ pub struct TerminalSession {
     pub dragging_splitter: Option<(u32, SplitDirection, Rect)>,
     pub hovered_url: Option<String>,
     pub scroll_pixel_accumulator: f64,
+    pub search_open: bool,
+    pub search_query: String,
+    pub search_matches: Vec<skterm_core::SearchMatch>,
+    pub active_search_idx: Option<usize>,
 }
 
 impl TerminalSession {
+    pub fn update_search_matches(&mut self) {
+        self.search_matches = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.active_terminal())
+            .map(|term| term.grid().active().search(&self.search_query))
+            .unwrap_or_default();
+
+        if self.search_matches.is_empty() {
+            self.active_search_idx = None;
+        } else {
+            let idx = self.search_matches.len() - 1;
+            self.active_search_idx = Some(idx);
+            let target_row = self.search_matches[idx].global_row;
+            if let Some(tab) = self.workspace.active_tab_mut() {
+                if let Some(term) = tab.active_terminal_mut() {
+                    term.grid_mut().active_mut().scroll_to_global_row(target_row);
+                }
+            }
+        }
+    }
+
+    pub fn next_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let next = match self.active_search_idx {
+            Some(i) => (i + 1) % self.search_matches.len(),
+            None => 0,
+        };
+        self.active_search_idx = Some(next);
+        let target_row = self.search_matches[next].global_row;
+        if let Some(tab) = self.workspace.active_tab_mut() {
+            if let Some(term) = tab.active_terminal_mut() {
+                term.grid_mut().active_mut().scroll_to_global_row(target_row);
+            }
+        }
+    }
+
+    pub fn prev_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let prev = match self.active_search_idx {
+            Some(i) => {
+                if i == 0 {
+                    self.search_matches.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => self.search_matches.len() - 1,
+        };
+        self.active_search_idx = Some(prev);
+        let target_row = self.search_matches[prev].global_row;
+        if let Some(tab) = self.workspace.active_tab_mut() {
+            if let Some(term) = tab.active_terminal_mut() {
+                term.grid_mut().active_mut().scroll_to_global_row(target_row);
+            }
+        }
+    }
     pub fn update_ime_position(&self, tab_bar_h: f32) {
         if let Some(active_tab) = self.workspace.active_tab() {
             if let Some(terminal) = active_tab.active_terminal() {
@@ -543,10 +608,19 @@ impl App {
             (None, default_args)
         };
 
+        let inherited_cwd = self
+            .active_session_id
+            .and_then(|wid| self.sessions.get(&wid))
+            .and_then(|s| s.workspace.active_tab())
+            .and_then(|t| t.active_terminal())
+            .and_then(|term| term.current_working_directory());
+
+        let cwd = inherited_cwd.or_else(|| term_cfg.working_directory.clone());
+
         PtySpawnOptions {
             shell,
             args,
-            cwd: term_cfg.working_directory.clone(),
+            cwd,
             term: Some(term_cfg.term.clone()),
             env: term_cfg.env.clone(),
         }
@@ -742,6 +816,10 @@ impl App {
             dragging_splitter: None,
             hovered_url: None,
             scroll_pixel_accumulator: 0.0,
+            search_open: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            active_search_idx: None,
         };
 
         self.sessions.insert(window_id, session);
@@ -1074,6 +1152,35 @@ impl ApplicationHandler for App {
                                 }
                                 return;
                             }
+                            "k" => {
+                                // Clear active buffer and scrollback history (Cmd+K)
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    if let Some(tab) = session.workspace.active_tab_mut() {
+                                        if let Some(term) = tab.active_terminal_mut() {
+                                            term.grid_mut()
+                                                .active_mut()
+                                                .clear_scrollback_and_screen();
+                                            let _ = term.write_to_pty(b"\x0c");
+                                            session.window.request_redraw();
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+                            "f" => {
+                                // Toggle Find in Scrollback bar (Cmd+F)
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    session.search_open = !session.search_open;
+                                    if session.search_open {
+                                        session.update_search_matches();
+                                    } else {
+                                        session.search_matches.clear();
+                                        session.active_search_idx = None;
+                                    }
+                                    session.window.request_redraw();
+                                }
+                                return;
+                            }
                             "+" | "=" => {
                                 if let Some(session) = self.sessions.get_mut(&window_id) {
                                     if self.modifiers.alt_key() {
@@ -1114,6 +1221,52 @@ impl ApplicationHandler for App {
                                             session.window.request_redraw();
                                         }
                                         return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Handle Find Bar input when search_open is active
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    if session.search_open && event.state == ElementState::Pressed {
+                        match &event.logical_key {
+                            Key::Named(NamedKey::Escape) => {
+                                session.search_open = false;
+                                session.search_matches.clear();
+                                session.active_search_idx = None;
+                                session.window.request_redraw();
+                                return;
+                            }
+                            Key::Named(NamedKey::Enter) => {
+                                if self.modifiers.shift_key() {
+                                    session.prev_search_match();
+                                } else {
+                                    session.next_search_match();
+                                }
+                                session.window.request_redraw();
+                                return;
+                            }
+                            Key::Named(NamedKey::Backspace) => {
+                                session.search_query.pop();
+                                session.update_search_matches();
+                                session.window.request_redraw();
+                                return;
+                            }
+                            _ => {
+                                if !self.modifiers.super_key() && !self.modifiers.control_key() {
+                                    if let Some(ref text) = event.text {
+                                        let filtered: String = text
+                                            .chars()
+                                            .filter(|c| !c.is_control())
+                                            .collect();
+                                        if !filtered.is_empty() {
+                                            session.search_query.push_str(&filtered);
+                                            session.update_search_matches();
+                                            session.window.request_redraw();
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -1523,15 +1676,25 @@ impl ApplicationHandler for App {
                                     }
                                     session.last_click_time = now;
 
-                                    let mode = match session.click_count {
-                                        2 => SelectionMode::Word,
-                                        3 => SelectionMode::Line,
-                                        _ => SelectionMode::Simple,
-                                    };
-
                                     if let Some(terminal) = tab.active_terminal_mut() {
-                                        terminal.grid_mut().active_mut().selection =
-                                            Some(Selection::new((row, col), (row, col), mode));
+                                        match session.click_count {
+                                            2 => terminal
+                                                .grid_mut()
+                                                .active_mut()
+                                                .select_word_at(row, col),
+                                            3 => terminal
+                                                .grid_mut()
+                                                .active_mut()
+                                                .select_line_at(row),
+                                            _ => {
+                                                terminal.grid_mut().active_mut().selection =
+                                                    Some(Selection::new(
+                                                        (row, col),
+                                                        (row, col),
+                                                        SelectionMode::Simple,
+                                                    ));
+                                            }
+                                        }
                                         session.window.request_redraw();
                                     }
                                 }
@@ -1668,13 +1831,29 @@ impl ApplicationHandler for App {
                     if let Some(active_tab) = session.workspace.active_tab() {
                         for (id, rect) in &pane_rects {
                             if let Some(t) = active_tab.root.find_terminal(*id) {
+                                let is_focused = *id == active_tab.active_pane_id;
                                 render_panes.push(PaneRenderItem {
                                     grid: t.grid(),
                                     rect_x: rect.x,
                                     rect_y: rect.y,
                                     rect_w: rect.width,
                                     rect_h: rect.height,
-                                    is_focused: *id == active_tab.active_pane_id,
+                                    is_focused,
+                                    search_matches: if is_focused {
+                                        &session.search_matches
+                                    } else {
+                                        &[]
+                                    },
+                                    active_search_idx: if is_focused {
+                                        session.active_search_idx
+                                    } else {
+                                        None
+                                    },
+                                    search_query: if is_focused && session.search_open {
+                                        Some(&session.search_query)
+                                    } else {
+                                        None
+                                    },
                                 });
                             }
                         }

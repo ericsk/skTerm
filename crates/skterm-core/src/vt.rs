@@ -43,6 +43,7 @@ pub struct TerminalState {
     pub sixel_buffer: Vec<u8>,
     pub kitty_parser: KittyGraphicsParser,
     pub insert_mode: bool,
+    pub current_working_directory: Option<String>,
 }
 
 impl TerminalState {
@@ -63,6 +64,7 @@ impl TerminalState {
             sixel_buffer: Vec::new(),
             kitty_parser: KittyGraphicsParser::new(),
             insert_mode: false,
+            current_working_directory: None,
         }
     }
 
@@ -298,6 +300,15 @@ impl Perform for TerminalState {
                 if params.len() > 1 {
                     if let Ok(title) = std::str::from_utf8(params[1]) {
                         self.title = title.to_string();
+                    }
+                }
+            }
+            b"7" => {
+                if params.len() > 1 {
+                    if let Ok(uri) = std::str::from_utf8(params[1]) {
+                        if let Some(path) = parse_osc7_uri(uri) {
+                            self.current_working_directory = Some(path);
+                        }
                     }
                 }
             }
@@ -564,4 +575,44 @@ impl Perform for TerminalState {
             _ => {}
         }
     }
+}
+
+/// Parse an OSC 7 file URI (e.g., `file://hostname/Users/name/path%20with%20spaces`)
+/// into a decoded local filesystem path string.
+fn parse_osc7_uri(uri: &str) -> Option<String> {
+    let raw_path = if let Some(after_scheme) = uri.strip_prefix("file://") {
+        // Skip hostname up to first '/'
+        if let Some(idx) = after_scheme.find('/') {
+            &after_scheme[idx..]
+        } else {
+            return None;
+        }
+    } else if uri.starts_with('/') {
+        uri
+    } else {
+        return None;
+    };
+
+    let mut bytes = Vec::with_capacity(raw_path.len());
+    let mut chars = raw_path.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next()?;
+            let h2 = chars.next()?;
+            let hex = [h1, h2];
+            if let Ok(s) = std::str::from_utf8(&hex) {
+                if let Ok(val) = u8::from_str_radix(s, 16) {
+                    bytes.push(val);
+                    continue;
+                }
+            }
+            bytes.push(b);
+            bytes.push(h1);
+            bytes.push(h2);
+        } else {
+            bytes.push(b);
+        }
+    }
+
+    String::from_utf8(bytes).ok()
 }

@@ -148,4 +148,42 @@ impl Terminal {
     pub fn url_at(&self, row: usize, col: usize) -> Option<String> {
         self.state.grid.url_at(row, col)
     }
+
+    /// Return the current working directory of this terminal (from OSC 7 or child OS process CWD).
+    pub fn current_working_directory(&self) -> Option<String> {
+        if let Some(ref cwd) = self.state.current_working_directory {
+            if std::path::Path::new(cwd).exists() {
+                return Some(cwd.clone());
+            }
+        }
+
+        if let Some(pid) = self.process_id() {
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(output) = std::process::Command::new("lsof")
+                    .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+                    .output()
+                {
+                    if let Ok(text) = String::from_utf8(output.stdout) {
+                        for line in text.lines() {
+                            if let Some(path) = line.strip_prefix('n') {
+                                if std::path::Path::new(path).exists() {
+                                    return Some(path.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", pid)) {
+                    if path.exists() {
+                        return Some(path.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        None
+    }
 }

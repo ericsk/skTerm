@@ -57,6 +57,9 @@ pub struct PaneRenderItem<'a> {
     pub rect_w: f32,
     pub rect_h: f32,
     pub is_focused: bool,
+    pub search_matches: &'a [skterm_core::SearchMatch],
+    pub active_search_idx: Option<usize>,
+    pub search_query: Option<&'a str>,
 }
 
 /// Render descriptor for a tab item in the tab bar
@@ -934,11 +937,17 @@ impl TermRenderer {
             }
 
             // Grid Cells
+            let top_global_row = active_buf
+                .scrollback
+                .len()
+                .saturating_sub(active_buf.scroll_offset);
+
             for r_idx in 0..active_buf.rows {
                 let y = py + self.padding_y + (r_idx as f32 * cell_h);
                 if y + cell_h > py + ph {
                     break;
                 }
+                let global_row = top_global_row + r_idx;
 
                 if let Some(row) = active_buf.get_visible_row(r_idx) {
                     for (c_idx, cell) in row.cells.iter().enumerate() {
@@ -971,6 +980,30 @@ impl TermRenderer {
                                 rect: [x, y, cell_w, cell_h],
                                 color: bg_rgba,
                             });
+                        }
+
+                        // Highlight search matches
+                        if !pane.search_matches.is_empty() {
+                            let mut match_highlight = None;
+                            for (m_idx, m) in pane.search_matches.iter().enumerate() {
+                                if m.global_row == global_row
+                                    && c_idx >= m.start_col
+                                    && c_idx <= m.end_col
+                                {
+                                    if pane.active_search_idx == Some(m_idx) {
+                                        match_highlight = Some([0.98, 0.68, 0.12, 0.90]);
+                                        break;
+                                    } else {
+                                        match_highlight = Some([0.85, 0.65, 0.15, 0.42]);
+                                    }
+                                }
+                            }
+                            if let Some(hl_col) = match_highlight {
+                                bg_instances.push(BgInstance {
+                                    rect: [x, y, cell_w, cell_h],
+                                    color: hl_col,
+                                });
+                            }
                         }
 
                         if is_selected {
@@ -1055,6 +1088,46 @@ impl TermRenderer {
                         color: self.theme.cursor_color,
                     });
                 }
+            }
+
+            // Floating Find Bar overlay (Cmd+F)
+            if let Some(query) = pane.search_query {
+                let count_str = if pane.search_matches.is_empty() {
+                    "0/0".to_string()
+                } else {
+                    format!(
+                        "{}/{}",
+                        pane.active_search_idx.unwrap_or(0) + 1,
+                        pane.search_matches.len()
+                    )
+                };
+                let label = format!("Find: {}▏  ({})", query, count_str);
+                let bar_w = ((label.chars().count() as f32 * cell_w) + 24.0 * scale)
+                    .clamp(220.0 * scale, (pw - 24.0 * scale).max(120.0));
+                let bar_h = cell_h + 12.0 * scale;
+                let bar_x = (px + pw - bar_w - 12.0 * scale).max(px + 4.0);
+                let bar_y = py + 8.0 * scale;
+
+                // Capsule background
+                bg_instances.push(BgInstance {
+                    rect: [bar_x, bar_y, bar_w, bar_h],
+                    color: [0.10, 0.12, 0.17, 0.96],
+                });
+                // Top accent line
+                bg_instances.push(BgInstance {
+                    rect: [bar_x, bar_y, bar_w, 2.0 * scale],
+                    color: [0.039, 0.518, 1.00, 0.95],
+                });
+
+                self.draw_text_line(
+                    &mut glyph_instances,
+                    &label,
+                    bar_x + 12.0 * scale,
+                    bar_y + 6.0 * scale,
+                    bar_w - 16.0 * scale,
+                    [0.96, 0.97, 1.0, 1.0],
+                    false,
+                );
             }
         }
 

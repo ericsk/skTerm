@@ -1107,7 +1107,10 @@ impl Workspace {
 /// Cached system process tree and CWD lookups for low-overhead AI Agent discovery.
 pub struct ProcessTreeCache {
     last_refresh: Option<std::time::Instant>,
-    children_map: std::collections::HashMap<u32, Vec<(u32, String)>>,
+    children_map: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<u32, Vec<(u32, String)>>>,
+    >,
+    is_refreshing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     cwd_cache: std::collections::HashMap<u32, String>,
 }
 
@@ -1120,8 +1123,12 @@ impl Default for ProcessTreeCache {
 impl ProcessTreeCache {
     pub fn new() -> Self {
         Self {
-            last_refresh: None,
-            children_map: std::collections::HashMap::new(),
+            // Defer first process tree scan so cold startup frame renders immediately with zero subprocess delay
+            last_refresh: Some(std::time::Instant::now()),
+            children_map: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            is_refreshing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cwd_cache: std::collections::HashMap::new(),
         }
     }
@@ -1132,33 +1139,54 @@ impl ProcessTreeCache {
                 return;
             }
         }
-        self.last_refresh = Some(std::time::Instant::now());
-        self.children_map.clear();
-
-        #[cfg(unix)]
+        if self
+            .is_refreshing
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
         {
-            if let Ok(output) = std::process::Command::new("ps")
-                .args(["-ax", "-o", "pid=,ppid=,args="])
-                .output()
+            return;
+        }
+
+        self.last_refresh = Some(std::time::Instant::now());
+        let map_arc = self.children_map.clone();
+        let flag_arc = self.is_refreshing.clone();
+
+        std::thread::spawn(move || {
+            let mut new_map: std::collections::HashMap<u32, Vec<(u32, String)>> =
+                std::collections::HashMap::new();
+
+            #[cfg(unix)]
             {
-                if let Ok(text) = String::from_utf8(output.stdout) {
-                    for line in text.lines() {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 3 {
-                            if let (Ok(pid), Ok(ppid)) =
-                                (parts[0].parse::<u32>(), parts[1].parse::<u32>())
-                            {
-                                let cmd_line = parts[2..].join(" ").to_lowercase();
-                                self.children_map
-                                    .entry(ppid)
-                                    .or_default()
-                                    .push((pid, cmd_line));
+                if let Ok(output) = std::process::Command::new("ps")
+                    .args(["-ax", "-o", "pid=,ppid=,args="])
+                    .output()
+                {
+                    if let Ok(text) = String::from_utf8(output.stdout) {
+                        for line in text.lines() {
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            if parts.len() >= 3 {
+                                if let (Ok(pid), Ok(ppid)) =
+                                    (parts[0].parse::<u32>(), parts[1].parse::<u32>())
+                                {
+                                    let cmd_line = parts[2..].join(" ").to_lowercase();
+                                    new_map.entry(ppid).or_default().push((pid, cmd_line));
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+
+            if let Ok(mut guard) = map_arc.lock() {
+                *guard = new_map;
+            }
+            flag_arc.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
     }
 
     fn match_agent_command(cmd_line: &str) -> Option<&'static str> {
@@ -1186,13 +1214,14 @@ impl ProcessTreeCache {
 
     /// Search descendant processes of `root_pid` for a known AI Agent CLI.
     pub fn find_agent_descendant(&self, root_pid: u32) -> Option<(u32, &'static str)> {
+        let guard = self.children_map.lock().ok()?;
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(root_pid);
         let mut visited = std::collections::HashSet::new();
         visited.insert(root_pid);
 
         while let Some(curr_pid) = queue.pop_front() {
-            if let Some(children) = self.children_map.get(&curr_pid) {
+            if let Some(children) = guard.get(&curr_pid) {
                 for (child_pid, cmd_line) in children {
                     if !visited.insert(*child_pid) {
                         continue;

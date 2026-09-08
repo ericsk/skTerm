@@ -1087,6 +1087,139 @@ impl ScreenBuffer {
             _ => {}
         }
     }
+
+    /// Clear both visible screen rows and scrollback history (`Cmd+K` behavior).
+    pub fn clear_scrollback_and_screen(&mut self) {
+        self.scrollback.clear();
+        self.images.clear();
+        self.scroll_offset = 0;
+        self.selection = None;
+        for r in 0..self.rows {
+            self.grid[r].clear(Color::DefaultBg);
+        }
+        self.cursor.row = 0;
+        self.cursor.col = 0;
+        self.cursor.pending_wrap = false;
+    }
+
+    /// Select the word at visible row and column (Double-click behavior).
+    pub fn select_word_at(&mut self, row: usize, col: usize) {
+        let is_word_char = |c: char| -> bool {
+            c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | '@' | ':' | '+')
+        };
+
+        let (start_col, end_col) = if let Some(r) = self.get_visible_row(row) {
+            if col >= r.cells.len() {
+                (col, col)
+            } else {
+                let target_is_word = is_word_char(r.cells[col].c);
+                let mut s = col;
+                while s > 0 {
+                    let prev = r.cells[s - 1].c;
+                    if is_word_char(prev) == target_is_word && prev != ' ' {
+                        s -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                let mut e = col;
+                while e + 1 < r.cells.len() {
+                    let next = r.cells[e + 1].c;
+                    if is_word_char(next) == target_is_word && next != ' ' {
+                        e += 1;
+                    } else {
+                        break;
+                    }
+                }
+                (s, e)
+            }
+        } else {
+            (col, col)
+        };
+
+        self.selection = Some(Selection::new(
+            (row, start_col),
+            (row, end_col),
+            SelectionMode::Word,
+        ));
+    }
+
+    /// Select the entire visible row (Triple-click behavior).
+    pub fn select_line_at(&mut self, row: usize) {
+        let last_col = self.cols.saturating_sub(1);
+        self.selection = Some(Selection::new(
+            (row, 0),
+            (row, last_col),
+            SelectionMode::Line,
+        ));
+    }
+
+    /// Case-insensitive search across scrollback history and active screen buffer.
+    /// Returns matches ordered from oldest scrollback line to bottom active row.
+    pub fn search(&self, query: &str) -> Vec<SearchMatch> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let q_lower: Vec<char> = q.to_lowercase().chars().collect();
+        let q_len = q_lower.len();
+        let mut matches = Vec::new();
+
+        let total_scrollback = self.scrollback.len();
+        let total_lines = total_scrollback + self.rows;
+
+        for global_row in 0..total_lines {
+            let row_ref = if global_row < total_scrollback {
+                self.scrollback.get(global_row)
+            } else {
+                self.grid.get(global_row - total_scrollback)
+            };
+
+            if let Some(row) = row_ref {
+                let row_chars: Vec<char> = row
+                    .cells
+                    .iter()
+                    .map(|c| c.c.to_lowercase().next().unwrap_or(c.c))
+                    .collect();
+
+                if row_chars.len() >= q_len {
+                    let mut c_idx = 0;
+                    while c_idx + q_len <= row_chars.len() {
+                        if row_chars[c_idx..c_idx + q_len] == q_lower[..] {
+                            matches.push(SearchMatch {
+                                global_row,
+                                start_col: c_idx,
+                                end_col: c_idx + q_len - 1,
+                            });
+                            c_idx += q_len;
+                        } else {
+                            c_idx += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        matches
+    }
+
+    /// Adjust `scroll_offset` so that `global_row` is visible on screen.
+    pub fn scroll_to_global_row(&mut self, global_row: usize) {
+        let total_scrollback = self.scrollback.len();
+        let desired_top = global_row.saturating_sub(self.rows / 2);
+        let new_offset = total_scrollback
+            .saturating_sub(desired_top)
+            .min(total_scrollback);
+        self.scroll_offset = new_offset;
+    }
+}
+
+/// A search match location in scrollback or active grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub global_row: usize,
+    pub start_col: usize,
+    pub end_col: usize,
 }
 
 /// Screen Grid containing dual buffers (Primary with Scrollback + Alternate Screen).
