@@ -11,6 +11,7 @@ pub struct Terminal {
     parser: Parser,
     pty: Option<PtyProcess>,
     pub last_output_time: std::time::Instant,
+    pub custom_label: Option<String>,
 }
 
 impl Terminal {
@@ -50,6 +51,7 @@ impl Terminal {
             parser,
             pty: Some(pty),
             last_output_time: std::time::Instant::now(),
+            custom_label: None,
         })
     }
 
@@ -60,6 +62,7 @@ impl Terminal {
             parser: Parser::new(),
             pty: None,
             last_output_time: std::time::Instant::now(),
+            custom_label: None,
         }
     }
 

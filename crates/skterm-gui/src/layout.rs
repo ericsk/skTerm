@@ -1075,12 +1075,22 @@ impl Workspace {
                     };
 
                     let location_label = format!("T{}•#{}", tab_idx + 1, pane_id);
-                    let title_summary = if terminal.state.title != "skTerm"
+                    let title_summary = if let Some(ref custom) = terminal.custom_label {
+                        if !custom.trim().is_empty() {
+                            custom.clone()
+                        } else if terminal.state.title != "skTerm"
+                            && !terminal.state.title.is_empty()
+                        {
+                            terminal.state.title.clone()
+                        } else {
+                            "Double-click to name...".to_string()
+                        }
+                    } else if terminal.state.title != "skTerm"
                         && !terminal.state.title.is_empty()
                     {
                         terminal.state.title.clone()
                     } else {
-                        String::new()
+                        "Double-click to name...".to_string()
                     };
 
                     let is_focused =

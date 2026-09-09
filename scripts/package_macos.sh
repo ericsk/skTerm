@@ -13,9 +13,12 @@ RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 rm -rf dist/macos
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
-# Copy binary
+# Copy binary and AppIcon
 cp target/release/skterm "${MACOS_DIR}/skterm"
 chmod +x "${MACOS_DIR}/skterm"
+if [ -f "assets/AppIcon.icns" ]; then
+    cp "assets/AppIcon.icns" "${RESOURCES_DIR}/AppIcon.icns"
+fi
 
 # Create Info.plist
 cat << 'PLIST' > "${CONTENTS_DIR}/Info.plist"
@@ -25,6 +28,8 @@ cat << 'PLIST' > "${CONTENTS_DIR}/Info.plist"
 <dict>
     <key>CFBundleExecutable</key>
     <string>skterm</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.ericsk.skterm</string>
     <key>CFBundleName</key>

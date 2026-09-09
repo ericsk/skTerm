@@ -766,16 +766,42 @@ impl TermRenderer {
                         color: dot_color,
                     });
 
-                    // Line 1: Agent Name + Location label
+                    // Determine if a custom task name or active rename is present
+                    let has_custom_task = !item.title_summary.is_empty()
+                        && item.title_summary != "Double-click to name...";
+
+                    let (top_title, bottom_subtitle) = if has_custom_task {
+                        let status_str = if item.is_active_output {
+                            "Running"
+                        } else {
+                            "Idle"
+                        };
+                        (
+                            item.title_summary.as_str(),
+                            format!("{} • {}", item.agent_name, status_str),
+                        )
+                    } else {
+                        let status_str = if item.is_active_output {
+                            "Running"
+                        } else {
+                            "Idle"
+                        };
+                        (
+                            item.agent_name.as_str(),
+                            format!("{} • Double-click to name...", status_str),
+                        )
+                    };
+
+                    // Line 1 (Prominent Title): Custom Task Name (or Agent Name if unnamed) + Location label
                     let text_x = dot_x + dot_size + 6.0 * scale;
                     let loc_w = (item.location_label.len() as f32 * cell_w) + 8.0 * scale;
                     self.draw_text_line(
                         &mut glyph_instances,
-                        &item.agent_name,
+                        top_title,
                         text_x,
                         cy + 6.0 * scale,
                         (card_w - (text_x - card_x) - loc_w).max(20.0),
-                        [0.98, 0.98, 1.0, 1.0],
+                        [0.98, 0.99, 1.0, 1.0],
                         true,
                     );
                     self.draw_text_line(
@@ -800,24 +826,14 @@ impl TermRenderer {
                         false,
                     );
 
-                    // Line 3: Status / Title Summary
-                    let status_prefix = if item.is_active_output {
-                        "Running"
-                    } else {
-                        "Idle"
-                    };
-                    let summary_line = if item.title_summary.is_empty() {
-                        status_prefix.to_string()
-                    } else {
-                        format!("{} • {}", status_prefix, item.title_summary)
-                    };
+                    // Line 3 (Smaller/Subtler Subtitle): Agent Type • Status
                     self.draw_text_line(
                         &mut glyph_instances,
-                        &summary_line,
+                        &bottom_subtitle,
                         card_x + 10.0 * scale,
                         cy + 42.0 * scale,
                         card_w - 16.0 * scale,
-                        [0.60, 0.64, 0.73, 0.9],
+                        [0.58, 0.63, 0.72, 0.88],
                         false,
                     );
                 }
@@ -963,15 +979,16 @@ impl TermRenderer {
                             .unwrap_or(false);
 
                         let is_inverse = cell.flags.contains(CellFlags::INVERSE);
+                        let is_bold_flag = cell.flags.contains(CellFlags::BOLD);
                         let (fg_rgba, bg_rgba) = if is_inverse {
                             (
-                                color_to_rgba_themed(cell.bg, false, &self.theme),
-                                color_to_rgba_themed(cell.fg, true, &self.theme),
+                                color_to_rgba_themed(cell.bg, false, is_bold_flag, &self.theme),
+                                color_to_rgba_themed(cell.fg, true, false, &self.theme),
                             )
                         } else {
                             (
-                                color_to_rgba_themed(cell.fg, false, &self.theme),
-                                color_to_rgba_themed(cell.bg, true, &self.theme),
+                                color_to_rgba_themed(cell.fg, false, is_bold_flag, &self.theme),
+                                color_to_rgba_themed(cell.bg, true, false, &self.theme),
                             )
                         };
 
@@ -1223,14 +1240,29 @@ impl TermRenderer {
     }
 }
 
-/// Convert skterm Color to RGBA considering active theme and custom palette.
-pub fn color_to_rgba_themed(color: Color, is_bg: bool, theme: &RenderTheme) -> [f32; 4] {
+/// Convert skterm Color to RGBA considering active theme, custom palette, and bold_is_bright.
+pub fn color_to_rgba_themed(
+    color: Color,
+    is_bg: bool,
+    is_bold: bool,
+    theme: &RenderTheme,
+) -> [f32; 4] {
     match color {
-        Color::DefaultFg => theme.default_fg,
+        Color::DefaultFg => {
+            if is_bold && !is_bg {
+                if let Some(palette) = theme.ansi_palette {
+                    return palette[15];
+                }
+            }
+            theme.default_fg
+        }
         Color::DefaultBg => theme.default_bg,
         Color::Named(named) => {
+            let mut idx = named as usize;
+            if is_bold && !is_bg && idx < 8 {
+                idx += 8;
+            }
             if let Some(palette) = theme.ansi_palette {
-                let idx = named as usize;
                 if idx < 16 {
                     return palette[idx];
                 }
@@ -1238,8 +1270,12 @@ pub fn color_to_rgba_themed(color: Color, is_bg: bool, theme: &RenderTheme) -> [
             color_to_rgba(color, is_bg)
         }
         Color::Indexed(idx) if idx < 16 => {
+            let mut target_idx = idx as usize;
+            if is_bold && !is_bg && target_idx < 8 {
+                target_idx += 8;
+            }
             if let Some(palette) = theme.ansi_palette {
-                return palette[idx as usize];
+                return palette[target_idx];
             }
             color_to_rgba(color, is_bg)
         }

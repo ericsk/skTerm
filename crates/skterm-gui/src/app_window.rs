@@ -66,6 +66,7 @@ pub struct TerminalSession {
     pub last_click_time: Instant,
     pub click_count: usize,
     pub dragging_splitter: Option<(u32, SplitDirection, Rect)>,
+    pub dragging_sidebar: bool,
     pub hovered_url: Option<String>,
     pub scroll_pixel_accumulator: f64,
     pub search_open: bool,
@@ -309,6 +310,13 @@ pub struct App {
     pub modifiers: ModifiersState,
     pub pending_geometry_save: bool,
     pub last_resize_time: Option<Instant>,
+    pub editing_agent_pane: Option<(WindowId, u32, u32)>,
+    pub editing_agent_text: String,
+    pub editing_agent_cursor: usize,
+    pub ime_preedit: String,
+    pub last_ime_commit_time: Option<Instant>,
+    #[cfg(target_os = "macos")]
+    pub macos_editor: crate::macos_textfield::NativeSidebarEditor,
 }
 
 impl Default for App {
@@ -340,6 +348,122 @@ impl App {
             modifiers: ModifiersState::default(),
             pending_geometry_save: false,
             last_resize_time: None,
+            editing_agent_pane: None,
+            editing_agent_text: String::new(),
+            editing_agent_cursor: 0,
+            ime_preedit: String::new(),
+            last_ime_commit_time: None,
+            #[cfg(target_os = "macos")]
+            macos_editor: crate::macos_textfield::NativeSidebarEditor::new(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn poll_macos_editor(&mut self) {
+        while let Ok(evt) = self.macos_editor.receiver.try_recv() {
+            match evt {
+                crate::macos_textfield::TextFieldEvent::Committed {
+                    target: (wid, tab_id, pane_id),
+                    text,
+                } => {
+                    let label = text.trim().to_string();
+                    if let Some(target_s) = self.sessions.get_mut(&wid) {
+                        if let Some(t_pos) = target_s
+                            .workspace
+                            .tabs
+                            .iter()
+                            .position(|t| t.id == tab_id)
+                        {
+                            if let Some(term) = target_s.workspace.tabs[t_pos]
+                                .root
+                                .find_terminal_mut(pane_id)
+                            {
+                                term.custom_label = if label.is_empty() {
+                                    None
+                                } else {
+                                    Some(label)
+                                };
+                            }
+                        }
+                        target_s.window.request_redraw();
+                    }
+                    self.editing_agent_pane = None;
+                    for s in self.sessions.values() {
+                        s.window.request_redraw();
+                    }
+                }
+                crate::macos_textfield::TextFieldEvent::Cancelled => {
+                    self.editing_agent_pane = None;
+                    for s in self.sessions.values() {
+                        s.window.request_redraw();
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn insert_editing_text(&mut self, s: &str) {
+        let mut chars: Vec<char> = self.editing_agent_text.chars().collect();
+        let cur = self.editing_agent_cursor.min(chars.len());
+        let insert_chars: Vec<char> = s.chars().collect();
+        let insert_len = insert_chars.len();
+        chars.splice(cur..cur, insert_chars);
+        self.editing_agent_text = chars.into_iter().collect();
+        self.editing_agent_cursor = cur + insert_len;
+    }
+
+    pub fn backspace_editing_text(&mut self) {
+        let mut chars: Vec<char> = self.editing_agent_text.chars().collect();
+        let cur = self.editing_agent_cursor.min(chars.len());
+        if cur > 0 {
+            chars.remove(cur - 1);
+            self.editing_agent_text = chars.into_iter().collect();
+            self.editing_agent_cursor = cur - 1;
+        }
+    }
+
+    pub fn delete_editing_text(&mut self) {
+        let mut chars: Vec<char> = self.editing_agent_text.chars().collect();
+        let cur = self.editing_agent_cursor.min(chars.len());
+        if cur < chars.len() {
+            chars.remove(cur);
+            self.editing_agent_text = chars.into_iter().collect();
+        }
+    }
+
+    pub fn commit_agent_label_edit(&mut self) {
+        #[cfg(target_os = "macos")]
+        if self.macos_editor.is_active() {
+            self.macos_editor.close_active(true);
+            self.poll_macos_editor();
+            return;
+        }
+        if let Some((edit_wid, edit_tab_id, edit_pane_id)) = self.editing_agent_pane.take() {
+            let label = self.editing_agent_text.trim().to_string();
+            if let Some(target_s) = self.sessions.get_mut(&edit_wid) {
+                if let Some(t_pos) = target_s
+                    .workspace
+                    .tabs
+                    .iter()
+                    .position(|t| t.id == edit_tab_id)
+                {
+                    if let Some(term) = target_s.workspace.tabs[t_pos]
+                        .root
+                        .find_terminal_mut(edit_pane_id)
+                    {
+                        term.custom_label = if label.is_empty() {
+                            None
+                        } else {
+                            Some(label)
+                        };
+                    }
+                }
+                target_s.window.request_redraw();
+            }
+            self.ime_preedit.clear();
+            for s in self.sessions.values() {
+                s.window.request_redraw();
+            }
         }
     }
 
@@ -369,6 +493,27 @@ impl App {
                     }
                     if Some(*wid) != active_wid {
                         agent.is_focused = false;
+                    }
+                    if self.editing_agent_pane == Some((*wid, agent.tab_id, agent.pane_id)) {
+                        #[cfg(target_os = "macos")]
+                        let hide_underlying = self.macos_editor.is_active();
+                        #[cfg(not(target_os = "macos"))]
+                        let hide_underlying = false;
+
+                        if hide_underlying {
+                            agent.title_summary = String::new();
+                        } else {
+                            let chars: Vec<char> = self.editing_agent_text.chars().collect();
+                            let cur = self.editing_agent_cursor.min(chars.len());
+                            let before: String = chars[..cur].iter().collect();
+                            let after: String = chars[cur..].iter().collect();
+                            if !self.ime_preedit.is_empty() {
+                                agent.title_summary =
+                                    format!("✎ {}[{}]▏{}", before, self.ime_preedit, after);
+                            } else {
+                                agent.title_summary = format!("✎ {}▏{}", before, after);
+                            }
+                        }
                     }
                     all_agents.push((*wid, agent.clone()));
                 }
@@ -688,9 +833,17 @@ impl App {
         let pad_x = self.config_manager.current_config.window.padding_x;
         let pad_y = self.config_manager.current_config.window.padding_y;
 
-        let mut window_attrs = WindowAttributes::default()
-            .with_title("skTerm")
-            .with_inner_size(LogicalSize::new(800.0, 500.0));
+        let existing_geometry = self
+            .active_session_id
+            .and_then(|id| self.sessions.get(&id))
+            .map(|s| (s.window.inner_size(), s.workspace.sidebar_width));
+
+        let mut window_attrs = WindowAttributes::default().with_title("skTerm");
+        if let Some((phys_size, _)) = existing_geometry {
+            window_attrs = window_attrs.with_inner_size(phys_size);
+        } else {
+            window_attrs = window_attrs.with_inner_size(LogicalSize::new(800.0, 500.0));
+        }
 
         #[cfg(target_os = "macos")]
         {
@@ -720,16 +873,18 @@ impl App {
         let window = Arc::new(event_loop.create_window(window_attrs)?);
         window.set_ime_allowed(true);
 
-        match self
-            .config_manager
-            .current_config
-            .window
-            .startup_mode
-            .as_str()
-        {
-            "maximized" => window.set_maximized(true),
-            "fullscreen" => window.set_fullscreen(Some(Fullscreen::Borderless(None))),
-            _ => {}
+        if existing_geometry.is_none() {
+            match self
+                .config_manager
+                .current_config
+                .window
+                .startup_mode
+                .as_str()
+            {
+                "maximized" => window.set_maximized(true),
+                "fullscreen" => window.set_fullscreen(Some(Fullscreen::Borderless(None))),
+                _ => {}
+            }
         }
 
         // On macOS: Enable NSWindowTabbingModePreferred and merge with parent tabbed window
@@ -768,15 +923,17 @@ impl App {
             &font_cfg.fallback_families,
         ))?;
 
-        let scale = renderer.scale_factor;
-        let cell_w_logical = renderer.cell_width() / scale;
-        let cell_h_logical = renderer.cell_height() / scale;
-        let target_logical_w = (init_cols * cell_w_logical + pad_x * 2.0).ceil();
-        let target_logical_h = (init_rows * cell_h_logical + pad_y * 2.0).ceil();
-        let _ = window.request_inner_size(LogicalSize::new(
-            target_logical_w as f64,
-            target_logical_h as f64,
-        ));
+        if existing_geometry.is_none() {
+            let scale = renderer.scale_factor;
+            let cell_w_logical = renderer.cell_width() / scale;
+            let cell_h_logical = renderer.cell_height() / scale;
+            let target_logical_w = (init_cols * cell_w_logical + pad_x * 2.0).ceil();
+            let target_logical_h = (init_rows * cell_h_logical + pad_y * 2.0).ceil();
+            let _ = window.request_inner_size(LogicalSize::new(
+                target_logical_w as f64,
+                target_logical_h as f64,
+            ));
+        }
 
         let pty_opts = self.build_pty_options();
         let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
@@ -788,6 +945,9 @@ impl App {
             pty_opts,
         )?;
         workspace.sidebar_open = self.sidebar_open;
+        if let Some((_, sidebar_w)) = existing_geometry {
+            workspace.sidebar_width = sidebar_w;
+        }
 
         let render_theme = self.build_render_theme();
         renderer.set_theme(render_theme);
@@ -814,6 +974,7 @@ impl App {
             last_click_time: Instant::now(),
             click_count: 0,
             dragging_splitter: None,
+            dragging_sidebar: false,
             hovered_url: None,
             scroll_pixel_accumulator: 0.0,
             search_open: false,
@@ -955,21 +1116,35 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Ime(ime_event) => {
-                if let Some(session) = self.sessions.get_mut(&window_id) {
-                    match ime_event {
-                        Ime::Commit(text) => {
-                            if let Some(tab) = session.workspace.active_tab_mut() {
+                match ime_event {
+                    Ime::Commit(text) => {
+                        self.last_ime_commit_time = Some(Instant::now());
+                        self.ime_preedit.clear();
+                        if self.editing_agent_pane.is_some() {
+                            self.insert_editing_text(&text);
+                            if let Some(session) = self.sessions.get(&window_id) {
+                                session.window.request_redraw();
+                            }
+                        } else if let Some(session) = self.sessions.get_mut(&window_id) {
+                            if session.search_open {
+                                session.search_query.push_str(&text);
+                                session.update_search_matches();
+                                session.window.request_redraw();
+                            } else if let Some(tab) = session.workspace.active_tab_mut() {
                                 if let Some(term) = tab.active_terminal_mut() {
                                     let _ = term.write_to_pty(text.as_bytes());
                                     session.window.request_redraw();
                                 }
                             }
                         }
-                        Ime::Preedit(_text, _cursor) => {
+                    }
+                    Ime::Preedit(text, _cursor) => {
+                        self.ime_preedit = text;
+                        if let Some(session) = self.sessions.get(&window_id) {
                             session.window.request_redraw();
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
 
@@ -1181,6 +1356,29 @@ impl ApplicationHandler for App {
                                 }
                                 return;
                             }
+                            "r" if is_shift => {
+                                // Rename active agent/pane task label (Cmd+Shift+R)
+                                if !self.sidebar_open {
+                                    self.toggle_sidebar();
+                                }
+                                if let Some(session) = self.sessions.get(&window_id) {
+                                    if let Some(tab) = session.workspace.active_tab() {
+                                        let pane_id = tab.active_pane_id;
+                                        let current = tab
+                                            .root
+                                            .find_terminal(pane_id)
+                                            .and_then(|t| t.custom_label.clone())
+                                            .unwrap_or_default();
+                                        self.editing_agent_pane =
+                                            Some((window_id, tab.id, pane_id));
+                                        self.editing_agent_text = current;
+                                        self.editing_agent_cursor =
+                                            self.editing_agent_text.chars().count();
+                                    }
+                                    session.window.request_redraw();
+                                }
+                                return;
+                            }
                             "+" | "=" => {
                                 if let Some(session) = self.sessions.get_mut(&window_id) {
                                     if self.modifiers.alt_key() {
@@ -1228,49 +1426,184 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // Handle Find Bar input when search_open is active
-                if let Some(session) = self.sessions.get_mut(&window_id) {
-                    if session.search_open && event.state == ElementState::Pressed {
+                // Handle Agent Task Label Inline Rename input when editing_agent_pane is active
+                if self.editing_agent_pane.is_some() {
+                    if event.state == ElementState::Pressed {
+                        // While IME preedit composition is active, let the IME handle keys
+                        if !self.ime_preedit.is_empty() {
+                            return;
+                        }
+
+                        // If an IME commit occurred in the exact same event tick (<20ms),
+                        // ignore the trailing KeyboardInput (e.g. Enter that confirmed the IME word)
+                        let just_committed_ime = self
+                            .last_ime_commit_time
+                            .map_or(false, |t| t.elapsed() < Duration::from_millis(20));
+                        if just_committed_ime {
+                            return;
+                        }
+
                         match &event.logical_key {
                             Key::Named(NamedKey::Escape) => {
-                                session.search_open = false;
-                                session.search_matches.clear();
-                                session.active_search_idx = None;
-                                session.window.request_redraw();
+                                self.editing_agent_pane = None;
+                                self.ime_preedit.clear();
+                                if let Some(s) = self.sessions.get(&window_id) {
+                                    s.window.request_redraw();
+                                }
                                 return;
                             }
                             Key::Named(NamedKey::Enter) => {
-                                if self.modifiers.shift_key() {
-                                    session.prev_search_match();
-                                } else {
-                                    session.next_search_match();
-                                }
-                                session.window.request_redraw();
+                                self.commit_agent_label_edit();
                                 return;
                             }
                             Key::Named(NamedKey::Backspace) => {
-                                session.search_query.pop();
-                                session.update_search_matches();
-                                session.window.request_redraw();
+                                self.backspace_editing_text();
+                                if let Some(s) = self.sessions.get(&window_id) {
+                                    s.window.request_redraw();
+                                }
+                                return;
+                            }
+                            Key::Named(NamedKey::Delete) => {
+                                self.delete_editing_text();
+                                if let Some(s) = self.sessions.get(&window_id) {
+                                    s.window.request_redraw();
+                                }
+                                return;
+                            }
+                            Key::Named(NamedKey::ArrowLeft) => {
+                                if self.modifiers.super_key() {
+                                    self.editing_agent_cursor = 0;
+                                } else {
+                                    self.editing_agent_cursor =
+                                        self.editing_agent_cursor.saturating_sub(1);
+                                }
+                                if let Some(s) = self.sessions.get(&window_id) {
+                                    s.window.request_redraw();
+                                }
+                                return;
+                            }
+                            Key::Named(NamedKey::ArrowRight) => {
+                                let len = self.editing_agent_text.chars().count();
+                                if self.modifiers.super_key() {
+                                    self.editing_agent_cursor = len;
+                                } else {
+                                    self.editing_agent_cursor =
+                                        (self.editing_agent_cursor + 1).min(len);
+                                }
+                                if let Some(s) = self.sessions.get(&window_id) {
+                                    s.window.request_redraw();
+                                }
+                                return;
+                            }
+                            Key::Named(NamedKey::Home) => {
+                                self.editing_agent_cursor = 0;
+                                if let Some(s) = self.sessions.get(&window_id) {
+                                    s.window.request_redraw();
+                                }
+                                return;
+                            }
+                            Key::Named(NamedKey::End) => {
+                                self.editing_agent_cursor =
+                                    self.editing_agent_text.chars().count();
+                                if let Some(s) = self.sessions.get(&window_id) {
+                                    s.window.request_redraw();
+                                }
                                 return;
                             }
                             _ => {
-                                if !self.modifiers.super_key() && !self.modifiers.control_key() {
+                                if self.modifiers.control_key() {
+                                    if let Key::Character(ref s) = event.logical_key {
+                                        if s.eq_ignore_ascii_case("a") {
+                                            self.editing_agent_cursor = 0;
+                                            if let Some(sess) = self.sessions.get(&window_id) {
+                                                sess.window.request_redraw();
+                                            }
+                                            return;
+                                        } else if s.eq_ignore_ascii_case("e") {
+                                            self.editing_agent_cursor =
+                                                self.editing_agent_text.chars().count();
+                                            if let Some(sess) = self.sessions.get(&window_id) {
+                                                sess.window.request_redraw();
+                                            }
+                                            return;
+                                        }
+                                    }
+                                } else if !self.modifiers.super_key() {
                                     if let Some(ref text) = event.text {
                                         let filtered: String = text
                                             .chars()
                                             .filter(|c| !c.is_control())
                                             .collect();
                                         if !filtered.is_empty() {
-                                            session.search_query.push_str(&filtered);
-                                            session.update_search_matches();
-                                            session.window.request_redraw();
+                                            self.insert_editing_text(&filtered);
+                                            if let Some(s) = self.sessions.get(&window_id) {
+                                                s.window.request_redraw();
+                                            }
                                             return;
                                         }
                                     }
                                 }
                             }
                         }
+                    }
+                    // Always consume all key events while editing_agent_pane is active so they never fall through to PTY
+                    return;
+                }
+
+                // Handle Find Bar input when search_open is active
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    if session.search_open {
+                        if event.state == ElementState::Pressed {
+                            let just_committed_ime = self
+                                .last_ime_commit_time
+                                .map_or(false, |t| t.elapsed() < Duration::from_millis(20));
+                            if !self.ime_preedit.is_empty() || just_committed_ime {
+                                return;
+                            }
+
+                            match &event.logical_key {
+                                Key::Named(NamedKey::Escape) => {
+                                    session.search_open = false;
+                                    session.search_matches.clear();
+                                    session.active_search_idx = None;
+                                    session.window.request_redraw();
+                                    return;
+                                }
+                                Key::Named(NamedKey::Enter) => {
+                                    if self.modifiers.shift_key() {
+                                        session.prev_search_match();
+                                    } else {
+                                        session.next_search_match();
+                                    }
+                                    session.window.request_redraw();
+                                    return;
+                                }
+                                Key::Named(NamedKey::Backspace) => {
+                                    session.search_query.pop();
+                                    session.update_search_matches();
+                                    session.window.request_redraw();
+                                    return;
+                                }
+                                _ => {
+                                    if !self.modifiers.super_key() && !self.modifiers.control_key()
+                                    {
+                                        if let Some(ref text) = event.text {
+                                            let filtered: String = text
+                                                .chars()
+                                                .filter(|c| !c.is_control())
+                                                .collect();
+                                            if !filtered.is_empty() {
+                                                session.search_query.push_str(&filtered);
+                                                session.update_search_matches();
+                                                session.window.request_redraw();
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return;
                     }
                 }
 
@@ -1293,6 +1626,16 @@ impl ApplicationHandler for App {
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     session.mouse_pos = (position.x as f32, position.y as f32);
                     let (mx, my) = session.mouse_pos;
+
+                    // 0.5 Handling Sidebar Resizing Dragging
+                    if session.dragging_sidebar {
+                        let scale = session.renderer.scale_factor;
+                        let new_w = (mx / scale).clamp(160.0, 480.0);
+                        session.workspace.sidebar_width = new_w;
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                        return;
+                    }
 
                     // 1. Handling Splitter Dragging
                     if let Some((split_id, direction, parent_rect)) = session.dragging_splitter {
@@ -1336,14 +1679,24 @@ impl ApplicationHandler for App {
                         let is_link_modifier = self.modifiers.control_key();
 
                         let mut is_over_splitter = false;
-                        if let Some(tab) = session.workspace.active_tab() {
-                            if let Some(splitter) = tab.find_splitter_at(bounds, mx, my) {
+                        if session.workspace.sidebar_open && my >= tab_bar_h {
+                            let scale = session.renderer.scale_factor;
+                            let sidebar_px = session.workspace.sidebar_width * scale;
+                            if (mx - sidebar_px).abs() <= 5.0 * scale {
                                 is_over_splitter = true;
-                                let icon = match splitter.direction {
-                                    SplitDirection::Horizontal => CursorIcon::ColResize,
-                                    SplitDirection::Vertical => CursorIcon::RowResize,
-                                };
-                                session.window.set_cursor(icon);
+                                session.window.set_cursor(CursorIcon::ColResize);
+                            }
+                        }
+                        if !is_over_splitter {
+                            if let Some(tab) = session.workspace.active_tab() {
+                                if let Some(splitter) = tab.find_splitter_at(bounds, mx, my) {
+                                    is_over_splitter = true;
+                                    let icon = match splitter.direction {
+                                        SplitDirection::Horizontal => CursorIcon::ColResize,
+                                        SplitDirection::Vertical => CursorIcon::RowResize,
+                                    };
+                                    session.window.set_cursor(icon);
+                                }
                             }
                         }
 
@@ -1495,6 +1848,15 @@ impl ApplicationHandler for App {
                         if state == ElementState::Pressed {
                             let scale = session.renderer.scale_factor;
 
+                            // 0. Check Sidebar Resize Splitter click
+                            if session.workspace.sidebar_open && my >= tab_bar_h {
+                                let sidebar_px = session.workspace.sidebar_width * scale;
+                                if (mx - sidebar_px).abs() <= 5.0 * scale {
+                                    session.dragging_sidebar = true;
+                                    return;
+                                }
+                            }
+
                             // 0. Check AI Sidebar Toggle Button click (in Tab Bar)
                             if tab_bar_h > 0.0 && my <= tab_bar_h {
                                 let base_x = if cfg!(target_os = "macos") {
@@ -1539,6 +1901,10 @@ impl ApplicationHandler for App {
                                             }
                                         }
                                         session.window.request_redraw();
+                                        let _ = session;
+                                        if self.editing_agent_pane.is_some() {
+                                            self.commit_agent_label_edit();
+                                        }
                                         return;
                                     }
 
@@ -1552,6 +1918,10 @@ impl ApplicationHandler for App {
                                             as usize;
                                         clicked_agent_idx = Some(idx);
                                     } else {
+                                        let _ = session;
+                                        if self.editing_agent_pane.is_some() {
+                                            self.commit_agent_label_edit();
+                                        }
                                         return;
                                     }
                                 }
@@ -1561,6 +1931,9 @@ impl ApplicationHandler for App {
                 }
 
                 if toggle_sidebar_clicked {
+                    if self.editing_agent_pane.is_some() {
+                        self.commit_agent_label_edit();
+                    }
                     self.toggle_sidebar();
                     return;
                 }
@@ -1568,6 +1941,93 @@ impl ApplicationHandler for App {
                 if let Some(idx) = clicked_agent_idx {
                     let all_agents = self.scan_all_ai_agents();
                     if let Some((target_wid, agent)) = all_agents.get(idx).cloned() {
+                        let is_same_editing = self.editing_agent_pane
+                            == Some((target_wid, agent.tab_id, agent.pane_id));
+
+                        let is_double_or_right_click = if button == MouseButton::Right {
+                            true
+                        } else if let Some(s) = self.sessions.get(&window_id) {
+                            Instant::now().duration_since(s.last_click_time)
+                                < Duration::from_millis(400)
+                        } else {
+                            false
+                        };
+
+                        if let Some(s) = self.sessions.get_mut(&window_id) {
+                            s.last_click_time = Instant::now();
+                        }
+
+                        if is_same_editing && !is_double_or_right_click {
+                            return;
+                        }
+
+                        if self.editing_agent_pane.is_some() {
+                            self.commit_agent_label_edit();
+                        }
+
+                        if is_double_or_right_click {
+                            // Start inline task rename on this agent card
+                            let current = self
+                                .sessions
+                                .get(&target_wid)
+                                .and_then(|s| {
+                                    s.workspace
+                                        .tabs
+                                        .iter()
+                                        .find(|t| t.id == agent.tab_id)
+                                })
+                                .and_then(|t| t.root.find_terminal(agent.pane_id))
+                                .and_then(|term| term.custom_label.clone())
+                                .unwrap_or_default();
+
+                            self.editing_agent_pane =
+                                Some((target_wid, agent.tab_id, agent.pane_id));
+                            self.editing_agent_text = current;
+                            self.editing_agent_cursor = self.editing_agent_text.chars().count();
+                            if let Some(s) = self.sessions.get(&window_id) {
+                                #[cfg(target_os = "macos")]
+                                {
+                                    let scale = s.renderer.scale_factor as f64;
+                                    let tab_bar_logical_h = (tab_bar_h as f64) / scale;
+                                    let list_start_y = tab_bar_logical_h + 38.0 + 8.0;
+                                    let card_y = list_start_y + (idx as f64) * (66.0 + 6.0);
+                                    let logical_x = 24.0;
+                                    let logical_y = card_y + 7.0;
+                                    let logical_w =
+                                        ((s.workspace.sidebar_width as f64) - 34.0).max(90.0);
+                                    let logical_h = 22.0;
+                                    let win = s.window.clone();
+                                    let _ = s;
+                                    self.macos_editor.open_for_card(
+                                        &win,
+                                        (target_wid, agent.tab_id, agent.pane_id),
+                                        &self.editing_agent_text,
+                                        logical_x,
+                                        logical_y,
+                                        logical_w,
+                                        logical_h,
+                                    );
+                                    win.request_redraw();
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                {
+                                    let scale = s.renderer.scale_factor as f64;
+                                    let (mx, my) = s.mouse_pos;
+                                    let logical_pos = LogicalPosition::new(
+                                        (mx as f64 / scale).max(16.0),
+                                        (my as f64 / scale) + 12.0,
+                                    );
+                                    let logical_size = LogicalSize::new(180.0, 22.0);
+                                    s.window.set_ime_cursor_area(
+                                        Position::Logical(logical_pos),
+                                        Size::Logical(logical_size),
+                                    );
+                                    s.window.request_redraw();
+                                }
+                            }
+                            return;
+                        }
+
                         self.active_session_id = Some(target_wid);
                         if let Some(target_session) = self.sessions.get_mut(&target_wid) {
                             if target_wid != window_id {
@@ -1606,6 +2066,12 @@ impl ApplicationHandler for App {
                         }
                     }
                     return;
+                }
+
+                if button == MouseButton::Left && state == ElementState::Pressed {
+                    if self.editing_agent_pane.is_some() {
+                        self.commit_agent_label_edit();
+                    }
                 }
 
                 if let Some(session) = self.sessions.get_mut(&window_id) {
@@ -1701,6 +2167,11 @@ impl ApplicationHandler for App {
                             }
                         } else {
                             session.is_mouse_down = false;
+                            if session.dragging_sidebar {
+                                session.dragging_sidebar = false;
+                                session.sync_all_pane_sizes(tab_bar_h);
+                                session.window.request_redraw();
+                            }
                             if session.dragging_splitter.is_some() {
                                 session.dragging_splitter = None;
                                 session.sync_all_pane_sizes(tab_bar_h);
@@ -1800,7 +2271,9 @@ impl ApplicationHandler for App {
                     .collect();
 
                 if let Some(session) = self.sessions.get_mut(&window_id) {
-                    session.update_ime_position(tab_bar_h);
+                    if self.editing_agent_pane.is_none() {
+                        session.update_ime_position(tab_bar_h);
+                    }
 
                     let tabs: Vec<TabItem> = session
                         .workspace
@@ -1899,6 +2372,9 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        self.poll_macos_editor();
+
         // 1. Hot Reload Configuration
         let old_cfg = self.config_manager.current_config.clone();
         let reloaded = self.config_manager.check_reload().cloned();

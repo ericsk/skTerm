@@ -4,6 +4,8 @@ pub mod app_window;
 pub mod config;
 pub mod input;
 pub mod layout;
+#[cfg(target_os = "macos")]
+pub mod macos_textfield;
 pub mod preferences_gui;
 pub mod preferences_window;
 

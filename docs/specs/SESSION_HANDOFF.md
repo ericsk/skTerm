@@ -30,8 +30,21 @@
     - 修正 `ScreenBuffer::scroll_display` 方向邏輯，與 macOS「自然捲動 (Natural Scrolling)」設定一致。
     - 加入 `scroll_pixel_accumulator` 累積 `MouseScrollDelta::PixelDelta` 次像素位移，支援觸控板與 Magic Mouse 平滑捲動。
     - 支援 Alternate Screen 與 Mouse Reporting（`vim`、`tmux`、`less`、`htop`）滾輪事件自動轉發。
-  - [x] **全域 AI Agent 側邊欄架構 (Global AI Agent Sidebar)**：
+  - [x] **全域 AI Agent 側邊欄架構與寬度拖曳縮放 (Global Resizable AI Agent Sidebar)**：
     - 側邊欄開關狀態 (`App::sidebar_open`) 提升至視窗群組層級（高於分頁與窗格），開新分頁自動同步顯示且支援跨分頁掃描與點擊跳轉。
+    - 支援滑鼠移至側邊欄右緣顯示雙向調整游標（`CursorIcon::ColResize`），可自由拖曳調整寬度（範圍 `160px` 至 `480px`）。
+    - 自訂任務名稱（`custom_label`）作為卡片主標題醒目呈現，下方副標題顯示 Agent 類型、狀態與工作目錄。
+  - [x] **macOS 原生 `NSTextField` 側邊欄內嵌編輯器 (`crates/skterm-gui/src/macos_textfield.rs`)**：
+    - 雙擊/右鍵點擊側邊欄卡片或按 `Cmd+Shift+R` 時，透過 Objective-C Runtime 動態生成與卡片配色一致的原生 `NSTextField` 覆蓋於卡片標題處。
+    - 100% 原生支援 macOS 注音/拼音組字底線、候選字視窗跟隨、`Cmd+A/C/V/X/Z` 快捷鍵、滑鼠拖曳反白選取。
+    - 支援按下 `Enter` 或點擊外部區域自動儲存名稱，按下 `Escape` 取消編輯並還原焦點至終端機。
+  - [x] **macOS 原生分頁開新分頁尺寸保持 (Tab Geometry Preservation)**：
+    - 修正 `Cmd+T` 開啟新分頁時視窗被重設為預設 80×24 大小的問題；新分頁自動繼承現有視窗的 `inner_size` 與 `sidebar_width`。
+  - [x] **`bold_is_bright` 粗體自動高亮與主題色盤對比優化 (`crates/skterm-render/src/renderer.rs`, `config.rs`)**：
+    - 實作 `bold_is_bright`：SGR 1 粗體屬性（`CellFlags::BOLD`）自動將 ANSI 0..7 標準色映射至 8..15 高亮色，預設前景色自動提升為純白 `#FFFFFF`。
+    - 優化 `pure-black`、`catppuccin-mocha`、`tokyo-night`、`nord` 等內建主題的普通色與高亮色階層對比。
+  - [x] **現代化 macOS 應用程式圖示 (`assets/AppIcon.icns`)**：
+    - 設計滿版 Apple Continuous Squircle 圓角黑曜石玻璃圖示（`Sleek Obsidian Glass`），包含 16×16 至 1024×1024 全套 Retina 解析度，並整合至 `scripts/package_macos.sh` 自動封裝入 `skTerm.app/Contents/Resources/AppIcon.icns`。
   - [x] 單元測試與相容性測試：全部 **45/45 PASS**（100% 成功，0 Warning，0 Error）。
 
 ---
@@ -44,6 +57,6 @@ cargo test --workspace
 # 啟動原生終端並測試偏好設定與熱重載
 cargo run -p skterm-app
 
-# 測試打包 macOS App Bundle
+# 測試打包 macOS App Bundle (含 AppIcon.icns 與簽署)
 ./scripts/package_macos.sh
 ```

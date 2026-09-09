@@ -42,12 +42,21 @@ mod tests {
         use skterm_core::Color;
         let theme = RenderTheme::default();
         assert_eq!(
-            color_to_rgba_themed(Color::DefaultFg, false, &theme),
+            color_to_rgba_themed(Color::DefaultFg, false, false, &theme),
             theme.default_fg
         );
         assert_eq!(
-            color_to_rgba_themed(Color::DefaultBg, true, &theme),
+            color_to_rgba_themed(Color::DefaultBg, true, false, &theme),
             theme.default_bg
+        );
+        // Verify bold_is_bright promotes ANSI 0..7 to 8..15 when palette is present
+        let mut themed = theme;
+        let mut palette = [[0.0f32; 4]; 16];
+        palette[9] = [1.0, 0.2, 0.2, 1.0];
+        themed.ansi_palette = Some(palette);
+        assert_eq!(
+            color_to_rgba_themed(Color::Indexed(1), false, true, &themed),
+            palette[9]
         );
     }
 }
