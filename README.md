@@ -2,11 +2,10 @@
 
 <div align="center">
 
-**跨平台原生高效能 GPU 加速終端機**  
-*Next-Generation High-Performance GPU-Accelerated Terminal Emulator in Rust*
+**Next-Generation High-Performance GPU-Accelerated Terminal Emulator in Rust**
 
 [![CI](https://github.com/ericsk/skTerm/actions/workflows/ci.yml/badge.svg)](https://github.com/ericsk/skTerm/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)]()
 
@@ -14,178 +13,178 @@
 
 ---
 
-## 🌟 核心特色 (Key Features)
+## 🌟 Key Features
 
-- 🚀 **極致效能與 GPU 渲染 (GPU-Accelerated Rendering)**：
-  - 基於 `wgpu 24.0` 跨平台原生硬體加速（macOS Metal / Windows DirectX 12 & Vulkan / Linux Vulkan）。
-  - 動態 2D Glyph Texture Atlas 快取與極速冷啟動（< 15ms），實測吞吐量超過 **1,111,225 行/秒 (102.57 MB/s)**。
-- 🖥️ **完整 VT100 / ANSI / xterm / 24-bit TrueColor 相容**：
-  - 雙緩衝架構（Primary Buffer with 10,000+ 行 Scrollback + Alternate Screen Buffer）。
-  - 完整支援 16 色、256 色與 24-bit TrueColor RGB 配色。
-  - 支援 DECSTBM 自訂滾動區域、游標形狀切換（Block █ / Beam ❘ / Underline  ）與 OSC 8 點擊超連結。
-- 🌏 **完善 CJK 與國際化支援 (First-Class CJK & IME Support)**：
-  - 智慧多重回退字型引擎（自動搜尋 `~/Library/Fonts`, `/Library/Fonts`, `/usr/share/fonts` 等）。
-  - 支援注音、拼音、倉頡等原生中文輸入法（IME），候選字浮動視窗精準跟隨游標。
-  - CJK 雙寬字元（Double-Width）與 Emoji 完美對齊排版。
-- 🪟 **多分頁與 BSP 空間分割窗格 (Tabs & Split Panes Multiplexing)**：
-  - 內建二元空間分割樹（BSP Tree），支援任意深度的左右（垂直）與上下（水平）窗格動態切分。
-  - 支援滑鼠拖曳分割線（Splitter Dragging）、快捷鍵微調比例、一鍵等分尺寸與窗格全螢幕最大化縮放（Pane Zooming `[Z]`）。
-  - 多分頁標籤列（Tab Bar），支援分頁順序動態調整（Move Tab Left/Right）與獨立 PTY 執行個體。
-  - 智慧 Session 偵測：輸入 `exit` 或按下 `Ctrl+D` 自動關閉窗格/分頁，全數關閉時安全結束程式。
-- 🔗 **智慧超連結與點擊互動 (Clickable Hyperlinks & URL Auto-detection)**：
-  - 支援標準 **OSC 8** 逸出碼超連結與終端輸出純文字 URL（`https://`, `http://`, `www.` 等）即時自動偵測。
-  - 按住 `Cmd` (macOS) 或 `Ctrl` (Linux/Windows) 懸停自動切換手型游標（Pointer），點擊直接以預設瀏覽器開啟。
-- 🖼️ **進階終端圖像協定 (Sixel & Kitty Graphics)**：
-  - **DEC Sixel**：完整點陣光柵解碼與調色盤支援。
-  - **Kitty Graphics Protocol**：支援 32-bit RGBA、24-bit RGB 與 PNG 圖像直接由 GPU 紋理管線渲染。
-- ⚙️ **圖形化偏好設定 GUI 介面與即時熱重載 (Preferences GUI & Hot Reload)**：
-  - 內建原生 GPU 渲染偏好設定視窗（Preferences Modal），按 `Cmd+,`（`Ctrl+Shift+,`）即可直接呼叫 GUI 介面進行視覺化設定。
-  - 支援外觀字型、色彩主題、模擬器 Shell、游標動態即時設定並一鍵儲存套用，同步支援 TOML 文字編輯器開啟。
-  - 修改設定檔無需重啟，存檔即時熱更新外觀。
+- 🚀 **GPU-Accelerated Rendering**:
+  - Cross-platform native hardware acceleration powered by `wgpu 24.0` (macOS Metal / Windows DirectX 12 & Vulkan / Linux Vulkan).
+  - Dynamic 2D Glyph Texture Atlas caching with ultra-fast cold startup (< 15ms) and benchmarked throughput exceeding **1,111,225 lines/sec (102.57 MB/s)**.
+- 🖥️ **Full VT100 / ANSI / xterm / 24-bit TrueColor Compatibility**:
+  - Dual-buffer architecture (Primary Buffer with 10,000+ lines of Scrollback + Alternate Screen Buffer).
+  - Full support for 16-color, 256-color, and 24-bit TrueColor RGB palettes.
+  - Supports DECSTBM custom scroll regions, cursor shape switching (Block `█` / Beam `❘` / Underline `_`), and OSC 8 clickable hyperlinks.
+- 🌏 **First-Class CJK & IME Support**:
+  - Smart multi-fallback font engine (automatically discovers fonts in `~/Library/Fonts`, `/Library/Fonts`, `/usr/share/fonts`, etc.).
+  - Full Input Method Editor (IME) support for Zhuyin, Pinyin, Cangjie, Japanese, Korean, and more, with candidate windows accurately tracking the cursor position.
+  - Pixel-perfect alignment for CJK double-width characters and Emojis.
+- 🪟 **Tabs & Split Panes Multiplexing**:
+  - Built-in Binary Space Partitioning (BSP) tree supporting arbitrary-depth vertical (left/right) and horizontal (top/bottom) dynamic pane splitting.
+  - Interactive mouse splitter dragging, keyboard shortcuts for fine-tuning pane ratios, one-key pane equalization, and full-screen pane zooming (`[Z]`).
+  - Multi-tab bar with dynamic tab reordering (Move Tab Left/Right) and isolated PTY instances per session.
+  - Smart session detection: typing `exit` or pressing `Ctrl+D` automatically closes the active pane or tab, and cleanly exits the application when the last session closes.
+- 🔗 **Clickable Hyperlinks & URL Auto-Detection**:
+  - Supports standard **OSC 8** escape sequence hyperlinks alongside real-time plain-text URL auto-detection (`https://`, `http://`, `www.`, etc.).
+  - Hold `Cmd` (macOS) or `Ctrl` (Linux/Windows) while hovering to display a pointer cursor, and click to open links directly in your default browser.
+- 🖼️ **Advanced Terminal Graphics Protocols (Sixel & Kitty Graphics)**:
+  - **DEC Sixel**: Full bitmap raster decoding and palette support.
+  - **Kitty Graphics Protocol**: Direct GPU texture pipeline rendering for 32-bit RGBA, 24-bit RGB, and PNG images.
+- ⚙️ **Preferences GUI & Hot Reload**:
+  - Built-in native GPU-rendered Preferences Modal (`Cmd+,` or `Ctrl+Shift+,`) for interactive visual configuration.
+  - Live configuration of fonts, color themes, shell programs, and cursor styles with one-click save & apply, plus quick access to open the configuration in your external TOML editor.
+  - Automatic hot-reloading applies configuration file changes immediately upon saving without restarting the terminal.
 
 ---
 
-## ⌨️ 快捷鍵指南 (Keyboard Shortcuts)
+## ⌨️ Keyboard Shortcuts
 
-| 快捷鍵 (macOS) | 快捷鍵 (Linux/Windows) | 說明 |
+| Shortcut (macOS) | Shortcut (Linux/Windows) | Description |
 | :--- | :--- | :--- |
-| `Cmd + ,` | `Ctrl + Shift + ,` | **開啟偏好設定 GUI 視窗 (Open Preferences GUI)** |
-| `Cmd + =` / `Cmd + +` | `Ctrl + =` | **放大字型大小 (Zoom In Font Size)** |
-| `Cmd + -` | `Ctrl + -` | **縮小字型大小 (Zoom Out Font Size)** |
-| `Cmd + 0` | `Ctrl + 0` | **重設字型大小 (Reset Font Size)** |
-| `Cmd + T` | `Ctrl + Shift + T` | **新增分頁 (New Tab)** |
-| `Cmd + W` | `Ctrl + Shift + W` | **關閉當前窗格/分頁 (Close Pane/Tab)** |
-| `Cmd + D` | `Ctrl + Shift + D` | **垂直切分窗格 (左右分割)** |
-| `Cmd + Shift + D` | `Ctrl + Shift + H` | **水平切分窗格 (上下分割)** |
-| `Cmd + Shift + Enter` / `Z` | `Ctrl + Shift + Enter` | **窗格最大化 / 還原縮放 (Toggle Pane Zoom)** |
-| `Cmd + Option + =` | `Ctrl + Alt + =` | **等分所有窗格尺寸 (Equalize Panes)** |
-| `Cmd + Option + 方向鍵` | `Ctrl + Alt + 方向鍵` | **微調當前窗格分割比例 (Resize Pane Ratio)** |
-| `Cmd + Option + [` / `]` | `Ctrl + Alt + [` / `]` | **向前 / 向後移動當前分頁順序 (Move Tab Left/Right)** |
-| `Cmd + ]` / `Cmd + [` | `Ctrl + ]` / `Ctrl + [` | **切換焦點窗格 (Next/Prev Pane)** |
-| `Cmd + Shift + ]` / `[` | `Ctrl + Tab` / `Ctrl + Shift + Tab` | **切換分頁 (Next/Prev Tab)** |
-| `Cmd + 1` ~ `9` | `Ctrl + 1` ~ `9` | **直接切換至第 1 ~ 9 個分頁** |
-| `Cmd + C` | `Ctrl + Shift + C` | **複製選取文字至剪貼簿** |
-| `Cmd + V` | `Ctrl + Shift + V` | **貼上剪貼簿文字 (支援 Bracketed Paste)** |
-| `Cmd + 滑鼠左鍵點擊` | `Ctrl + 滑鼠左鍵點擊` | **直接點擊超連結 (OSC 8 / URL) 並在瀏覽器中開啟** |
-| `滑鼠拖曳分割線` | `滑鼠拖曳分割線` | **直覺拖曳調整任意窗格大小 (Splitter Dragging)** |
-| `Ctrl + D` | `Ctrl + D` | **發送 EOF 訊號 (登出/結束程式)** |
-| `Ctrl + C` | `Ctrl + C` | **發送 SIGINT 訊號 (中斷程式)** |
-| `滑鼠滾輪` | `滑鼠滾輪` | **流暢滾動檢視歷史緩衝區 (Scrollback)** |
-| `滑鼠左鍵拖曳` | `滑鼠左鍵拖曳` | **文字反白選取 (雙擊選詞，三擊選行)** |
-| `滑鼠右鍵點擊` | `滑鼠右鍵點擊` | **快速貼上剪貼簿內容** |
+| `Cmd + ,` | `Ctrl + Shift + ,` | **Open Preferences GUI Modal** |
+| `Cmd + =` / `Cmd + +` | `Ctrl + =` | **Zoom In Font Size** |
+| `Cmd + -` | `Ctrl + -` | **Zoom Out Font Size** |
+| `Cmd + 0` | `Ctrl + 0` | **Reset Font Size** |
+| `Cmd + T` | `Ctrl + Shift + T` | **New Tab** |
+| `Cmd + W` | `Ctrl + Shift + W` | **Close Current Pane / Tab** |
+| `Cmd + D` | `Ctrl + Shift + D` | **Split Pane Vertically (Left / Right)** |
+| `Cmd + Shift + D` | `Ctrl + Shift + H` | **Split Pane Horizontally (Top / Bottom)** |
+| `Cmd + Shift + Enter` / `Z` | `Ctrl + Shift + Enter` | **Toggle Pane Maximize / Zoom** |
+| `Cmd + Option + =` | `Ctrl + Alt + =` | **Equalize All Pane Sizes** |
+| `Cmd + Option + Arrow Keys` | `Ctrl + Alt + Arrow Keys` | **Resize Current Pane Ratio** |
+| `Cmd + Option + [` / `]` | `Ctrl + Alt + [` / `]` | **Move Current Tab Left / Right** |
+| `Cmd + ]` / `Cmd + [` | `Ctrl + ]` / `Ctrl + [` | **Focus Next / Previous Pane** |
+| `Cmd + Shift + ]` / `[` | `Ctrl + Tab` / `Ctrl + Shift + Tab` | **Switch to Next / Previous Tab** |
+| `Cmd + 1` ~ `9` | `Ctrl + 1` ~ `9` | **Switch Directly to Tab 1 ~ 9** |
+| `Cmd + C` | `Ctrl + Shift + C` | **Copy Selected Text to Clipboard** |
+| `Cmd + V` | `Ctrl + Shift + V` | **Paste Clipboard Text (Supports Bracketed Paste)** |
+| `Cmd + Left Click` | `Ctrl + Left Click` | **Open Hyperlink (OSC 8 / URL) in Default Browser** |
+| `Mouse Drag Splitter` | `Mouse Drag Splitter` | **Drag Split Dividers to Resize Panes** |
+| `Ctrl + D` | `Ctrl + D` | **Send EOF Signal (Logout / Terminate Session)** |
+| `Ctrl + C` | `Ctrl + C` | **Send SIGINT Signal (Interrupt Process)** |
+| `Mouse Scroll Wheel` | `Mouse Scroll Wheel` | **Smooth Scroll Through Scrollback Buffer** |
+| `Mouse Left Drag` | `Mouse Left Drag` | **Select Text (Double-Click for Word, Triple-Click for Line)** |
+| `Mouse Right Click` | `Mouse Right Click` | **Quick Paste Clipboard Content** |
 
 ---
 
-## 🛠️ 建置與執行 (Build & Run)
+## 🛠️ Build & Run
 
-### 系統依賴要求
+### Prerequisites
 - **Rust Toolchain**: 1.80+ (`cargo`, `rustc`)
 
-### 開發與測試
+### Development & Testing
 ```bash
-# 執行全部 30 項單元測試與相容性測試
+# Run all workspace unit tests and compatibility test suites
 cargo test --workspace
 
-# 啟動 skTerm 終端機
+# Launch the skTerm application
 cargo run -p skterm-app
 
-# 執行吞吐量效能測試基準 (Benchmark)
+# Run throughput performance benchmark
 cargo run --release --example benchmark -p skterm-app
 ```
 
-### 跨平台發行打包 (Packaging)
+### Cross-Platform Packaging
 ```bash
-# macOS App Bundle (產出 dist/macos/skTerm.app)
+# macOS App Bundle (outputs dist/macos/skTerm.app)
 ./scripts/package_macos.sh
 
-# Linux .deb 安裝包 (產出 dist/linux/skterm_0.1.0_amd64.deb)
+# Linux .deb Package (outputs dist/linux/skterm_0.1.0_amd64.deb)
 ./scripts/package_linux.sh
 
-# Windows 可攜式壓縮包 (PowerShell)
+# Windows Portable Archive (PowerShell)
 .\scripts\package_windows.ps1
 ```
 
 ---
 
-## ⚙️ 設定檔範例 (`~/.config/skterm/config.toml`)
+## ⚙️ Configuration Example (`~/.config/skterm/config.toml`)
 
 ```toml
 [font]
-# 主要等寬字型家族名稱 (支援逗號分隔複合字型鏈)
+# Primary monospace font family (supports comma-separated fallback chains)
 family = "NotoSansMNerdFontMono, NotoSansTC, Menlo"
-# 字型大小 (pt 單位)
+# Font size in points (pt)
 size = 16.0
-# 行高倍率
+# Line height multiplier
 line_height = 1.2
-# 自訂 CJK 多重回退字型搜尋清單 (選填)
+# Custom CJK fallback font search list (optional)
 fallback_families = ["Hiragino Sans GB", "PingFang TC", "Noto Sans CJK TC"]
 
 [window]
-# 初始終端幾何大小 (欄數與行數)
+# Initial terminal geometry (columns and rows)
 columns = 80
 rows = 24
-# 視窗邊距 (單位: pt)
+# Window inner padding in points (pt)
 padding_x = 8.0
 padding_y = 8.0
-# 視窗背景不透明度 (0.1 ~ 1.0)
+# Background opacity (0.1 ~ 1.0)
 opacity = 1.0
-# 啟動視窗模式 ("normal", "maximized", "fullscreen")
+# Startup window mode ("normal", "maximized", "fullscreen")
 startup_mode = "normal"
-# 標題列與視窗外觀 ("full", "transparent", "none")
+# Window decorations and title bar style ("full", "transparent", "none")
 decorations = "full"
-# 分頁標籤列顯示策略 ("auto", "always", "never")
+# Tab bar display policy ("auto", "always", "never")
 tab_bar_style = "auto"
 
 [terminal]
-# 終端模擬器 TERM 環境變數 (預設: "xterm-256color")
+# Terminal emulator TERM environment variable (default: "xterm-256color")
 term = "xterm-256color"
-# 自訂預設 Shell 與啟動參數 (選填)
+# Custom default shell program and arguments (optional)
 # shell = { program = "/bin/zsh", args = ["--login"] }
-# 初始工作目錄 (選填)
+# Initial working directory (optional)
 # working_directory = "~"
-# 歷史滾動緩衝區行數
+# Scrollback history buffer size in lines
 scrollback_lines = 10000
-# 自訂環境變數表 (選填)
+# Custom environment variables map (optional)
 # [terminal.env]
 # COLORTERM = "truecolor"
 # EDITOR = "vim"
-# macOS Option 鍵行為 ("both", "only_left", "only_right", "none")
+# macOS Option key behavior ("both", "only_left", "only_right", "none")
 option_as_alt = "both"
-# 終端鈴聲模式 ("visual", "sound", "none")
+# Terminal bell notification mode ("visual", "sound", "none")
 bell = "visual"
 
 [colors]
-# 內建色彩主題: "catppuccin-mocha", "tokyo-night", "dracula", "solarized-dark", "nord", "default-dark"
+# Built-in color themes: "catppuccin-mocha", "tokyo-night", "dracula", "solarized-dark", "nord", "default-dark"
 theme = "catppuccin-mocha"
-# 自訂色彩覆蓋 (選填 Hex 碼)
+# Custom color overrides in hex format (optional)
 # foreground = "#cdd6f4"
 # background = "#1e1e2e"
 # cursor     = "#f5e0dc"
 # selection  = "#585b70"
 
 [cursor]
-# 游標形狀: "block" (█), "beam" (❘), "underline" (_)
+# Cursor shape: "block" (█), "beam" (❘), "underline" (_)
 shape = "block"
-# 游標閃爍開關
+# Toggle cursor blinking
 blink = true
-# 閃爍頻率 (毫秒)
+# Cursor blink interval in milliseconds
 blink_interval_ms = 500
 ```
 
 ---
 
-## 🏛️ 架構設計 (Architecture)
+## 🏛️ Architecture
 
 ```
 skTerm Workspace
-├── crates/skterm-core    # VT100 狀態機、字元網格、PTY 管理、雙緩衝與圖像解碼
-├── crates/skterm-render  # wgpu 24.0 管線、2D 字型圖集、Sixel/Kitty GPU 渲染
-├── crates/skterm-gui     # winit 事件迴圈、BSP 窗格切分、IME 處理與 egui 偏好設定
-└── crates/skterm-app     # 應用程式進入點與效能測試基準 (Benchmark)
+├── crates/skterm-core    # VT100 state machine, character grid, PTY management, dual buffer & graphics decoding
+├── crates/skterm-render  # wgpu 24.0 pipeline, 2D glyph texture atlas, Sixel/Kitty GPU rendering
+├── crates/skterm-gui     # winit event loop, BSP split panes, IME handling & egui preferences UI
+└── crates/skterm-app     # Application binary entry point & performance benchmarks
 ```
 
 ---
 
-## 📄 開源授權 (License)
+## 📄 License
 
-本專案採用雙重開源授權 [MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE)。
+This project is licensed under the [MIT License](LICENSE).
