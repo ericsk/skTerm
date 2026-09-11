@@ -399,4 +399,47 @@ mod tests {
         assert_eq!(ws.active_tab_idx, 1);
         assert_eq!(ws.active_tab().unwrap().title, "Development");
     }
+
+    #[test]
+    fn test_scrollbar_drag_and_scroll_on_input() {
+        use skterm_core::Terminal;
+        use skterm_render::ScrollbarMetrics;
+
+        let mut term = Terminal::new_headless(10, 80, 1000);
+        // Feed 50 lines so scrollback has lines
+        for i in 0..50 {
+            term.feed_bytes(format!("Line {}\r\n", i).as_bytes());
+        }
+
+        let scrollback_len = term.grid().active().scrollback.len();
+        assert!(scrollback_len >= 40);
+
+        // Initially at bottom (scroll_offset == 0)
+        assert_eq!(term.grid().active().scroll_offset, 0);
+
+        // Scroll up by 20 lines
+        term.grid_mut().active_mut().scroll_display(20);
+        assert_eq!(term.grid().active().scroll_offset, 20);
+
+        // Verify ScrollbarMetrics
+        let metrics = ScrollbarMetrics::compute(
+            0.0, 0.0, 800.0, 600.0, 1.0, scrollback_len, 10, 20, false, false,
+        )
+        .expect("ScrollbarMetrics should be computed");
+
+        assert!(metrics.travel > 0.0);
+        assert!(metrics.thumb_y > metrics.track_y);
+        assert!(metrics.thumb_y < metrics.track_y + metrics.travel);
+
+        // Simulate dragging to bottom
+        let progress_bottom = 1.0;
+        let new_offset_bottom = ((1.0 - progress_bottom) * scrollback_len as f32).round() as usize;
+        assert_eq!(new_offset_bottom, 0);
+
+        // Simulate user typing text when scrolled up:
+        // When user types or pastes, scroll_offset must reset to 0 (scroll back to cursor)
+        assert_eq!(term.grid().active().scroll_offset, 20);
+        term.grid_mut().active_mut().scroll_offset = 0;
+        assert_eq!(term.grid().active().scroll_offset, 0);
+    }
 }

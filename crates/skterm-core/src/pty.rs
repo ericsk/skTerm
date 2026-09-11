@@ -16,13 +16,27 @@ pub enum PtyEvent {
 }
 
 /// Advanced options for spawning a PTY subprocess.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct PtySpawnOptions {
     pub shell: Option<String>,
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub term: Option<String>,
     pub env: HashMap<String, String>,
+    pub wakeup_cb: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for PtySpawnOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtySpawnOptions")
+            .field("shell", &self.shell)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("term", &self.term)
+            .field("env", &self.env)
+            .field("has_wakeup_cb", &self.wakeup_cb.is_some())
+            .finish()
+    }
 }
 
 /// A running PTY process with asynchronous reader and synchronized writer.
@@ -31,6 +45,8 @@ pub struct PtyProcess {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     event_rx: Receiver<PtyEvent>,
+    has_exited: Arc<std::sync::atomic::AtomicBool>,
+    pid: Option<u32>,
     _reader_thread: thread::JoinHandle<()>,
 }
 
@@ -161,6 +177,7 @@ impl PtyProcess {
         }
 
         let child = pair.slave.spawn_command(cmd)?;
+        let pid = child.process_id();
         let child = Arc::new(Mutex::new(child));
         let child_clone = Arc::clone(&child);
 
@@ -168,6 +185,10 @@ impl PtyProcess {
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
 
         let (event_tx, event_rx): (Sender<PtyEvent>, Receiver<PtyEvent>) = unbounded();
+
+        let wakeup_cb = options.wakeup_cb;
+        let has_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let has_exited_thread = has_exited.clone();
 
         let reader_thread = thread::Builder::new()
             .name("skterm-pty-reader".to_string())
@@ -177,27 +198,38 @@ impl PtyProcess {
                     match reader.read(&mut buf) {
                         Ok(0) => {
                             info!("PTY stream reached EOF");
+                            has_exited_thread.store(true, std::sync::atomic::Ordering::SeqCst);
                             let exit_code = child_clone
                                 .lock()
                                 .ok()
                                 .and_then(|mut c| c.try_wait().ok().flatten())
                                 .map(|status| status.exit_code());
                             let _ = event_tx.send(PtyEvent::Exit(exit_code));
+                            if let Some(ref cb) = wakeup_cb {
+                                cb();
+                            }
                             break;
                         }
                         Ok(n) => {
                             if event_tx.send(PtyEvent::Output(buf[..n].to_vec())).is_err() {
                                 break;
                             }
+                            if let Some(ref cb) = wakeup_cb {
+                                cb();
+                            }
                         }
                         Err(e) => {
                             error!("PTY read error: {:?}", e);
+                            has_exited_thread.store(true, std::sync::atomic::Ordering::SeqCst);
                             let exit_code = child_clone
                                 .lock()
                                 .ok()
                                 .and_then(|mut c| c.try_wait().ok().flatten())
                                 .map(|status| status.exit_code());
                             let _ = event_tx.send(PtyEvent::Exit(exit_code));
+                            if let Some(ref cb) = wakeup_cb {
+                                cb();
+                            }
                             break;
                         }
                     }
@@ -209,6 +241,8 @@ impl PtyProcess {
             writer,
             child,
             event_rx,
+            has_exited,
+            pid,
             _reader_thread: reader_thread,
         })
     }
@@ -242,9 +276,15 @@ impl PtyProcess {
 
     /// Check if the child process has exited.
     pub fn is_alive(&self) -> bool {
+        if self.has_exited.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
         if let Ok(mut child) = self.child.lock() {
             match child.try_wait() {
-                Ok(Some(_)) => false,
+                Ok(Some(_)) => {
+                    self.has_exited.store(true, std::sync::atomic::Ordering::Relaxed);
+                    false
+                }
                 Ok(None) => true,
                 Err(_) => false,
             }
@@ -255,11 +295,7 @@ impl PtyProcess {
 
     /// Return the OS process ID of the spawned shell/child process.
     pub fn process_id(&self) -> Option<u32> {
-        if let Ok(child) = self.child.lock() {
-            child.process_id()
-        } else {
-            None
-        }
+        self.pid
     }
 }
 

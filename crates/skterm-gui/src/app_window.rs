@@ -9,7 +9,7 @@ use crate::layout::{PaneId, Rect, SplitDirection, Workspace};
 use crate::preferences_window::PreferencesWindow;
 use arboard::Clipboard;
 use skterm_core::{PtySpawnOptions, Selection, SelectionMode};
-use skterm_render::{PaneRenderItem, RenderTheme, TabItem, TermRenderer};
+use skterm_render::{PaneRenderItem, RenderTheme, ScrollbarMetrics, TabItem, TermRenderer};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -55,6 +55,21 @@ pub fn open_url_in_browser(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Custom application events for asynchronous wakeups.
+#[derive(Debug, Clone, Copy)]
+pub enum AppEvent {
+    PtyWakeup,
+}
+
+/// Active drag state when user clicks and drags a pane's scrollbar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollbarDragState {
+    pub pane_id: PaneId,
+    pub track_y: f32,
+    pub travel: f32,
+    pub drag_offset_y: f32,
+}
+
 /// Terminal Window Session representing an active window (or native macOS tab).
 pub struct TerminalSession {
     pub window: Arc<Window>,
@@ -67,12 +82,16 @@ pub struct TerminalSession {
     pub click_count: usize,
     pub dragging_splitter: Option<(u32, SplitDirection, Rect)>,
     pub dragging_sidebar: bool,
+    pub dragging_scrollbar: Option<ScrollbarDragState>,
+    pub hovered_scrollbar_pane: Option<PaneId>,
+    pub last_scroll_time: Option<Instant>,
     pub hovered_url: Option<String>,
     pub scroll_pixel_accumulator: f64,
     pub search_open: bool,
     pub search_query: String,
     pub search_matches: Vec<skterm_core::SearchMatch>,
     pub active_search_idx: Option<usize>,
+    pub last_ime_cursor_area: Option<(i32, i32, i32, i32)>,
 }
 
 impl TerminalSession {
@@ -137,7 +156,7 @@ impl TerminalSession {
             }
         }
     }
-    pub fn update_ime_position(&self, tab_bar_h: f32) {
+    pub fn update_ime_position(&mut self, tab_bar_h: f32) {
         if let Some(active_tab) = self.workspace.active_tab() {
             if let Some(terminal) = active_tab.active_terminal() {
                 let pane_rects = self.workspace.compute_active_pane_rects_with_scale(
@@ -166,6 +185,17 @@ impl TerminalSession {
                         let logical_size =
                             LogicalSize::new(cell_w as f64 / scale, cell_h as f64 / scale);
 
+                        let area_key = (
+                            logical_pos.x.round() as i32,
+                            logical_pos.y.round() as i32,
+                            logical_size.width.round() as i32,
+                            logical_size.height.round() as i32,
+                        );
+                        if self.last_ime_cursor_area == Some(area_key) {
+                            break;
+                        }
+                        self.last_ime_cursor_area = Some(area_key);
+
                         self.window.set_ime_cursor_area(
                             Position::Logical(logical_pos),
                             Size::Logical(logical_size),
@@ -193,7 +223,7 @@ impl TerminalSession {
         }
     }
 
-    pub fn paste_from_clipboard(&self, clipboard: Option<&Arc<Mutex<Clipboard>>>) {
+    pub fn paste_from_clipboard(&mut self, clipboard: Option<&Arc<Mutex<Clipboard>>>) {
         if let Some(cb) = clipboard {
             if let Ok(mut clip) = cb.lock() {
                 let text_to_paste = if let Ok(text) = clip.get_text() {
@@ -235,8 +265,9 @@ impl TerminalSession {
                 };
 
                 if let Some(text) = final_text {
-                    if let Some(active_tab) = self.workspace.active_tab() {
-                        if let Some(terminal) = active_tab.active_terminal() {
+                    if let Some(active_tab) = self.workspace.active_tab_mut() {
+                        if let Some(terminal) = active_tab.active_terminal_mut() {
+                            terminal.grid_mut().active_mut().scroll_offset = 0;
                             let bracketed = terminal.state.bracketed_paste;
                             let payload = if bracketed {
                                 format!("\x1b[200~{}\x1b[201~", text)
@@ -315,6 +346,9 @@ pub struct App {
     pub editing_agent_cursor: usize,
     pub ime_preedit: String,
     pub last_ime_commit_time: Option<Instant>,
+    pub event_proxy: Option<winit::event_loop::EventLoopProxy<AppEvent>>,
+    pub cached_ai_agents: Vec<skterm_render::AgentSidebarItem>,
+    pub last_ai_agent_scan: Option<Instant>,
     #[cfg(target_os = "macos")]
     pub macos_editor: crate::macos_textfield::NativeSidebarEditor,
 }
@@ -353,6 +387,9 @@ impl App {
             editing_agent_cursor: 0,
             ime_preedit: String::new(),
             last_ime_commit_time: None,
+            event_proxy: None,
+            cached_ai_agents: Vec::new(),
+            last_ai_agent_scan: None,
             #[cfg(target_os = "macos")]
             macos_editor: crate::macos_textfield::NativeSidebarEditor::new(),
         }
@@ -524,7 +561,8 @@ impl App {
     }
 
     pub fn run(mut self) -> anyhow::Result<()> {
-        let event_loop = EventLoop::new()?;
+        let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
+        self.event_proxy = Some(event_loop.create_proxy());
         event_loop.set_control_flow(ControlFlow::WaitUntil(
             Instant::now() + Duration::from_millis(16),
         ));
@@ -762,12 +800,20 @@ impl App {
 
         let cwd = inherited_cwd.or_else(|| term_cfg.working_directory.clone());
 
+        let wakeup_cb = self.event_proxy.as_ref().map(|p| {
+            let p = p.clone();
+            Arc::new(move || {
+                let _ = p.send_event(AppEvent::PtyWakeup);
+            }) as Arc<dyn Fn() + Send + Sync>
+        });
+
         PtySpawnOptions {
             shell,
             args,
             cwd,
             term: Some(term_cfg.term.clone()),
             env: term_cfg.env.clone(),
+            wakeup_cb,
         }
     }
 
@@ -975,12 +1021,16 @@ impl App {
             click_count: 0,
             dragging_splitter: None,
             dragging_sidebar: false,
+            dragging_scrollbar: None,
+            hovered_scrollbar_pane: None,
+            last_scroll_time: None,
             hovered_url: None,
             scroll_pixel_accumulator: 0.0,
             search_open: false,
             search_query: String::new(),
             search_matches: Vec::new(),
             active_search_idx: None,
+            last_ime_cursor_area: None,
         };
 
         self.sessions.insert(window_id, session);
@@ -991,7 +1041,19 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::PtyWakeup => {
+                for session in self.sessions.values_mut() {
+                    if session.workspace.poll_all_ptys() {
+                        session.window.request_redraw();
+                    }
+                }
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.sessions.is_empty() {
             if let Err(e) = self.create_terminal_session(event_loop) {
@@ -1118,6 +1180,7 @@ impl ApplicationHandler for App {
             WindowEvent::Ime(ime_event) => {
                 match ime_event {
                     Ime::Commit(text) => {
+                        let had_preedit = !self.ime_preedit.is_empty();
                         self.last_ime_commit_time = Some(Instant::now());
                         self.ime_preedit.clear();
                         if self.editing_agent_pane.is_some() {
@@ -1132,15 +1195,32 @@ impl ApplicationHandler for App {
                                 session.window.request_redraw();
                             } else if let Some(tab) = session.workspace.active_tab_mut() {
                                 if let Some(term) = tab.active_terminal_mut() {
+                                    let was_scrolled = term.grid().active().scroll_offset != 0;
+                                    term.grid_mut().active_mut().scroll_offset = 0;
                                     let _ = term.write_to_pty(text.as_bytes());
-                                    session.window.request_redraw();
+                                    if had_preedit || was_scrolled || term.poll_pty() {
+                                        session.window.request_redraw();
+                                    }
                                 }
                             }
                         }
                     }
                     Ime::Preedit(text, _cursor) => {
                         self.ime_preedit = text;
-                        if let Some(session) = self.sessions.get(&window_id) {
+                        if self.editing_agent_pane.is_none() {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                if !session.search_open {
+                                    if let Some(tab) = session.workspace.active_tab_mut() {
+                                        if let Some(term) = tab.active_terminal_mut() {
+                                            if term.grid().active().scroll_offset != 0 {
+                                                term.grid_mut().active_mut().scroll_offset = 0;
+                                            }
+                                        }
+                                    }
+                                }
+                                session.window.request_redraw();
+                            }
+                        } else if let Some(session) = self.sessions.get(&window_id) {
                             session.window.request_redraw();
                         }
                     }
@@ -1202,6 +1282,63 @@ impl ApplicationHandler for App {
                                 session.sync_all_pane_sizes(tab_bar_h);
                                 session.window.request_redraw();
                                 return;
+                            }
+                        }
+                        Key::Named(NamedKey::PageUp) => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                if let Some(tab) = session.workspace.active_tab_mut() {
+                                    if let Some(term) = tab.active_terminal_mut() {
+                                        let page_lines =
+                                            term.grid().active().rows.saturating_sub(2).max(1);
+                                        term.grid_mut()
+                                            .active_mut()
+                                            .scroll_display(page_lines as isize);
+                                        session.last_scroll_time = Some(Instant::now());
+                                        session.window.request_redraw();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::PageDown) => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                if let Some(tab) = session.workspace.active_tab_mut() {
+                                    if let Some(term) = tab.active_terminal_mut() {
+                                        let page_lines =
+                                            term.grid().active().rows.saturating_sub(2).max(1);
+                                        term.grid_mut()
+                                            .active_mut()
+                                            .scroll_display(-(page_lines as isize));
+                                        session.last_scroll_time = Some(Instant::now());
+                                        session.window.request_redraw();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::Home) => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                if let Some(tab) = session.workspace.active_tab_mut() {
+                                    if let Some(term) = tab.active_terminal_mut() {
+                                        let max_scroll = term.grid().active().scrollback.len();
+                                        term.grid_mut().active_mut().scroll_offset = max_scroll;
+                                        session.last_scroll_time = Some(Instant::now());
+                                        session.window.request_redraw();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::End) => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                if let Some(tab) = session.workspace.active_tab_mut() {
+                                    if let Some(term) = tab.active_terminal_mut() {
+                                        term.grid_mut().active_mut().scroll_offset = 0;
+                                        session.last_scroll_time = Some(Instant::now());
+                                        session.window.request_redraw();
+                                        return;
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -1322,7 +1459,7 @@ impl ApplicationHandler for App {
                                 return;
                             }
                             "v" => {
-                                if let Some(session) = self.sessions.get(&window_id) {
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
                                     session.paste_from_clipboard(self.clipboard.as_ref());
                                 }
                                 return;
@@ -1607,6 +1744,70 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Shift+PageUp / Shift+PageDown / Shift+Home / Shift+End quick scrolling
+                if is_shift && !self.modifiers.control_key() && !self.modifiers.alt_key() {
+                    match event.logical_key {
+                        Key::Named(NamedKey::PageUp) => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                if let Some(tab) = session.workspace.active_tab_mut() {
+                                    if let Some(term) = tab.active_terminal_mut() {
+                                        let page_lines =
+                                            term.grid().active().rows.saturating_sub(2).max(1);
+                                        term.grid_mut()
+                                            .active_mut()
+                                            .scroll_display(page_lines as isize);
+                                        session.last_scroll_time = Some(Instant::now());
+                                        session.window.request_redraw();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::PageDown) => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                if let Some(tab) = session.workspace.active_tab_mut() {
+                                    if let Some(term) = tab.active_terminal_mut() {
+                                        let page_lines =
+                                            term.grid().active().rows.saturating_sub(2).max(1);
+                                        term.grid_mut()
+                                            .active_mut()
+                                            .scroll_display(-(page_lines as isize));
+                                        session.last_scroll_time = Some(Instant::now());
+                                        session.window.request_redraw();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::Home) => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                if let Some(tab) = session.workspace.active_tab_mut() {
+                                    if let Some(term) = tab.active_terminal_mut() {
+                                        let max_scroll = term.grid().active().scrollback.len();
+                                        term.grid_mut().active_mut().scroll_offset = max_scroll;
+                                        session.last_scroll_time = Some(Instant::now());
+                                        session.window.request_redraw();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::End) => {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                if let Some(tab) = session.workspace.active_tab_mut() {
+                                    if let Some(term) = tab.active_terminal_mut() {
+                                        term.grid_mut().active_mut().scroll_offset = 0;
+                                        session.last_scroll_time = Some(Instant::now());
+                                        session.window.request_redraw();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Send Normal Key to PTY
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     if let Some(tab) = session.workspace.active_tab_mut() {
@@ -1614,8 +1815,12 @@ impl ApplicationHandler for App {
                             let app_cursor = term.state.application_cursor_keys;
                             if let Some(bytes) = encode_key_event(event, self.modifiers, app_cursor)
                             {
+                                let was_scrolled = term.grid().active().scroll_offset != 0;
+                                term.grid_mut().active_mut().scroll_offset = 0;
                                 let _ = term.write_to_pty(&bytes);
-                                session.window.request_redraw();
+                                if was_scrolled || term.poll_pty() {
+                                    session.window.request_redraw();
+                                }
                             }
                         }
                     }
@@ -1626,6 +1831,31 @@ impl ApplicationHandler for App {
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     session.mouse_pos = (position.x as f32, position.y as f32);
                     let (mx, my) = session.mouse_pos;
+
+                    // 0.4 Handling Scrollbar Dragging
+                    if let Some(drag) = session.dragging_scrollbar {
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            if let Some(term) = tab.root.find_terminal_mut(drag.pane_id) {
+                                let active_buf = term.grid_mut().active_mut();
+                                let scrollback_len = active_buf.scrollback.len();
+                                if scrollback_len > 0 && drag.travel > 0.0 {
+                                    let target_thumb_y = my - drag.drag_offset_y;
+                                    let clamped_thumb_y =
+                                        target_thumb_y.clamp(drag.track_y, drag.track_y + drag.travel);
+                                    let progress =
+                                        (clamped_thumb_y - drag.track_y) / drag.travel;
+                                    let new_offset =
+                                        ((1.0 - progress) * scrollback_len as f32).round() as usize;
+                                    active_buf.scroll_offset =
+                                        new_offset.min(scrollback_len);
+                                    session.last_scroll_time = Some(Instant::now());
+                                    session.window.request_redraw();
+                                }
+                            }
+                        }
+                        session.window.set_cursor(CursorIcon::Default);
+                        return;
+                    }
 
                     // 0.5 Handling Sidebar Resizing Dragging
                     if session.dragging_sidebar {
@@ -1668,10 +1898,62 @@ impl ApplicationHandler for App {
                             }
                         }
                     } else {
-                        // 3. Hover testing for Splitters and Hyperlinks to update cursor icon
+                        // 3. Hover testing for Scrollbar, Splitters, and Hyperlinks to update cursor icon
                         let width = session.renderer.config.width as f32;
                         let height = session.renderer.config.height as f32;
                         let bounds = Rect::new(0.0, tab_bar_h, width, height - tab_bar_h);
+
+                        // 3.0 Check Scrollbar Hover
+                        let scale = session.renderer.scale_factor;
+                        let pane_rects = session.workspace.compute_active_pane_rects_with_scale(
+                            width,
+                            height,
+                            tab_bar_h,
+                            scale,
+                        );
+
+                        let mut over_scrollbar_pane = None;
+                        if let Some(active_tab) = session.workspace.active_tab() {
+                            for (id, rect) in &pane_rects {
+                                if let Some(term) = active_tab.root.find_terminal(*id) {
+                                    let grid = term.grid();
+                                    if !grid.is_alternate {
+                                        let active_buf = grid.active();
+                                        if let Some(metrics) = ScrollbarMetrics::compute(
+                                            rect.x,
+                                            rect.y,
+                                            rect.width,
+                                            rect.height,
+                                            scale,
+                                            active_buf.scrollback.len(),
+                                            active_buf.rows,
+                                            active_buf.scroll_offset,
+                                            false,
+                                            false,
+                                        ) {
+                                            if mx >= metrics.hit_x
+                                                && mx <= rect.x + rect.width
+                                                && my >= metrics.hit_y
+                                                && my <= metrics.hit_y + metrics.hit_h
+                                            {
+                                                over_scrollbar_pane = Some(*id);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if over_scrollbar_pane != session.hovered_scrollbar_pane {
+                            session.hovered_scrollbar_pane = over_scrollbar_pane;
+                            session.window.request_redraw();
+                        }
+
+                        if session.hovered_scrollbar_pane.is_some() {
+                            session.window.set_cursor(CursorIcon::Default);
+                            return;
+                        }
 
                         #[cfg(target_os = "macos")]
                         let is_link_modifier = self.modifiers.super_key();
@@ -2123,6 +2405,96 @@ impl ApplicationHandler for App {
                                 }
                             }
 
+                            // 2.5 Check Scrollbar Click / Drag Start
+                            let mut scrollbar_clicked = false;
+                            let pane_rects = session
+                                .workspace
+                                .compute_active_pane_rects_with_scale(
+                                    width, height, tab_bar_h, scale,
+                                );
+                            if let Some(active_tab) = session.workspace.active_tab_mut() {
+                                for (id, rect) in &pane_rects {
+                                    if let Some(term) = active_tab.root.find_terminal_mut(*id) {
+                                        let (is_alt, scrollback_len, rows, scroll_offset) = {
+                                            let grid = term.grid();
+                                            let buf = grid.active();
+                                            (
+                                                grid.is_alternate,
+                                                buf.scrollback.len(),
+                                                buf.rows,
+                                                buf.scroll_offset,
+                                            )
+                                        };
+                                        if !is_alt && scrollback_len > 0 {
+                                            if let Some(metrics) = ScrollbarMetrics::compute(
+                                                rect.x,
+                                                rect.y,
+                                                rect.width,
+                                                rect.height,
+                                                scale,
+                                                scrollback_len,
+                                                rows,
+                                                scroll_offset,
+                                                true,
+                                                false,
+                                            ) {
+                                                if mx >= metrics.hit_x
+                                                    && mx <= rect.x + rect.width
+                                                    && my >= metrics.hit_y
+                                                    && my <= metrics.hit_y + metrics.hit_h
+                                                {
+                                                    scrollbar_clicked = true;
+                                                    active_tab.active_pane_id = *id;
+
+                                                    let (target_thumb_y, drag_offset_y) = if my
+                                                        >= metrics.thumb_y
+                                                        && my <= metrics.thumb_y + metrics.thumb_h
+                                                    {
+                                                        (metrics.thumb_y, my - metrics.thumb_y)
+                                                    } else {
+                                                        let target_y = (my
+                                                            - metrics.thumb_h / 2.0)
+                                                            .clamp(
+                                                                metrics.track_y,
+                                                                metrics.track_y + metrics.travel,
+                                                            );
+                                                        (target_y, metrics.thumb_h / 2.0)
+                                                    };
+
+                                                    if metrics.travel > 0.0 {
+                                                        let progress = (target_thumb_y
+                                                            - metrics.track_y)
+                                                            / metrics.travel;
+                                                        let new_offset = ((1.0 - progress)
+                                                            * scrollback_len as f32)
+                                                            .round()
+                                                            as usize;
+                                                        term.grid_mut().active_mut().scroll_offset =
+                                                            new_offset.min(scrollback_len);
+                                                    }
+
+                                                    session.dragging_scrollbar =
+                                                        Some(ScrollbarDragState {
+                                                            pane_id: *id,
+                                                            track_y: metrics.track_y,
+                                                            travel: metrics.travel,
+                                                            drag_offset_y,
+                                                        });
+                                                    session.last_scroll_time =
+                                                        Some(Instant::now());
+                                                    session.window.request_redraw();
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if scrollbar_clicked {
+                                return;
+                            }
+
                             session.is_mouse_down = true;
 
                             // Click inside Terminal Pane
@@ -2167,6 +2539,10 @@ impl ApplicationHandler for App {
                             }
                         } else {
                             session.is_mouse_down = false;
+                            if session.dragging_scrollbar.is_some() {
+                                session.dragging_scrollbar = None;
+                                session.window.request_redraw();
+                            }
                             if session.dragging_sidebar {
                                 session.dragging_sidebar = false;
                                 session.sync_all_pane_sizes(tab_bar_h);
@@ -2255,6 +2631,7 @@ impl ApplicationHandler for App {
                                         .grid_mut()
                                         .active_mut()
                                         .scroll_display(lines as isize);
+                                    session.last_scroll_time = Some(Instant::now());
                                     session.window.request_redraw();
                                 }
                             }
@@ -2264,14 +2641,25 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                let agents: Vec<skterm_render::AgentSidebarItem> = self
-                    .scan_all_ai_agents()
-                    .into_iter()
-                    .map(|(_, a)| a)
-                    .collect();
+                let local_agents;
+                let agents: &[skterm_render::AgentSidebarItem] = if self.editing_agent_pane.is_some() || self.cached_ai_agents.is_empty() {
+                    local_agents = self
+                        .scan_all_ai_agents()
+                        .into_iter()
+                        .map(|(_, a)| a)
+                        .collect::<Vec<_>>();
+                    &local_agents
+                } else {
+                    &self.cached_ai_agents
+                };
 
                 if let Some(session) = self.sessions.get_mut(&window_id) {
-                    if self.editing_agent_pane.is_none() {
+                    if self.editing_agent_pane.is_none()
+                        && (!self.ime_preedit.is_empty()
+                            || self
+                                .last_ime_commit_time
+                                .map_or(false, |t| t.elapsed() < Duration::from_millis(200)))
+                    {
                         session.update_ime_position(tab_bar_h);
                     }
 
@@ -2305,6 +2693,16 @@ impl ApplicationHandler for App {
                         for (id, rect) in &pane_rects {
                             if let Some(t) = active_tab.root.find_terminal(*id) {
                                 let is_focused = *id == active_tab.active_pane_id;
+                                let is_scrollbar_hovered =
+                                    session.hovered_scrollbar_pane == Some(*id);
+                                let is_scrollbar_dragging = session
+                                    .dragging_scrollbar
+                                    .as_ref()
+                                    .map_or(false, |d| d.pane_id == *id);
+                                let is_recently_scrolled = session
+                                    .last_scroll_time
+                                    .map_or(false, |t| t.elapsed() < Duration::from_millis(1500));
+
                                 render_panes.push(PaneRenderItem {
                                     grid: t.grid(),
                                     rect_x: rect.x,
@@ -2327,6 +2725,9 @@ impl ApplicationHandler for App {
                                     } else {
                                         None
                                     },
+                                    is_scrollbar_hovered,
+                                    is_scrollbar_dragging,
+                                    is_recently_scrolled,
                                 });
                             }
                         }
@@ -2376,13 +2777,23 @@ impl ApplicationHandler for App {
         self.poll_macos_editor();
 
         // 1. Hot Reload Configuration
-        let old_cfg = self.config_manager.current_config.clone();
-        let reloaded = self.config_manager.check_reload().cloned();
-        if let Some(reloaded_cfg) = reloaded {
-            if old_cfg != reloaded_cfg {
-                info!("Config file modified on disk, applying live changes to all sessions...");
-                self.apply_config_live(&reloaded_cfg);
-            }
+        if let Some(reloaded_cfg) = self.config_manager.check_reload().cloned() {
+            info!("Config file modified on disk, applying live changes to all sessions...");
+            self.apply_config_live(&reloaded_cfg);
+        }
+
+        // 1.5 Scan AI agents periodically (every 1.5s) to avoid scanning during RedrawRequested
+        let need_scan = match self.last_ai_agent_scan {
+            Some(last) => last.elapsed() > Duration::from_millis(1500),
+            None => true,
+        };
+        if need_scan {
+            self.last_ai_agent_scan = Some(Instant::now());
+            self.cached_ai_agents = self
+                .scan_all_ai_agents()
+                .into_iter()
+                .map(|(_, a)| a)
+                .collect();
         }
 
         // 2. Poll all sessions for PTY output and dead sessions

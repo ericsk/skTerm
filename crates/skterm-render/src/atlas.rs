@@ -62,7 +62,7 @@ impl GlyphAtlas {
 
     pub fn new_with_family(
         device: &wgpu::Device,
-        _queue: &Queue,
+        queue: &Queue,
         font_size: f32,
         font_family: &str,
         fallback_families: &[String],
@@ -125,7 +125,7 @@ impl GlyphAtlas {
             fallback_fonts.len()
         );
 
-        Ok(Self {
+        let mut atlas = Self {
             texture,
             texture_view,
             sampler,
@@ -144,7 +144,16 @@ impl GlyphAtlas {
             cell_width,
             cell_height,
             baseline_offset,
-        })
+        };
+
+        // Pre-warm common printable ASCII glyphs (32..=126) so typing never hits on-demand rasterization lag
+        for ch in 32u8..=126u8 {
+            let c = ch as char;
+            let _ = atlas.get_or_insert_glyph(queue, c, false, false);
+            let _ = atlas.get_or_insert_glyph(queue, c, true, false);
+        }
+
+        Ok(atlas)
     }
 
     /// Lazy-load standard system CJK / Emoji fallback fonts on first demand if not already in chain

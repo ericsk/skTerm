@@ -1247,10 +1247,23 @@ impl ProcessTreeCache {
     }
 
     pub fn get_project_name(&mut self, pid: u32) -> String {
+        if pid == 0 {
+            return "workspace".to_string();
+        }
         if let Some(cached) = self.cwd_cache.get(&pid) {
             return cached.clone();
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", pid)) {
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    let name_str = name.to_string();
+                    self.cwd_cache.insert(pid, name_str.clone());
+                    return name_str;
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
         {
             if let Ok(output) = std::process::Command::new("lsof")
                 .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
@@ -1271,6 +1284,8 @@ impl ProcessTreeCache {
                 }
             }
         }
+        // Cache fallback so we never repeatedly run failing lookups on every frame
+        self.cwd_cache.insert(pid, "workspace".to_string());
         "workspace".to_string()
     }
 }

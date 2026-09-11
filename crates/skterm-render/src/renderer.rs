@@ -49,6 +49,81 @@ impl Default for RenderTheme {
     }
 }
 
+/// Layout metrics and geometry for a pane's vertical scrollbar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollbarMetrics {
+    pub track_x: f32,
+    pub track_y: f32,
+    pub track_w: f32,
+    pub track_h: f32,
+    pub thumb_x: f32,
+    pub thumb_y: f32,
+    pub thumb_w: f32,
+    pub thumb_h: f32,
+    pub travel: f32,
+    pub hit_x: f32,
+    pub hit_y: f32,
+    pub hit_w: f32,
+    pub hit_h: f32,
+}
+
+impl ScrollbarMetrics {
+    pub fn compute(
+        rect_x: f32,
+        rect_y: f32,
+        rect_w: f32,
+        rect_h: f32,
+        scale: f32,
+        scrollback_len: usize,
+        screen_rows: usize,
+        scroll_offset: usize,
+        is_hovered: bool,
+        is_dragging: bool,
+    ) -> Option<Self> {
+        if scrollback_len == 0 {
+            return None;
+        }
+
+        let track_w = 8.0 * scale;
+        let track_x = rect_x + rect_w - track_w - 2.0 * scale;
+        let track_y = rect_y + 2.0 * scale;
+        let track_h = (rect_h - 4.0 * scale).max(10.0 * scale);
+
+        let total_rows = scrollback_len + screen_rows;
+        let visible_ratio = (screen_rows as f32 / total_rows as f32).clamp(0.02, 1.0);
+        let thumb_h = (track_h * visible_ratio).clamp(20.0 * scale, track_h);
+        let travel = (track_h - thumb_h).max(0.0);
+
+        let progress = 1.0 - (scroll_offset as f32 / scrollback_len as f32).clamp(0.0, 1.0);
+        let thumb_y = track_y + progress * travel;
+
+        let is_active = is_hovered || is_dragging;
+        let thumb_w = if is_active { 7.0 * scale } else { 5.0 * scale };
+        let thumb_x = rect_x + rect_w - thumb_w - if is_active { 2.5 * scale } else { 3.5 * scale };
+
+        let hit_w = 16.0 * scale;
+        let hit_x = rect_x + rect_w - hit_w;
+        let hit_y = rect_y;
+        let hit_h = rect_h;
+
+        Some(Self {
+            track_x,
+            track_y,
+            track_w,
+            track_h,
+            thumb_x,
+            thumb_y,
+            thumb_w,
+            thumb_h,
+            travel,
+            hit_x,
+            hit_y,
+            hit_w,
+            hit_h,
+        })
+    }
+}
+
 /// Render descriptor for an individual pane on screen
 pub struct PaneRenderItem<'a> {
     pub grid: &'a ScreenGrid,
@@ -60,6 +135,9 @@ pub struct PaneRenderItem<'a> {
     pub search_matches: &'a [skterm_core::SearchMatch],
     pub active_search_idx: Option<usize>,
     pub search_query: Option<&'a str>,
+    pub is_scrollbar_hovered: bool,
+    pub is_scrollbar_dragging: bool,
+    pub is_recently_scrolled: bool,
 }
 
 /// Render descriptor for a tab item in the tab bar
@@ -155,15 +233,31 @@ impl TermRenderer {
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
+        // Prioritize non-blocking, low-latency presentation modes for maximum typing smoothness
+        let present_mode = if surface_caps.present_modes.contains(&PresentMode::Mailbox) {
+            PresentMode::Mailbox
+        } else if surface_caps.present_modes.contains(&PresentMode::AutoNoVsync) {
+            PresentMode::AutoNoVsync
+        } else if surface_caps.present_modes.contains(&PresentMode::Immediate) {
+            PresentMode::Immediate
+        } else {
+            PresentMode::AutoVsync
+        };
+
+        info!(
+            "Surface present mode selected: {:?} (supported: {:?})",
+            present_mode, surface_caps.present_modes
+        );
+
         let config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width,
             height,
-            present_mode: PresentMode::AutoVsync,
+            present_mode,
             alpha_mode: CompositeAlphaMode::Auto,
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
         };
 
         surface.configure(&device, &config);
@@ -401,8 +495,8 @@ impl TermRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut bg_instances = Vec::new();
-        let mut glyph_instances = Vec::new();
+        let mut bg_instances = Vec::with_capacity(1024);
+        let mut glyph_instances = Vec::with_capacity(4096);
         let mut image_draw_calls: Vec<(u32, ImageInstance)> = Vec::new();
 
         let cell_w = self.atlas.cell_width;
@@ -978,6 +1072,16 @@ impl TermRenderer {
                             .map(|s| s.contains(r_idx, c_idx))
                             .unwrap_or(false);
 
+                        // Fast-path: Skip default empty blank cells (typically 80-90% of screen)
+                        if cell.c == ' '
+                            && cell.bg == Color::DefaultBg
+                            && !cell.flags.contains(CellFlags::INVERSE)
+                            && !is_selected
+                            && pane.search_matches.is_empty()
+                        {
+                            continue;
+                        }
+
                         let is_inverse = cell.flags.contains(CellFlags::INVERSE);
                         let is_bold_flag = cell.flags.contains(CellFlags::BOLD);
                         let (fg_rgba, bg_rgba) = if is_inverse {
@@ -1145,6 +1249,99 @@ impl TermRenderer {
                     [0.96, 0.97, 1.0, 1.0],
                     false,
                 );
+            }
+
+            // Vertical Scrollbar (Overlay on right side of pane)
+            if !pane.grid.is_alternate {
+                if let Some(metrics) = ScrollbarMetrics::compute(
+                    px,
+                    py,
+                    pw,
+                    ph,
+                    scale,
+                    active_buf.scrollback.len(),
+                    active_buf.rows,
+                    active_buf.scroll_offset,
+                    pane.is_scrollbar_hovered,
+                    pane.is_scrollbar_dragging,
+                ) {
+                    let is_active = pane.is_scrollbar_dragging || pane.is_scrollbar_hovered;
+
+                    // Track background
+                    if is_active || pane.is_recently_scrolled {
+                        let track_alpha = if pane.is_scrollbar_dragging {
+                            0.08
+                        } else if pane.is_scrollbar_hovered {
+                            0.05
+                        } else {
+                            0.03
+                        };
+                        bg_instances.push(BgInstance {
+                            rect: [
+                                metrics.track_x,
+                                metrics.track_y,
+                                metrics.track_w,
+                                metrics.track_h,
+                            ],
+                            color: [1.0, 1.0, 1.0, track_alpha],
+                        });
+                    }
+
+                    // Thumb
+                    let thumb_alpha = if pane.is_scrollbar_dragging {
+                        0.75
+                    } else if pane.is_scrollbar_hovered {
+                        0.60
+                    } else if pane.is_recently_scrolled {
+                        0.50
+                    } else if active_buf.scroll_offset > 0 {
+                        0.40
+                    } else {
+                        0.22
+                    };
+
+                    let thumb_color = [1.0, 1.0, 1.0, thumb_alpha];
+                    let corner = 1.0 * scale;
+                    if metrics.thumb_h > 4.0 * scale && metrics.thumb_w > 2.0 * scale {
+                        bg_instances.push(BgInstance {
+                            rect: [
+                                metrics.thumb_x + corner,
+                                metrics.thumb_y,
+                                metrics.thumb_w - corner * 2.0,
+                                corner,
+                            ],
+                            color: thumb_color,
+                        });
+                        bg_instances.push(BgInstance {
+                            rect: [
+                                metrics.thumb_x,
+                                metrics.thumb_y + corner,
+                                metrics.thumb_w,
+                                metrics.thumb_h - corner * 2.0,
+                            ],
+                            color: thumb_color,
+                        });
+                        bg_instances.push(BgInstance {
+                            rect: [
+                                metrics.thumb_x + corner,
+                                metrics.thumb_y + metrics.thumb_h - corner,
+                                metrics.thumb_w - corner * 2.0,
+                                corner,
+                            ],
+                            color: thumb_color,
+                        });
+                    } else {
+                        bg_instances.push(BgInstance {
+                            rect: [
+                                metrics.thumb_x,
+                                metrics.thumb_y,
+                                metrics.thumb_w,
+                                metrics.thumb_h,
+                            ],
+                            color: thumb_color,
+                        });
+                    }
+                }
             }
         }
 
