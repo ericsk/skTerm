@@ -2,6 +2,7 @@
 
 pub mod app_window;
 pub mod config;
+pub mod icon;
 pub mod input;
 pub mod layout;
 #[cfg(target_os = "macos")]
@@ -11,6 +12,7 @@ pub mod preferences_window;
 
 pub use app_window::App;
 pub use config::{default_config_template, parse_hex_color, Config, ConfigManager, Theme};
+pub use icon::{apply_window_icon, configure_window_attributes, get_app_icon};
 pub use input::{encode_key, encode_key_event};
 pub use layout::{PaneId, PaneNode, Rect, SplitDirection, SplitterBar, Tab, TabId, Workspace};
 pub use preferences_gui::{PreferencesGui, PreferencesTab};

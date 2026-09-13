@@ -444,7 +444,10 @@ impl PreferencesWindow {
             window_attrs.with_title_hidden(false)
         };
 
+        let window_attrs = crate::icon::configure_window_attributes(window_attrs);
+
         let window = Arc::new(event_loop.create_window(window_attrs)?);
+        crate::icon::apply_window_icon(&window);
 
         let instance = Instance::new(&InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone())?;

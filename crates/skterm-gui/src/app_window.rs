@@ -993,7 +993,10 @@ impl App {
             _ => {}
         }
 
+        window_attrs = crate::icon::configure_window_attributes(window_attrs);
+
         let window = Arc::new(event_loop.create_window(window_attrs)?);
+        crate::icon::apply_window_icon(&window);
         window.set_ime_allowed(true);
 
         if existing_geometry.is_none() {
