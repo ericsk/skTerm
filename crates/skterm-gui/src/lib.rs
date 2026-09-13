@@ -279,6 +279,7 @@ mod tests {
         assert_eq!(ws.tabs.len(), 1);
     }
 
+
     #[test]
     fn test_preferences_gui_state() {
         let mut gui = PreferencesGui::new();

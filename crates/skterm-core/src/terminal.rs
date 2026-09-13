@@ -160,11 +160,11 @@ impl Terminal {
             }
         }
 
-        if let Some(pid) = self.process_id() {
+        if let Some(_pid) = self.process_id() {
             #[cfg(target_os = "macos")]
             {
                 if let Ok(output) = std::process::Command::new("lsof")
-                    .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+                    .args(["-a", "-p", &_pid.to_string(), "-d", "cwd", "-Fn"])
                     .output()
                 {
                     if let Ok(text) = String::from_utf8(output.stdout) {
@@ -180,7 +180,7 @@ impl Terminal {
             }
             #[cfg(target_os = "linux")]
             {
-                if let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", pid)) {
+                if let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", _pid)) {
                     if path.exists() {
                         return Some(path.to_string_lossy().into_owned());
                     }

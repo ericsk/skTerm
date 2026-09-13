@@ -1167,6 +1167,7 @@ impl ProcessTreeCache {
         let flag_arc = self.is_refreshing.clone();
 
         std::thread::spawn(move || {
+            #[allow(unused_mut)]
             let mut new_map: std::collections::HashMap<u32, Vec<(u32, String)>> =
                 std::collections::HashMap::new();
 

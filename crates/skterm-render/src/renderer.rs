@@ -1198,10 +1198,11 @@ impl TermRenderer {
                         CursorShape::Beam => (cur_x, cur_y, 2.0 * self.scale_factor, cell_h),
                         CursorShape::Underline => (
                             cur_x,
-                            cur_y + cell_h - 2.0 * self.scale_factor,
+                            cur_y + baseline,
                             cell_w,
-                            2.0 * self.scale_factor,
+                            (2.0 * self.scale_factor).max(1.0),
                         ),
+
                     };
 
                     bg_instances.push(BgInstance {
