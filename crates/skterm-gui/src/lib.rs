@@ -13,7 +13,10 @@ pub mod preferences_window;
 pub use app_window::App;
 pub use config::{default_config_template, parse_hex_color, Config, ConfigManager, Theme};
 pub use icon::{apply_window_icon, configure_window_attributes, get_app_icon};
-pub use input::{encode_key, encode_key_event};
+pub use input::{
+    check_tab_switch, check_tab_switch_for_os, encode_key, encode_key_event,
+    is_tab_switch_modifier, is_tab_switch_modifier_for_os, parse_tab_switch_digit,
+};
 pub use layout::{PaneId, PaneNode, Rect, SplitDirection, SplitterBar, Tab, TabId, Workspace};
 pub use preferences_gui::{PreferencesGui, PreferencesTab};
 pub use preferences_window::{PreferencesCategory, PreferencesWindow};
@@ -443,5 +446,193 @@ mod tests {
         assert_eq!(term.grid().active().scroll_offset, 20);
         term.grid_mut().active_mut().scroll_offset = 0;
         assert_eq!(term.grid().active().scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_tab_switch_modifiers_windows_linux_vs_macos() {
+        let mut ctrl = ModifiersState::empty();
+        ctrl.insert(ModifiersState::CONTROL);
+
+        let mut super_key = ModifiersState::empty();
+        super_key.insert(ModifiersState::SUPER);
+
+        let mut alt = ModifiersState::empty();
+        alt.insert(ModifiersState::ALT);
+
+        let mut ctrl_shift = ModifiersState::empty();
+        ctrl_shift.insert(ModifiersState::CONTROL);
+        ctrl_shift.insert(ModifiersState::SHIFT);
+
+        let mut super_shift = ModifiersState::empty();
+        super_shift.insert(ModifiersState::SUPER);
+        super_shift.insert(ModifiersState::SHIFT);
+
+        let mut ctrl_alt = ModifiersState::empty();
+        ctrl_alt.insert(ModifiersState::CONTROL);
+        ctrl_alt.insert(ModifiersState::ALT);
+
+        let mut super_alt = ModifiersState::empty();
+        super_alt.insert(ModifiersState::SUPER);
+        super_alt.insert(ModifiersState::ALT);
+
+        let mut ctrl_super = ModifiersState::empty();
+        ctrl_super.insert(ModifiersState::CONTROL);
+        ctrl_super.insert(ModifiersState::SUPER);
+
+        // On Windows and Linux (is_macos = false):
+        // Tab switching must trigger on CTRL (with or without Shift)
+        // Must NOT trigger with Alt or Super
+        assert!(is_tab_switch_modifier_for_os(ctrl, false));
+        assert!(is_tab_switch_modifier_for_os(ctrl_shift, false));
+        assert!(!is_tab_switch_modifier_for_os(ctrl_alt, false));
+        assert!(!is_tab_switch_modifier_for_os(ctrl_super, false));
+        assert!(!is_tab_switch_modifier_for_os(super_key, false));
+        assert!(!is_tab_switch_modifier_for_os(alt, false));
+        assert!(!is_tab_switch_modifier_for_os(ModifiersState::empty(), false));
+
+        // On macOS (is_macos = true):
+        // Tab switching must trigger on CMD / Super (with or without Shift)
+        // Must NOT trigger with Ctrl or Alt
+        assert!(is_tab_switch_modifier_for_os(super_key, true));
+        assert!(is_tab_switch_modifier_for_os(super_shift, true));
+        assert!(!is_tab_switch_modifier_for_os(super_alt, true));
+        assert!(!is_tab_switch_modifier_for_os(ctrl_super, true));
+        assert!(!is_tab_switch_modifier_for_os(ctrl, true));
+        assert!(!is_tab_switch_modifier_for_os(alt, true));
+        assert!(!is_tab_switch_modifier_for_os(ModifiersState::empty(), true));
+    }
+
+    #[test]
+    fn test_parse_tab_switch_digit() {
+        use winit::keyboard::{Key, KeyCode, PhysicalKey};
+
+        // 1. Logical key digits 1..=9
+        for d in 1..=9 {
+            let logical = Key::Character(d.to_string().into());
+            let physical = PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified);
+            assert_eq!(parse_tab_switch_digit(&logical, physical), Some(d));
+        }
+
+        // 0 and non-digits should return None
+        let logical_0 = Key::Character("0".into());
+        let dummy_physical = PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified);
+        assert_eq!(parse_tab_switch_digit(&logical_0, dummy_physical), None);
+
+        let logical_a = Key::Character("a".into());
+        let physical_a = PhysicalKey::Code(KeyCode::KeyA);
+        assert_eq!(parse_tab_switch_digit(&logical_a, physical_a), None);
+
+        // 2. Physical key digits (e.g. AZERTY top row where logical key might be shifted symbols, or numpad)
+        let keycodes = [
+            (KeyCode::Digit1, 1),
+            (KeyCode::Digit2, 2),
+            (KeyCode::Digit3, 3),
+            (KeyCode::Digit4, 4),
+            (KeyCode::Digit5, 5),
+            (KeyCode::Digit6, 6),
+            (KeyCode::Digit7, 7),
+            (KeyCode::Digit8, 8),
+            (KeyCode::Digit9, 9),
+            (KeyCode::Numpad1, 1),
+            (KeyCode::Numpad2, 2),
+            (KeyCode::Numpad3, 3),
+            (KeyCode::Numpad4, 4),
+            (KeyCode::Numpad5, 5),
+            (KeyCode::Numpad6, 6),
+            (KeyCode::Numpad7, 7),
+            (KeyCode::Numpad8, 8),
+            (KeyCode::Numpad9, 9),
+        ];
+
+        let dummy_logical = Key::Character("&".into()); // e.g. unshifted top row symbol on AZERTY
+        for (code, expected_digit) in keycodes {
+            assert_eq!(
+                parse_tab_switch_digit(&dummy_logical, PhysicalKey::Code(code)),
+                Some(expected_digit)
+            );
+        }
+
+        // Digit0 and Numpad0 should return None
+        assert_eq!(
+            parse_tab_switch_digit(&dummy_logical, PhysicalKey::Code(KeyCode::Digit0)),
+            None
+        );
+        assert_eq!(
+            parse_tab_switch_digit(&dummy_logical, PhysicalKey::Code(KeyCode::Numpad0)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_check_tab_switch_cross_platform() {
+        use winit::keyboard::{Key, KeyCode, PhysicalKey};
+
+        let mut ctrl = ModifiersState::empty();
+        ctrl.insert(ModifiersState::CONTROL);
+
+        let mut cmd = ModifiersState::empty();
+        cmd.insert(ModifiersState::SUPER);
+
+        let logical_3 = Key::Character("3".into());
+        let physical_3 = PhysicalKey::Code(KeyCode::Digit3);
+
+        // Windows & Linux:
+        // Ctrl+3 Pressed -> Some(3)
+        assert_eq!(
+            check_tab_switch_for_os(&logical_3, physical_3, ElementState::Pressed, ctrl, false),
+            Some(3)
+        );
+        // Cmd+3 on Linux/Win -> None
+        assert_eq!(
+            check_tab_switch_for_os(&logical_3, physical_3, ElementState::Pressed, cmd, false),
+            None
+        );
+        // Released key -> None
+        assert_eq!(
+            check_tab_switch_for_os(&logical_3, physical_3, ElementState::Released, ctrl, false),
+            None
+        );
+
+        // macOS:
+        // Cmd+3 Pressed -> Some(3)
+        assert_eq!(
+            check_tab_switch_for_os(&logical_3, physical_3, ElementState::Pressed, cmd, true),
+            Some(3)
+        );
+        // Ctrl+3 on Mac -> None
+        assert_eq!(
+            check_tab_switch_for_os(&logical_3, physical_3, ElementState::Pressed, ctrl, true),
+            None
+        );
+        // Released key -> None
+        assert_eq!(
+            check_tab_switch_for_os(&logical_3, physical_3, ElementState::Released, cmd, true),
+            None
+        );
+    }
+
+    #[test]
+    fn test_workspace_select_tab_direct_index() {
+        let mut ws = Workspace::new(24, 80).expect("Failed to create workspace");
+        ws.new_tab(24, 80).expect("Failed to create tab 2");
+        ws.new_tab(24, 80).expect("Failed to create tab 3");
+        assert_eq!(ws.tabs.len(), 3);
+        assert_eq!(ws.active_tab_idx, 2);
+
+        // Switch to Tab 1 (index 0)
+        ws.select_tab(0);
+        assert_eq!(ws.active_tab_idx, 0);
+
+        // Switch to Tab 2 (index 1)
+        ws.select_tab(1);
+        assert_eq!(ws.active_tab_idx, 1);
+
+        // Switch to Tab 3 (index 2)
+        ws.select_tab(2);
+        assert_eq!(ws.active_tab_idx, 2);
+
+        // Attempt to switch to out-of-range Tab (e.g. index 8 for Tab 9) -> index remains unchanged
+        ws.select_tab(8);
+        assert_eq!(ws.active_tab_idx, 2);
     }
 }

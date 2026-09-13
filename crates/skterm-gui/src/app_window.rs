@@ -4,7 +4,7 @@
 #![allow(unexpected_cfgs)]
 
 use crate::config::{parse_hex_color, Config, ConfigManager, Theme};
-use crate::input::encode_key_event;
+use crate::input::{check_tab_switch, encode_key_event};
 use crate::layout::{PaneId, Rect, SplitDirection, Workspace};
 use crate::preferences_window::PreferencesWindow;
 use arboard::Clipboard;
@@ -1329,6 +1329,131 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
 
+                // 1. Tab Switching by Number (Ctrl+1~9 on Windows/Linux, Cmd+1~9 on macOS)
+                if let Some(digit) = check_tab_switch(event, self.modifiers) {
+                    let target_idx = digit - 1;
+
+                    #[cfg(target_os = "macos")]
+                    {
+                        if self.session_order.len() > 1
+                            && self
+                                .sessions
+                                .get(&window_id)
+                                .map_or(true, |s| s.workspace.tabs.len() <= 1)
+                        {
+                            let order_idx = if digit == 9 && self.session_order.len() < 9 {
+                                self.session_order.len() - 1
+                            } else {
+                                target_idx
+                            };
+                            if let Some(&target_wid) = self.session_order.get(order_idx) {
+                                self.active_session_id = Some(target_wid);
+                                if let Some(target_session) = self.sessions.get_mut(&target_wid) {
+                                    target_session.window.focus_window();
+                                    let ns_win = get_nswindow(&target_session.window);
+                                    if !ns_win.is_null() {
+                                        use objc::{msg_send, sel, sel_impl};
+                                        let _: () = unsafe {
+                                            msg_send![
+                                                ns_win,
+                                                makeKeyAndOrderFront: std::ptr::null::<objc::runtime::Object>()
+                                            ]
+                                        };
+                                    }
+                                    target_session.sync_all_pane_sizes(tab_bar_h);
+                                    target_session.window.request_redraw();
+                                }
+                                return;
+                            }
+                        }
+                    }
+
+                    if let Some(session) = self.sessions.get_mut(&window_id) {
+                        let final_idx = if target_idx < session.workspace.tabs.len() {
+                            Some(target_idx)
+                        } else if digit == 9 && !session.workspace.tabs.is_empty() {
+                            Some(session.workspace.tabs.len() - 1)
+                        } else {
+                            None
+                        };
+
+                        if let Some(idx) = final_idx {
+                            session.workspace.select_tab(idx);
+                            session.sync_all_pane_sizes(tab_bar_h);
+                            session.window.request_redraw();
+                        }
+                    }
+                    return;
+                }
+
+                // 2. Tab Switching by Ctrl+Tab / Ctrl+Shift+Tab on Windows/Linux
+                #[cfg(not(target_os = "macos"))]
+                if event.logical_key == Key::Named(NamedKey::Tab)
+                    && self.modifiers.control_key()
+                    && !self.modifiers.super_key()
+                    && !self.modifiers.alt_key()
+                {
+                    if let Some(session) = self.sessions.get_mut(&window_id) {
+                        if self.modifiers.shift_key() {
+                            session.workspace.prev_tab();
+                        } else {
+                            session.workspace.next_tab();
+                        }
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                    }
+                    return;
+                }
+
+                // 3. Zoom / Reset Font Size (Ctrl + = / - / 0 on Windows/Linux, Cmd + = / - / 0 on macOS)
+                #[cfg(target_os = "macos")]
+                let is_zoom_or_reset = self.modifiers.super_key() && !self.modifiers.control_key();
+
+                #[cfg(not(target_os = "macos"))]
+                let is_zoom_or_reset =
+                    self.modifiers.control_key() && !self.modifiers.super_key();
+
+                if is_zoom_or_reset {
+                    if let Key::Character(ref s) = event.logical_key {
+                        match s.as_str() {
+                            "+" | "=" => {
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    if self.modifiers.alt_key() {
+                                        session.workspace.equalize_active_panes();
+                                    } else {
+                                        let cur_pt = session.renderer.font_size_pt;
+                                        let _ = session.renderer.update_font_size(cur_pt + 1.0);
+                                    }
+                                    session.sync_all_pane_sizes(tab_bar_h);
+                                    session.window.request_redraw();
+                                }
+                                return;
+                            }
+                            "-" => {
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    let cur_pt = session.renderer.font_size_pt;
+                                    let _ = session
+                                        .renderer
+                                        .update_font_size((cur_pt - 1.0).max(8.0));
+                                    session.sync_all_pane_sizes(tab_bar_h);
+                                    session.window.request_redraw();
+                                }
+                                return;
+                            }
+                            "0" => {
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    let def_pt = self.config_manager.current_config.font.size;
+                                    let _ = session.renderer.update_font_size(def_pt);
+                                    session.sync_all_pane_sizes(tab_bar_h);
+                                    session.window.request_redraw();
+                                }
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 #[cfg(target_os = "macos")]
                 let is_cmd = self.modifiers.super_key();
 
@@ -1644,17 +1769,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 }
                                 return;
                             }
-                            _ => {
-                                if let Ok(digit) = lower.parse::<usize>() {
-                                    if (1..=9).contains(&digit) {
-                                        if let Some(session) = self.sessions.get_mut(&window_id) {
-                                            session.workspace.select_tab(digit - 1);
-                                            session.window.request_redraw();
-                                        }
-                                        return;
-                                    }
-                                }
-                            }
+                            _ => {}
                         }
                     }
                 }
