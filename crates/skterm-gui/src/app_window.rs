@@ -36,6 +36,81 @@ fn get_nswindow(window: &Window) -> *mut objc::runtime::Object {
     std::ptr::null_mut()
 }
 
+#[cfg(target_os = "macos")]
+pub fn center_macos_window_title(win_ptr: *mut objc::runtime::Object) {
+    use objc::{class, msg_send, sel, sel_impl};
+    if win_ptr.is_null() {
+        return;
+    }
+
+    unsafe fn find_titlebar_text_field(view: *mut objc::runtime::Object) -> *mut objc::runtime::Object {
+        if view.is_null() {
+            return std::ptr::null_mut();
+        }
+        let is_tf: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
+        if is_tf {
+            return view;
+        }
+        let subviews: *mut objc::runtime::Object = msg_send![view, subviews];
+        if subviews.is_null() {
+            return std::ptr::null_mut();
+        }
+        let count: usize = msg_send![subviews, count];
+        for i in 0..count {
+            let sub: *mut objc::runtime::Object = msg_send![subviews, objectAtIndex: i];
+            let found = find_titlebar_text_field(sub);
+            if !found.is_null() {
+                return found;
+            }
+        }
+        std::ptr::null_mut()
+    }
+
+    unsafe {
+        let content_view: *mut objc::runtime::Object = msg_send![win_ptr, contentView];
+        if content_view.is_null() {
+            return;
+        }
+        let frame_view: *mut objc::runtime::Object = msg_send![content_view, superview];
+        if frame_view.is_null() {
+            return;
+        }
+        let tf = find_titlebar_text_field(frame_view);
+        if tf.is_null() {
+            return;
+        }
+        let titlebar: *mut objc::runtime::Object = msg_send![tf, superview];
+        if titlebar.is_null() {
+            return;
+        }
+
+        let _: () = msg_send![tf, setTranslatesAutoresizingMaskIntoConstraints: false];
+
+        let tf_center_x: *mut objc::runtime::Object = msg_send![tf, centerXAnchor];
+        let bar_center_x: *mut objc::runtime::Object = msg_send![titlebar, centerXAnchor];
+        if !tf_center_x.is_null() && !bar_center_x.is_null() {
+            let constraint_x: *mut objc::runtime::Object =
+                msg_send![tf_center_x, constraintEqualToAnchor: bar_center_x];
+            if !constraint_x.is_null() {
+                let _: () = msg_send![constraint_x, setActive: true];
+            }
+        }
+
+        let tf_center_y: *mut objc::runtime::Object = msg_send![tf, centerYAnchor];
+        let bar_center_y: *mut objc::runtime::Object = msg_send![titlebar, centerYAnchor];
+        if !tf_center_y.is_null() && !bar_center_y.is_null() {
+            let constraint_y: *mut objc::runtime::Object =
+                msg_send![tf_center_y, constraintEqualToAnchor: bar_center_y];
+            if !constraint_y.is_null() {
+                let _: () = msg_send![constraint_y, setActive: true];
+            }
+        }
+
+        let _: () = msg_send![tf, setAlignment: 1isize]; // NSTextAlignmentCenter = 1
+        let _: () = msg_send![titlebar, layoutSubtreeIfNeeded];
+    }
+}
+
 /// Open a URL using the default system browser in a cross-platform manner.
 pub fn open_url_in_browser(url: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
@@ -896,8 +971,10 @@ impl App {
             use winit::platform::macos::WindowAttributesExtMacOS;
             window_attrs = window_attrs
                 .with_tabbing_identifier("skterm.tabs")
-                .with_title_hidden(true)
-                .with_titlebar_transparent(true);
+                .with_title_hidden(false);
+            if self.config_manager.current_config.window.decorations == "transparent" {
+                window_attrs = window_attrs.with_titlebar_transparent(true);
+            }
         }
 
         match self
@@ -940,8 +1017,11 @@ impl App {
 
             let new_ptr = get_nswindow(&window);
             if !new_ptr.is_null() {
-                // NSWindowTabbingModePreferred = 2
-                let _: () = unsafe { msg_send![new_ptr, setTabbingMode: 2isize] };
+                // NSWindowTabbingModeAutomatic = 0
+                let _: () = unsafe { msg_send![new_ptr, setTabbingMode: 0isize] };
+                // NSWindowToolbarStyleExpanded = 1 (forces centered window title on macOS 11+)
+                let _: () = unsafe { msg_send![new_ptr, setToolbarStyle: 1isize] };
+                center_macos_window_title(new_ptr);
             }
 
             if let Some(active_id) = self.active_session_id {
@@ -1132,19 +1212,32 @@ impl ApplicationHandler<AppEvent> for App {
                         .resize(physical_size.width, physical_size.height);
                     session.sync_all_pane_sizes(tab_bar_h);
 
-                    if let Some(active_tab) = session.workspace.active_tab() {
-                        if let Some(term) = active_tab.active_terminal() {
-                            let new_cols = term.grid().active().cols as u16;
-                            let new_rows = term.grid().active().rows as u16;
-                            let current_cols = self.config_manager.current_config.window.columns;
-                            let current_rows = self.config_manager.current_config.window.rows;
-                            if new_cols != current_cols || new_rows != current_rows {
-                                self.config_manager.current_config.window.columns = new_cols;
-                                self.config_manager.current_config.window.rows = new_rows;
-                                self.pending_geometry_save = true;
-                                self.last_resize_time = Some(Instant::now());
-                            }
-                        }
+                    let bounds = session.workspace.content_bounds(
+                        physical_size.width as f32,
+                        physical_size.height as f32,
+                        tab_bar_h,
+                        session.renderer.scale_factor,
+                    );
+                    let cell_w = session.renderer.cell_width();
+                    let cell_h = session.renderer.cell_height();
+                    let pad_x = session.renderer.padding_x;
+                    let pad_y = session.renderer.padding_y;
+                    let avail_w = (bounds.width - pad_x * 2.0).max(cell_w);
+                    let avail_h = (bounds.height - pad_y * 2.0).max(cell_h);
+                    let new_cols = (avail_w / cell_w).floor().max(1.0) as u16;
+                    let new_rows = (avail_h / cell_h).floor().max(1.0) as u16;
+                    let current_cols = self.config_manager.current_config.window.columns;
+                    let current_rows = self.config_manager.current_config.window.rows;
+                    if new_cols != current_cols || new_rows != current_rows {
+                        self.config_manager.current_config.window.columns = new_cols;
+                        self.config_manager.current_config.window.rows = new_rows;
+                        self.pending_geometry_save = true;
+                        self.last_resize_time = Some(Instant::now());
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        let win_ptr = get_nswindow(&session.window);
+                        center_macos_window_title(win_ptr);
                     }
                     session.window.request_redraw();
                 }
@@ -2661,6 +2754,22 @@ impl ApplicationHandler<AppEvent> for App {
                                 .map_or(false, |t| t.elapsed() < Duration::from_millis(200)))
                     {
                         session.update_ime_position(tab_bar_h);
+                    }
+
+                    if let Some(active_tab) = session.workspace.active_tab() {
+                        let win_title = if active_tab.title.is_empty() || active_tab.title == "skTerm" {
+                            "skTerm".to_string()
+                        } else {
+                            format!("skTerm — {}", active_tab.title)
+                        };
+                        if session.window.title() != win_title {
+                            session.window.set_title(&win_title);
+                            #[cfg(target_os = "macos")]
+                            {
+                                let win_ptr = get_nswindow(&session.window);
+                                center_macos_window_title(win_ptr);
+                            }
+                        }
                     }
 
                     let tabs: Vec<TabItem> = session
