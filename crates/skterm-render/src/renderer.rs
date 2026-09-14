@@ -159,6 +159,24 @@ pub struct AgentSidebarItem {
     pub is_focused: bool,
 }
 
+/// Descriptor for an item in the top dropdown menu.
+#[derive(Debug, Clone)]
+pub struct TopDropdownMenuItem {
+    pub label: String,
+    pub shortcut: Option<String>,
+    pub is_separator: bool,
+}
+
+/// Descriptor for the floating top dropdown menu.
+#[derive(Debug, Clone)]
+pub struct TopDropdownMenu {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub items: Vec<TopDropdownMenuItem>,
+    pub hovered_idx: Option<usize>,
+}
+
 pub struct TermRenderer {
     pub window: Arc<Window>,
     pub surface: Surface<'static>,
@@ -444,6 +462,7 @@ impl TermRenderer {
             false,
             0.0,
             &[],
+            None,
             None::<fn(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration)>,
         )
     }
@@ -459,7 +478,7 @@ impl TermRenderer {
     where
         F: FnOnce(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration),
     {
-        self.render_workspace_with_sidebar(tabs, panes, tab_bar_h, false, 0.0, &[], overlay_fn)
+        self.render_workspace_with_sidebar(tabs, panes, tab_bar_h, false, 0.0, &[], None, overlay_fn)
     }
 
     /// Render workspace with AI Agents Sidebar and optional overlay.
@@ -472,6 +491,7 @@ impl TermRenderer {
         sidebar_open: bool,
         sidebar_w: f32,
         agents: &[AgentSidebarItem],
+        top_menu: Option<&TopDropdownMenu>,
         overlay_fn: Option<F>,
     ) -> anyhow::Result<()>
     where
@@ -719,6 +739,49 @@ impl TermRenderer {
                             glyph_info.uv_max[1],
                         ],
                         color: [0.80, 0.84, 0.94, 0.9],
+                    });
+                }
+            }
+
+            // 2.4 Dropdown Menu Button "v" (Chevron)
+            let menu_btn_w = 20.0 * scale;
+            let menu_btn_x = plus_btn_x + plus_btn_w + 3.0 * scale;
+            let menu_btn_y = plus_btn_y;
+            let is_menu_open = top_menu.is_some();
+
+            bg_instances.push(BgInstance {
+                rect: [menu_btn_x, menu_btn_y, menu_btn_w, plus_btn_w],
+                color: if is_menu_open {
+                    [0.22, 0.28, 0.42, 0.95]
+                } else {
+                    [0.12, 0.14, 0.18, 0.7]
+                },
+            });
+            bg_instances.push(BgInstance {
+                rect: [menu_btn_x, menu_btn_y, menu_btn_w, 1.0],
+                color: [0.22, 0.25, 0.33, 0.6],
+            });
+
+            if let Some(glyph_info) = self
+                .atlas
+                .get_or_insert_glyph(&self.queue, 'v', false, false)
+            {
+                if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
+                    let draw_x = menu_btn_x + (menu_btn_w - glyph_info.size[0]) / 2.0;
+                    let draw_y = menu_btn_y + (plus_btn_w - glyph_info.size[1]) / 2.0;
+                    glyph_instances.push(GlyphInstance {
+                        rect: [draw_x, draw_y, glyph_info.size[0], glyph_info.size[1]],
+                        uv: [
+                            glyph_info.uv_min[0],
+                            glyph_info.uv_min[1],
+                            glyph_info.uv_max[0],
+                            glyph_info.uv_max[1],
+                        ],
+                        color: if is_menu_open {
+                            [1.0, 1.0, 1.0, 1.0]
+                        } else {
+                            [0.80, 0.84, 0.94, 0.9]
+                        },
                     });
                 }
             }
@@ -1342,6 +1405,81 @@ impl TermRenderer {
                             color: thumb_color,
                         });
                     }
+                }
+            }
+        }
+
+        // Floating Top Dropdown Menu Overlay
+        if let Some(menu) = top_menu {
+            let row_h = 24.0 * scale;
+            let sep_h = 6.0 * scale;
+            let mut total_h = 6.0 * scale;
+            for item in &menu.items {
+                if item.is_separator {
+                    total_h += sep_h;
+                } else {
+                    total_h += row_h;
+                }
+            }
+
+            // Drop shadow / border outline
+            bg_instances.push(BgInstance {
+                rect: [menu.x - 1.0, menu.y - 1.0, menu.width + 2.0, total_h + 2.0],
+                color: [0.28, 0.32, 0.44, 0.9],
+            });
+            // Opaque dark acrylic background
+            bg_instances.push(BgInstance {
+                rect: [menu.x, menu.y, menu.width, total_h],
+                color: [0.12, 0.13, 0.18, 0.98],
+            });
+
+            let mut cur_y = menu.y + 3.0 * scale;
+            for (idx, item) in menu.items.iter().enumerate() {
+                if item.is_separator {
+                    bg_instances.push(BgInstance {
+                        rect: [menu.x + 8.0 * scale, cur_y + sep_h / 2.0, menu.width - 16.0 * scale, 1.0],
+                        color: [0.22, 0.25, 0.34, 0.8],
+                    });
+                    cur_y += sep_h;
+                } else {
+                    let is_hovered = menu.hovered_idx == Some(idx);
+                    if is_hovered {
+                        bg_instances.push(BgInstance {
+                            rect: [menu.x + 3.0 * scale, cur_y, menu.width - 6.0 * scale, row_h],
+                            color: [0.20, 0.28, 0.45, 0.95],
+                        });
+                    }
+
+                    let text_color = if is_hovered {
+                        [1.0, 1.0, 1.0, 1.0]
+                    } else {
+                        [0.88, 0.90, 0.96, 1.0]
+                    };
+
+                    self.draw_text_line(
+                        &mut glyph_instances,
+                        &item.label,
+                        menu.x + 10.0 * scale,
+                        cur_y + (row_h - cell_h) / 2.0,
+                        menu.width - 20.0 * scale,
+                        text_color,
+                        is_hovered,
+                    );
+
+                    if let Some(ref sc) = item.shortcut {
+                        let sc_w = sc.len() as f32 * cell_w;
+                        self.draw_text_line(
+                            &mut glyph_instances,
+                            sc,
+                            menu.x + menu.width - sc_w - 10.0 * scale,
+                            cur_y + (row_h - cell_h) / 2.0,
+                            sc_w + 4.0,
+                            [0.55, 0.60, 0.72, 0.9],
+                            false,
+                        );
+                    }
+
+                    cur_y += row_h;
                 }
             }
         }

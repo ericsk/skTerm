@@ -6,10 +6,13 @@
 use crate::config::{parse_hex_color, Config, ConfigManager, Theme};
 use crate::input::encode_key_event;
 use crate::layout::{PaneId, Rect, SplitDirection, Workspace};
-use crate::preferences_window::PreferencesWindow;
+use crate::preferences_window::{PreferencesCategory, PreferencesWindow};
 use arboard::Clipboard;
 use skterm_core::{PtySpawnOptions, Selection, SelectionMode};
-use skterm_render::{PaneRenderItem, RenderTheme, ScrollbarMetrics, TabItem, TermRenderer};
+use skterm_render::{
+    PaneRenderItem, RenderTheme, ScrollbarMetrics, TabItem, TermRenderer, TopDropdownMenu,
+    TopDropdownMenuItem,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,7 +21,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, Position, Size};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Fullscreen, Window, WindowAttributes, WindowId};
 
 #[cfg(target_os = "macos")]
@@ -92,6 +95,8 @@ pub struct TerminalSession {
     pub search_matches: Vec<skterm_core::SearchMatch>,
     pub active_search_idx: Option<usize>,
     pub last_ime_cursor_area: Option<(i32, i32, i32, i32)>,
+    pub menu_open: bool,
+    pub menu_hovered_idx: Option<usize>,
 }
 
 impl TerminalSession {
@@ -327,6 +332,205 @@ impl TerminalSession {
             self.renderer.scale_factor,
         );
     }
+
+    pub fn get_menu_button_rect(&self, tab_bar_h: f32) -> (f32, f32, f32, f32) {
+        let scale = self.renderer.scale_factor;
+        let base_x = if cfg!(target_os = "macos") {
+            78.0 * scale
+        } else {
+            8.0 * scale
+        };
+        let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);
+        let tab_y = (tab_bar_h - tab_h) / 2.0;
+        let ai_btn_w = 34.0 * scale;
+
+        let start_x = base_x + ai_btn_w + 6.0 * scale;
+        let plus_btn_w = 24.0 * scale;
+        let tab_gap = 4.0 * scale;
+        let screen_w = self.renderer.config.width as f32;
+        let avail_w = (screen_w - start_x - plus_btn_w - 16.0 * scale).max(80.0);
+        let tabs_len = self.workspace.tabs.len();
+        let total_gaps = (tabs_len.saturating_sub(1) as f32) * tab_gap;
+        let tab_w = ((avail_w - total_gaps) / tabs_len as f32).clamp(75.0 * scale, 190.0 * scale);
+
+        let last_tab_right = start_x + (tabs_len as f32 * (tab_w + tab_gap));
+        let plus_btn_x = last_tab_right + 2.0 * scale;
+        let menu_btn_w = 20.0 * scale;
+        let menu_btn_x = plus_btn_x + plus_btn_w + 3.0 * scale;
+        let menu_btn_y = tab_y + (tab_h - plus_btn_w) / 2.0;
+
+        (menu_btn_x, menu_btn_y, menu_btn_w, plus_btn_w)
+    }
+
+    pub fn get_dropdown_menu_x(&self, tab_bar_h: f32, menu_w: f32) -> f32 {
+        let (btn_x, _, _, _) = self.get_menu_button_rect(tab_bar_h);
+        let screen_w = self.renderer.config.width as f32;
+        if btn_x + menu_w > screen_w - 10.0 {
+            (screen_w - menu_w - 10.0).max(0.0)
+        } else {
+            btn_x
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopMenuAction {
+    OpenPreferences,
+    NewTabCmd,
+    NewTabWinPowerShell,
+    NewTabPwsh,
+    SplitHorizontal,
+    SplitVertical,
+    OpenConfigFile,
+}
+
+pub fn build_top_dropdown_menu(
+    scale: f32,
+    menu_x: f32,
+    tab_bar_h: f32,
+    hovered_idx: Option<usize>,
+) -> (TopDropdownMenu, Vec<Option<TopMenuAction>>) {
+    let mut items = Vec::new();
+    let mut actions = Vec::new();
+
+    // 1. Preferences
+    items.push(TopDropdownMenuItem {
+        label: "⚙  偏好設定...".to_string(),
+        shortcut: Some(if cfg!(target_os = "macos") {
+            "Cmd+,".to_string()
+        } else {
+            "Ctrl+,".to_string()
+        }),
+        is_separator: false,
+    });
+    actions.push(Some(TopMenuAction::OpenPreferences));
+
+    // Separator
+    items.push(TopDropdownMenuItem {
+        label: String::new(),
+        shortcut: None,
+        is_separator: true,
+    });
+    actions.push(None);
+
+    // Shell Presets (on Windows: Command Prompt, Windows PowerShell, PowerShell 7)
+    #[cfg(target_os = "windows")]
+    {
+        items.push(TopDropdownMenuItem {
+            label: "💻 新增 命令提示字元".to_string(),
+            shortcut: None,
+            is_separator: false,
+        });
+        actions.push(Some(TopMenuAction::NewTabCmd));
+        if skterm_core::find_windows_powershell().is_some() {
+            items.push(TopDropdownMenuItem {
+                label: "⚡ 新增 Windows PowerShell".to_string(),
+                shortcut: None,
+                is_separator: false,
+            });
+            actions.push(Some(TopMenuAction::NewTabWinPowerShell));
+        }
+        if skterm_core::find_pwsh_path().is_some() {
+            items.push(TopDropdownMenuItem {
+                label: "🚀 新增 PowerShell 7 (pwsh)".to_string(),
+                shortcut: None,
+                is_separator: false,
+            });
+            actions.push(Some(TopMenuAction::NewTabPwsh));
+        }
+
+        items.push(TopDropdownMenuItem {
+            label: String::new(),
+            shortcut: None,
+            is_separator: true,
+        });
+        actions.push(None);
+    }
+
+    // Split Panes
+    items.push(TopDropdownMenuItem {
+        label: "🪟 水平分割窗格".to_string(),
+        shortcut: Some(if cfg!(target_os = "macos") {
+            "Cmd+Shift+D".to_string()
+        } else {
+            "Ctrl+Shift+D".to_string()
+        }),
+        is_separator: false,
+    });
+    actions.push(Some(TopMenuAction::SplitHorizontal));
+
+    items.push(TopDropdownMenuItem {
+        label: "🪟 垂直分割窗格".to_string(),
+        shortcut: Some(if cfg!(target_os = "macos") {
+            "Cmd+Shift+E".to_string()
+        } else {
+            "Ctrl+Shift+E".to_string()
+        }),
+        is_separator: false,
+    });
+    actions.push(Some(TopMenuAction::SplitVertical));
+
+    // Separator
+    items.push(TopDropdownMenuItem {
+        label: String::new(),
+        shortcut: None,
+        is_separator: true,
+    });
+    actions.push(None);
+
+    // Config file
+    items.push(TopDropdownMenuItem {
+        label: "📁 開啟設定檔 (config.toml)".to_string(),
+        shortcut: None,
+        is_separator: false,
+    });
+    actions.push(Some(TopMenuAction::OpenConfigFile));
+
+    let menu_w = 230.0 * scale;
+    let menu = TopDropdownMenu {
+        x: menu_x,
+        y: tab_bar_h + 2.0 * scale,
+        width: menu_w,
+        items,
+        hovered_idx,
+    };
+    (menu, actions)
+}
+
+pub fn hit_test_dropdown_menu(
+    menu: &TopDropdownMenu,
+    scale: f32,
+    mx: f32,
+    my: f32,
+) -> Option<usize> {
+    let row_h = 24.0 * scale;
+    let sep_h = 6.0 * scale;
+    let mut total_h = 6.0 * scale;
+    for item in &menu.items {
+        if item.is_separator {
+            total_h += sep_h;
+        } else {
+            total_h += row_h;
+        }
+    }
+
+    if mx < menu.x || mx > menu.x + menu.width || my < menu.y || my > menu.y + total_h {
+        return None;
+    }
+
+    let mut cur_y = menu.y + 3.0 * scale;
+    for (idx, item) in menu.items.iter().enumerate() {
+        let item_h = if item.is_separator { sep_h } else { row_h };
+        if my >= cur_y && my < cur_y + item_h {
+            if !item.is_separator {
+                return Some(idx);
+            } else {
+                return None;
+            }
+        }
+        cur_y += item_h;
+    }
+    None
 }
 
 /// skTerm GUI Application instance managing multiple native window sessions or native tabs.
@@ -571,7 +775,16 @@ impl App {
     }
 
     pub fn open_preferences_window(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(pref) = &self.preferences_window {
+        self.open_preferences_category(event_loop, PreferencesCategory::Appearance);
+    }
+
+    pub fn open_preferences_category(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        category: PreferencesCategory,
+    ) {
+        if let Some(pref) = &mut self.preferences_window {
+            pref.active_category = category;
             pref.window.focus_window();
             pref.window.request_redraw();
             return;
@@ -581,12 +794,108 @@ impl App {
             event_loop,
             &self.config_manager.current_config,
         )) {
-            Ok(pref) => {
+            Ok(mut pref) => {
+                pref.active_category = category;
                 info!("Opened dedicated Preferences Window (ID: {:?})", pref.id());
                 self.preferences_window = Some(pref);
             }
             Err(e) => {
                 error!("Failed to open Preferences Window: {:?}", e);
+            }
+        }
+    }
+
+    pub fn execute_top_menu_action(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        tab_bar_h: f32,
+        action: TopMenuAction,
+    ) {
+        match action {
+            TopMenuAction::OpenPreferences => {
+                self.open_preferences_window(event_loop);
+            }
+            TopMenuAction::NewTabCmd => {
+                let mut pty_opts = self.build_pty_options();
+                #[cfg(target_os = "windows")]
+                {
+                    pty_opts.shell = Some(skterm_core::find_cmd());
+                    pty_opts.args = vec![];
+                }
+                let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    let _ = session
+                        .workspace
+                        .new_tab_with_options(24, 80, scrollback, pty_opts);
+                    session.sync_all_pane_sizes(tab_bar_h);
+                    session.window.request_redraw();
+                }
+            }
+            TopMenuAction::NewTabWinPowerShell => {
+                let mut pty_opts = self.build_pty_options();
+                #[cfg(target_os = "windows")]
+                if let Some(ps_path) = skterm_core::find_windows_powershell() {
+                    pty_opts.shell = Some(ps_path);
+                    pty_opts.args = vec!["-NoLogo".to_string()];
+                }
+                let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    let _ = session
+                        .workspace
+                        .new_tab_with_options(24, 80, scrollback, pty_opts);
+                    session.sync_all_pane_sizes(tab_bar_h);
+                    session.window.request_redraw();
+                }
+            }
+            TopMenuAction::NewTabPwsh => {
+                let mut pty_opts = self.build_pty_options();
+                #[cfg(target_os = "windows")]
+                if let Some(pwsh_path) = skterm_core::find_pwsh_path() {
+                    pty_opts.shell = Some(pwsh_path);
+                    pty_opts.args = vec!["-NoLogo".to_string()];
+                }
+                let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    let _ = session
+                        .workspace
+                        .new_tab_with_options(24, 80, scrollback, pty_opts);
+                    session.sync_all_pane_sizes(tab_bar_h);
+                    session.window.request_redraw();
+                }
+            }
+            TopMenuAction::SplitHorizontal => {
+                let pty_opts = self.build_pty_options();
+                let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    let _ = session.workspace.split_active_pane(
+                        SplitDirection::Horizontal,
+                        24,
+                        80,
+                        scrollback,
+                        pty_opts,
+                    );
+                    session.sync_all_pane_sizes(tab_bar_h);
+                    session.window.request_redraw();
+                }
+            }
+            TopMenuAction::SplitVertical => {
+                let pty_opts = self.build_pty_options();
+                let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    let _ = session.workspace.split_active_pane(
+                        SplitDirection::Vertical,
+                        24,
+                        80,
+                        scrollback,
+                        pty_opts,
+                    );
+                    session.sync_all_pane_sizes(tab_bar_h);
+                    session.window.request_redraw();
+                }
+            }
+            TopMenuAction::OpenConfigFile => {
+                self.config_manager.open_in_editor();
             }
         }
     }
@@ -833,7 +1142,7 @@ impl App {
                 .window
                 .tab_bar_style
                 .as_str();
-            let tab_count = self
+            let _tab_count = self
                 .active_session()
                 .map(|s| s.workspace.tabs.len())
                 .unwrap_or(0);
@@ -844,14 +1153,7 @@ impl App {
 
             match tab_bar_style {
                 "never" => 0.0,
-                "always" => 36.0 * scale,
-                "auto" | _ => {
-                    if tab_count > 1 {
-                        36.0 * scale
-                    } else {
-                        0.0
-                    }
-                }
+                "auto" | "always" | _ => 36.0 * scale,
             }
         }
     }
@@ -1031,6 +1333,8 @@ impl App {
             search_matches: Vec::new(),
             active_search_idx: None,
             last_ime_cursor_area: None,
+            menu_open: false,
+            menu_hovered_idx: None,
         };
 
         self.sessions.insert(window_id, session);
@@ -1230,6 +1534,30 @@ impl ApplicationHandler<AppEvent> for App {
 
             WindowEvent::KeyboardInput { ref event, .. } => {
                 if event.state != ElementState::Pressed {
+                    return;
+                }
+
+                // If dropdown menu is open, Escape closes it
+                if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+                    if let Some(session) = self.sessions.get_mut(&window_id) {
+                        if session.menu_open {
+                            session.menu_open = false;
+                            session.menu_hovered_idx = None;
+                            session.window.request_redraw();
+                            return;
+                        }
+                    }
+                }
+
+                // Preferences Shortcut: Ctrl+, (Windows/Linux) or Cmd+, (macOS)
+                let is_ctrl = self.modifiers.control_key();
+                let is_super = self.modifiers.super_key();
+                let is_comma = match &event.logical_key {
+                    Key::Character(s) => s == ",",
+                    _ => matches!(event.physical_key, PhysicalKey::Code(KeyCode::Comma)),
+                };
+                if (is_ctrl || is_super) && is_comma {
+                    self.open_preferences_window(event_loop);
                     return;
                 }
 
@@ -1832,6 +2160,28 @@ impl ApplicationHandler<AppEvent> for App {
                     session.mouse_pos = (position.x as f32, position.y as f32);
                     let (mx, my) = session.mouse_pos;
 
+                    // 0.1 Handling Dropdown Menu Hover
+                    if session.menu_open && tab_bar_h > 0.0 {
+                        let scale = session.renderer.scale_factor;
+                        let menu_w = 230.0 * scale;
+                        let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
+                        let (menu, _) = build_top_dropdown_menu(
+                            scale,
+                            menu_x,
+                            tab_bar_h,
+                            session.menu_hovered_idx,
+                        );
+                        let hovered = hit_test_dropdown_menu(&menu, scale, mx, my);
+                        if hovered != session.menu_hovered_idx {
+                            session.menu_hovered_idx = hovered;
+                            session.window.request_redraw();
+                        }
+                        if hovered.is_some() {
+                            session.window.set_cursor(CursorIcon::Pointer);
+                            return;
+                        }
+                    }
+
                     // 0.4 Handling Scrollbar Dragging
                     if let Some(drag) = session.dragging_scrollbar {
                         if let Some(tab) = session.workspace.active_tab_mut() {
@@ -2011,23 +2361,83 @@ impl ApplicationHandler<AppEvent> for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                // Inline Tab Bar & Dropdown Menu handling (Windows/Linux only)
+                #[cfg(not(target_os = "macos"))]
+                if state == ElementState::Pressed && tab_bar_h > 0.0 {
+                    let mut menu_action_to_run = None;
+                    if let Some(session) = self.sessions.get_mut(&window_id) {
+                        if session.menu_open {
+                            let scale = session.renderer.scale_factor;
+                            let (mx, my) = session.mouse_pos;
+                            let menu_w = 230.0 * scale;
+                            let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
+                            let (menu, actions) = build_top_dropdown_menu(
+                                scale,
+                                menu_x,
+                                tab_bar_h,
+                                session.menu_hovered_idx,
+                            );
+
+                            let (btn_x, btn_y, btn_w, btn_h) =
+                                session.get_menu_button_rect(tab_bar_h);
+                            let is_on_btn = mx >= btn_x - 2.0 * scale
+                                && mx <= btn_x + btn_w + 2.0 * scale
+                                && my >= btn_y - 2.0 * scale
+                                && my <= btn_y + btn_h + 2.0 * scale;
+
+                            if let Some(idx) = hit_test_dropdown_menu(&menu, scale, mx, my) {
+                                session.menu_open = false;
+                                session.menu_hovered_idx = None;
+                                session.window.request_redraw();
+                                if let Some(Some(act)) = actions.get(idx) {
+                                    menu_action_to_run = Some(*act);
+                                }
+                            } else if is_on_btn {
+                                session.menu_open = false;
+                                session.menu_hovered_idx = None;
+                                session.window.request_redraw();
+                                return;
+                            } else {
+                                session.menu_open = false;
+                                session.menu_hovered_idx = None;
+                                session.window.request_redraw();
+                                if mx >= menu.x && mx <= menu.x + menu.width && my >= menu.y {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(act) = menu_action_to_run {
+                        self.execute_top_menu_action(event_loop, window_id, tab_bar_h, act);
+                        return;
+                    }
+                }
+
                 // Inline Tab Bar handling (Windows/Linux only)
                 #[cfg(not(target_os = "macos"))]
-                if button == MouseButton::Left && state == ElementState::Pressed && tab_bar_h > 0.0
+                if (button == MouseButton::Left || button == MouseButton::Right)
+                    && state == ElementState::Pressed
+                    && tab_bar_h > 0.0
                 {
                     enum TabAction {
                         NewTab,
+                        ToggleTopMenu,
                         CloseTab(usize),
                         SelectTab(usize),
                     }
 
                     let mut action = None;
+                    let mut consumed_tab_bar_click = false;
                     if let Some(session) = self.sessions.get(&window_id) {
                         let (mx, my) = session.mouse_pos;
                         if my <= tab_bar_h {
+                            consumed_tab_bar_click = true;
                             let scale = session.renderer.scale_factor;
                             let tabs_len = session.workspace.tabs.len();
-                            let start_x = 8.0 * scale;
+                            let base_x = 8.0 * scale;
+                            let ai_btn_w = 34.0 * scale;
+                            let start_x = base_x + ai_btn_w + 6.0 * scale;
                             let plus_btn_w = 24.0 * scale;
                             let tab_gap = 4.0 * scale;
                             let avail_w = (session.renderer.config.width as f32
@@ -2043,13 +2453,33 @@ impl ApplicationHandler<AppEvent> for App {
 
                             let last_tab_right = start_x + (tabs_len as f32 * (tab_w + tab_gap));
                             let plus_btn_x = last_tab_right + 2.0 * scale;
-                            if mx >= plus_btn_x - 4.0 * scale
-                                && mx <= plus_btn_x + plus_btn_w + 6.0 * scale
-                                && my >= tab_y
-                                && my <= tab_y + tab_h
+                            let plus_btn_y = tab_y + (tab_h - plus_btn_w) / 2.0;
+
+                            let (btn_x, btn_y, btn_w, btn_h) =
+                                session.get_menu_button_rect(tab_bar_h);
+
+                            // 1. Check Chevron Menu Button "v"
+                            if mx >= btn_x - 2.0 * scale
+                                && mx <= btn_x + btn_w + 4.0 * scale
+                                && my >= btn_y - 2.0 * scale
+                                && my <= btn_y + btn_h + 2.0 * scale
                             {
-                                action = Some(TabAction::NewTab);
-                            } else {
+                                action = Some(TabAction::ToggleTopMenu);
+                            }
+                            // 2. Check Plus Button "+"
+                            else if mx >= plus_btn_x - 2.0 * scale
+                                && mx <= plus_btn_x + plus_btn_w + 2.0 * scale
+                                && my >= plus_btn_y - 2.0 * scale
+                                && my <= plus_btn_y + plus_btn_w + 2.0 * scale
+                            {
+                                if button == MouseButton::Right {
+                                    action = Some(TabAction::ToggleTopMenu);
+                                } else {
+                                    action = Some(TabAction::NewTab);
+                                }
+                            }
+                            // 3. Check Tab Capsules
+                            else if button == MouseButton::Left {
                                 for idx in 0..tabs_len {
                                     let tab_x = start_x + (idx as f32 * (tab_w + tab_gap));
                                     if mx >= tab_x
@@ -2073,6 +2503,13 @@ impl ApplicationHandler<AppEvent> for App {
 
                     if let Some(act) = action {
                         match act {
+                            TabAction::ToggleTopMenu => {
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    session.menu_open = !session.menu_open;
+                                    session.menu_hovered_idx = None;
+                                    session.window.request_redraw();
+                                }
+                            }
                             TabAction::NewTab => {
                                 let pty_opts = self.build_pty_options();
                                 let scrollback =
@@ -2109,6 +2546,10 @@ impl ApplicationHandler<AppEvent> for App {
                                 }
                             }
                         }
+                        return;
+                    }
+
+                    if consumed_tab_bar_click {
                         return;
                     }
                 }
@@ -2739,6 +3180,21 @@ impl ApplicationHandler<AppEvent> for App {
                         0.0
                     };
 
+                    let (top_menu, _actions) = if session.menu_open && tab_bar_h > 0.0 {
+                        let scale = session.renderer.scale_factor;
+                        let menu_w = 230.0 * scale;
+                        let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
+                        let (m, acts) = build_top_dropdown_menu(
+                            scale,
+                            menu_x,
+                            tab_bar_h,
+                            session.menu_hovered_idx,
+                        );
+                        (Some(m), acts)
+                    } else {
+                        (None, Vec::new())
+                    };
+
                     if let Err(e) = session.renderer.render_workspace_with_sidebar(
                         &tabs,
                         &render_panes,
@@ -2746,6 +3202,7 @@ impl ApplicationHandler<AppEvent> for App {
                         session.workspace.sidebar_open,
                         sidebar_px,
                         &agents,
+                        top_menu.as_ref(),
                         None::<
                             fn(
                                 &wgpu::Device,

@@ -1,5 +1,7 @@
 //! `skterm`: Main application entry point for skTerm cross-platform terminal emulator.
 
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use skterm_gui::App;
 use tracing::info;
 

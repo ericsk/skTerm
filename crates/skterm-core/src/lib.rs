@@ -11,7 +11,10 @@ pub use grid::{
     Cell, CellFlags, Color, Cursor, CursorShape, NamedColor, Row, ScreenBuffer, ScreenGrid,
     SearchMatch, Selection, SelectionMode,
 };
-pub use pty::{PtyEvent, PtyProcess, PtySpawnOptions};
+pub use pty::{
+    available_shell_presets, find_cmd, find_git_bash_path, find_pwsh_path,
+    find_windows_powershell, PtyEvent, PtyProcess, PtySpawnOptions, ShellPresetInfo,
+};
 pub use terminal::Terminal;
 pub use vt::{MouseFormat, MouseProtocol, TerminalState};
 
@@ -28,6 +31,21 @@ mod tests {
     #[test]
     fn test_core_info() {
         assert_eq!(core_info(), "skterm-core v0.1.0");
+    }
+
+    #[test]
+    fn test_shell_presets() {
+        let presets = available_shell_presets();
+        assert!(!presets.is_empty(), "Should return at least one shell preset");
+        #[cfg(target_os = "windows")]
+        {
+            let cmd_preset = presets.iter().find(|p| p.id == "cmd");
+            assert!(cmd_preset.is_some(), "cmd preset must exist on Windows");
+            let ps_preset = presets.iter().find(|p| p.id == "powershell");
+            assert!(ps_preset.is_some(), "powershell preset must exist on Windows");
+            let pwsh_preset = presets.iter().find(|p| p.id == "pwsh");
+            assert!(pwsh_preset.is_some(), "pwsh preset must exist on Windows");
+        }
     }
 
     #[test]
