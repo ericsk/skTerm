@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// Root Configuration
@@ -478,11 +480,18 @@ pub fn parse_hex_color(hex: &str) -> Option<[f32; 4]> {
     }
 }
 
+/// Callback used by the file watcher to wake a sleeping event loop.
+pub type ConfigWakeup = Arc<dyn Fn() + Send + Sync>;
+
+
 /// Hot-reloading configuration manager
 pub struct ConfigManager {
     pub current_config: Config,
     pub path: PathBuf,
     rx: Receiver<Config>,
+    /// Installed once the winit event-loop proxy exists (i.e. after construction),
+    /// hence the `OnceLock` indirection shared with the watcher closure.
+    wakeup: Arc<OnceLock<ConfigWakeup>>,
     _watcher: Option<RecommendedWatcher>,
 }
 
@@ -527,21 +536,34 @@ impl ConfigManager {
         };
 
         let watch_path = path.clone();
-        let watcher = setup_watcher(watch_path, tx);
+        let wakeup: Arc<OnceLock<ConfigWakeup>> = Arc::new(OnceLock::new());
+        let watcher = setup_watcher(watch_path, tx, Arc::clone(&wakeup));
 
         Self {
             current_config: config,
             path,
             rx,
+            wakeup,
             _watcher: watcher,
         }
+    }
+
+    /// Install the event-loop wakeup used by the watcher thread. Only the first
+    /// call takes effect.
+    pub fn set_wakeup(&self, cb: ConfigWakeup) {
+        let _ = self.wakeup.set(cb);
     }
 
     pub fn check_reload(&mut self) -> Option<&Config> {
         let mut updated = false;
         while let Ok(new_cfg) = self.rx.try_recv() {
-            self.current_config = new_cfg;
-            updated = true;
+            // Ignore no-op reloads. Besides saving a full re-apply (fonts, themes, pane
+            // resizes), this is what stops our own auto-save from bouncing back through
+            // the watcher as a "change".
+            if new_cfg != self.current_config {
+                self.current_config = new_cfg;
+                updated = true;
+            }
         }
         if updated {
             Some(&self.current_config)
@@ -579,15 +601,41 @@ impl ConfigManager {
     }
 }
 
-fn setup_watcher(path: PathBuf, tx: Sender<Config>) -> Option<RecommendedWatcher> {
+fn setup_watcher(
+    path: PathBuf,
+    tx: Sender<Config>,
+    wakeup: Arc<OnceLock<ConfigWakeup>>,
+) -> Option<RecommendedWatcher> {
     let watch_target = path.clone();
+    // Editors emit several events per save (and atomic "write temp + rename" saves show
+    // up as Create rather than Modify), so we accept both kinds and collapse bursts.
+    const DEBOUNCE: Duration = Duration::from_millis(150);
+    let mut last_emit: Option<Instant> = None;
+
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res {
-            if event.kind.is_modify() {
-                if let Ok(content) = fs::read_to_string(&watch_target) {
-                    if let Ok(new_config) = toml::from_str::<Config>(&content) {
-                        info!("Config hot-reloaded successfully from {:?}", watch_target);
-                        let _ = tx.send(new_config);
+            if !(event.kind.is_modify() || event.kind.is_create()) {
+                return;
+            }
+            // We watch the parent directory, so ignore unrelated files next to it.
+            if !event.paths.iter().any(|p| p == &watch_target) {
+                return;
+            }
+            let now = Instant::now();
+            if let Some(prev) = last_emit {
+                if now.duration_since(prev) < DEBOUNCE {
+                    return;
+                }
+            }
+            if let Ok(content) = fs::read_to_string(&watch_target) {
+                if let Ok(new_config) = toml::from_str::<Config>(&content) {
+                    info!("Config hot-reloaded successfully from {:?}", watch_target);
+                    last_emit = Some(now);
+                    let _ = tx.send(new_config);
+                    // The event loop may be parked in `ControlFlow::Wait`; nudge it
+                    // so the reload is applied now rather than on the next input.
+                    if let Some(cb) = wakeup.get() {
+                        cb();
                     }
                 }
             }

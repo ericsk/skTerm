@@ -118,6 +118,10 @@ pub struct TerminalPipeline {
 impl TerminalPipeline {
     pub const INITIAL_MAX_INSTANCES: usize = 32768;
 
+    /// Capacity of `image_instance_buffer`, in `ImageInstance`s. Callers must not
+    /// submit more image draws than this in a single frame.
+    pub const MAX_IMAGE_INSTANCES: usize = 1024;
+
     pub fn new(
         device: &Device,
         config: &SurfaceConfiguration,
@@ -341,7 +345,7 @@ impl TerminalPipeline {
 
         let image_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("skterm_image_instance_buffer"),
-            size: (1024 * std::mem::size_of::<ImageInstance>()) as u64,
+            size: (Self::MAX_IMAGE_INSTANCES * std::mem::size_of::<ImageInstance>()) as u64,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

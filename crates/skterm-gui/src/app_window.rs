@@ -11,6 +11,7 @@ use arboard::Clipboard;
 use skterm_core::{PtySpawnOptions, Selection, SelectionMode};
 use skterm_render::{PaneRenderItem, RenderTheme, ScrollbarMetrics, TabItem, TermRenderer};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -36,8 +37,14 @@ fn get_nswindow(window: &Window) -> *mut objc::runtime::Object {
     std::ptr::null_mut()
 }
 
+/// Centers the macOS window title by re-anchoring the titlebar `NSTextField`.
+///
+/// # Safety
+/// `win_ptr` must be null or a valid pointer to a live `NSWindow`. The caller must
+/// ensure this is invoked on the main thread, as it walks and mutates the AppKit
+/// view hierarchy.
 #[cfg(target_os = "macos")]
-pub fn center_macos_window_title(win_ptr: *mut objc::runtime::Object) {
+pub unsafe fn center_macos_window_title(win_ptr: *mut objc::runtime::Object) {
     use objc::{class, msg_send, sel, sel_impl};
     if win_ptr.is_null() {
         return;
@@ -134,7 +141,20 @@ pub fn open_url_in_browser(url: &str) -> anyhow::Result<()> {
 #[derive(Debug, Clone, Copy)]
 pub enum AppEvent {
     PtyWakeup,
+    /// Sent from the config file-watcher thread. The loop now sleeps in
+    /// `ControlFlow::Wait`, so the watcher has to wake it explicitly or a hot
+    /// reload would sit in the channel until the next unrelated event.
+    ConfigChanged,
 }
+
+/// How long the scrollbar stays visible after the last scroll.
+const SCROLLBAR_FADE_AFTER: Duration = Duration::from_millis(1500);
+/// Cadence of the AI-agent process-tree rescan (only while the sidebar is open).
+const AGENT_SCAN_INTERVAL: Duration = Duration::from_millis(1500);
+/// Debounce before persisting config.toml after a geometry or preference change.
+const GEOMETRY_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
+/// Backstop cadence for reaping panes whose child exited without a pty EOF.
+const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Active drag state when user clicks and drags a pane's scrollbar.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -422,6 +442,10 @@ pub struct App {
     pub ime_preedit: String,
     pub last_ime_commit_time: Option<Instant>,
     pub event_proxy: Option<winit::event_loop::EventLoopProxy<AppEvent>>,
+    /// Set by PTY reader threads when they have queued output, cleared by the event
+    /// loop when it drains. Ensures at most one `PtyWakeup` is in flight at a time
+    /// instead of one per 64 KiB read.
+    pub pty_wakeup_pending: Arc<AtomicBool>,
     pub cached_ai_agents: Vec<skterm_render::AgentSidebarItem>,
     pub last_ai_agent_scan: Option<Instant>,
     #[cfg(target_os = "macos")]
@@ -463,6 +487,7 @@ impl App {
             ime_preedit: String::new(),
             last_ime_commit_time: None,
             event_proxy: None,
+            pty_wakeup_pending: Arc::new(AtomicBool::new(false)),
             cached_ai_agents: Vec::new(),
             last_ai_agent_scan: None,
             #[cfg(target_os = "macos")]
@@ -581,6 +606,13 @@ impl App {
 
     pub fn toggle_sidebar(&mut self) {
         self.sidebar_open = !self.sidebar_open;
+        if self.sidebar_open {
+            // The periodic scan is gated on the sidebar being visible, so its cached
+            // result is stale (or empty) by now. Force a fresh scan on the next tick.
+            self.last_ai_agent_scan = None;
+        } else {
+            self.cached_ai_agents.clear();
+        }
         let tab_bar_h = self.get_tab_bar_height();
         for session in self.sessions.values_mut() {
             session.workspace.sidebar_open = self.sidebar_open;
@@ -637,10 +669,15 @@ impl App {
 
     pub fn run(mut self) -> anyhow::Result<()> {
         let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
-        self.event_proxy = Some(event_loop.create_proxy());
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(16),
-        ));
+        let proxy = event_loop.create_proxy();
+        self.event_proxy = Some(proxy.clone());
+        self.config_manager.set_wakeup(Arc::new(move || {
+            let _ = proxy.send_event(AppEvent::ConfigChanged);
+        }));
+        // Sleep until something actually happens. `about_to_wait` re-arms a timer
+        // whenever there is pending timed work (scrollbar fade, agent rescan,
+        // debounced autosave, dead-pane reaping).
+        event_loop.set_control_flow(ControlFlow::Wait);
         event_loop.run_app(&mut self)?;
         Ok(())
     }
@@ -810,7 +847,12 @@ impl App {
         render_theme
     }
 
-    pub fn apply_config_live(&mut self, new_cfg: &Config) {
+    /// Applies a configuration to every live session.
+    ///
+    /// `persist` controls whether the config is also written back to `config.toml`.
+    /// It MUST be `false` when the config originated from the file watcher, otherwise
+    /// the write re-triggers the watcher and the two feed each other in a loop.
+    pub fn apply_config_live(&mut self, new_cfg: &Config, persist: bool) {
         info!("Applying live configuration update to all terminal sessions...");
         let old_font = self.config_manager.current_config.font.clone();
         let font_changed = old_font.family != new_cfg.font.family
@@ -846,11 +888,13 @@ impl App {
         }
 
         // Auto-save to config.toml in background thread
-        if let Ok(toml_str) = toml::to_string_pretty(new_cfg) {
-            let path = self.config_manager.path.clone();
-            std::thread::spawn(move || {
-                let _ = std::fs::write(&path, toml_str);
-            });
+        if persist {
+            if let Ok(toml_str) = toml::to_string_pretty(new_cfg) {
+                let path = self.config_manager.path.clone();
+                std::thread::spawn(move || {
+                    let _ = std::fs::write(&path, toml_str);
+                });
+            }
         }
     }
 
@@ -877,8 +921,14 @@ impl App {
 
         let wakeup_cb = self.event_proxy.as_ref().map(|p| {
             let p = p.clone();
+            let pending = Arc::clone(&self.pty_wakeup_pending);
             Arc::new(move || {
-                let _ = p.send_event(AppEvent::PtyWakeup);
+                // Coalesce: only send on a false->true transition. The event loop clears
+                // the flag before draining, so at most one wakeup is ever in flight even
+                // when several reader threads are producing output at full speed.
+                if !pending.swap(true, Ordering::AcqRel) {
+                    let _ = p.send_event(AppEvent::PtyWakeup);
+                }
             }) as Arc<dyn Fn() + Send + Sync>
         });
 
@@ -1024,7 +1074,7 @@ impl App {
                 let _: () = unsafe { msg_send![new_ptr, setTabbingMode: 0isize] };
                 // NSWindowToolbarStyleExpanded = 1 (forces centered window title on macOS 11+)
                 let _: () = unsafe { msg_send![new_ptr, setToolbarStyle: 1isize] };
-                center_macos_window_title(new_ptr);
+                unsafe { center_macos_window_title(new_ptr) };
             }
 
             if let Some(active_id) = self.active_session_id {
@@ -1128,12 +1178,18 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::PtyWakeup => {
+                // Clear before draining: any output that arrives while we are polling
+                // will flip the flag again and schedule another wakeup, so nothing is lost.
+                self.pty_wakeup_pending.store(false, Ordering::Release);
                 for session in self.sessions.values_mut() {
                     if session.workspace.poll_all_ptys() {
                         session.window.request_redraw();
                     }
                 }
             }
+            // Nothing to do here: waking the loop is the whole point, and
+            // `about_to_wait` drains the config channel right after this returns.
+            AppEvent::ConfigChanged => {}
         }
     }
 
@@ -1169,7 +1225,8 @@ impl ApplicationHandler<AppEvent> for App {
                     WindowEvent::RedrawRequested => {
                         let maybe_new_cfg = pref.render_frame(&self.config_manager);
                         if let Some(new_cfg) = maybe_new_cfg {
-                            self.apply_config_live(&new_cfg);
+                            // Originates from the user editing the prefs UI -> persist.
+                            self.apply_config_live(&new_cfg, true);
                         }
                         return;
                     }
@@ -1179,7 +1236,7 @@ impl ApplicationHandler<AppEvent> for App {
                             pref.window.request_redraw();
                         }
                         if let Some(new_cfg) = pref.check_changed(&self.config_manager) {
-                            self.apply_config_live(&new_cfg);
+                            self.apply_config_live(&new_cfg, true);
                         }
                         return;
                     }
@@ -1240,7 +1297,7 @@ impl ApplicationHandler<AppEvent> for App {
                     #[cfg(target_os = "macos")]
                     {
                         let win_ptr = get_nswindow(&session.window);
-                        center_macos_window_title(win_ptr);
+                        unsafe { center_macos_window_title(win_ptr) };
                     }
                     session.window.request_redraw();
                 }
@@ -2324,15 +2381,9 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
 
-                let pty_opts = self.build_pty_options();
-                let scrollback = self
-                    .config_manager
-                    .current_config
-                    .terminal
-                    .scrollback_lines;
-
                 let mut toggle_sidebar_clicked = false;
                 let mut clicked_agent_idx: Option<usize> = None;
+                let mut spawn_agent_pane = false;
 
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     let (mx, my) = session.mouse_pos;
@@ -2380,47 +2431,65 @@ impl ApplicationHandler<AppEvent> for App {
                                         && my >= new_btn_y
                                         && my <= new_btn_y + new_btn_h
                                     {
-                                        let _ = session.workspace.split_active_pane(
-                                            SplitDirection::Horizontal,
-                                            24,
-                                            80,
-                                            scrollback,
-                                            pty_opts,
-                                        );
-                                        session.sync_all_pane_sizes(tab_bar_h);
-                                        if let Some(tab) = session.workspace.active_tab_mut() {
-                                            if let Some(term) = tab.active_terminal_mut() {
-                                                let _ = term.write_to_pty(b"agy\r");
-                                            }
-                                        }
-                                        session.window.request_redraw();
-                                        let _ = session;
-                                        if self.editing_agent_pane.is_some() {
-                                            self.commit_agent_label_edit();
-                                        }
-                                        return;
-                                    }
-
-                                    // Check Agent Card click
-                                    let card_h = 66.0 * scale;
-                                    let card_gap = 6.0 * scale;
-                                    let list_start_y = header_top + header_h + 8.0 * scale;
-                                    if my >= list_start_y {
-                                        let idx = ((my - list_start_y) / (card_h + card_gap))
-                                            .floor()
-                                            as usize;
-                                        clicked_agent_idx = Some(idx);
+                                        // Defer the spawn until the `session` borrow
+                                        // ends below: `build_pty_options` reads
+                                        // `self.sessions`, so it cannot be called here.
+                                        spawn_agent_pane = true;
                                     } else {
-                                        let _ = session;
-                                        if self.editing_agent_pane.is_some() {
-                                            self.commit_agent_label_edit();
+                                        // Check Agent Card click
+                                        let card_h = 66.0 * scale;
+                                        let card_gap = 6.0 * scale;
+                                        let list_start_y = header_top + header_h + 8.0 * scale;
+                                        if my >= list_start_y {
+                                            let idx = ((my - list_start_y) / (card_h + card_gap))
+                                                .floor()
+                                                as usize;
+                                            clicked_agent_idx = Some(idx);
+                                        } else {
+                                            let _ = session;
+                                            if self.editing_agent_pane.is_some() {
+                                                self.commit_agent_label_edit();
+                                            }
+                                            return;
                                         }
-                                        return;
                                     }
                                 }
                             }
                         }
                     }
+                }
+
+                if spawn_agent_pane {
+                    // Built here rather than at the top of the handler: this clones the
+                    // shell args, TERM and the whole env map, so doing it for every
+                    // mouse press and release was pure waste.
+                    let pty_opts = self.build_pty_options();
+                    let scrollback = self
+                        .config_manager
+                        .current_config
+                        .terminal
+                        .scrollback_lines;
+
+                    if let Some(session) = self.sessions.get_mut(&window_id) {
+                        let _ = session.workspace.split_active_pane(
+                            SplitDirection::Horizontal,
+                            24,
+                            80,
+                            scrollback,
+                            pty_opts,
+                        );
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            if let Some(term) = tab.active_terminal_mut() {
+                                let _ = term.write_to_pty(b"agy\r");
+                            }
+                        }
+                        session.window.request_redraw();
+                    }
+                    if self.editing_agent_pane.is_some() {
+                        self.commit_agent_label_edit();
+                    }
+                    return;
                 }
 
                 if toggle_sidebar_clicked {
@@ -2853,7 +2922,12 @@ impl ApplicationHandler<AppEvent> for App {
 
             WindowEvent::RedrawRequested => {
                 let local_agents;
-                let agents: &[skterm_render::AgentSidebarItem] = if self.editing_agent_pane.is_some() || self.cached_ai_agents.is_empty() {
+                // The agent list is only ever drawn inside the sidebar, and scanning walks
+                // the whole process tree (plus an `lsof` on cache miss). Skip it outright
+                // when the sidebar is hidden, otherwise this runs on every single frame.
+                let agents: &[skterm_render::AgentSidebarItem] = if !self.sidebar_open {
+                    &[]
+                } else if self.editing_agent_pane.is_some() || self.cached_ai_agents.is_empty() {
                     local_agents = self
                         .scan_all_ai_agents()
                         .into_iter()
@@ -2885,7 +2959,7 @@ impl ApplicationHandler<AppEvent> for App {
                             #[cfg(target_os = "macos")]
                             {
                                 let win_ptr = get_nswindow(&session.window);
-                                center_macos_window_title(win_ptr);
+                                unsafe { center_macos_window_title(win_ptr) };
                             }
                         }
                     }
@@ -2928,7 +3002,7 @@ impl ApplicationHandler<AppEvent> for App {
                                     .map_or(false, |d| d.pane_id == *id);
                                 let is_recently_scrolled = session
                                     .last_scroll_time
-                                    .map_or(false, |t| t.elapsed() < Duration::from_millis(1500));
+                                    .map_or(false, |t| t.elapsed() < SCROLLBAR_FADE_AFTER);
 
                                 render_panes.push(PaneRenderItem {
                                     grid: t.grid(),
@@ -2972,7 +3046,7 @@ impl ApplicationHandler<AppEvent> for App {
                         tab_bar_h,
                         session.workspace.sidebar_open,
                         sidebar_px,
-                        &agents,
+                        agents,
                         None::<
                             fn(
                                 &wgpu::Device,
@@ -3006,32 +3080,49 @@ impl ApplicationHandler<AppEvent> for App {
         // 1. Hot Reload Configuration
         if let Some(reloaded_cfg) = self.config_manager.check_reload().cloned() {
             info!("Config file modified on disk, applying live changes to all sessions...");
-            self.apply_config_live(&reloaded_cfg);
+            // Came from disk -- do NOT write it back, or we retrigger the watcher.
+            self.apply_config_live(&reloaded_cfg, false);
         }
 
-        // 1.5 Scan AI agents periodically (every 1.5s) to avoid scanning during RedrawRequested
-        let need_scan = match self.last_ai_agent_scan {
-            Some(last) => last.elapsed() > Duration::from_millis(1500),
-            None => true,
-        };
-        if need_scan {
-            self.last_ai_agent_scan = Some(Instant::now());
-            self.cached_ai_agents = self
-                .scan_all_ai_agents()
-                .into_iter()
-                .map(|(_, a)| a)
-                .collect();
+        // 1.5 Scan AI agents periodically (every 1.5s) to avoid scanning during
+        // RedrawRequested. Only meaningful while the sidebar is visible -- with it
+        // closed nothing reads `cached_ai_agents`, and the scan walks the whole
+        // process tree, so doing it anyway would keep the machine awake for nothing.
+        if self.sidebar_open {
+            let need_scan = match self.last_ai_agent_scan {
+                Some(last) => last.elapsed() >= AGENT_SCAN_INTERVAL,
+                None => true,
+            };
+            if need_scan {
+                self.last_ai_agent_scan = Some(Instant::now());
+                self.cached_ai_agents = self
+                    .scan_all_ai_agents()
+                    .into_iter()
+                    .map(|(_, a)| a)
+                    .collect();
+            }
         }
 
         // 2. Poll all sessions for PTY output and dead sessions
         let tab_bar_h = self.get_tab_bar_height();
         let mut dead_sessions = Vec::new();
+        let now = Instant::now();
+        // Earliest moment at which we have timed work to do. `None` means "sleep
+        // until an actual event arrives".
+        let mut next_deadline: Option<Instant> = None;
+        let mut arm = |at: Instant| {
+            next_deadline = Some(match next_deadline {
+                Some(cur) if cur <= at => cur,
+                _ => at,
+            });
+        };
 
         for (id, session) in self.sessions.iter_mut() {
             if session.workspace.has_dead_sessions() {
                 let all_dead = session.workspace.cleanup_dead_sessions();
                 if all_dead {
                     dead_sessions.push(*id);
+                    continue;
                 } else {
                     session.sync_all_pane_sizes(tab_bar_h);
                     session.window.request_redraw();
@@ -3040,6 +3131,19 @@ impl ApplicationHandler<AppEvent> for App {
                 let has_output = session.workspace.poll_all_ptys();
                 if has_output {
                     session.window.request_redraw();
+                }
+            }
+
+            // The scrollbar is shown for SCROLLBAR_FADE_AFTER after the last scroll and
+            // then simply disappears -- there is no interpolation, so a single redraw at
+            // the boundary is all that is needed.
+            if let Some(last) = session.last_scroll_time {
+                let deadline = last + SCROLLBAR_FADE_AFTER;
+                if now >= deadline {
+                    session.last_scroll_time = None;
+                    session.window.request_redraw();
+                } else {
+                    arm(deadline);
                 }
             }
         }
@@ -3055,25 +3159,40 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
 
-        // 3. Debounced Auto-Save
+        // 3. Debounced window geometry auto-save.
         if self.pending_geometry_save {
             if let Some(last) = self.last_resize_time {
-                if last.elapsed() > Duration::from_millis(400) {
+                let deadline = last + GEOMETRY_SAVE_DEBOUNCE;
+                if now >= deadline {
                     self.pending_geometry_save = false;
-                    if let Ok(toml_str) =
-                        toml::to_string_pretty(&self.config_manager.current_config)
+                    if let Ok(toml_str) = toml::to_string_pretty(&self.config_manager.current_config)
                     {
                         let path = self.config_manager.path.clone();
                         std::thread::spawn(move || {
                             let _ = std::fs::write(&path, toml_str);
                         });
                     }
+                } else {
+                    arm(deadline);
                 }
             }
         }
 
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(16),
-        ));
+        if self.sidebar_open {
+            arm(self
+                .last_ai_agent_scan
+                .map_or(now, |last| last + AGENT_SCAN_INTERVAL));
+        }
+
+        // A child can exit without the pty ever reaching EOF (e.g. another process is
+        // holding the slave fd open), in which case no wakeup arrives and the pane would
+        // linger forever. A slow backstop poll costs one throttled `waitpid` per pane per
+        // second -- negligible next to the 60 Hz tick this replaces.
+        arm(now + LIVENESS_POLL_INTERVAL);
+
+        event_loop.set_control_flow(match next_deadline {
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Wait,
+        });
     }
 }

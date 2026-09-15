@@ -284,6 +284,58 @@ mod tests {
         assert_eq!(ws.tabs.len(), 1);
     }
 
+    /// Regression test: splitting a pane that lives in the `first` subtree of an
+    /// existing split used to hand the new pane a `Terminal::new_headless(..)` dummy
+    /// (via a `clone_dummy()` call made to satisfy the by-value recursion), silently
+    /// dropping the real PTY-backed terminal. The result was an empty, permanently
+    /// dead pane. Every leaf must own a live PTY.
+    #[test]
+    fn test_split_in_first_subtree_keeps_real_pty() {
+        let mut ws = Workspace::new(24, 80).expect("Failed to create workspace");
+
+        // First split: root becomes Split { first: Leaf(0), second: Leaf(1) }.
+        ws.split_active_pane(
+            SplitDirection::Horizontal,
+            24,
+            80,
+            1000,
+            skterm_core::PtySpawnOptions::default(),
+        )
+        .expect("first split failed");
+
+        // Focus the pane in the `first` subtree -- this is what triggered the bug.
+        let tab = ws.active_tab_mut().expect("no active tab");
+        let leaves = tab.root.all_leaf_ids();
+        assert_eq!(leaves.len(), 2);
+        tab.active_pane_id = leaves[0];
+
+        // Second split, now nested inside `first`.
+        ws.split_active_pane(
+            SplitDirection::Vertical,
+            24,
+            80,
+            1000,
+            skterm_core::PtySpawnOptions::default(),
+        )
+        .expect("second split failed");
+
+        let tab = ws.active_tab().expect("no active tab");
+        let leaves = tab.root.all_leaf_ids();
+        assert_eq!(leaves.len(), 3, "expected three panes after two splits");
+
+        for id in leaves {
+            let term = tab
+                .root
+                .find_terminal(id)
+                .unwrap_or_else(|| panic!("pane {} missing from tree", id));
+            assert!(
+                term.process_id().is_some(),
+                "pane {} has no PTY -- a headless dummy terminal was installed",
+                id
+            );
+        }
+    }
+
     #[test]
     fn test_preferences_gui_state() {
         let mut gui = PreferencesGui::new();

@@ -12,6 +12,12 @@ pub struct Terminal {
     pty: Option<PtyProcess>,
     pub last_output_time: std::time::Instant,
     pub custom_label: Option<String>,
+    /// Reused across `poll_pty` calls so steady-state reading allocates nothing.
+    read_buf: Vec<u8>,
+    /// Set once `PtyEvent::Exit` has been observed. `Some(None)` means the child exited
+    /// but no status could be retrieved.
+    exit_code: Option<Option<u32>>,
+    has_exited: bool,
 }
 
 impl Terminal {
@@ -52,6 +58,9 @@ impl Terminal {
             pty: Some(pty),
             last_output_time: std::time::Instant::now(),
             custom_label: None,
+            read_buf: Vec::new(),
+            exit_code: None,
+            has_exited: false,
         })
     }
 
@@ -63,6 +72,9 @@ impl Terminal {
             pty: None,
             last_output_time: std::time::Instant::now(),
             custom_label: None,
+            read_buf: Vec::new(),
+            exit_code: None,
+            has_exited: false,
         }
     }
 
@@ -71,38 +83,68 @@ impl Terminal {
         self.parser.advance(&mut self.state, bytes);
     }
 
-    /// Drain all available output from the PTY process and update terminal state.
+    /// Drain available output from the PTY process and update terminal state.
     /// Returns `true` if any data was processed.
+    ///
+    /// Reads are accumulated into one reusable contiguous buffer and handed to the
+    /// parser in a single `advance` call: this avoids re-entering the VTE state machine
+    /// per 8 KiB chunk and keeps locality. At most `MAX_BYTES_PER_POLL` is consumed per
+    /// call so that `cat`-ing a huge file cannot stall input handling and rendering --
+    /// anything left over stays queued and is picked up on the next poll.
     pub fn poll_pty(&mut self) -> bool {
-        let mut chunks = Vec::new();
+        /// Roughly a few frames' worth of output at typical terminal throughput.
+        const MAX_BYTES_PER_POLL: usize = 4 * 1024 * 1024;
+
+        let mut buf = std::mem::take(&mut self.read_buf);
+        buf.clear();
+
         if let Some(pty) = &self.pty {
-            while let Some(event) = pty.try_recv() {
-                match event {
-                    PtyEvent::Output(bytes) => chunks.push(bytes),
-                    PtyEvent::Exit(_) => {}
+            while buf.len() < MAX_BYTES_PER_POLL {
+                match pty.try_recv() {
+                    Some(PtyEvent::Output(bytes)) => buf.extend_from_slice(&bytes),
+                    Some(PtyEvent::Exit(code)) => {
+                        // Previously discarded. Recording it lets the UI report the exit
+                        // status and lets `is_child_alive` answer without a syscall.
+                        self.exit_code = Some(code);
+                        self.has_exited = true;
+                    }
+                    None => break,
                 }
             }
         }
 
-        if chunks.is_empty() {
-            return false;
+        let had_data = !buf.is_empty();
+        if had_data {
+            self.last_output_time = std::time::Instant::now();
+            self.parser.advance(&mut self.state, &buf);
         }
 
-        self.last_output_time = std::time::Instant::now();
-        for chunk in chunks {
-            self.parser.advance(&mut self.state, &chunk);
-        }
-        true
+        // Return the buffer so its capacity is reused next poll.
+        self.read_buf = buf;
+        had_data
     }
 
     /// Check if the attached PTY process has exited.
     pub fn is_child_alive(&self) -> bool {
+        // Fast path: the reader thread already told us the child is gone, so there is
+        // no need to ask the OS again.
+        if self.has_exited {
+            return false;
+        }
         self.pty.as_ref().map(|p| p.is_alive()).unwrap_or(false)
     }
 
     /// Alias to is_child_alive.
     pub fn is_alive(&self) -> bool {
         self.is_child_alive()
+    }
+
+    /// Exit status of the child, if it has exited and a status was available.
+    ///
+    /// Returns `None` while the child is running, `Some(None)` if it exited but no
+    /// status could be retrieved, and `Some(Some(code))` otherwise.
+    pub fn exit_code(&self) -> Option<Option<u32>> {
+        self.exit_code
     }
 
     /// Return the OS process ID of the attached shell process.
@@ -124,7 +166,18 @@ impl Terminal {
     }
 
     /// Notify PTY and Grid of window resize.
+    ///
+    /// No-ops when the size is unchanged. This matters because `resize` is called from
+    /// many UI paths (splitter drags, every layout sync, most keyboard shortcuts) and
+    /// both halves are expensive: `grid.resize` reflows the entire scrollback, and
+    /// `pty.resize` is a `TIOCSWINSZ` ioctl that sends `SIGWINCH` to the child --
+    /// spamming it at mouse-move rate makes vim/htop redraw continuously.
     pub fn resize(&mut self, rows: usize, cols: usize) -> anyhow::Result<()> {
+        let active = self.state.grid.active();
+        if active.rows == rows && active.cols == cols {
+            return Ok(());
+        }
+
         self.state.grid.resize(rows, cols);
         if let Some(pty) = &self.pty {
             pty.resize(rows as u16, cols as u16)?;

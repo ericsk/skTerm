@@ -420,8 +420,6 @@ pub struct PreferencesWindow {
     pub cursor_shape: String,
     pub cursor_blink: bool,
     pub blink_interval_ms: u64,
-
-    pub last_synced_snap: String,
 }
 
 impl PreferencesWindow {
@@ -559,12 +557,9 @@ impl PreferencesWindow {
             cursor_shape: "block".to_string(),
             cursor_blink: true,
             blink_interval_ms: 500,
-            last_synced_snap: String::new(),
         };
 
         instance.load_from_config(initial_config);
-        let snap = instance.snapshot_values();
-        instance.last_synced_snap = snap;
         Ok(instance)
     }
 
@@ -580,11 +575,19 @@ impl PreferencesWindow {
         }
     }
 
+    /// Returns the form's configuration if it differs from what is currently applied.
+    ///
+    /// This compares whole `Config` values rather than a hand-written list of fields.
+    /// The previous string-snapshot approach silently omitted `decorations`,
+    /// `working_directory`, `scrollback_lines`, `option_as_alt` and `bell`, so editing
+    /// those controls had no effect.
+    ///
+    /// Comparing against `current_config` (rather than a stored baseline) also means
+    /// the check cannot drift when the base config is updated elsewhere.
     pub fn check_changed(&mut self, config_manager: &ConfigManager) -> Option<Config> {
-        let cur = self.snapshot_values();
-        if cur != self.last_synced_snap {
-            self.last_synced_snap = cur;
-            Some(self.to_config(&config_manager.current_config))
+        let cur = self.to_config(&config_manager.current_config);
+        if cur != config_manager.current_config {
+            Some(cur)
         } else {
             None
         }
@@ -724,7 +727,6 @@ impl PreferencesWindow {
     /// Render Preferences Window UI and return Option<Config> if any values were modified (for Live Sync).
     pub fn render_frame(&mut self, config_manager: &ConfigManager) -> Option<Config> {
         let raw_input = self.egui_state.take_egui_input(&self.window);
-        let mut changed = false;
 
         let egui_ctx = self.egui_ctx.clone();
         let full_output = egui_ctx.run(raw_input, |ctx| {
@@ -821,7 +823,6 @@ impl PreferencesWindow {
                             .clicked()
                         {
                             self.load_from_config(&Config::default());
-                            changed = true;
                         }
                         ui.add_space(8.0);
                         let (divider_rect, _) = ui.allocate_exact_size(
@@ -845,17 +846,12 @@ impl PreferencesWindow {
                 )
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        let prev_snap = self.snapshot_values();
                         match self.active_category {
                             PreferencesCategory::Appearance => self.render_appearance_view(ui),
                             PreferencesCategory::Colors => self.render_colors_view(ui),
                             PreferencesCategory::Terminal => self.render_terminal_view(ui),
                             PreferencesCategory::Cursor => self.render_cursor_view(ui),
                             PreferencesCategory::Keybindings => self.render_keybindings_view(ui),
-                        }
-                        let next_snap = self.snapshot_values();
-                        if prev_snap != next_snap {
-                            changed = true;
                         }
                     });
                 });
@@ -869,11 +865,9 @@ impl PreferencesWindow {
             Ok(t) => t,
             Err(e) => {
                 info!("Surface error in preferences window: {:?}", e);
-                return if changed {
-                    Some(self.to_config(&config_manager.current_config))
-                } else {
-                    None
-                };
+                // Still report edits made this frame, via the same detection path
+                // used by the normal return below.
+                return self.check_changed(config_manager);
             }
         };
 
@@ -1503,34 +1497,6 @@ impl PreferencesWindow {
                 });
             }
         });
-    }
-
-    fn snapshot_values(&self) -> String {
-        format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-            self.font_family,
-            self.font_size,
-            self.line_height,
-            self.columns,
-            self.rows,
-            self.padding_x,
-            self.padding_y,
-            self.opacity,
-            self.startup_mode,
-            self.tab_bar_style,
-            self.theme,
-            self.fg_override,
-            self.bg_override,
-            self.cursor_override,
-            self.selection_override,
-            self.term,
-            self.custom_shell_enabled,
-            self.shell_program,
-            self.shell_args,
-            self.cursor_shape,
-            self.cursor_blink,
-            self.blink_interval_ms
-        )
     }
 }
 

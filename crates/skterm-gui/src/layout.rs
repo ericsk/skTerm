@@ -131,6 +131,17 @@ impl PaneNode {
         dead
     }
 
+    /// Whether any leaf in this subtree has a dead child process.
+    ///
+    /// Short-circuits and allocates nothing, unlike `find_dead_panes().is_empty()`.
+    /// This is polled frequently, so the "nothing died" answer must be cheap.
+    pub fn any_dead(&self) -> bool {
+        match self {
+            PaneNode::Leaf { terminal, .. } => !terminal.is_child_alive(),
+            PaneNode::Split { first, second, .. } => first.any_dead() || second.any_dead(),
+        }
+    }
+
     fn collect_dead_panes(&self, out: &mut Vec<PaneId>) {
         match self {
             PaneNode::Leaf { id, terminal } => {
@@ -145,17 +156,27 @@ impl PaneNode {
         }
     }
 
+    /// Splits the pane identified by `target_id`.
+    ///
+    /// `new_terminal` is passed as `&mut Option<Terminal>` so that ownership of the
+    /// (PTY-backed) terminal is transferred exactly once, at the matching leaf. Passing
+    /// it by value would require cloning it down every recursion branch, and `Terminal`
+    /// cannot be meaningfully cloned because it owns a PTY.
     pub fn split_pane(
         &mut self,
         target_id: PaneId,
         direction: SplitDirection,
         new_id: PaneId,
-        new_terminal: Terminal,
+        new_terminal: &mut Option<Terminal>,
         split_id: u32,
     ) -> bool {
         match self {
             PaneNode::Leaf { id, terminal } => {
                 if *id == target_id {
+                    let Some(new_terminal) = new_terminal.take() else {
+                        // Already consumed by an earlier branch; nothing left to install.
+                        return false;
+                    };
                     let old_id = *id;
                     let old_terminal = std::mem::replace(terminal, Terminal::new_headless(1, 1, 0));
 
@@ -178,17 +199,8 @@ impl PaneNode {
                 }
             }
             PaneNode::Split { first, second, .. } => {
-                if first.split_pane(
-                    target_id,
-                    direction,
-                    new_id,
-                    new_terminal.clone_dummy(),
-                    split_id,
-                ) {
-                    true
-                } else {
-                    second.split_pane(target_id, direction, new_id, new_terminal, split_id)
-                }
+                first.split_pane(target_id, direction, new_id, new_terminal, split_id)
+                    || second.split_pane(target_id, direction, new_id, new_terminal, split_id)
             }
         }
     }
@@ -436,16 +448,6 @@ impl PaneNode {
     }
 }
 
-trait TerminalDummy {
-    fn clone_dummy(&self) -> Terminal;
-}
-
-impl TerminalDummy for Terminal {
-    fn clone_dummy(&self) -> Terminal {
-        Terminal::new_headless(self.grid().active().rows, self.grid().active().cols, 100)
-    }
-}
-
 /// A single tab containing a BSP tree of panes.
 pub struct Tab {
     pub id: TabId,
@@ -539,13 +541,18 @@ impl Tab {
         self.next_split_id += 1;
 
         let new_terminal = Terminal::new_with_options(rows, cols, scrollback_lines, options)?;
-        self.root.split_pane(
+        let mut new_terminal = Some(new_terminal);
+        let installed = self.root.split_pane(
             self.active_pane_id,
             direction,
             new_id,
-            new_terminal,
+            &mut new_terminal,
             split_id,
         );
+        if !installed {
+            // Target pane vanished; don't leave a phantom pane id behind.
+            anyhow::bail!("split target pane {} not found", self.active_pane_id);
+        }
         self.active_pane_id = new_id;
         self.zoomed_pane_id = None;
         Ok(new_id)
@@ -810,12 +817,7 @@ impl Workspace {
     }
 
     pub fn has_dead_sessions(&self) -> bool {
-        for tab in &self.tabs {
-            if !tab.root.find_dead_panes().is_empty() {
-                return true;
-            }
-        }
-        false
+        self.tabs.iter().any(|tab| tab.root.any_dead())
     }
 
     pub fn cleanup_dead_sessions(&mut self) -> bool {

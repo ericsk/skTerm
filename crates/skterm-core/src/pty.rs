@@ -1,11 +1,12 @@
 //! Cross-platform PTY subprocess management using portable-pty.
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use tracing::{error, info};
 
 /// Events produced by the background PTY reader thread.
@@ -46,6 +47,8 @@ pub struct PtyProcess {
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     event_rx: Receiver<PtyEvent>,
     has_exited: Arc<std::sync::atomic::AtomicBool>,
+    /// Rate-limits the `waitpid` backstop in [`PtyProcess::is_alive`].
+    last_liveness_probe: Mutex<Instant>,
     pid: Option<u32>,
     _reader_thread: thread::JoinHandle<()>,
 }
@@ -184,7 +187,13 @@ impl PtyProcess {
         let mut reader = pair.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
 
-        let (event_tx, event_rx): (Sender<PtyEvent>, Receiver<PtyEvent>) = unbounded();
+        // Bounded, not unbounded: a producer that outruns the ~60 Hz consumer (`yes`,
+        // `cat /dev/urandom`, a runaway build log) would otherwise grow this queue
+        // without limit and blow up RSS. Blocking the reader here backpressures through
+        // the pty to the child, which is the correct behaviour for a terminal.
+        const EVENT_QUEUE_DEPTH: usize = 256;
+        let (event_tx, event_rx): (Sender<PtyEvent>, Receiver<PtyEvent>) =
+            bounded(EVENT_QUEUE_DEPTH);
 
         let wakeup_cb = options.wakeup_cb;
         let has_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -193,7 +202,9 @@ impl PtyProcess {
         let reader_thread = thread::Builder::new()
             .name("skterm-pty-reader".to_string())
             .spawn(move || {
-                let mut buf = [0u8; 8192];
+                // 64 KiB rather than 8 KiB: under heavy output this cuts the number of
+                // read syscalls, channel sends and per-chunk allocations by 8x.
+                let mut buf = [0u8; 65536];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => {
@@ -242,6 +253,7 @@ impl PtyProcess {
             child,
             event_rx,
             has_exited,
+            last_liveness_probe: Mutex::new(Instant::now()),
             pid,
             _reader_thread: reader_thread,
         })
@@ -275,14 +287,36 @@ impl PtyProcess {
     }
 
     /// Check if the child process has exited.
+    ///
+    /// The reader thread is the primary exit signal (it sets `has_exited` on EOF or
+    /// read error). The `try_wait` below is only a backstop for a child that exits
+    /// while some other process still holds the pty open, so it is rate-limited:
+    /// callers poll this per pane per frame, and an unthrottled `waitpid` there costs
+    /// a syscall every time.
     pub fn is_alive(&self) -> bool {
+        const LIVENESS_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
         if self.has_exited.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
+
+        match self.last_liveness_probe.lock() {
+            Ok(mut last) => {
+                if last.elapsed() < LIVENESS_PROBE_INTERVAL {
+                    // Assume still alive; `has_exited` above would have caught a
+                    // reader-observed exit already.
+                    return true;
+                }
+                *last = Instant::now();
+            }
+            Err(_) => return true,
+        }
+
         if let Ok(mut child) = self.child.lock() {
             match child.try_wait() {
                 Ok(Some(_)) => {
-                    self.has_exited.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.has_exited
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     false
                 }
                 Ok(None) => true,

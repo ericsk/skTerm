@@ -368,4 +368,115 @@ mod tests {
         assert_eq!(matches.len(), 8);
         assert_eq!(matches[0].start_col, 18);
     }
+    /// Scrolling recycles row buffers instead of allocating. If a recycled row is
+    /// not fully blanked, old text reappears at the bottom of the screen -- these
+    /// cover every recycling source.
+    mod row_recycling {
+        use super::*;
+
+        fn row_text(term: &Terminal, row: usize) -> String {
+            term.grid().active().grid[row]
+                .cells
+                .iter()
+                .map(|c| c.c)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        }
+
+        #[test]
+        fn scroll_up_recycles_evicted_scrollback_row() {
+            // max_scrollback = 2 so the ring starts evicting almost immediately and
+            // the evicted buffers get reused for the new bottom rows.
+            let mut term = Terminal::new_headless(3, 20, 2);
+            for i in 0..10 {
+                term.feed_bytes(format!("line{}\r\n", i).as_bytes());
+            }
+            assert_eq!(term.grid().active().scrollback.len(), 2);
+            assert_eq!(row_text(&term, 0), "line8");
+            assert_eq!(row_text(&term, 1), "line9");
+            assert_eq!(row_text(&term, 2), "", "recycled row still holds old text");
+        }
+
+        #[test]
+        fn scroll_up_recycles_own_row_when_scrollback_disabled() {
+            let mut term = Terminal::new_headless(3, 20, 0);
+            for i in 0..10 {
+                term.feed_bytes(format!("line{}\r\n", i).as_bytes());
+            }
+            assert!(term.grid().active().scrollback.is_empty());
+            assert_eq!(row_text(&term, 0), "line8");
+            assert_eq!(row_text(&term, 1), "line9");
+            assert_eq!(row_text(&term, 2), "");
+        }
+
+        #[test]
+        fn scroll_region_recycles_row() {
+            let mut term = Terminal::new_headless(5, 20, 100);
+            term.feed_bytes(b"a\r\nb\r\nc\r\nd\r\ne");
+            // Restrict the region to rows 1-3, park the cursor at its bottom, then
+            // force a scroll inside it with a linefeed.
+            term.feed_bytes(b"\x1b[2;4r\x1b[4;1H\n");
+            assert_eq!(row_text(&term, 0), "a");
+            assert_eq!(row_text(&term, 1), "c");
+            assert_eq!(row_text(&term, 2), "d");
+            assert_eq!(row_text(&term, 3), "");
+            assert_eq!(row_text(&term, 4), "e");
+        }
+
+        #[test]
+        fn insert_and_delete_lines_recycle_rows() {
+            let mut term = Terminal::new_headless(4, 20, 100);
+            term.feed_bytes(b"one\r\ntwo\r\nthree\r\nfour");
+
+            // IL at row 1 pushes "four" off the bottom and blanks row 1.
+            term.feed_bytes(b"\x1b[2;1H\x1b[L");
+            assert_eq!(row_text(&term, 0), "one");
+            assert_eq!(row_text(&term, 1), "");
+            assert_eq!(row_text(&term, 2), "two");
+            assert_eq!(row_text(&term, 3), "three");
+
+            // DL at row 1 pulls the rest up and blanks the bottom row.
+            term.feed_bytes(b"\x1b[2;1H\x1b[M");
+            assert_eq!(row_text(&term, 0), "one");
+            assert_eq!(row_text(&term, 1), "two");
+            assert_eq!(row_text(&term, 2), "three");
+            assert_eq!(row_text(&term, 3), "");
+        }
+
+        #[test]
+        fn delete_and_insert_chars_shift_correctly() {
+            let mut term = Terminal::new_headless(2, 10, 100);
+
+            // DCH: delete 3 chars at col 2 of "abcdefghij".
+            term.feed_bytes(b"abcdefghij");
+            term.feed_bytes(b"\x1b[1;3H\x1b[3P");
+            assert_eq!(row_text(&term, 0), "abfghij");
+
+            // ICH: insert 2 blanks at col 2, pushing the tail right and off the edge.
+            term.feed_bytes(b"\x1b[1;1H\x1b[2K\x1b[1;1Habcdefghij");
+            term.feed_bytes(b"\x1b[1;3H\x1b[2@");
+            let cells = &term.grid().active().grid[0].cells;
+            assert_eq!(cells[0].c, 'a');
+            assert_eq!(cells[1].c, 'b');
+            assert_eq!(cells[2].c, ' ');
+            assert_eq!(cells[3].c, ' ');
+            assert_eq!(cells[4].c, 'c');
+            assert_eq!(cells[9].c, 'h');
+        }
+
+        #[test]
+        fn erase_chars_uses_current_background() {
+            let mut term = Terminal::new_headless(2, 10, 100);
+            term.feed_bytes(b"abcdefghij");
+            // Red background, then ECH 3 at col 1.
+            term.feed_bytes(b"\x1b[41m\x1b[1;1H\x1b[3X");
+            let cells = &term.grid().active().grid[0].cells;
+            for cell in cells.iter().take(3) {
+                assert_eq!(cell.c, ' ');
+                assert_eq!(cell.bg, Color::Named(NamedColor::Red));
+            }
+            assert_eq!(cells[3].c, 'd');
+        }
+    }
 }

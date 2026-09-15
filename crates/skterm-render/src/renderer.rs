@@ -1366,6 +1366,26 @@ impl TermRenderer {
             );
         }
 
+        // Images must have ALL their instances uploaded *before* the render pass.
+        //
+        // `Queue::write_buffer` is not ordered with respect to commands recorded into a
+        // command encoder: every queued write is flushed before the submitted command
+        // buffer executes. Writing one instance at a time inside the pass would therefore
+        // leave only the last write visible, and every image would be drawn at the last
+        // image's rect. Instead we upload the whole array once and select per draw via
+        // the instance index.
+        image_draw_calls.retain(|(id, _)| self.image_cache.contains_key(id));
+        image_draw_calls.truncate(TerminalPipeline::MAX_IMAGE_INSTANCES);
+        if !image_draw_calls.is_empty() {
+            let img_instances: Vec<ImageInstance> =
+                image_draw_calls.iter().map(|(_, inst)| *inst).collect();
+            self.queue.write_buffer(
+                &self.pipeline.image_instance_buffer,
+                0,
+                bytemuck::cast_slice(&img_instances),
+            );
+        }
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1403,17 +1423,18 @@ impl TermRenderer {
             }
 
             // 2. Draw Graphic Images (Sixel / Kitty)
-            for (id, img_inst) in &image_draw_calls {
-                if let Some((_, _, img_bg)) = self.image_cache.get(id) {
-                    self.queue.write_buffer(
-                        &self.pipeline.image_instance_buffer,
-                        0,
-                        bytemuck::cast_slice(&[*img_inst]),
-                    );
-                    render_pass.set_pipeline(&self.pipeline.image_pipeline);
-                    render_pass.set_bind_group(1, img_bg, &[]);
-                    render_pass.set_vertex_buffer(0, self.pipeline.image_instance_buffer.slice(..));
-                    render_pass.draw(0..6, 0..1);
+            // Each image owns its own bind group, so we still need one draw per image,
+            // but the pipeline and vertex buffer are bound once and each draw selects
+            // its instance by index into the array uploaded above.
+            if !image_draw_calls.is_empty() {
+                render_pass.set_pipeline(&self.pipeline.image_pipeline);
+                render_pass.set_vertex_buffer(0, self.pipeline.image_instance_buffer.slice(..));
+                for (idx, (id, _)) in image_draw_calls.iter().enumerate() {
+                    if let Some((_, _, img_bg)) = self.image_cache.get(id) {
+                        render_pass.set_bind_group(1, img_bg, &[]);
+                        let idx = idx as u32;
+                        render_pass.draw(0..6, idx..idx + 1);
+                    }
                 }
             }
 

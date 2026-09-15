@@ -3,6 +3,7 @@
 use crate::graphics::GraphicImage;
 use bitflags::bitflags;
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
 
@@ -57,14 +58,26 @@ pub enum Color {
 }
 
 /// A single terminal character cell.
+///
+/// Memory here is multiplied by `(rows + scrollback) * cols`, so the layout matters:
+/// at 200 columns with 10k lines of scrollback, every byte costs ~2 MB per pane.
+///
+/// `hyperlink_id` uses `NonZeroU32` so that `Option` can exploit the null niche
+/// instead of spending 4 extra bytes on a discriminant (`Option<u32>` is 8 bytes,
+/// `Option<NonZeroU32>` is 4). Hyperlink ids are handed out starting from 1, so zero
+/// is never a valid id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     pub c: char,
     pub fg: Color,
     pub bg: Color,
     pub flags: CellFlags,
-    pub hyperlink_id: Option<u32>,
+    pub hyperlink_id: Option<NonZeroU32>,
 }
+
+// Lock in the layout: 4 (char) + 4 (fg) + 4 (bg) + 2 (flags) + 4 (link) = 18, padded
+// to 20 by the alignment-4 fields. If this ever fails, check what was added to `Cell`.
+const _: () = assert!(std::mem::size_of::<Cell>() == 20);
 
 impl Default for Cell {
     fn default() -> Self {
@@ -91,6 +104,19 @@ impl Cell {
 
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// An erased cell carrying the current background colour. This is what every
+    /// clear/erase/scroll path fills with, so it exists as a single definition.
+    #[inline]
+    pub const fn blank(bg: Color) -> Self {
+        Self {
+            c: ' ',
+            fg: Color::DefaultFg,
+            bg,
+            flags: CellFlags::empty(),
+            hyperlink_id: None,
+        }
     }
 }
 
@@ -136,12 +162,21 @@ impl Row {
     }
 
     pub fn clear(&mut self, bg: Color) {
-        for cell in &mut self.cells {
-            cell.c = ' ';
-            cell.fg = Color::DefaultFg;
-            cell.bg = bg;
-            cell.flags = CellFlags::empty();
-            cell.hyperlink_id = None;
+        self.cells.fill(Cell::blank(bg));
+        self.is_dirty = true;
+        self.is_wrapped = false;
+    }
+
+    /// Recycle this row's existing allocation as a fresh blank line of `cols`
+    /// columns. Scrolling a full screen happens once per output line, so reusing
+    /// the buffer here is what keeps the steady state allocation-free.
+    pub fn reuse_as_blank(&mut self, cols: usize, bg: Color) {
+        let blank = Cell::blank(bg);
+        if self.cells.len() == cols {
+            self.cells.fill(blank);
+        } else {
+            self.cells.clear();
+            self.cells.resize(cols, blank);
         }
         self.is_dirty = true;
         self.is_wrapped = false;
@@ -254,7 +289,11 @@ impl Selection {
 pub struct ScreenBuffer {
     pub rows: usize,
     pub cols: usize,
-    pub grid: Vec<Row>,
+    /// Visible rows, newest at the back. A deque rather than a `Vec` because the
+    /// single hottest operation in the whole emulator is "scroll the screen up by
+    /// one line", which is a `pop_front` + `push_back` here instead of shifting
+    /// every row down by one slot.
+    pub grid: VecDeque<Row>,
     pub scrollback: VecDeque<Row>,
     pub max_scrollback: usize,
     pub cursor: Cursor,
@@ -305,15 +344,17 @@ impl ScreenBuffer {
             let diff = new_rows - self.rows;
             for _ in 0..diff {
                 if let Some(old_row) = self.scrollback.pop_back() {
-                    self.grid.insert(0, old_row);
+                    self.grid.push_front(old_row);
                 } else {
-                    self.grid.push(Row::new(self.cols));
+                    self.grid.push_back(Row::new(self.cols));
                 }
             }
         } else if new_rows < self.rows {
             let diff = self.rows - new_rows;
             for _ in 0..diff {
-                let removed = self.grid.remove(0);
+                let Some(removed) = self.grid.pop_front() else {
+                    break;
+                };
                 if self.max_scrollback > 0 {
                     if self.scrollback.len() >= self.max_scrollback {
                         self.scrollback.pop_front();
@@ -346,15 +387,17 @@ impl ScreenBuffer {
             for _ in 0..diff {
                 if let Some(mut old_row) = self.scrollback.pop_back() {
                     old_row.resize(new_cols);
-                    self.grid.insert(0, old_row);
+                    self.grid.push_front(old_row);
                 } else {
-                    self.grid.push(Row::new(new_cols));
+                    self.grid.push_back(Row::new(new_cols));
                 }
             }
         } else if new_rows < self.rows {
             let diff = self.rows - new_rows;
             for _ in 0..diff {
-                let removed = self.grid.remove(0);
+                let Some(removed) = self.grid.pop_front() else {
+                    break;
+                };
                 if self.max_scrollback > 0 {
                     if self.scrollback.len() >= self.max_scrollback {
                         self.scrollback.pop_front();
@@ -605,9 +648,10 @@ impl ScreenBuffer {
         if grid_content_count <= new_rows {
             let mut scrollback_rows: VecDeque<Row> =
                 new_physical_rows.drain(..first_grid_row).collect();
-            self.grid = new_physical_rows;
+            // `Vec -> VecDeque` reuses the same allocation, so this is not a copy.
+            self.grid = new_physical_rows.into();
             while self.grid.len() < new_rows {
-                self.grid.push(Row::new(new_cols));
+                self.grid.push_back(Row::new(new_cols));
             }
 
             if self.max_scrollback > 0 {
@@ -625,7 +669,7 @@ impl ScreenBuffer {
             let split_point = total_new - new_rows;
             let mut scrollback_rows: VecDeque<Row> =
                 new_physical_rows.drain(..split_point).collect();
-            self.grid = new_physical_rows;
+            self.grid = new_physical_rows.into();
 
             if self.max_scrollback > 0 {
                 while scrollback_rows.len() > self.max_scrollback {
@@ -774,19 +818,39 @@ impl ScreenBuffer {
 
     pub fn scroll_up(&mut self, n: usize) {
         let (top, bottom) = self.scroll_region;
+        let full_screen = top == 0 && bottom == self.rows.saturating_sub(1);
+        let cols = self.cols;
+
         for _ in 0..n {
-            if top == 0 && bottom == self.rows.saturating_sub(1) {
-                let removed = self.grid.remove(0);
-                if self.max_scrollback > 0 {
-                    if self.scrollback.len() >= self.max_scrollback {
-                        self.scrollback.pop_front();
+            if full_screen {
+                let Some(evicted) = self.grid.pop_front() else {
+                    break;
+                };
+                // The blank line appended at the bottom reuses an existing buffer:
+                // either the row falling out of the scrollback ring, or -- when
+                // scrollback is off -- the row we just removed.
+                let mut blank = if self.max_scrollback > 0 {
+                    let recycled = if self.scrollback.len() >= self.max_scrollback {
+                        self.scrollback.pop_front()
+                    } else {
+                        None
+                    };
+                    self.scrollback.push_back(evicted);
+                    match recycled {
+                        Some(r) => r,
+                        None => Row::new(cols),
                     }
-                    self.scrollback.push_back(removed);
-                }
-                self.grid.push(Row::new(self.cols));
+                } else {
+                    evicted
+                };
+                blank.reuse_as_blank(cols, Color::DefaultBg);
+                self.grid.push_back(blank);
             } else {
-                self.grid.remove(top);
-                self.grid.insert(bottom, Row::new(self.cols));
+                let Some(mut row) = self.grid.remove(top) else {
+                    break;
+                };
+                row.reuse_as_blank(cols, Color::DefaultBg);
+                self.grid.insert(bottom, row);
             }
         }
 
@@ -798,9 +862,13 @@ impl ScreenBuffer {
 
     pub fn scroll_down(&mut self, n: usize) {
         let (top, bottom) = self.scroll_region;
+        let cols = self.cols;
         for _ in 0..n {
-            self.grid.remove(bottom);
-            self.grid.insert(top, Row::new(self.cols));
+            let Some(mut row) = self.grid.remove(bottom) else {
+                break;
+            };
+            row.reuse_as_blank(cols, Color::DefaultBg);
+            self.grid.insert(top, row);
         }
 
         for img in &mut self.images {
@@ -856,7 +924,7 @@ impl ScreenBuffer {
         fg: Color,
         bg: Color,
         flags: CellFlags,
-        hyperlink_id: Option<u32>,
+        hyperlink_id: Option<NonZeroU32>,
     ) {
         let char_width = UnicodeWidthChar::width(c).unwrap_or(1);
         if char_width == 0 {
@@ -880,6 +948,7 @@ impl ScreenBuffer {
 
         let cur_row = self.cursor.row;
         let cur_col = self.cursor.col;
+        let cols = self.cols;
 
         self.clear_split_wide_chars(cur_row, cur_col, cur_col + char_width);
 
@@ -888,16 +957,19 @@ impl ScreenBuffer {
             actual_flags.insert(CellFlags::WIDE_CHAR);
         }
 
-        let cell = &mut self.grid[cur_row].cells[cur_col];
+        // Resolve the row once: this runs per printed character, and every
+        // `self.grid[..]` is an index computation on the deque.
+        let row = &mut self.grid[cur_row];
+        let cell = &mut row.cells[cur_col];
         cell.c = c;
         cell.fg = fg;
         cell.bg = bg;
         cell.flags = actual_flags;
         cell.hyperlink_id = hyperlink_id;
-        self.grid[cur_row].is_dirty = true;
+        row.is_dirty = true;
 
-        if char_width == 2 && cur_col + 1 < self.cols {
-            let spacer_cell = &mut self.grid[cur_row].cells[cur_col + 1];
+        if char_width == 2 && cur_col + 1 < cols {
+            let spacer_cell = &mut row.cells[cur_col + 1];
             spacer_cell.c = ' ';
             spacer_cell.fg = fg;
             spacer_cell.bg = bg;
@@ -922,18 +994,14 @@ impl ScreenBuffer {
             return;
         }
         let count = n.min(self.cols - cur_col);
+        let cols = self.cols;
 
         self.clear_split_wide_chars(cur_row, cur_col, cur_col + count);
 
         let row = &mut self.grid[cur_row];
-        for c in cur_col..self.cols {
-            if c + count < self.cols {
-                row.cells[c] = row.cells[c + count];
-            } else {
-                row.cells[c].reset();
-                row.cells[c].bg = bg;
-            }
-        }
+        // Shift the tail left, then blank the `count` columns it vacated.
+        row.cells.copy_within(cur_col + count..cols, cur_col);
+        row.cells[cols - count..].fill(Cell::blank(bg));
         row.is_dirty = true;
     }
 
@@ -946,20 +1014,18 @@ impl ScreenBuffer {
             return;
         }
         let count = n.min(self.cols - cur_col);
+        let cols = self.cols;
 
         self.clear_split_wide_chars(cur_row, cur_col, cur_col);
 
         let row = &mut self.grid[cur_row];
-        for c in (cur_col + count..self.cols).rev() {
-            row.cells[c] = row.cells[c - count];
-        }
-        for c in cur_col..cur_col + count {
-            row.cells[c].reset();
-            row.cells[c].bg = bg;
-        }
-        if row.cells[self.cols - 1].flags.contains(CellFlags::WIDE_CHAR) {
-            row.cells[self.cols - 1].reset();
-            row.cells[self.cols - 1].bg = bg;
+        // `copy_within` handles the overlap correctly, so this replaces the
+        // reverse per-cell loop.
+        row.cells.copy_within(cur_col..cols - count, cur_col + count);
+        row.cells[cur_col..cur_col + count].fill(Cell::blank(bg));
+        // A wide char pushed half-off the right edge leaves a dangling lead cell.
+        if row.cells[cols - 1].flags.contains(CellFlags::WIDE_CHAR) {
+            row.cells[cols - 1] = Cell::blank(bg);
         }
         row.is_dirty = true;
     }
@@ -976,10 +1042,7 @@ impl ScreenBuffer {
         self.clear_split_wide_chars(cur_row, cur_col, end_col);
 
         let row = &mut self.grid[cur_row];
-        for c in cur_col..end_col {
-            row.cells[c].reset();
-            row.cells[c].bg = bg;
-        }
+        row.cells[cur_col..end_col].fill(Cell::blank(bg));
         row.is_dirty = true;
     }
 
@@ -991,11 +1054,15 @@ impl ScreenBuffer {
             return;
         }
         let count = n.min(bottom - cur_row + 1);
+        let cols = self.cols;
         for _ in 0..count {
-            self.grid.remove(bottom);
-            let mut new_row = Row::new(self.cols);
-            new_row.clear(bg);
-            self.grid.insert(cur_row, new_row);
+            // The row pushed out of the bottom of the region becomes the blank row
+            // inserted at the top, so no allocation is needed.
+            let Some(mut row) = self.grid.remove(bottom) else {
+                break;
+            };
+            row.reuse_as_blank(cols, bg);
+            self.grid.insert(cur_row, row);
         }
         self.cursor.pending_wrap = false;
     }
@@ -1008,11 +1075,13 @@ impl ScreenBuffer {
             return;
         }
         let count = n.min(bottom - cur_row + 1);
+        let cols = self.cols;
         for _ in 0..count {
-            self.grid.remove(cur_row);
-            let mut new_row = Row::new(self.cols);
-            new_row.clear(bg);
-            self.grid.insert(bottom, new_row);
+            let Some(mut row) = self.grid.remove(cur_row) else {
+                break;
+            };
+            row.reuse_as_blank(cols, bg);
+            self.grid.insert(bottom, row);
         }
         self.cursor.pending_wrap = false;
     }
@@ -1023,11 +1092,9 @@ impl ScreenBuffer {
                 let cur_row = self.cursor.row;
                 let cur_col = self.cursor.col;
                 self.clear_split_wide_chars(cur_row, cur_col, self.cols);
-                for c in cur_col..self.cols {
-                    self.grid[cur_row].cells[c].reset();
-                    self.grid[cur_row].cells[c].bg = bg;
-                }
-                self.grid[cur_row].is_dirty = true;
+                let row = &mut self.grid[cur_row];
+                row.cells[cur_col..].fill(Cell::blank(bg));
+                row.is_dirty = true;
                 for r in (cur_row + 1)..self.rows {
                     self.grid[r].clear(bg);
                 }
@@ -1040,11 +1107,9 @@ impl ScreenBuffer {
                 }
                 let end = cur_col.min(self.cols.saturating_sub(1));
                 self.clear_split_wide_chars(cur_row, 0, end + 1);
-                for c in 0..=end {
-                    self.grid[cur_row].cells[c].reset();
-                    self.grid[cur_row].cells[c].bg = bg;
-                }
-                self.grid[cur_row].is_dirty = true;
+                let row = &mut self.grid[cur_row];
+                row.cells[..=end].fill(Cell::blank(bg));
+                row.is_dirty = true;
             }
             2 | 3 => {
                 for r in 0..self.rows {
@@ -1066,20 +1131,16 @@ impl ScreenBuffer {
         match mode {
             0 => {
                 self.clear_split_wide_chars(cur_row, cur_col, self.cols);
-                for c in cur_col..self.cols {
-                    self.grid[cur_row].cells[c].reset();
-                    self.grid[cur_row].cells[c].bg = bg;
-                }
-                self.grid[cur_row].is_dirty = true;
+                let row = &mut self.grid[cur_row];
+                row.cells[cur_col..].fill(Cell::blank(bg));
+                row.is_dirty = true;
             }
             1 => {
                 let end = cur_col.min(self.cols.saturating_sub(1));
                 self.clear_split_wide_chars(cur_row, 0, end + 1);
-                for c in 0..=end {
-                    self.grid[cur_row].cells[c].reset();
-                    self.grid[cur_row].cells[c].bg = bg;
-                }
-                self.grid[cur_row].is_dirty = true;
+                let row = &mut self.grid[cur_row];
+                row.cells[..=end].fill(Cell::blank(bg));
+                row.is_dirty = true;
             }
             2 => {
                 self.grid[cur_row].clear(bg);
@@ -1228,8 +1289,8 @@ pub struct ScreenGrid {
     pub primary: ScreenBuffer,
     pub alternate: ScreenBuffer,
     pub is_alternate: bool,
-    pub next_hyperlink_id: u32,
-    pub hyperlinks: HashMap<u32, Arc<String>>,
+    pub next_hyperlink_id: NonZeroU32,
+    pub hyperlinks: HashMap<NonZeroU32, Arc<String>>,
     pub next_image_id: u32,
 }
 
@@ -1239,20 +1300,25 @@ impl ScreenGrid {
             primary: ScreenBuffer::new(rows, cols, max_scrollback),
             alternate: ScreenBuffer::new(rows, cols, 0),
             is_alternate: false,
-            next_hyperlink_id: 1,
+            // Starts at 1: zero is reserved as the `None` niche in `Cell::hyperlink_id`.
+            next_hyperlink_id: NonZeroU32::new(1).unwrap(),
             hyperlinks: HashMap::new(),
             next_image_id: 1,
         }
     }
 
-    pub fn register_hyperlink(&mut self, uri: &str) -> u32 {
+    pub fn register_hyperlink(&mut self, uri: &str) -> NonZeroU32 {
         let id = self.next_hyperlink_id;
-        self.next_hyperlink_id += 1;
+        // Saturate rather than wrap. Wrapping would eventually hand out 0, which is
+        // reserved as the `None` niche in `Cell::hyperlink_id`. Note that ids are not
+        // interned today, so a shell emitting the same URI repeatedly grows this table;
+        // saturating merely makes the degenerate case safe, not cheap.
+        self.next_hyperlink_id = self.next_hyperlink_id.checked_add(1).unwrap_or(id);
         self.hyperlinks.insert(id, Arc::new(uri.to_string()));
         id
     }
 
-    pub fn get_hyperlink(&self, id: u32) -> Option<&str> {
+    pub fn get_hyperlink(&self, id: NonZeroU32) -> Option<&str> {
         self.hyperlinks.get(&id).map(|s| s.as_str())
     }
 

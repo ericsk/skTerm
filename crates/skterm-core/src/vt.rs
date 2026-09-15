@@ -2,6 +2,7 @@
 
 use crate::graphics::{GraphicImage, KittyGraphicsParser, SixelDecoder};
 use crate::grid::{CellFlags, Color, CursorShape, NamedColor, SavedCursor, ScreenGrid};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use tracing::info;
 use vte::{Params, Perform};
@@ -33,7 +34,7 @@ pub struct TerminalState {
     pub bg: Color,
     pub flags: CellFlags,
     pub current_hyperlink: Option<Arc<String>>,
-    pub current_hyperlink_id: Option<u32>,
+    pub current_hyperlink_id: Option<NonZeroU32>,
     pub title: String,
     pub application_cursor_keys: bool,
     pub bracketed_paste: bool,
@@ -105,19 +106,15 @@ impl TerminalState {
     }
 
     fn parse_sgr(&mut self, params: &Params) {
-        let mut flat_params = Vec::new();
-        for param in params.iter() {
-            for &val in param {
-                flat_params.push(val);
-            }
-        }
-
-        if flat_params.is_empty() {
+        if params.is_empty() {
             self.reset_sgr();
             return;
         }
 
-        let mut iter = flat_params.into_iter();
+        // Flatten subparameters lazily. Building a `Vec` here cost one malloc/free per
+        // `ESC[...m`, which for colored output (ls, cargo, rg, vim, tmux) is more
+        // frequent than one per printed character.
+        let mut iter = params.iter().flat_map(|p| p.iter().copied());
         while let Some(code) = iter.next() {
             match code {
                 0 => self.reset_sgr(),
