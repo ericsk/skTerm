@@ -370,8 +370,11 @@ fn get_cached_font_index() -> &'static [(PathBuf, String)] {
                         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                             let ext_lower = ext.to_lowercase();
                             if ext_lower == "ttf" || ext_lower == "ttc" || ext_lower == "otf" {
-                                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                                    let clean = clean_name(file_name);
+                                // Index the stem, not the file name: the extension
+                                // would otherwise count as "extra" characters when
+                                // ranking candidates below.
+                                if let Some(stem) = path.file_stem().and_then(|n| n.to_str()) {
+                                    let clean = clean_name(stem);
                                     files.push((path, clean));
                                 }
                             }
@@ -382,6 +385,87 @@ fn get_cached_font_index() -> &'static [(PathBuf, String)] {
         }
         files
     })
+}
+
+/// Style keywords that change how a face looks.
+///
+/// Order matters only for readability; every token is tested independently.
+/// Longer spellings are listed next to the shorter ones they contain so it is
+/// obvious that e.g. "semicondensed" also trips "condensed" -- that double count
+/// is harmless because it only makes an unwanted face rank even lower.
+const STYLE_TOKENS: &[&str] = &[
+    "italic",
+    "oblique",
+    "thin",
+    "extralight",
+    "ultralight",
+    "semilight",
+    "light",
+    "extrabold",
+    "ultrabold",
+    "semibold",
+    "demibold",
+    "bold",
+    "black",
+    "heavy",
+    "medium",
+    "ultracondensed",
+    "extracondensed",
+    "semicondensed",
+    "condensed",
+    "semiexpanded",
+    "extraexpanded",
+    "expanded",
+    "narrow",
+];
+
+/// Count style keywords the candidate has but the query never asked for.
+///
+/// Returns `None` when the candidate is missing a style the query *did* ask for,
+/// which is what stops an italic request from being satisfied by an upright face.
+fn style_penalty(query: &str, candidate: &str) -> Option<u32> {
+    let mut penalty = 0;
+    for token in STYLE_TOKENS {
+        let wanted = query.contains(token);
+        let present = candidate.contains(token);
+        if wanted && !present {
+            return None;
+        }
+        if present && !wanted {
+            penalty += 1;
+        }
+    }
+    Some(penalty)
+}
+
+/// Rank a candidate against a cleaned query. Lower is better; `None` means the
+/// candidate is not an acceptable match at all.
+///
+/// A family name is normally a prefix of every style in that family, so a query
+/// like `notosansmnerdfontmono` matches three dozen files. Ranking keeps that from
+/// being decided by `read_dir` order. Style mismatches dominate the score because
+/// length alone would prefer "Italic" (6 chars) over "Regular" (7).
+fn match_score(query: &str, candidate: &str) -> Option<u32> {
+    let at = candidate.find(query)?;
+    let penalty = style_penalty(query, candidate)?;
+    let extra = (candidate.len() - query.len()) as u32;
+    // Prefer the family name at the start ("Family-Regular") over buried in the
+    // middle of some unrelated name.
+    let position = if at == 0 { 0 } else { 1 };
+    Some(penalty * 10_000 + position * 1_000 + extra)
+}
+
+/// Load the best-scoring candidate, skipping any file that fails to parse.
+fn load_best(mut scored: Vec<(u32, &PathBuf)>) -> Option<(Font, PathBuf)> {
+    scored.sort_by_key(|(score, path)| (*score, (*path).clone()));
+    for (_, path) in scored {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                return Some((font, path.clone()));
+            }
+        }
+    }
+    None
 }
 
 /// Search user and system font directories for a font family name, returning the parsed Font.
@@ -412,15 +496,13 @@ pub fn find_font_file(query: &str) -> Option<(Font, PathBuf)> {
 
     let files = get_cached_font_index();
 
-    // 1. Direct contains match
-    for (path, clean_f) in files {
-        if clean_f.contains(&clean_q) {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
-                    return Some((font, path.clone()));
-                }
-            }
-        }
+    // 1. Best contains match
+    let scored: Vec<(u32, &PathBuf)> = files
+        .iter()
+        .filter_map(|(path, clean_f)| Some((match_score(&clean_q, clean_f)?, path)))
+        .collect();
+    if let Some(found) = load_best(scored) {
+        return Some(found);
     }
 
     // 2. Multi-token fallback match
@@ -428,6 +510,11 @@ pub fn find_font_file(query: &str) -> Option<(Font, PathBuf)> {
         vec!["noto", "mono"]
     } else if clean_q.contains("noto") && clean_q.contains("nerd") {
         vec!["noto", "nerd"]
+    } else if clean_q.contains("sanstc") {
+        // Anchor on "sanstc" rather than a bare "tc": "tc" also occurs inside
+        // "NotoSansMNerdFont-Condensed..." ("fon-tc-ondensed"), which would pull in
+        // a completely unrelated family.
+        vec!["sanstc"]
     } else if clean_q.contains("noto") && clean_q.contains("tc") {
         vec!["noto", "tc"]
     } else {
@@ -435,14 +522,18 @@ pub fn find_font_file(query: &str) -> Option<(Font, PathBuf)> {
     };
 
     if !tokens.is_empty() {
-        for (path, clean_f) in files {
-            if tokens.iter().all(|t| clean_f.contains(t)) {
-                if let Ok(bytes) = std::fs::read(path) {
-                    if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
-                        return Some((font, path.clone()));
-                    }
-                }
-            }
+        let scored: Vec<(u32, &PathBuf)> = files
+            .iter()
+            .filter(|(_, clean_f)| tokens.iter().all(|t| clean_f.contains(t)))
+            .filter_map(|(path, clean_f)| {
+                // Same style rules as above: a loose family match must still not
+                // hand back an upright face for an italic request.
+                let penalty = style_penalty(&clean_q, clean_f)?;
+                Some((penalty * 10_000 + clean_f.len() as u32, path))
+            })
+            .collect();
+        if let Some(found) = load_best(scored) {
+            return Some(found);
         }
     }
 
@@ -522,4 +613,131 @@ pub fn load_configured_font_chain(
     });
 
     (primary, bold_font, italic_font, fallback_fonts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The real filenames that caused the bug: a 36-file Nerd Font family where
+    /// every name starts with the family the user configured.
+    ///
+    /// Deliberately ordered with the *wrong* face first, which is what
+    /// `read_dir` actually returned on the machine this was reported from. A
+    /// first-match-wins implementation passes only if Regular happens to come
+    /// first, so the fixture must not be sorted.
+    fn nerd_family() -> Vec<String> {
+        [
+            "NotoSansMNerdFontMono-SemiCondensedRegular",
+            "NotoSansMNerdFontMono-Thin",
+            "NotoSansMNerdFontMono-CondensedBold",
+            "NotoSansMNerdFontMono-Regular",
+            "NotoSansMNerdFontMono-Bold",
+            "NotoSansMNerdFontMono-ExtraCondensedThin",
+        ]
+        .iter()
+        .map(|s| clean_name(s))
+        .collect()
+    }
+
+    fn best<'a>(query: &str, candidates: &'a [String]) -> Option<&'a str> {
+        let q = clean_name(query);
+        candidates
+            .iter()
+            .filter_map(|c| Some((match_score(&q, c)?, c.as_str())))
+            .min_by_key(|(score, _)| *score)
+            .map(|(_, c)| c)
+    }
+
+    #[test]
+    fn family_query_prefers_regular_over_width_variants() {
+        // Was picking whichever file `read_dir` happened to yield first, which on
+        // the reporter's machine was SemiCondensedRegular.
+        let files = nerd_family();
+        assert_eq!(
+            best("NotoSansMNerdFontMono", &files),
+            Some(clean_name("NotoSansMNerdFontMono-Regular").as_str())
+        );
+    }
+
+    #[test]
+    fn bold_query_picks_the_bold_face() {
+        let files = nerd_family();
+        assert_eq!(
+            best("NotoSansMNerdFontMonoBold", &files),
+            Some(clean_name("NotoSansMNerdFontMono-Bold").as_str())
+        );
+    }
+
+    #[test]
+    fn bold_query_rejects_faces_without_bold() {
+        let q = clean_name("NotoSansMNerdFontMonoBold");
+        // Same family, wrong weight: must never be offered as the bold face.
+        assert_eq!(
+            style_penalty(&q, &clean_name("NotoSansMNerdFontMono-Regular")),
+            None
+        );
+        // Right weight but an extra width axis: usable, yet it must rank behind
+        // the plain Bold.
+        let plain = style_penalty(&q, &clean_name("NotoSansMNerdFontMono-Bold")).unwrap();
+        let condensed =
+            style_penalty(&q, &clean_name("NotoSansMNerdFontMono-CondensedBold")).unwrap();
+        assert_eq!(plain, 0);
+        assert!(plain < condensed);
+    }
+
+    #[test]
+    fn italic_query_never_matches_an_upright_face() {
+        // The old code answered an italic request with an upright SemiCondensed
+        // face, so italic text silently rendered straight. That came from the
+        // loose token fallback, so assert on `style_penalty` too -- it is the
+        // guard that path relies on, and `best` alone would not cover it.
+        let q = clean_name("NotoSansMNerdFontMonoItalic");
+        assert_eq!(best("NotoSansMNerdFontMonoItalic", &nerd_family()), None);
+        for upright in [
+            "NotoSansMNerdFontMono-Regular",
+            "NotoSansMNerdFontMono-SemiCondensedRegular",
+            "NotoMonoNerdFont-Regular",
+        ] {
+            assert_eq!(
+                style_penalty(&q, &clean_name(upright)),
+                None,
+                "{} is not an italic face",
+                upright
+            );
+        }
+        // A genuine italic is still accepted.
+        assert!(style_penalty(&q, &clean_name("NotoSansMNerdFontMono-Italic")).is_some());
+    }
+
+    #[test]
+    fn unstyled_query_rejects_nothing_but_ranks_plain_first() {
+        let q = clean_name("NotoSansMNerdFontMono");
+        let regular = match_score(&q, &clean_name("NotoSansMNerdFontMono-Regular")).unwrap();
+        for styled in [
+            "NotoSansMNerdFontMono-Thin",
+            "NotoSansMNerdFontMono-SemiCondensedRegular",
+            "NotoSansMNerdFontMono-CondensedBold",
+        ] {
+            let score = match_score(&q, &clean_name(styled)).unwrap();
+            assert!(regular < score, "Regular should outrank {}", styled);
+        }
+    }
+
+    #[test]
+    fn exact_name_beats_a_longer_superstring() {
+        let q = clean_name("NotoSansTC");
+        let exact = match_score(&q, &clean_name("NotoSansTC")).unwrap();
+        let variable = match_score(&q, &clean_name("NotoSansTC-VariableFont_wght")).unwrap();
+        assert_eq!(exact, 0);
+        assert!(exact < variable);
+    }
+
+    #[test]
+    fn family_buried_mid_name_ranks_below_a_prefix_match() {
+        let q = clean_name("mono");
+        let prefix = match_score(&q, &clean_name("Mono-Regular")).unwrap();
+        let infix = match_score(&q, &clean_name("NotoSansMono")).unwrap();
+        assert!(prefix < infix);
+    }
 }
