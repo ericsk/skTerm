@@ -687,4 +687,131 @@ mod tests {
         ws.select_tab(8);
         assert_eq!(ws.active_tab_idx, 2);
     }
+    /// The bug these cover: `fs::write` truncates in place and then streams the
+    /// body, so the preference autosave and the geometry autosave could interleave
+    /// inside `config.toml` and leave invalid TOML behind -- after which startup
+    /// silently fell back to defaults and the user's font setting looked ignored.
+    ///
+    /// Note the payload sizes below. A ~1 KB config is usually written in a single
+    /// syscall, which hides the bug; these use a config big enough that the write
+    /// is necessarily split, which is what makes the tests actually fail against
+    /// the old `fs::write` implementation.
+    mod config_persistence {
+        use super::*;
+        use crate::config::write_config_atomically;
+
+        fn temp_dir(tag: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "skterm-cfg-test-{}-{}-{}",
+                tag,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// A config whose serialized form is `filler_len` bytes larger than default.
+        fn bulky_config(family: &str, filler_len: usize) -> Config {
+            let mut cfg = Config::default();
+            cfg.font.family = family.to_string();
+            cfg.terminal
+                .env
+                .insert("SKTERM_TEST_FILLER".to_string(), "a".repeat(filler_len));
+            cfg
+        }
+
+        #[test]
+        fn concurrent_writes_never_leave_invalid_toml() {
+            let dir = temp_dir("concurrent");
+            let path = dir.join("config.toml");
+
+            // Different families AND different lengths: a torn file shows up either
+            // as unparseable TOML or as a blend of the two documents.
+            let small = bulky_config("Menlo", 64 * 1024);
+            let large = bulky_config("JetBrains Mono", 192 * 1024);
+            let small_toml = toml::to_string_pretty(&small).unwrap();
+            let large_toml = toml::to_string_pretty(&large).unwrap();
+
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let path = path.clone();
+                    let body = if i % 2 == 0 {
+                        small_toml.clone()
+                    } else {
+                        large_toml.clone()
+                    };
+                    std::thread::spawn(move || {
+                        for _ in 0..40 {
+                            write_config_atomically(&path, &body).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            let parsed = toml::from_str::<Config>(&content)
+                .expect("config.toml must always be valid TOML after concurrent writes");
+            assert!(
+                parsed == small || parsed == large,
+                "file contains a blend of two different writes"
+            );
+
+            // The temp file must be cleaned up, not left next to the config.
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n != "config.toml")
+                .collect();
+            assert!(leftovers.is_empty(), "stray temp files: {:?}", leftovers);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn reader_never_observes_a_partial_file() {
+            // This is what the file watcher does: read the config whenever it
+            // changes. It must never parse a half-written document.
+            let dir = temp_dir("reader");
+            let path = dir.join("config.toml");
+            let cfg = bulky_config("Menlo", 256 * 1024);
+            let body = toml::to_string_pretty(&cfg).unwrap();
+            write_config_atomically(&path, &body).unwrap();
+
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer_done = done.clone();
+            let writer_path = path.clone();
+            let writer_body = body.clone();
+            let writer = std::thread::spawn(move || {
+                for _ in 0..100 {
+                    write_config_atomically(&writer_path, &writer_body).unwrap();
+                }
+                writer_done.store(true, std::sync::atomic::Ordering::Release);
+            });
+
+            let mut reads = 0usize;
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    assert_eq!(
+                        content.len(),
+                        body.len(),
+                        "reader saw a partially written config ({} of {} bytes)",
+                        content.len(),
+                        body.len()
+                    );
+                    reads += 1;
+                }
+            }
+            writer.join().unwrap();
+            assert!(reads > 0, "test did not actually read anything");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }

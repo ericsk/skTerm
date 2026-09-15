@@ -152,7 +152,7 @@ const SCROLLBAR_FADE_AFTER: Duration = Duration::from_millis(1500);
 /// Cadence of the AI-agent process-tree rescan (only while the sidebar is open).
 const AGENT_SCAN_INTERVAL: Duration = Duration::from_millis(1500);
 /// Debounce before persisting config.toml after a geometry or preference change.
-const GEOMETRY_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
+const CONFIG_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 /// Backstop cadence for reaping panes whose child exited without a pty EOF.
 const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -434,8 +434,11 @@ pub struct App {
     pub sidebar_open: bool,
     pub clipboard: Option<Arc<Mutex<Clipboard>>>,
     pub modifiers: ModifiersState,
-    pub pending_geometry_save: bool,
-    pub last_resize_time: Option<Instant>,
+    /// Set whenever `current_config` differs from what is on disk. Both window
+    /// geometry changes and live preference edits funnel through here so there is
+    /// only ever one writer, debounced by `last_config_change`.
+    pub pending_config_save: bool,
+    pub last_config_change: Option<Instant>,
     pub editing_agent_pane: Option<(WindowId, u32, u32)>,
     pub editing_agent_text: String,
     pub editing_agent_cursor: usize,
@@ -479,8 +482,8 @@ impl App {
             sidebar_open: false,
             clipboard,
             modifiers: ModifiersState::default(),
-            pending_geometry_save: false,
-            last_resize_time: None,
+            pending_config_save: false,
+            last_config_change: None,
             editing_agent_pane: None,
             editing_agent_text: String::new(),
             editing_agent_cursor: 0,
@@ -887,14 +890,13 @@ impl App {
             session.window.request_redraw();
         }
 
-        // Auto-save to config.toml in background thread
+        // Mark dirty rather than writing here. `check_changed` fires on *every*
+        // preferences-window event, so dragging a slider used to spawn a writer
+        // thread per mouse move; those raced each other inside the same file and
+        // could leave invalid TOML on disk.
         if persist {
-            if let Ok(toml_str) = toml::to_string_pretty(new_cfg) {
-                let path = self.config_manager.path.clone();
-                std::thread::spawn(move || {
-                    let _ = std::fs::write(&path, toml_str);
-                });
-            }
+            self.pending_config_save = true;
+            self.last_config_change = Some(Instant::now());
         }
     }
 
@@ -1291,8 +1293,8 @@ impl ApplicationHandler<AppEvent> for App {
                     if new_cols != current_cols || new_rows != current_rows {
                         self.config_manager.current_config.window.columns = new_cols;
                         self.config_manager.current_config.window.rows = new_rows;
-                        self.pending_geometry_save = true;
-                        self.last_resize_time = Some(Instant::now());
+                        self.pending_config_save = true;
+                        self.last_config_change = Some(Instant::now());
                     }
                     #[cfg(target_os = "macos")]
                     {
@@ -3159,18 +3161,25 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
 
-        // 3. Debounced window geometry auto-save.
-        if self.pending_geometry_save {
-            if let Some(last) = self.last_resize_time {
-                let deadline = last + GEOMETRY_SAVE_DEBOUNCE;
+        // 3. Debounced config auto-save. This is the only place that writes
+        // config.toml while running, which is what keeps the file consistent.
+        if self.pending_config_save {
+            if let Some(last) = self.last_config_change {
+                let deadline = last + CONFIG_SAVE_DEBOUNCE;
                 if now >= deadline {
-                    self.pending_geometry_save = false;
-                    if let Ok(toml_str) = toml::to_string_pretty(&self.config_manager.current_config)
-                    {
-                        let path = self.config_manager.path.clone();
-                        std::thread::spawn(move || {
-                            let _ = std::fs::write(&path, toml_str);
-                        });
+                    self.pending_config_save = false;
+                    match toml::to_string_pretty(&self.config_manager.current_config) {
+                        Ok(toml_str) => {
+                            let path = self.config_manager.path.clone();
+                            std::thread::spawn(move || {
+                                if let Err(e) = crate::config::write_config_atomically(
+                                    &path, &toml_str,
+                                ) {
+                                    error!("Failed to save config to {:?}: {}", path, e);
+                                }
+                            });
+                        }
+                        Err(e) => error!("Failed to serialize config: {}", e),
                     }
                 } else {
                     arm(deadline);
@@ -3194,5 +3203,25 @@ impl ApplicationHandler<AppEvent> for App {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Wait,
         });
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Saves are debounced, so a change made in the last few hundred
+        // milliseconds before quitting would otherwise never reach disk. Write it
+        // synchronously here rather than on a thread we are about to outlive.
+        if self.pending_config_save {
+            self.pending_config_save = false;
+            match toml::to_string_pretty(&self.config_manager.current_config) {
+                Ok(toml_str) => {
+                    if let Err(e) = crate::config::write_config_atomically(
+                        &self.config_manager.path,
+                        &toml_str,
+                    ) {
+                        error!("Failed to flush config on exit: {}", e);
+                    }
+                }
+                Err(e) => error!("Failed to serialize config on exit: {}", e),
+            }
+        }
     }
 }

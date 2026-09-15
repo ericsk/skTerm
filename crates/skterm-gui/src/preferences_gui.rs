@@ -314,7 +314,10 @@ impl PreferencesGui {
                 {
                     let new_cfg = self.to_config(&config_manager.current_config);
                     if let Ok(toml_str) = toml::to_string_pretty(&new_cfg) {
-                        let _ = fs::write(&config_manager.path, toml_str);
+                        let _ = crate::config::write_config_atomically(
+                            &config_manager.path,
+                            &toml_str,
+                        );
                         config_manager.current_config = new_cfg;
                         info!(
                             "Saved preferences directly from GUI to {:?}",

@@ -5,11 +5,12 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Root Configuration
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -483,6 +484,62 @@ pub fn parse_hex_color(hex: &str) -> Option<[f32; 4]> {
 /// Callback used by the file watcher to wake a sleeping event loop.
 pub type ConfigWakeup = Arc<dyn Fn() + Send + Sync>;
 
+/// Serialises config writes across threads.
+///
+/// Persisting happens on background threads from more than one place (live
+/// preference edits and the debounced geometry autosave). `fs::write` opens with
+/// `O_TRUNC` and then writes, so two of those overlapping would interleave their
+/// bytes in the same file -- which is how a `config.toml` ends up with a
+/// half-finished key like `l_ms = 500` and a duplicated table header.
+static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Write `contents` to `path` atomically.
+///
+/// Writes a sibling temp file, flushes it to disk, then `rename`s it over the
+/// target. `rename` within a directory is atomic, so readers -- including our own
+/// file watcher -- only ever observe the complete old or the complete new file,
+/// never a partial one.
+pub fn write_config_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    // Poisoning only means some other writer panicked; the file itself is still
+    // consistent because that writer never renamed a partial temp file into place.
+    let _guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Keep the temp file in the same directory so the rename stays on one
+    // filesystem. The watcher matches on the exact config path, so it ignores it.
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    let result = (|| {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Copy an unparseable config aside so the user can recover their settings.
+/// Returns the path it was copied to (or the original path if the copy failed).
+fn backup_unreadable_config(path: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = path.with_extension(format!("toml.invalid.{}", stamp));
+    match fs::copy(path, &backup) {
+        Ok(_) => backup,
+        Err(e) => {
+            warn!("Could not back up invalid config: {}", e);
+            path.to_path_buf()
+        }
+    }
+}
 
 /// Hot-reloading configuration manager
 pub struct ConfigManager {
@@ -508,9 +565,14 @@ impl ConfigManager {
                         cfg
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to parse config at {:?}: {:?}. Using default.",
-                            path, e
+                        // Falling back to defaults silently is dangerous: the next
+                        // autosave would write those defaults over the file and
+                        // destroy whatever the user actually had. Keep a copy.
+                        let backup = backup_unreadable_config(&path);
+                        error!(
+                            "Config at {:?} is not valid TOML and was ignored: {}. \
+                             A copy was kept at {:?}. Starting from defaults.",
+                            path, e, backup
                         );
                         Config::default()
                     }
@@ -525,11 +587,8 @@ impl ConfigManager {
             }
         } else {
             let default_cfg = Config::default();
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
             let template = default_config_template();
-            if fs::write(&path, template).is_ok() {
+            if write_config_atomically(&path, template).is_ok() {
                 info!("Created default config with template at {:?}", path);
             }
             default_cfg
@@ -575,10 +634,7 @@ impl ConfigManager {
     /// Open configuration file in default text editor
     pub fn open_in_editor(&self) {
         if !self.path.exists() {
-            if let Some(parent) = self.path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let _ = fs::write(&self.path, default_config_template());
+            let _ = write_config_atomically(&self.path, default_config_template());
         }
 
         #[cfg(target_os = "macos")]
