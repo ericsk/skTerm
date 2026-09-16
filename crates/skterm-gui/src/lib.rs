@@ -9,6 +9,7 @@ pub mod layout;
 pub mod macos_textfield;
 pub mod preferences_gui;
 pub mod preferences_window;
+pub mod tab_title;
 
 pub use app_window::App;
 pub use config::{default_config_template, parse_hex_color, Config, ConfigManager, Theme};

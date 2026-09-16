@@ -205,6 +205,12 @@ impl Terminal {
         self.state.grid.url_at(row, col)
     }
 
+    /// Name of the process currently in the foreground of this terminal's pty,
+    /// e.g. `nvim` while editing and the shell name otherwise.
+    pub fn foreground_process_name(&self) -> Option<String> {
+        self.pty.as_ref()?.foreground_process_name()
+    }
+
     /// Return the current working directory of this terminal (from OSC 7 or child OS process CWD).
     pub fn current_working_directory(&self) -> Option<String> {
         if let Some(ref cwd) = self.state.current_working_directory {
@@ -216,18 +222,9 @@ impl Terminal {
         if let Some(pid) = self.process_id() {
             #[cfg(target_os = "macos")]
             {
-                if let Ok(output) = std::process::Command::new("lsof")
-                    .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-                    .output()
-                {
-                    if let Ok(text) = String::from_utf8(output.stdout) {
-                        for line in text.lines() {
-                            if let Some(path) = line.strip_prefix('n') {
-                                if std::path::Path::new(path).exists() {
-                                    return Some(path.to_string());
-                                }
-                            }
-                        }
+                if let Some(path) = crate::pty::process_cwd(pid as libc::pid_t) {
+                    if std::path::Path::new(&path).exists() {
+                        return Some(path);
                     }
                 }
             }

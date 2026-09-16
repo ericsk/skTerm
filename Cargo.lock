@@ -2318,6 +2318,7 @@ dependencies = [
  "bitflags 2.13.1",
  "crossbeam-channel",
  "image",
+ "libc",
  "portable-pty",
  "thiserror 2.0.19",
  "tracing",

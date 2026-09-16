@@ -479,4 +479,131 @@ mod tests {
             assert_eq!(cells[3].c, 'd');
         }
     }
+
+    /// Covers the lookup behind the macOS native tab label.
+    #[cfg(unix)]
+    mod foreground_process {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        fn spawn_sh() -> PtyProcess {
+            PtyProcess::spawn_with_options(
+                24,
+                80,
+                PtySpawnOptions {
+                    shell: Some("/bin/sh".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("spawn pty")
+        }
+
+        /// Poll until the reported name is `want`, or give up after 5s.
+        fn wait_for_name(pty: &PtyProcess, want: &str) -> Option<String> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut last = None;
+            while Instant::now() < deadline {
+                last = pty.foreground_process_name();
+                if last.as_deref() == Some(want) {
+                    return last;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            last
+        }
+
+        /// Poll until a name is reported at all, or give up after 5s.
+        fn wait_for_any_name(pty: &PtyProcess) -> Option<String> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if let Some(name) = pty.foreground_process_name() {
+                    return Some(name);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None
+        }
+
+        #[test]
+        fn reports_the_program_running_in_the_foreground() {
+            let pty = spawn_sh();
+
+            // Deliberately not asserting the exact shell name: macOS `/bin/sh -l`
+            // re-execs itself as bash a few ms in, so this alternates between
+            // "sh" and "bash" depending on when we sample.
+            let shell = wait_for_any_name(&pty);
+            assert!(
+                shell.is_some(),
+                "expected some foreground process name for a live shell"
+            );
+
+            // `exec` replaces the shell image in place, so the pid owning the
+            // foreground process group stays the same and only its name changes.
+            // That keeps this independent of whether job control is enabled.
+            pty.write_all(b"exec sleep 30\n").expect("write to pty");
+
+            let running = wait_for_name(&pty, "sleep");
+            assert_eq!(
+                running.as_deref(),
+                Some("sleep"),
+                "foreground name did not follow the exec'd program, got {:?}",
+                running
+            );
+        }
+
+        /// portable-pty reports the child's pid as soon as it forks, before the
+        /// child has exec'd the shell. Until then the child is a copy of us and
+        /// carries *our* name, which used to surface as a tab labelled with the
+        /// application's own name for the first ~12ms of every new tab.
+        #[test]
+        fn never_reports_the_host_process_during_spawn() {
+            // Poll from the instant of spawn, with no sleep, to land inside the
+            // pre-exec window rather than skipping over it.
+            let pty = spawn_sh();
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut observed = Vec::new();
+            let mut saw_shell = false;
+            while Instant::now() < deadline {
+                if let Some(name) = pty.foreground_process_name() {
+                    if !observed.contains(&name) {
+                        observed.push(name.clone());
+                    }
+                    // The test binary is named `skterm_core-<hash>`, so leaking
+                    // our own identity shows up as this substring.
+                    assert!(
+                        !name.to_lowercase().contains("skterm"),
+                        "reported the host process as the foreground program: {:?} \
+                         (all observed: {:?})",
+                        name,
+                        observed
+                    );
+                    saw_shell = true;
+                }
+            }
+
+            assert!(
+                saw_shell,
+                "never observed any foreground process, so the assertion above \
+                 never actually ran"
+            );
+        }
+
+        /// The cwd lookup replaced an `lsof` subprocess, so it is worth pinning
+        /// to a known answer rather than just "returns something".
+        #[test]
+        #[cfg(target_os = "macos")]
+        fn process_cwd_matches_our_own_working_directory() {
+            let expected = std::env::current_dir().expect("current_dir");
+            let got = crate::pty::process_cwd(unsafe { libc::getpid() })
+                .expect("process_cwd returned None for our own pid");
+
+            // Canonicalise both: on macOS /tmp and /private/tmp style symlinks
+            // make a raw string comparison unreliable.
+            assert_eq!(
+                std::fs::canonicalize(&got).expect("canonicalize result"),
+                std::fs::canonicalize(&expected).expect("canonicalize expected"),
+            );
+        }
+    }
 }

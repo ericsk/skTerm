@@ -18,4 +18,9 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 
+# Used for the pty's foreground-process and cwd lookups
+# (tcgetpgrp / proc_name / proc_pidinfo).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]

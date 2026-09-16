@@ -37,6 +37,58 @@ fn get_nswindow(window: &Window) -> *mut objc::runtime::Object {
     std::ptr::null_mut()
 }
 
+/// Label a macOS native tab independently of its window title.
+///
+/// A native tab normally borrows the window title. Ours starts with `skTerm — `,
+/// and because tab labels are narrow, several tabs all truncate to `skTerm — …`
+/// and become indistinguishable. `NSWindow.tab` lets us keep the app name in the
+/// window title (where Mission Control and the Window menu want it) while the tab
+/// itself shows only what identifies the session.
+///
+/// `tooltip` is shown on hover, which is where the full path can live.
+///
+/// # Safety
+/// `win_ptr` must be null or a valid pointer to a live `NSWindow`, and this must
+/// run on the main thread, as it messages AppKit objects.
+#[cfg(target_os = "macos")]
+pub unsafe fn set_macos_tab_label(win_ptr: *mut objc::runtime::Object, label: &str, tooltip: &str) {
+    use objc::{msg_send, sel, sel_impl};
+    if win_ptr.is_null() {
+        return;
+    }
+    // `-[NSWindow tab]` is 10.13+. Guard rather than assume, so an older system
+    // degrades to the plain window title instead of crashing.
+    let responds: bool = msg_send![win_ptr, respondsToSelector: sel!(tab)];
+    if !responds {
+        return;
+    }
+    let tab: *mut objc::runtime::Object = msg_send![win_ptr, tab];
+    if tab.is_null() {
+        return;
+    }
+
+    unsafe fn nsstring(s: &str) -> *mut objc::runtime::Object {
+        use objc::{class, msg_send, sel, sel_impl};
+        let bytes = s.as_bytes();
+        let data: *mut objc::runtime::Object = msg_send![class!(NSString), alloc];
+        // Length-explicit constructor: tab labels are user data and may contain
+        // interior NULs or invalid UTF-8 boundaries that a C-string API would cut.
+        let s: *mut objc::runtime::Object = msg_send![data,
+            initWithBytes: bytes.as_ptr() as *const std::os::raw::c_void
+            length: bytes.len()
+            encoding: 4usize]; // NSUTF8StringEncoding
+        s
+    }
+
+    let ns_label = nsstring(label);
+    let _: () = msg_send![tab, setTitle: ns_label];
+    let _: () = msg_send![ns_label, release];
+
+    let ns_tip = nsstring(tooltip);
+    let _: () = msg_send![tab, setToolTip: ns_tip];
+    let _: () = msg_send![ns_tip, release];
+}
+
 /// Centers the macOS window title by re-anchoring the titlebar `NSTextField`.
 ///
 /// # Safety
@@ -155,6 +207,11 @@ const AGENT_SCAN_INTERVAL: Duration = Duration::from_millis(1500);
 const CONFIG_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 /// Backstop cadence for reaping panes whose child exited without a pty EOF.
 const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+/// Cadence of native-tab label recomputation.
+///
+/// Recomputing means two process lookups per session, and a tab label that lags
+/// a `cd` by half a second is not something a user can perceive.
+const TAB_LABEL_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Active drag state when user clicks and drags a pane's scrollbar.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -187,9 +244,86 @@ pub struct TerminalSession {
     pub search_matches: Vec<skterm_core::SearchMatch>,
     pub active_search_idx: Option<usize>,
     pub last_ime_cursor_area: Option<(i32, i32, i32, i32)>,
+    /// Last time the native tab label was recomputed.
+    ///
+    /// Building the label costs a foreground-process lookup plus a cwd lookup
+    /// per session. Cheap individually, but not worth paying every frame for a
+    /// string that changes only when the user runs something or cds.
+    pub last_tab_label_refresh: Option<Instant>,
+    pub cached_tab_label: String,
+    pub cached_tab_tooltip: String,
+    /// PTY output arrived while this window was not the focused one.
+    pub has_unseen_output: bool,
 }
 
 impl TerminalSession {
+    /// Note that output arrived while this session was not the visible one.
+    ///
+    /// Resetting the throttle makes the indicator show up on the next pass of
+    /// the event loop instead of up to [`TAB_LABEL_REFRESH_INTERVAL`] later.
+    pub fn mark_unseen_output(&mut self) {
+        if !self.has_unseen_output {
+            self.has_unseen_output = true;
+            self.last_tab_label_refresh = None;
+        }
+    }
+
+    /// The user is now looking at this session, so its output is no longer unseen.
+    pub fn clear_unseen_output(&mut self) {
+        if self.has_unseen_output {
+            self.has_unseen_output = false;
+            self.last_tab_label_refresh = None;
+        }
+    }
+
+    /// Recompute this window's native tab label, at most once per
+    /// [`TAB_LABEL_REFRESH_INTERVAL`].
+    ///
+    /// Returns `Some((label, tooltip))` **only when the text actually changed**.
+    /// In the steady state a terminal sits in one directory running one program,
+    /// so this returns `None` and the caller skips the AppKit round-trip
+    /// entirely.
+    pub fn refresh_tab_label(
+        &mut self,
+        configured_shell: Option<&str>,
+    ) -> Option<(String, String)> {
+        let due = match self.last_tab_label_refresh {
+            Some(t) => t.elapsed() >= TAB_LABEL_REFRESH_INTERVAL,
+            None => true,
+        };
+        if !due {
+            return None;
+        }
+        self.last_tab_label_refresh = Some(Instant::now());
+
+        let active_tab = self.workspace.active_tab()?;
+        let terminal = active_tab.active_terminal()?;
+
+        let process = terminal.foreground_process_name();
+        let cwd = terminal.current_working_directory();
+        let home = std::env::var("HOME").ok();
+
+        let mut label = crate::tab_title::build_tab_label(
+            process.as_deref(),
+            cwd.as_deref(),
+            home.as_deref(),
+            configured_shell,
+            &active_tab.title,
+        );
+        if self.has_unseen_output {
+            label.insert_str(0, "• ");
+        }
+        // Hover is the only place with room for the path the label abbreviated away.
+        let tooltip = cwd.unwrap_or_else(|| label.clone());
+
+        if label == self.cached_tab_label && tooltip == self.cached_tab_tooltip {
+            return None;
+        }
+        self.cached_tab_label = label.clone();
+        self.cached_tab_tooltip = tooltip.clone();
+        Some((label, tooltip))
+    }
+
     pub fn update_search_matches(&mut self) {
         self.search_matches = self
             .workspace
@@ -1166,6 +1300,10 @@ impl App {
             search_matches: Vec::new(),
             active_search_idx: None,
             last_ime_cursor_area: None,
+            last_tab_label_refresh: None,
+            cached_tab_label: String::new(),
+            cached_tab_tooltip: String::new(),
+            has_unseen_output: false,
         };
 
         self.sessions.insert(window_id, session);
@@ -1183,8 +1321,12 @@ impl ApplicationHandler<AppEvent> for App {
                 // Clear before draining: any output that arrives while we are polling
                 // will flip the flag again and schedule another wakeup, so nothing is lost.
                 self.pty_wakeup_pending.store(false, Ordering::Release);
-                for session in self.sessions.values_mut() {
+                let active_session = self.active_session_id;
+                for (id, session) in self.sessions.iter_mut() {
                     if session.workspace.poll_all_ptys() {
+                        if active_session != Some(*id) {
+                            session.mark_unseen_output();
+                        }
                         session.window.request_redraw();
                     }
                 }
@@ -1249,6 +1391,10 @@ impl ApplicationHandler<AppEvent> for App {
         // 2. Track Focused Window
         if let WindowEvent::Focused(true) = event {
             self.active_session_id = Some(window_id);
+            // Selecting a tab is the user seeing it, so retire its activity dot.
+            if let Some(session) = self.sessions.get_mut(&window_id) {
+                session.clear_unseen_output();
+            }
         }
 
         // 3. Handle Terminal Window Session Events
@@ -2966,6 +3112,7 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
 
+
                     let tabs: Vec<TabItem> = session
                         .workspace
                         .tabs
@@ -3119,6 +3266,18 @@ impl ApplicationHandler<AppEvent> for App {
             });
         };
 
+        // Read before the loop: the loop takes `&mut self.sessions`, and these
+        // live on other fields.
+        let active_session = self.active_session_id;
+        #[cfg(target_os = "macos")]
+        let configured_shell: Option<&str> = self
+            .config_manager
+            .current_config
+            .terminal
+            .shell
+            .as_ref()
+            .map(|s| s.program.as_str());
+
         for (id, session) in self.sessions.iter_mut() {
             if session.workspace.has_dead_sessions() {
                 let all_dead = session.workspace.cleanup_dead_sessions();
@@ -3132,8 +3291,24 @@ impl ApplicationHandler<AppEvent> for App {
             } else {
                 let has_output = session.workspace.poll_all_ptys();
                 if has_output {
+                    // A macOS tab group shows exactly one of its windows at a
+                    // time, so output in any other session is output the user
+                    // cannot currently see. Flag it so the tab can say so.
+                    if active_session != Some(*id) {
+                        session.mark_unseen_output();
+                    }
                     session.window.request_redraw();
                 }
+            }
+
+            // Refreshed here rather than in `RedrawRequested`: macOS orders out
+            // the tab windows that are not selected, so they stop receiving
+            // redraws and their labels would freeze at whatever they last
+            // showed -- exactly the tabs whose labels matter most.
+            #[cfg(target_os = "macos")]
+            if let Some((label, tooltip)) = session.refresh_tab_label(configured_shell) {
+                let win_ptr = get_nswindow(&session.window);
+                unsafe { set_macos_tab_label(win_ptr, &label, &tooltip) };
             }
 
             // The scrollbar is shown for SCROLLBAR_FADE_AFTER after the last scroll and

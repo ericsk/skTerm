@@ -331,6 +331,126 @@ impl PtyProcess {
     pub fn process_id(&self) -> Option<u32> {
         self.pid
     }
+
+    /// Name of the process currently in the foreground of this pty.
+    ///
+    /// This is the terminal's own notion of "what is running right now" -- the
+    /// kernel tracks it as the pty's foreground process group, so running `vim`
+    /// reports `vim` and quitting it reports the shell again, with no process
+    /// tree walking.
+    ///
+    /// Two cheap syscalls (`tcgetpgrp` plus a name lookup); no subprocess. Still
+    /// worth throttling if called from a render loop.
+    #[cfg(unix)]
+    pub fn foreground_process_name(&self) -> Option<String> {
+        let pgid = self.master.process_group_leader()?;
+        if pgid <= 0 {
+            return None;
+        }
+        let name = process_name(pgid)?;
+        // portable-pty hands back the child's pid as soon as it forks, which is
+        // before the child has exec'd the shell. For that window (~12ms on every
+        // spawn) the child is still a copy of us and reports *our* name, which
+        // would label a brand new tab with the application's own name.
+        //
+        // Suppressing the match costs only the rare case of running this
+        // terminal inside itself, which then falls back to showing the
+        // directory -- exactly what an idle shell already shows.
+        if self_process_name().as_deref() == Some(name.as_str()) {
+            return None;
+        }
+        Some(name)
+    }
+
+    #[cfg(not(unix))]
+    pub fn foreground_process_name(&self) -> Option<String> {
+        None
+    }
+}
+
+/// This process's own name, resolved once.
+///
+/// Used to recognise a forked-but-not-yet-exec'd child, which still carries our
+/// name. Looked up through the same path as any other pid so the two results are
+/// directly comparable.
+#[cfg(unix)]
+fn self_process_name() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static SELF_NAME: OnceLock<Option<String>> = OnceLock::new();
+    SELF_NAME
+        .get_or_init(|| process_name(unsafe { libc::getpid() }))
+        .as_deref()
+}
+
+/// The current working directory of `pid`, via a single syscall.
+///
+/// The alternative is shelling out to `lsof`. That matters here because the tab
+/// label asks for the cwd on a timer, and macOS's stock `zshrc` only emits the
+/// OSC 7 that would make this unnecessary when `TERM_PROGRAM` is
+/// `Apple_Terminal` -- so for us this is the normal path, not a rare fallback.
+#[cfg(target_os = "macos")]
+pub fn process_cwd(pid: libc::pid_t) -> Option<String> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    // A short write means the kernel did not populate the struct, e.g. the
+    // process is gone or we are not allowed to look at it.
+    if written < size {
+        return None;
+    }
+    // libc declares this as `[[c_char; 32]; 32]` rather than `[c_char; MAXPATHLEN]`
+    // to work around an old-rustc limitation, so flatten it back out.
+    let bytes: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .iter()
+        .flatten()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    if bytes.is_empty() {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Look up a process name by pid.
+#[cfg(target_os = "macos")]
+fn process_name(pid: libc::pid_t) -> Option<String> {
+    // PROC_PIDPATHINFO_MAXSIZE is 4 * MAXPATHLEN; `proc_name` only ever writes a
+    // short basename, but oversizing the buffer costs nothing on the stack.
+    let mut buf = [0u8; 256];
+    let len =
+        unsafe { libc::proc_name(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
+    if len <= 0 {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&buf[..len as usize]).into_owned();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Look up a process name by pid.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn process_name(pid: libc::pid_t) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid)).ok()?;
+    let name = comm.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 /// Detect default system shell path based on platform and environment.
