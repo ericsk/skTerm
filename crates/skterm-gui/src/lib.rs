@@ -364,10 +364,26 @@ mod tests {
     }
 
     #[test]
-    fn test_preferences_window_font_scan() {
-        let fonts = preferences_window::scan_available_monospace_fonts();
-        // Even if empty on minimal CI container, it should safely return a Vec<String>
-        assert!(fonts.len() <= 30);
+    fn test_installed_font_families_are_deduplicated() {
+        let families = skterm_render::atlas::installed_font_families();
+        // A minimal CI container may have no fonts at all, so only assert the
+        // invariant that matters: one entry per family, not one per file.
+        // Must match the case-insensitive key the implementation dedups on,
+        // otherwise "Foo" and "FOO" would look distinct here and the assertion
+        // would pass vacuously.
+        let mut cleaned: Vec<String> = families
+            .iter()
+            .map(|f| {
+                f.chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .collect::<String>()
+                    .to_lowercase()
+            })
+            .collect();
+        let before = cleaned.len();
+        cleaned.sort();
+        cleaned.dedup();
+        assert_eq!(before, cleaned.len(), "family list contains duplicates");
     }
 
     #[test]

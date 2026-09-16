@@ -455,27 +455,10 @@ fn match_score(query: &str, candidate: &str) -> Option<u32> {
     Some(penalty * 10_000 + position * 1_000 + extra)
 }
 
-/// Load the best-scoring candidate, skipping any file that fails to parse.
-fn load_best(mut scored: Vec<(u32, &PathBuf)>) -> Option<(Font, PathBuf)> {
-    scored.sort_by_key(|(score, path)| (*score, (*path).clone()));
-    for (_, path) in scored {
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
-                return Some((font, path.clone()));
-            }
-        }
-    }
-    None
-}
-
-/// Search user and system font directories for a font family name, returning the parsed Font.
-pub fn find_font_file(query: &str) -> Option<(Font, PathBuf)> {
-    let clean_q = clean_name(query);
-    if clean_q.is_empty() {
-        return None;
-    }
-
-    // Fast-path direct lookup for standard system monospace fonts (avoids any directory scan on startup)
+/// A hard-coded path for a well-known system font, if `clean_q` names one.
+///
+/// Lets the common case skip the directory scan entirely on startup.
+fn direct_candidate(clean_q: &str) -> Option<PathBuf> {
     let direct_candidates: &[(&str, &str)] = &[
         ("menlo", "/System/Library/Fonts/Menlo.ttc"),
         ("monaco", "/System/Library/Fonts/Monaco.ttf"),
@@ -483,61 +466,138 @@ pub fn find_font_file(query: &str) -> Option<(Font, PathBuf)> {
         ("dejavusansmono", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"),
         ("consolas", "C:\\Windows\\Fonts\\consola.ttf"),
     ];
-    for (name, path_str) in direct_candidates {
-        if clean_q == *name {
-            let path = PathBuf::from(path_str);
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
-                    return Some((font, path));
-                }
-            }
-        }
+    direct_candidates
+        .iter()
+        .find(|(name, _)| clean_q == *name)
+        .map(|(_, path)| PathBuf::from(path))
+        .filter(|path| path.exists())
+}
+
+/// Every acceptable file for `query`, best first.
+///
+/// Shared by the real font loader and by the preferences UI, so what the user is
+/// shown is exactly what will be loaded.
+fn ranked_candidates(query: &str) -> Vec<PathBuf> {
+    let clean_q = clean_name(query);
+    if clean_q.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    if let Some(path) = direct_candidate(&clean_q) {
+        out.push(path);
     }
 
     let files = get_cached_font_index();
 
     // 1. Best contains match
-    let scored: Vec<(u32, &PathBuf)> = files
+    let mut scored: Vec<(u32, &PathBuf)> = files
         .iter()
         .filter_map(|(path, clean_f)| Some((match_score(&clean_q, clean_f)?, path)))
         .collect();
-    if let Some(found) = load_best(scored) {
-        return Some(found);
-    }
 
-    // 2. Multi-token fallback match
-    let tokens: Vec<&str> = if clean_q.contains("noto") && clean_q.contains("mono") {
-        vec!["noto", "mono"]
-    } else if clean_q.contains("noto") && clean_q.contains("nerd") {
-        vec!["noto", "nerd"]
-    } else if clean_q.contains("sanstc") {
-        // Anchor on "sanstc" rather than a bare "tc": "tc" also occurs inside
-        // "NotoSansMNerdFont-Condensed..." ("fon-tc-ondensed"), which would pull in
-        // a completely unrelated family.
-        vec!["sanstc"]
-    } else if clean_q.contains("noto") && clean_q.contains("tc") {
-        vec!["noto", "tc"]
-    } else {
-        vec![]
-    };
+    // 2. Multi-token fallback, only if nothing matched the name directly
+    if scored.is_empty() {
+        let tokens: Vec<&str> = if clean_q.contains("noto") && clean_q.contains("mono") {
+            vec!["noto", "mono"]
+        } else if clean_q.contains("noto") && clean_q.contains("nerd") {
+            vec!["noto", "nerd"]
+        } else if clean_q.contains("sanstc") {
+            // Anchor on "sanstc" rather than a bare "tc": "tc" also occurs inside
+            // "NotoSansMNerdFont-Condensed..." ("fon-tc-ondensed"), which would pull in
+            // a completely unrelated family.
+            vec!["sanstc"]
+        } else if clean_q.contains("noto") && clean_q.contains("tc") {
+            vec!["noto", "tc"]
+        } else {
+            vec![]
+        };
 
-    if !tokens.is_empty() {
-        let scored: Vec<(u32, &PathBuf)> = files
-            .iter()
-            .filter(|(_, clean_f)| tokens.iter().all(|t| clean_f.contains(t)))
-            .filter_map(|(path, clean_f)| {
-                // Same style rules as above: a loose family match must still not
-                // hand back an upright face for an italic request.
-                let penalty = style_penalty(&clean_q, clean_f)?;
-                Some((penalty * 10_000 + clean_f.len() as u32, path))
-            })
-            .collect();
-        if let Some(found) = load_best(scored) {
-            return Some(found);
+        if !tokens.is_empty() {
+            scored = files
+                .iter()
+                .filter(|(_, clean_f)| tokens.iter().all(|t| clean_f.contains(t)))
+                .filter_map(|(path, clean_f)| {
+                    // Same style rules as above: a loose family match must still not
+                    // hand back an upright face for an italic request.
+                    let penalty = style_penalty(&clean_q, clean_f)?;
+                    Some((penalty * 10_000 + clean_f.len() as u32, path))
+                })
+                .collect();
         }
     }
 
+    // Sort by path as the tie-break so the result does not depend on `read_dir`.
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    out.extend(scored.into_iter().map(|(_, path)| path.clone()));
+    out
+}
+
+/// Resolve a family name to the file that would be used, without parsing it.
+///
+/// Cheap enough to call while the user types: it only scores the cached index.
+/// A file that turns out to be unparseable is therefore still reported here,
+/// whereas [`find_font_file`] would skip to the next candidate.
+pub fn resolve_font_path(query: &str) -> Option<PathBuf> {
+    ranked_candidates(query).into_iter().next()
+}
+
+/// Search user and system font directories for a font family name, returning the parsed Font.
+pub fn find_font_file(query: &str) -> Option<(Font, PathBuf)> {
+    for path in ranked_candidates(query) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                return Some((font, path));
+            }
+        }
+    }
     None
+}
+
+/// Distinct font family names installed on this machine, for the settings UI.
+///
+/// The index holds one entry per *file*, so a single family shows up dozens of
+/// times ("NotoSansMNerdFontMono-SemiCondensedBlack" and friends). Strip the
+/// trailing style segment and de-duplicate so the list is pickable.
+pub fn installed_font_families() -> Vec<String> {
+    let mut families: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for (path, _) in get_cached_font_index() {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let family = family_of(stem);
+        if family.is_empty() {
+            continue;
+        }
+        if seen.insert(clean_name(&family)) {
+            families.push(family);
+        }
+    }
+
+    families.sort_by_key(|f| f.to_lowercase());
+    families
+}
+
+/// Strip a trailing style segment from a font file stem.
+///
+/// "NotoSansMNerdFontMono-SemiCondensedBlack" -> "NotoSansMNerdFontMono"
+/// "NotoSansTC-VariableFont_wght"             -> "NotoSansTC"
+/// "Andale Mono"                              -> "Andale Mono"
+fn family_of(stem: &str) -> String {
+    let Some((head, tail)) = stem.rsplit_once('-') else {
+        return stem.to_string();
+    };
+    let clean_tail = clean_name(tail);
+    let is_style = clean_tail.starts_with("regular")
+        || clean_tail.starts_with("variablefont")
+        || STYLE_TOKENS.iter().any(|t| clean_tail.contains(t));
+    if is_style && !head.is_empty() {
+        head.to_string()
+    } else {
+        stem.to_string()
+    }
 }
 
 /// Load full configured font chain (Primary Monospace + Fallbacks)
@@ -739,5 +799,32 @@ mod tests {
         let prefix = match_score(&q, &clean_name("Mono-Regular")).unwrap();
         let infix = match_score(&q, &clean_name("NotoSansMono")).unwrap();
         assert!(prefix < infix);
+    }
+
+    #[test]
+    fn family_of_strips_only_style_segments() {
+        // The picker lists one entry per family, so the style suffix has to go...
+        assert_eq!(family_of("NotoSansMNerdFontMono-SemiCondensedBlack"), "NotoSansMNerdFontMono");
+        assert_eq!(family_of("NotoSansTC-VariableFont_wght"), "NotoSansTC");
+        assert_eq!(family_of("SFMono-Regular"), "SFMono");
+        assert_eq!(family_of("NotoSansMNerdFontMono-Italic"), "NotoSansMNerdFontMono");
+        // ...but a dash that is part of the name itself must survive, otherwise
+        // the family would be truncated to something that resolves elsewhere.
+        assert_eq!(family_of("Andale Mono"), "Andale Mono");
+        assert_eq!(family_of("Menlo"), "Menlo");
+        assert_eq!(family_of("Noto-Kufi"), "Noto-Kufi");
+    }
+
+    #[test]
+    fn family_names_round_trip_to_a_real_file() {
+        // A name offered by the picker must resolve, or the UI would suggest
+        // entries that silently do nothing.
+        for family in installed_font_families().iter().take(40) {
+            assert!(
+                resolve_font_path(family).is_some(),
+                "picker offers {:?} but it resolves to nothing",
+                family
+            );
+        }
     }
 }
