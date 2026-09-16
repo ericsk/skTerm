@@ -102,9 +102,20 @@ pub unsafe fn center_macos_window_title(win_ptr: *mut objc::runtime::Object) {
         return;
     }
 
-    unsafe fn find_titlebar_text_field(view: *mut objc::runtime::Object) -> *mut objc::runtime::Object {
-        if view.is_null() {
+    unsafe fn find_titlebar_text_field(
+        view: *mut objc::runtime::Object,
+        content_view: *mut objc::runtime::Object,
+    ) -> *mut objc::runtime::Object {
+        if view.is_null() || view == content_view {
             return std::ptr::null_mut();
+        }
+        // Never descend into NSTabBar: tab buttons also contain NSTextField
+        // subviews, and touching those would corrupt the tab bar.
+        if let Some(tab_bar_cls) = objc::runtime::Class::get("NSTabBar") {
+            let is_tab_bar: bool = msg_send![view, isKindOfClass: tab_bar_cls];
+            if is_tab_bar {
+                return std::ptr::null_mut();
+            }
         }
         let is_tf: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
         if is_tf {
@@ -117,7 +128,7 @@ pub unsafe fn center_macos_window_title(win_ptr: *mut objc::runtime::Object) {
         let count: usize = msg_send![subviews, count];
         for i in 0..count {
             let sub: *mut objc::runtime::Object = msg_send![subviews, objectAtIndex: i];
-            let found = find_titlebar_text_field(sub);
+            let found = find_titlebar_text_field(sub, content_view);
             if !found.is_null() {
                 return found;
             }
@@ -125,49 +136,225 @@ pub unsafe fn center_macos_window_title(win_ptr: *mut objc::runtime::Object) {
         std::ptr::null_mut()
     }
 
-    unsafe {
-        let content_view: *mut objc::runtime::Object = msg_send![win_ptr, contentView];
-        if content_view.is_null() {
-            return;
-        }
-        let frame_view: *mut objc::runtime::Object = msg_send![content_view, superview];
-        if frame_view.is_null() {
-            return;
-        }
-        let tf = find_titlebar_text_field(frame_view);
-        if tf.is_null() {
-            return;
-        }
-        let titlebar: *mut objc::runtime::Object = msg_send![tf, superview];
-        if titlebar.is_null() {
-            return;
-        }
-
-        let _: () = msg_send![tf, setTranslatesAutoresizingMaskIntoConstraints: false];
-
-        let tf_center_x: *mut objc::runtime::Object = msg_send![tf, centerXAnchor];
-        let bar_center_x: *mut objc::runtime::Object = msg_send![titlebar, centerXAnchor];
-        if !tf_center_x.is_null() && !bar_center_x.is_null() {
-            let constraint_x: *mut objc::runtime::Object =
-                msg_send![tf_center_x, constraintEqualToAnchor: bar_center_x];
-            if !constraint_x.is_null() {
-                let _: () = msg_send![constraint_x, setActive: true];
-            }
-        }
-
-        let tf_center_y: *mut objc::runtime::Object = msg_send![tf, centerYAnchor];
-        let bar_center_y: *mut objc::runtime::Object = msg_send![titlebar, centerYAnchor];
-        if !tf_center_y.is_null() && !bar_center_y.is_null() {
-            let constraint_y: *mut objc::runtime::Object =
-                msg_send![tf_center_y, constraintEqualToAnchor: bar_center_y];
-            if !constraint_y.is_null() {
-                let _: () = msg_send![constraint_y, setActive: true];
-            }
-        }
-
-        let _: () = msg_send![tf, setAlignment: 1isize]; // NSTextAlignmentCenter = 1
-        let _: () = msg_send![titlebar, layoutSubtreeIfNeeded];
+    let content_view: *mut objc::runtime::Object = msg_send![win_ptr, contentView];
+    if content_view.is_null() {
+        return;
     }
+    let frame_view: *mut objc::runtime::Object = msg_send![content_view, superview];
+    if frame_view.is_null() {
+        return;
+    }
+    let tf = find_titlebar_text_field(frame_view, content_view);
+    if tf.is_null() {
+        return;
+    }
+    let titlebar: *mut objc::runtime::Object = msg_send![tf, superview];
+    if titlebar.is_null() {
+        return;
+    }
+
+    let _: () = msg_send![tf, setAlignment: 1isize]; // NSTextAlignmentCenter = 1
+
+    // Install Auto Layout constraints at most once per window. Re-adding them on
+    // every resize or title update accumulates duplicate constraints.
+    let translates: bool = msg_send![tf, translatesAutoresizingMaskIntoConstraints];
+    if !translates {
+        let _: () = msg_send![titlebar, layoutSubtreeIfNeeded];
+        return;
+    }
+
+    let _: () = msg_send![tf, setTranslatesAutoresizingMaskIntoConstraints: false];
+
+    let tf_center_x: *mut objc::runtime::Object = msg_send![tf, centerXAnchor];
+    let bar_center_x: *mut objc::runtime::Object = msg_send![titlebar, centerXAnchor];
+    if !tf_center_x.is_null() && !bar_center_x.is_null() {
+        let constraint_x: *mut objc::runtime::Object =
+            msg_send![tf_center_x, constraintEqualToAnchor: bar_center_x];
+        if !constraint_x.is_null() {
+            let _: () = msg_send![constraint_x, setActive: true];
+        }
+    }
+
+    // Anchor vertical position to the traffic-light close button
+    // (NSWindowCloseButton = 0) rather than `titlebar.centerYAnchor`. When native
+    // tabs are open, `titlebar` (NSTitlebarView) grows to include the NSTabBar
+    // below the titlebar strip, so `titlebar.centerYAnchor` lands right on the
+    // boundary between the titlebar and the tab bar and drags the window title
+    // over the tabs. The traffic lights always stay in the top titlebar strip.
+    let close_btn: *mut objc::runtime::Object = msg_send![win_ptr, standardWindowButton: 0usize];
+    let target_center_y: *mut objc::runtime::Object = if !close_btn.is_null() {
+        msg_send![close_btn, centerYAnchor]
+    } else {
+        msg_send![titlebar, centerYAnchor]
+    };
+    let tf_center_y: *mut objc::runtime::Object = msg_send![tf, centerYAnchor];
+    if !tf_center_y.is_null() && !target_center_y.is_null() {
+        let constraint_y: *mut objc::runtime::Object =
+            msg_send![tf_center_y, constraintEqualToAnchor: target_center_y];
+        if !constraint_y.is_null() {
+            let _: () = msg_send![constraint_y, setActive: true];
+        }
+    }
+
+    let _: () = msg_send![titlebar, layoutSubtreeIfNeeded];
+}
+
+/// Highlights the focused tab in AppKit's native `NSTabBar` so it stands out
+/// clearly from inactive tabs.
+///
+/// In dark mode macOS draws the active tab as a subtle gray pill that is hard to
+/// distinguish at a glance. Walking the `NSTabButton` subviews and applying an
+/// accent border, tinted pill background, and bold white label makes the active
+/// tab unmistakable.
+///
+/// # Safety
+/// `active_win_ptr` must be null or a valid pointer to a live `NSWindow` on the
+/// main thread.
+#[cfg(target_os = "macos")]
+pub unsafe fn style_macos_tab_bar(active_win_ptr: *mut objc::runtime::Object) {
+    use objc::{class, msg_send, sel, sel_impl};
+    if active_win_ptr.is_null() {
+        return;
+    }
+
+    unsafe fn style_button_subviews(view: *mut objc::runtime::Object, is_active: bool) {
+        if view.is_null() {
+            return;
+        }
+        if let Some(glass_cls) = objc::runtime::Class::get("NSGlassEffectView") {
+            let is_glass: bool = msg_send![view, isKindOfClass: glass_cls];
+            if is_glass {
+                let _: () = msg_send![view, setWantsLayer: true];
+                let layer: *mut objc::runtime::Object = msg_send![view, layer];
+                if !layer.is_null() {
+                    if is_active {
+                        let _: () = msg_send![layer, setCornerRadius: 6.0f64];
+                        let ns_bg: *mut objc::runtime::Object = msg_send![
+                            class!(NSColor),
+                            colorWithSRGBRed: 0.22f64
+                            green: 0.36f64
+                            blue: 0.58f64
+                            alpha: 0.55f64
+                        ];
+                        let cg_bg: *mut std::os::raw::c_void = msg_send![ns_bg, CGColor];
+                        let _: () = msg_send![layer, setBackgroundColor: cg_bg];
+                    } else {
+                        let null_cg: *mut std::os::raw::c_void = std::ptr::null_mut();
+                        let _: () = msg_send![layer, setBackgroundColor: null_cg];
+                    }
+                }
+            }
+        }
+        let is_tf: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
+        if is_tf {
+            let color: *mut objc::runtime::Object = if is_active {
+                msg_send![
+                    class!(NSColor),
+                    colorWithSRGBRed: 1.0f64
+                    green: 1.0f64
+                    blue: 1.0f64
+                    alpha: 1.0f64
+                ]
+            } else {
+                msg_send![
+                    class!(NSColor),
+                    colorWithSRGBRed: 0.65f64
+                    green: 0.67f64
+                    blue: 0.70f64
+                    alpha: 1.0f64
+                ]
+            };
+            let _: () = msg_send![view, setTextColor: color];
+            let font: *mut objc::runtime::Object = if is_active {
+                msg_send![class!(NSFont), boldSystemFontOfSize: 12.0f64]
+            } else {
+                msg_send![class!(NSFont), systemFontOfSize: 12.0f64]
+            };
+            if !font.is_null() {
+                let _: () = msg_send![view, setFont: font];
+            }
+        }
+        let subviews: *mut objc::runtime::Object = msg_send![view, subviews];
+        if !subviews.is_null() {
+            let count: usize = msg_send![subviews, count];
+            for i in 0..count {
+                let sub: *mut objc::runtime::Object = msg_send![subviews, objectAtIndex: i];
+                style_button_subviews(sub, is_active);
+            }
+        }
+    }
+
+    unsafe fn walk_for_tab_buttons(
+        view: *mut objc::runtime::Object,
+        active_win_ptr: *mut objc::runtime::Object,
+        content_view: *mut objc::runtime::Object,
+    ) {
+        if view.is_null() || view == content_view {
+            return;
+        }
+        if let Some(tab_btn_cls) = objc::runtime::Class::get("NSTabButton") {
+            let is_btn: bool = msg_send![view, isKindOfClass: tab_btn_cls];
+            if is_btn {
+                let responds: bool = msg_send![view, respondsToSelector: sel!(associatedWindow)];
+                let assoc_win: *mut objc::runtime::Object = if responds {
+                    msg_send![view, associatedWindow]
+                } else {
+                    std::ptr::null_mut()
+                };
+                let is_active = assoc_win == active_win_ptr;
+                let _: () = msg_send![view, setWantsLayer: true];
+                let layer: *mut objc::runtime::Object = msg_send![view, layer];
+                if !layer.is_null() {
+                    if is_active {
+                        let _: () = msg_send![layer, setCornerRadius: 6.0f64];
+                        let _: () = msg_send![layer, setBorderWidth: 1.5f64];
+                        let ns_border: *mut objc::runtime::Object = msg_send![
+                            class!(NSColor),
+                            colorWithSRGBRed: 0.42f64
+                            green: 0.72f64
+                            blue: 1.0f64
+                            alpha: 0.95f64
+                        ];
+                        let cg_border: *mut std::os::raw::c_void = msg_send![ns_border, CGColor];
+                        let _: () = msg_send![layer, setBorderColor: cg_border];
+                        let ns_bg: *mut objc::runtime::Object = msg_send![
+                            class!(NSColor),
+                            colorWithSRGBRed: 0.22f64
+                            green: 0.36f64
+                            blue: 0.58f64
+                            alpha: 0.35f64
+                        ];
+                        let cg_bg: *mut std::os::raw::c_void = msg_send![ns_bg, CGColor];
+                        let _: () = msg_send![layer, setBackgroundColor: cg_bg];
+                    } else {
+                        let _: () = msg_send![layer, setBorderWidth: 0.0f64];
+                        let null_cg: *mut std::os::raw::c_void = std::ptr::null_mut();
+                        let _: () = msg_send![layer, setBackgroundColor: null_cg];
+                    }
+                }
+                style_button_subviews(view, is_active);
+                return;
+            }
+        }
+        let subviews: *mut objc::runtime::Object = msg_send![view, subviews];
+        if !subviews.is_null() {
+            let count: usize = msg_send![subviews, count];
+            for i in 0..count {
+                let sub: *mut objc::runtime::Object = msg_send![subviews, objectAtIndex: i];
+                walk_for_tab_buttons(sub, active_win_ptr, content_view);
+            }
+        }
+    }
+
+    let content_view: *mut objc::runtime::Object = msg_send![active_win_ptr, contentView];
+    if content_view.is_null() {
+        return;
+    }
+    let frame_view: *mut objc::runtime::Object = msg_send![content_view, superview];
+    if frame_view.is_null() {
+        return;
+    }
+    walk_for_tab_buttons(frame_view, active_win_ptr, content_view);
 }
 
 /// Open a URL using the default system browser in a cross-platform manner.
@@ -1214,7 +1401,7 @@ impl App {
             }
 
             if let Some(active_id) = self.active_session_id {
-                if let Some(active_sess) = self.sessions.get(&active_id) {
+                if let Some(active_sess) = self.sessions.get_mut(&active_id) {
                     let parent_ptr = get_nswindow(&active_sess.window);
                     if !parent_ptr.is_null() && !new_ptr.is_null() {
                         // NSWindowAbove = 1
@@ -1225,6 +1412,13 @@ impl App {
                                 ordered: 1isize
                             ]
                         };
+                        active_sess.last_tab_label_refresh = None;
+                        active_sess.cached_tab_label.clear();
+                        unsafe {
+                            center_macos_window_title(parent_ptr);
+                            center_macos_window_title(new_ptr);
+                            style_macos_tab_bar(new_ptr);
+                        }
                     }
                 }
             }
@@ -1394,6 +1588,14 @@ impl ApplicationHandler<AppEvent> for App {
             // Selecting a tab is the user seeing it, so retire its activity dot.
             if let Some(session) = self.sessions.get_mut(&window_id) {
                 session.clear_unseen_output();
+                #[cfg(target_os = "macos")]
+                {
+                    let win_ptr = get_nswindow(&session.window);
+                    unsafe {
+                        center_macos_window_title(win_ptr);
+                        style_macos_tab_bar(win_ptr);
+                    }
+                }
             }
         }
 
@@ -1445,7 +1647,10 @@ impl ApplicationHandler<AppEvent> for App {
                     #[cfg(target_os = "macos")]
                     {
                         let win_ptr = get_nswindow(&session.window);
-                        unsafe { center_macos_window_title(win_ptr) };
+                        unsafe {
+                            center_macos_window_title(win_ptr);
+                            style_macos_tab_bar(win_ptr);
+                        }
                     }
                     session.window.request_redraw();
                 }
@@ -3097,17 +3302,49 @@ impl ApplicationHandler<AppEvent> for App {
                     }
 
                     if let Some(active_tab) = session.workspace.active_tab() {
-                        let win_title = if active_tab.title.is_empty() || active_tab.title == "skTerm" {
+                        let raw_title = {
+                            #[cfg(target_os = "macos")]
+                            {
+                                let clean = session
+                                    .cached_tab_label
+                                    .strip_prefix("• ")
+                                    .unwrap_or(&session.cached_tab_label);
+                                if !clean.is_empty() {
+                                    clean.to_string()
+                                } else if active_tab.title == "Tab 1" {
+                                    "skTerm".to_string()
+                                } else {
+                                    active_tab.title.clone()
+                                }
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                active_tab.title.clone()
+                            }
+                        };
+                        let win_title = if raw_title.is_empty() || raw_title == "skTerm" {
                             "skTerm".to_string()
                         } else {
-                            format!("skTerm — {}", active_tab.title)
+                            format!("skTerm — {}", raw_title)
                         };
                         if session.window.title() != win_title {
                             session.window.set_title(&win_title);
                             #[cfg(target_os = "macos")]
                             {
                                 let win_ptr = get_nswindow(&session.window);
-                                unsafe { center_macos_window_title(win_ptr) };
+                                if !session.cached_tab_label.is_empty() {
+                                    unsafe {
+                                        set_macos_tab_label(
+                                            win_ptr,
+                                            &session.cached_tab_label,
+                                            &session.cached_tab_tooltip,
+                                        );
+                                    }
+                                }
+                                unsafe {
+                                    center_macos_window_title(win_ptr);
+                                    style_macos_tab_bar(win_ptr);
+                                }
                             }
                         }
                     }
@@ -3270,6 +3507,11 @@ impl ApplicationHandler<AppEvent> for App {
         // live on other fields.
         let active_session = self.active_session_id;
         #[cfg(target_os = "macos")]
+        let active_win_ptr = active_session
+            .and_then(|aid| self.sessions.get(&aid))
+            .map(|s| get_nswindow(&s.window))
+            .unwrap_or(std::ptr::null_mut());
+        #[cfg(target_os = "macos")]
         let configured_shell: Option<&str> = self
             .config_manager
             .current_config
@@ -3308,7 +3550,25 @@ impl ApplicationHandler<AppEvent> for App {
             #[cfg(target_os = "macos")]
             if let Some((label, tooltip)) = session.refresh_tab_label(configured_shell) {
                 let win_ptr = get_nswindow(&session.window);
-                unsafe { set_macos_tab_label(win_ptr, &label, &tooltip) };
+                let clean = label.strip_prefix("• ").unwrap_or(&label);
+                let win_title = if clean.is_empty() || clean == "skTerm" {
+                    "skTerm".to_string()
+                } else {
+                    format!("skTerm — {}", clean)
+                };
+                if session.window.title() != win_title {
+                    session.window.set_title(&win_title);
+                }
+                unsafe {
+                    set_macos_tab_label(win_ptr, &label, &tooltip);
+                    center_macos_window_title(win_ptr);
+                    let target_active = if !active_win_ptr.is_null() {
+                        active_win_ptr
+                    } else {
+                        win_ptr
+                    };
+                    style_macos_tab_bar(target_active);
+                }
             }
 
             // The scrollbar is shown for SCROLLBAR_FADE_AFTER after the last scroll and
