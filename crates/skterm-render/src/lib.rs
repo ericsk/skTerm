@@ -1,16 +1,18 @@
 //! `skterm-render`: wgpu-based GPU text & quad rendering pipeline, glyph atlas, and shaders.
 
+pub mod agent_panel;
 pub mod atlas;
 pub mod box_drawing;
 pub mod pipeline;
 pub mod renderer;
 pub mod shader;
 
+pub use agent_panel::{AgentPanelHit, AgentPanelLayout, PanelRect};
 pub use atlas::{GlyphAtlas, GlyphInfo, GlyphKey};
 pub use pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
 pub use renderer::{
-    color_to_rgba_themed, AgentSidebarItem, PaneRenderItem, RenderTheme, ScrollbarMetrics, TabItem,
-    TermRenderer,
+    color_to_rgba_themed, AgentPanelState, AgentSidebarItem, PaneRenderItem, RenderTheme,
+    ScrollbarMetrics, TabItem, TermRenderer,
 };
 
 /// skterm-render version and basic info

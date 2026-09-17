@@ -1,62 +1,73 @@
-# Session Handoff & 開發進度總表
+# Session Handoff & 開發進度總表 (Development Progress Summary)
 
-## 1. 當前專案狀態 (Current Status)
-* **當前分支**：`main` (已完全整合並通過所有測試)
-* **當前階段**：**macOS HIG 偏好設定視窗重構、即時主題同步與純黑預設外觀 (macOS Sonoma HIG & Live Theming)**
-* **已完成項目**：
-  - [x] `Phase 0 ~ Phase 6`: 核心終端機、GPU 渲染管線、輸入與 IME、多窗格分頁、Sixel/Kitty 圖像協定與發行打包已全數合併至 `main`。
-  - [x] **macOS Sonoma/Sequoia HIG 獨立偏好設定視窗 (`PreferencesWindow`)**：
-    - `190pt` 左側導航欄，整合狀態指示點與檔案快捷存取。
-    - 右側 Inset Grouped Table Cards 樣式卡片。
-    - 翠綠色 Toggle Switch (`#30D158`)、Segmented Control 分段切換按鈕、Keyboard Badges 膠囊徽章。
-  - [x] **一鍵主題卡片畫廊 (1-Click Theme Gallery)**：
-    - 6 款主題卡片一鍵切換，支援即時 Hover 微光與 macOS 系統藍高亮邊框 (`#0A84FF`)。
-  - [x] **純黑預設主題 (Pure Black OLED #000000)**：
-    - 預設背景純黑 `#000000` + 亮白 `#F5F5F7` 文字 + 鮮明 16 色 ANSI 調色盤。
-    - 自訂色彩覆蓋區支援調色盤選色器、Hex 輸入與快速一鍵色點（純黑、深墨黑、亮白、駭客綠、琥珀黃等）。
-  - [x] **視窗尺寸自動記住 (Debounced Geometry Auto-Save)**：
-    - 拖拉視窗改變大小後 400ms 背景防抖存檔，下次啟動時精準維持前一次拉好的視窗大小。
-  - [x] **零延遲即時同步與效能優化 (Zero-Latency Live Sync)**：
-    - 消除純切換主題時的 WGPU Shader 與字形 Atlas 重建卡頓。
-    - 實作背景執行緒寫入 `config.toml`，消除磁碟 I/O 阻塞。
-    - 加入回聲熱重載過濾 (`Echo Hot-Reload Filter`)，避免自動存檔引發連鎖卡頓。
-  - [x] **平台原生分頁架構升級 (Platform-Native Tab Architecture)**：
-    - **macOS（路徑一）**：全套重構為 `TerminalSession` 多視窗會話模型，透過 Cocoa Objective-C runtime 深度整合 macOS 系統原生 **`NSWindow` Tabbing**（`NSWindowTabbingModePreferred` 與 `addTabbedWindow:ordered:`），享有 100% macOS 系統級毛玻璃、分頁拖曳抽離成獨立視窗/拖回合夥、縮圖檢視 (`Cmd+Shift+\`)，畫布內無需自繪避讓，終端保持 100% 純淨顯示高度。
-    - **Windows / Linux 準備**：保留內嵌分頁與多 Session 抽象層，預留未來透過 HWND 嵌入 WinUI 3 XAML Islands `TabView` 的擴充插槽。
-  - [x] **鍵盤編碼系統擴充 (Keyboard Encoding Enhancements)**：
-    - 完整支援 **`Shift + Tab`（Backtab）** 發送標準 ANSI/xterm 序列 **`\x1b[Z`**（CSI Z），支援 Shell/TUI 反向補全。
-    - 支援 `Shift`/`Alt`/`Ctrl` 複合修飾鍵對方向鍵與導航鍵的 xterm 參數編碼（如 `Ctrl + Left/Right` 跳詞）。
-  - [x] **macOS 系統捲動連動與觸控板平滑捲動 (macOS Natural Scrolling & Smooth Trackpad Scroll)**：
-    - 修正 `ScreenBuffer::scroll_display` 方向邏輯，與 macOS「自然捲動 (Natural Scrolling)」設定一致。
-    - 加入 `scroll_pixel_accumulator` 累積 `MouseScrollDelta::PixelDelta` 次像素位移，支援觸控板與 Magic Mouse 平滑捲動。
-    - 支援 Alternate Screen 與 Mouse Reporting（`vim`、`tmux`、`less`、`htop`）滾輪事件自動轉發。
-  - [x] **全域 AI Agent 側邊欄架構與寬度拖曳縮放 (Global Resizable AI Agent Sidebar)**：
-    - 側邊欄開關狀態 (`App::sidebar_open`) 提升至視窗群組層級（高於分頁與窗格），開新分頁自動同步顯示且支援跨分頁掃描與點擊跳轉。
-    - 支援滑鼠移至側邊欄右緣顯示雙向調整游標（`CursorIcon::ColResize`），可自由拖曳調整寬度（範圍 `160px` 至 `480px`）。
-    - 自訂任務名稱（`custom_label`）作為卡片主標題醒目呈現，下方副標題顯示 Agent 類型、狀態與工作目錄。
-  - [x] **macOS 原生 `NSTextField` 側邊欄內嵌編輯器 (`crates/skterm-gui/src/macos_textfield.rs`)**：
-    - 雙擊/右鍵點擊側邊欄卡片或按 `Cmd+Shift+R` 時，透過 Objective-C Runtime 動態生成與卡片配色一致的原生 `NSTextField` 覆蓋於卡片標題處。
-    - 100% 原生支援 macOS 注音/拼音組字底線、候選字視窗跟隨、`Cmd+A/C/V/X/Z` 快捷鍵、滑鼠拖曳反白選取。
-    - 支援按下 `Enter` 或點擊外部區域自動儲存名稱，按下 `Escape` 取消編輯並還原焦點至終端機。
-  - [x] **macOS 原生分頁開新分頁尺寸保持 (Tab Geometry Preservation)**：
-    - 修正 `Cmd+T` 開啟新分頁時視窗被重設為預設 80×24 大小的問題；新分頁自動繼承現有視窗的 `inner_size` 與 `sidebar_width`。
-  - [x] **`bold_is_bright` 粗體自動高亮與主題色盤對比優化 (`crates/skterm-render/src/renderer.rs`, `config.rs`)**：
-    - 實作 `bold_is_bright`：SGR 1 粗體屬性（`CellFlags::BOLD`）自動將 ANSI 0..7 標準色映射至 8..15 高亮色，預設前景色自動提升為純白 `#FFFFFF`。
-    - 優化 `pure-black`、`catppuccin-mocha`、`tokyo-night`、`nord` 等內建主題的普通色與高亮色階層對比。
-  - [x] **現代化 macOS 應用程式圖示 (`assets/AppIcon.icns`)**：
-    - 設計滿版 Apple Continuous Squircle 圓角黑曜石玻璃圖示（`Sleek Obsidian Glass`），包含 16×16 至 1024×1024 全套 Retina 解析度，並整合至 `scripts/package_macos.sh` 自動封裝入 `skTerm.app/Contents/Resources/AppIcon.icns`。
-  - [x] 單元測試與相容性測試：全部 **45/45 PASS**（100% 成功，0 Warning，0 Error）。
+## 1. 當前專案狀態 (Current Project Status)
+* **當前分支**：`main`（已完全整合所有模組並通過全數自動化測試）
+* **最新進度階段**：**全域 AI Agent 面板階層重構、macOS 原生標題列配件、零配置滾動與 VSCode 多字體回退系統 (Global AI Panel Hierarchy, Native Titlebar Accessory, Zero-Alloc Grid & Multi-Font Engine)**
+* **自動化測試狀態**：全 Workspace **105 / 105 PASS**（100% 通過，0 Warning，0 Error）
+  - `skterm-core`：27 項單元測試 + 12 項 VT 相容性測試
+  - `skterm-gui`：35 項單元測試
+  - `skterm-render`：30 項單元測試 + 1 項 CJK 字型光柵化整合測試
 
 ---
 
-## 2. 驗證指令
+## 2. 已完成開發里程碑總覽 (Completed Milestones)
+
+### A. 視窗佈局階層與全域 AI Agent 監控面板 (`skterm-gui`, `skterm-render`)
+- [x] **頂層左右分割佈局（主工作區 vs 右側全域 AI 面板）**：
+  - 視窗水平分割為左側主工作區（`screen_w - reserved_sidebar_w`）與右側全域 AI Agents 面板（`reserved_sidebar_w`）。
+  - 分頁標籤列（Tab List）僅於左側主工作區頂端展開，**絕不橫跨至右側邊欄上方**；右側 AI 面板上緣與左側分頁列頂部齊高（`y = PANEL_MARGIN .. screen_h - PANEL_MARGIN`），直覺表達「面板層級高於分頁、跨分頁運作」之語意。
+- [x] **單一來源幾何結構 (`skterm_render::agent_panel::AgentPanelLayout`)**：
+  - 渲染器繪圖與 GUI 點擊判定（Hit-testing）共用同一組 `AgentPanelLayout` 像素座標，消除繪圖與點擊區域漂移，並涵蓋 16 項幾何單元測試。
+- [x] **macOS 原生標題列 `AI` 按鈕配件 (`crates/skterm-gui/src/macos_titlebar.rs`)**：
+  - 透過 `NSTitlebarAccessoryViewController` 於 macOS 原生標題列右側嵌入 PushOnPushOff 樣式的 `AI` 開關按鈕，不佔用分頁或終端機顯示空間，點擊狀態跨視窗同步且透過原子計數器 (`CLICK_COUNT`) 零配置傳遞至事件迴圈。
+- [x] **跨分頁 AI Agent 自動發現與導覽 (`App::scan_all_ai_agents`)**：
+  - 透過 `ProcessTreeCache` 跨分頁與窗格自動偵測正在執行的 AI 代理（Antigravity CLI、Claude Code、Gemini CLI、Jetski 等），標示所屬分頁徽章（`Tab 1 · #1`）並支援一鍵點擊切換分頁與聚焦窗格。
+- [x] **macOS 原生 `NSTextField` 卡片標題內嵌編輯 (`macos_textfield.rs`)**：
+  - 雙擊/右鍵點擊卡片或按 `Cmd+Shift+R` 喚出原生 `NSTextField` 自訂任務名稱，100% 支援 macOS 原生輸入法組字、候選字視窗與選取快捷鍵。
+
+### B. 分頁管理、智慧標題與 BSP 窗格切分 (`skterm-gui`, `skterm-core`)
+- [x] **跨平台一致懸浮膠囊分頁列與智慧標題 (`tab_title.rs`)**：
+  - 停用 macOS 全寬 `NSWindow` 原生分頁列（`NSWindowTabbingModeDisallowed`），統一由內部 `Workspace::tabs` 管理，解決標題列重疊並確保右側全域 AI 面板完整置頂。
+  - **前景行程與縮短路徑標題**：閒置 Shell 顯示縮短路徑（如 `~/P/skTerm`、隱藏目錄保留首字元如 `~/.c/nvim`）；執行程式時顯示 `程式名稱: 縮短路徑`（如 `claude: ~/P/skTerm`）。
+  - **背景活動圓點與排序**：背景分頁有新輸出時顯示 `• ` 提示；支援滑鼠左右拖曳調整分頁順序，並支援 `Cmd + 1~9`（macOS）/ `Ctrl + 1~9`（Windows/Linux）直達分頁。
+- [x] **BSP 二元空間分割窗格與進階操作 (`layout.rs`)**：
+  - 支援無限層級垂直/水平分割（`Cmd+D` / `Cmd+Shift+D`）、滑鼠拖曳分隔線無段調整比例（`CursorIcon::ColResize` / `RowResize`）、單一窗格最大化縮放（`Cmd+Shift+Enter` Toggle Pane Zoom）。
+  - 新開分頁或分割窗格自動繼承當前窗格的工作目錄（透過 OSC 7 或系統行程表查詢）。
+
+### C. GPU 渲染引擎與字型排版系統 (`skterm-render`)
+- [x] **VSCode 風格多字體回退串列与智慧字重匹配 (`atlas.rs`)**：
+  - 支援逗號分隔的多字體設定（如 `"JetBrains Mono, Menlo, PingFang TC"`），於偏好設定視窗提供即時字體解析預覽（Live Resolution Preview）。
+  - 智慧解析多變體字型家族：自動剝離樣式後綴、優先選擇標準寬度（Regular Width），並根據粗體/斜體旗標精準匹配字面。
+- [x] **程序化無縫框線與區塊元素 (`box_drawing.rs`)**：
+  - 針對 Unicode Box Drawing (`U+2500..U+257F`) 與 Block Elements (`U+2580..U+259F`) 直接以 GPU 幾何頂點程序化繪製，徹底消除行高調整導致的 TUI 表格斷線與縫隙。
+- [x] **`bold_is_bright` 粗體高亮與零重建即時變色**：
+  - 粗體文字自動映射至高亮 ANSI 色盤（0..7 -> 8..15）或純白前景；切換主題透過 Uniform 緩衝區更新實現 0 毫秒無閃爍變色。
+
+### D. 終端核心效能、搜尋與互動體驗 (`skterm-core`, `skterm-gui`)
+- [x] **零配置滾動行回收池 (`RowPool` / `recycled_rows`)**：
+  - 滾動（`scroll_up`、`DECSTBM`、`IL`/`DL`）時循環重用被淘汰的 `Row` 記憶體緩衝區，達成大量文字輸出時零 Heap 分配。
+- [x] **零閒置耗電事件迴圈 (`ControlFlow::Wait` / `WaitUntil`) 與 Release 最佳化**：
+  - 終端靜止時完全休眠（0.0% CPU 佔用）；`Cargo.toml` Release Profile 啟用 `lto = "thin"`、`codegen-units = 1`、`panic = "abort"` 與 `strip = true`。
+- [x] **全緩衝區即時搜尋 (`Cmd+F`)、清空畫面 (`Cmd+K`) 與互動式捲軸**：
+  - 支援跨 Scrollback 與當前畫面的關鍵字高亮搜尋與上下跳轉；`Cmd+K` 清空歷史與畫面；右側提供可拖曳捲軸並在打字時自動回到底部。
+- [x] **剪貼簿圖片直接貼上轉路徑 & 純文字 URL 自動偵測**：
+  - `Cmd+V` 貼上剪貼簿圖片時自動存為 `/tmp/skterm_paste_*.png` 並插入跳脫路徑；同時支援 OSC 8 與純文字網址 Hover 底線與 `Cmd/Ctrl + Click` 開啟瀏覽器。
+- [x] **原子化設定檔儲存 (`config_persistence`)**：
+  - 透過暫存檔寫入後原子級 `rename` 覆蓋 `config.toml`，防止並發存檔或熱重載讀取時發生檔案損毀。
+
+---
+
+## 3. 常用開發與驗證指令
 ```bash
-# 執行所有單元測試與相容性測試
+# 執行全 Workspace 105 項自動化單元與相容性測試
 cargo test --workspace
 
-# 啟動原生終端並測試偏好設定與熱重載
+# 啟動開發版 skTerm 終端模擬器
 cargo run -p skterm-app
 
-# 測試打包 macOS App Bundle (含 AppIcon.icns 與簽署)
+# 編譯最佳化 Release 版本
+cargo build --release
+
+# 打包 macOS App Bundle (skTerm.app 含 AppIcon.icns 與 ad-hoc 簽署)
 ./scripts/package_macos.sh
 ```

@@ -7,6 +7,8 @@ pub mod input;
 pub mod layout;
 #[cfg(target_os = "macos")]
 pub mod macos_textfield;
+#[cfg(target_os = "macos")]
+pub mod macos_titlebar;
 pub mod preferences_gui;
 pub mod preferences_window;
 pub mod tab_title;

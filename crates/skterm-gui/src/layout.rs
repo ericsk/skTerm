@@ -456,6 +456,7 @@ pub struct Tab {
     pub active_pane_id: PaneId,
     pub zoomed_pane_id: Option<PaneId>,
     pub next_split_id: u32,
+    pub has_unseen_output: bool,
 }
 
 impl Tab {
@@ -497,6 +498,7 @@ impl Tab {
             active_pane_id: pane_id,
             zoomed_pane_id: None,
             next_split_id: 1,
+            has_unseen_output: false,
         })
     }
 
@@ -839,12 +841,14 @@ impl Workspace {
     pub fn select_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
             self.active_tab_idx = idx;
+            self.tabs[idx].has_unseen_output = false;
         }
     }
 
     pub fn next_tab(&mut self) {
         if !self.tabs.is_empty() {
             self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
+            self.tabs[self.active_tab_idx].has_unseen_output = false;
         }
     }
 
@@ -855,6 +859,7 @@ impl Workspace {
             } else {
                 self.active_tab_idx - 1
             };
+            self.tabs[self.active_tab_idx].has_unseen_output = false;
         }
     }
 
@@ -921,8 +926,12 @@ impl Workspace {
 
     pub fn poll_all_ptys(&mut self) -> bool {
         let mut any_data = false;
-        for tab in &mut self.tabs {
+        let active_idx = self.active_tab_idx;
+        for (idx, tab) in self.tabs.iter_mut().enumerate() {
             if tab.root.poll_all_ptys() {
+                if idx != active_idx {
+                    tab.has_unseen_output = true;
+                }
                 any_data = true;
             }
         }
@@ -936,15 +945,21 @@ impl Workspace {
         tab_bar_h: f32,
         scale_factor: f32,
     ) -> Rect {
-        let sidebar_px = if self.sidebar_open {
-            self.sidebar_width * scale_factor
+        // The agents panel is docked to the right as a floating card, so the
+        // terminal keeps the left edge and gives up the card plus the gutters on
+        // either side of it.
+        let reserved = if self.sidebar_open {
+            skterm_render::AgentPanelLayout::reserved_width(
+                self.sidebar_width * scale_factor,
+                scale_factor,
+            )
         } else {
             0.0
         };
         Rect::new(
-            sidebar_px,
+            0.0,
             tab_bar_h,
-            (screen_w - sidebar_px).max(0.0),
+            (screen_w - reserved).max(0.0),
             (screen_h - tab_bar_h).max(0.0),
         )
     }
@@ -1076,7 +1091,7 @@ impl Workspace {
                         "workspace".to_string()
                     };
 
-                    let location_label = format!("T{}•#{}", tab_idx + 1, pane_id);
+                    let location_label = format!("Tab {} · #{}", tab_idx + 1, pane_id);
                     let title_summary = if let Some(ref custom) = terminal.custom_label {
                         if !custom.trim().is_empty() {
                             custom.clone()

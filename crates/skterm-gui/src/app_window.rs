@@ -9,7 +9,10 @@ use crate::layout::{PaneId, Rect, SplitDirection, Workspace};
 use crate::preferences_window::PreferencesWindow;
 use arboard::Clipboard;
 use skterm_core::{PtySpawnOptions, Selection, SelectionMode};
-use skterm_render::{PaneRenderItem, RenderTheme, ScrollbarMetrics, TabItem, TermRenderer};
+use skterm_render::{
+    AgentPanelHit, AgentPanelLayout, AgentPanelState, PaneRenderItem, RenderTheme,
+    ScrollbarMetrics, TabItem, TermRenderer,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -116,6 +119,12 @@ pub unsafe fn center_macos_window_title(win_ptr: *mut objc::runtime::Object) {
             if is_tab_bar {
                 return std::ptr::null_mut();
             }
+        }
+        // Same reasoning for buttons -- the traffic lights and our titlebar
+        // accessory are NSButtons, and the window title is never inside one.
+        let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+        if is_button {
+            return std::ptr::null_mut();
         }
         let is_tf: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
         if is_tf {
@@ -483,25 +492,49 @@ impl TerminalSession {
         }
         self.last_tab_label_refresh = Some(Instant::now());
 
-        let active_tab = self.workspace.active_tab()?;
-        let terminal = active_tab.active_terminal()?;
-
-        let process = terminal.foreground_process_name();
-        let cwd = terminal.current_working_directory();
         let home = std::env::var("HOME").ok();
+        let active_idx = self.workspace.active_tab_idx;
+        let mut active_label = None;
+        let mut active_tooltip = None;
+        let mut any_tab_changed = false;
 
-        let mut label = crate::tab_title::build_tab_label(
-            process.as_deref(),
-            cwd.as_deref(),
-            home.as_deref(),
-            configured_shell,
-            &active_tab.title,
-        );
-        if self.has_unseen_output {
-            label.insert_str(0, "• ");
+        for (idx, tab) in self.workspace.tabs.iter_mut().enumerate() {
+            if let Some(terminal) = tab.active_terminal() {
+                let process = terminal.foreground_process_name();
+                let cwd = terminal.current_working_directory();
+                let fallback = format!("Tab {}", idx + 1);
+                let mut label = crate::tab_title::build_tab_label(
+                    process.as_deref(),
+                    cwd.as_deref(),
+                    home.as_deref(),
+                    configured_shell,
+                    &fallback,
+                );
+                if tab.has_unseen_output {
+                    label.insert_str(0, "• ");
+                }
+                if tab.title != label {
+                    tab.title = label.clone();
+                    any_tab_changed = true;
+                }
+                if idx == active_idx {
+                    let mut win_label = label;
+                    if self.has_unseen_output && !win_label.starts_with("• ") {
+                        win_label.insert_str(0, "• ");
+                    }
+                    let tooltip = cwd.unwrap_or_else(|| win_label.clone());
+                    active_label = Some(win_label);
+                    active_tooltip = Some(tooltip);
+                }
+            }
         }
-        // Hover is the only place with room for the path the label abbreviated away.
-        let tooltip = cwd.unwrap_or_else(|| label.clone());
+
+        if any_tab_changed {
+            self.window.request_redraw();
+        }
+
+        let label = active_label?;
+        let tooltip = active_tooltip?;
 
         if label == self.cached_tab_label && tooltip == self.cached_tab_tooltip {
             return None;
@@ -743,6 +776,24 @@ impl TerminalSession {
             self.renderer.scale_factor,
         );
     }
+
+    /// Geometry of the global agents panel for this window, or `None` when it is
+    /// closed. Every hit-test goes through here so the clickable regions are the
+    /// ones the renderer actually drew.
+    pub fn agent_panel_layout(&self, tab_bar_h: f32) -> Option<AgentPanelLayout> {
+        if !self.workspace.sidebar_open {
+            return None;
+        }
+        let scale = self.renderer.scale_factor;
+        Some(AgentPanelLayout::new(
+            self.renderer.config.width as f32,
+            self.renderer.config.height as f32,
+            tab_bar_h,
+            self.workspace.sidebar_width * scale,
+            scale,
+        ))
+    }
+
 }
 
 /// skTerm GUI Application instance managing multiple native window sessions or native tabs.
@@ -753,6 +804,12 @@ pub struct App {
     pub session_order: Vec<WindowId>,
     pub active_session_id: Option<WindowId>,
     pub sidebar_open: bool,
+    /// Last value of the macOS titlebar toggle's click counter that we acted on.
+    /// AppKit runs the button's action outside our event loop, so we observe it
+    /// by counter rather than by flag -- a flag would drop a second click that
+    /// landed before the first was polled.
+    #[cfg(target_os = "macos")]
+    pub last_agent_toggle_click: u64,
     pub clipboard: Option<Arc<Mutex<Clipboard>>>,
     pub modifiers: ModifiersState,
     /// Set whenever `current_config` differs from what is on disk. Both window
@@ -801,6 +858,8 @@ impl App {
             session_order: Vec::new(),
             active_session_id: None,
             sidebar_open: false,
+            #[cfg(target_os = "macos")]
+            last_agent_toggle_click: crate::macos_titlebar::click_count(),
             clipboard,
             modifiers: ModifiersState::default(),
             pending_config_save: false,
@@ -938,9 +997,19 @@ impl App {
             self.cached_ai_agents.clear();
         }
         let tab_bar_h = self.get_tab_bar_height();
+        let open = self.sidebar_open;
         for session in self.sessions.values_mut() {
-            session.workspace.sidebar_open = self.sidebar_open;
+            session.workspace.sidebar_open = open;
             session.sync_all_pane_sizes(tab_bar_h);
+            // The panel is global, so every window's titlebar toggle has to
+            // reflect it -- not just the one that was clicked.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                crate::macos_titlebar::set_agent_toggle_state(
+                    get_nswindow(&session.window),
+                    open,
+                );
+            }
             session.window.request_redraw();
         }
     }
@@ -957,7 +1026,8 @@ impl App {
                     .scan_ai_agents(&mut session.process_cache);
                 for agent in &mut agents {
                     if session_ids.len() > 1 {
-                        agent.location_label = format!("T{}•#{}", s_idx + 1, agent.pane_id);
+                        agent.location_label =
+                            format!("Win {} · {}", s_idx + 1, agent.location_label);
                     }
                     if Some(*wid) != active_wid {
                         agent.is_focused = false;
@@ -1268,37 +1338,29 @@ impl App {
     /// On macOS, native tabs are hosted in the system titlebar, so the internal canvas tab bar height is 0.
     /// On Windows/Linux, return the inline tab bar height if multiple tabs exist.
     pub fn get_tab_bar_height(&self) -> f32 {
-        #[cfg(target_os = "macos")]
-        {
-            // 100% native macOS NSWindow Tabs! Terminal Grid keeps full window height.
-            0.0
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let tab_bar_style = self
-                .config_manager
-                .current_config
-                .window
-                .tab_bar_style
-                .as_str();
-            let tab_count = self
-                .active_session()
-                .map(|s| s.workspace.tabs.len())
-                .unwrap_or(0);
-            let scale = self
-                .active_session()
-                .map(|s| s.renderer.scale_factor)
-                .unwrap_or(1.0);
+        let tab_bar_style = self
+            .config_manager
+            .current_config
+            .window
+            .tab_bar_style
+            .as_str();
+        let tab_count = self
+            .active_session()
+            .map(|s| s.workspace.tabs.len())
+            .unwrap_or(0);
+        let scale = self
+            .active_session()
+            .map(|s| s.renderer.scale_factor)
+            .unwrap_or(1.0);
 
-            match tab_bar_style {
-                "never" => 0.0,
-                "always" => 36.0 * scale,
-                "auto" | _ => {
-                    if tab_count > 1 {
-                        36.0 * scale
-                    } else {
-                        0.0
-                    }
+        match tab_bar_style {
+            "never" => 0.0,
+            "always" => 36.0 * scale,
+            _ => {
+                if tab_count > 1 {
+                    36.0 * scale
+                } else {
+                    0.0
                 }
             }
         }
@@ -1342,9 +1404,7 @@ impl App {
         #[cfg(target_os = "macos")]
         {
             use winit::platform::macos::WindowAttributesExtMacOS;
-            window_attrs = window_attrs
-                .with_tabbing_identifier("skterm.tabs")
-                .with_title_hidden(false);
+            window_attrs = window_attrs.with_title_hidden(false);
             if self.config_manager.current_config.window.decorations == "transparent" {
                 window_attrs = window_attrs.with_titlebar_transparent(true);
             }
@@ -1386,40 +1446,23 @@ impl App {
             }
         }
 
-        // On macOS: Enable NSWindowTabbingModePreferred and merge with parent tabbed window
+        // On macOS: Disallow native NSWindow tabbing so AppKit never inserts a
+        // full-width NSTabBar above the right-hand Agents sidebar. Tabs are
+        // managed inside the workspace and drawn in the left main area.
         #[cfg(target_os = "macos")]
         {
             use objc::{msg_send, sel, sel_impl};
 
             let new_ptr = get_nswindow(&window);
             if !new_ptr.is_null() {
-                // NSWindowTabbingModeAutomatic = 0
-                let _: () = unsafe { msg_send![new_ptr, setTabbingMode: 0isize] };
+                // NSWindowTabbingModeDisallowed = 2
+                let _: () = unsafe { msg_send![new_ptr, setTabbingMode: 2isize] };
                 // NSWindowToolbarStyleExpanded = 1 (forces centered window title on macOS 11+)
                 let _: () = unsafe { msg_send![new_ptr, setToolbarStyle: 1isize] };
-                unsafe { center_macos_window_title(new_ptr) };
-            }
-
-            if let Some(active_id) = self.active_session_id {
-                if let Some(active_sess) = self.sessions.get_mut(&active_id) {
-                    let parent_ptr = get_nswindow(&active_sess.window);
-                    if !parent_ptr.is_null() && !new_ptr.is_null() {
-                        // NSWindowAbove = 1
-                        let _: () = unsafe {
-                            msg_send![
-                                parent_ptr,
-                                addTabbedWindow: new_ptr
-                                ordered: 1isize
-                            ]
-                        };
-                        active_sess.last_tab_label_refresh = None;
-                        active_sess.cached_tab_label.clear();
-                        unsafe {
-                            center_macos_window_title(parent_ptr);
-                            center_macos_window_title(new_ptr);
-                            style_macos_tab_bar(new_ptr);
-                        }
-                    }
+                unsafe {
+                    center_macos_window_title(new_ptr);
+                    crate::macos_titlebar::install_agent_toggle(new_ptr);
+                    crate::macos_titlebar::set_agent_toggle_state(new_ptr, self.sidebar_open);
                 }
             }
         }
@@ -1605,6 +1648,12 @@ impl ApplicationHandler<AppEvent> for App {
         match event {
             WindowEvent::CloseRequested => {
                 info!("Terminal window close requested for {:?}", window_id);
+                // Read the NSWindow pointer while the session still owns the
+                // winit window -- it is unobtainable after the remove below.
+                #[cfg(target_os = "macos")]
+                if let Some(session) = self.sessions.get(&window_id) {
+                    crate::macos_titlebar::forget_window(get_nswindow(&session.window));
+                }
                 self.sessions.remove(&window_id);
                 self.session_order.retain(|&id| id != window_id);
                 if self.sessions.is_empty() {
@@ -1995,42 +2044,50 @@ impl ApplicationHandler<AppEvent> for App {
                                 return;
                             }
                             "t" => {
-                                // macOS Native Tab (or new window)
-                                #[cfg(target_os = "macos")]
-                                {
-                                    let _ = self.create_terminal_session(event_loop);
-                                    return;
+                                let pty_opts = self.build_pty_options();
+                                let scrollback = self
+                                    .config_manager
+                                    .current_config
+                                    .terminal
+                                    .scrollback_lines;
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    let _ = session
+                                        .workspace
+                                        .new_tab_with_options(24, 80, scrollback, pty_opts);
+                                    session.last_tab_label_refresh = None;
                                 }
-                                #[cfg(not(target_os = "macos"))]
-                                {
-                                    let pty_opts = self.build_pty_options();
-                                    let scrollback = self
-                                        .config_manager
-                                        .current_config
-                                        .terminal
-                                        .scrollback_lines;
-                                    if let Some(session) = self.sessions.get_mut(&window_id) {
-                                        let _ = session
-                                            .workspace
-                                            .new_tab_with_options(24, 80, scrollback, pty_opts);
-                                        session.sync_all_pane_sizes(tab_bar_h);
-                                        session.window.request_redraw();
-                                    }
-                                    return;
+                                let new_tab_bar_h = self.get_tab_bar_height();
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    session.sync_all_pane_sizes(new_tab_bar_h);
+                                    session.window.request_redraw();
                                 }
+                                return;
+                            }
+                            "n" => {
+                                let _ = self.create_terminal_session(event_loop);
+                                return;
                             }
                             "w" => {
                                 // Close Pane or Window Session
-                                if let Some(session) = self.sessions.get_mut(&window_id) {
-                                    let all_panes_closed = session.workspace.close_active_pane();
-                                    if all_panes_closed {
-                                        self.sessions.remove(&window_id);
-                                        self.session_order.retain(|&id| id != window_id);
-                                        if self.sessions.is_empty() {
-                                            event_loop.exit();
-                                        }
-                                    } else {
-                                        session.sync_all_pane_sizes(tab_bar_h);
+                                let all_panes_closed = if let Some(session) =
+                                    self.sessions.get_mut(&window_id)
+                                {
+                                    let closed = session.workspace.close_active_pane();
+                                    session.last_tab_label_refresh = None;
+                                    closed
+                                } else {
+                                    false
+                                };
+                                if all_panes_closed {
+                                    self.sessions.remove(&window_id);
+                                    self.session_order.retain(|&id| id != window_id);
+                                    if self.sessions.is_empty() {
+                                        event_loop.exit();
+                                    }
+                                } else {
+                                    let new_tab_bar_h = self.get_tab_bar_height();
+                                    if let Some(session) = self.sessions.get_mut(&window_id) {
+                                        session.sync_all_pane_sizes(new_tab_bar_h);
                                         session.window.request_redraw();
                                     }
                                 }
@@ -2478,11 +2535,16 @@ impl ApplicationHandler<AppEvent> for App {
                         return;
                     }
 
-                    // 0.5 Handling Sidebar Resizing Dragging
+                    // 0.5 Handling Agents Panel Resizing Dragging
                     if session.dragging_sidebar {
                         let scale = session.renderer.scale_factor;
-                        let new_w = (mx / scale).clamp(160.0, 480.0);
-                        session.workspace.sidebar_width = new_w;
+                        // The panel is docked right, so its width grows as the
+                        // pointer moves *away* from the right edge.
+                        session.workspace.sidebar_width = AgentPanelLayout::width_for_pointer(
+                            session.renderer.config.width as f32,
+                            mx,
+                            scale,
+                        );
                         session.sync_all_pane_sizes(tab_bar_h);
                         session.window.request_redraw();
                         return;
@@ -2522,7 +2584,15 @@ impl ApplicationHandler<AppEvent> for App {
                         // 3. Hover testing for Scrollbar, Splitters, and Hyperlinks to update cursor icon
                         let width = session.renderer.config.width as f32;
                         let height = session.renderer.config.height as f32;
-                        let bounds = Rect::new(0.0, tab_bar_h, width, height - tab_bar_h);
+
+                        // Must match the press handler: splitters live inside the
+                        // content area, which shrinks while the agents panel is open.
+                        let bounds = session.workspace.content_bounds(
+                            width,
+                            height,
+                            tab_bar_h,
+                            session.renderer.scale_factor,
+                        );
 
                         // 3.0 Check Scrollbar Hover
                         let scale = session.renderer.scale_factor;
@@ -2582,10 +2652,8 @@ impl ApplicationHandler<AppEvent> for App {
                         let is_link_modifier = self.modifiers.control_key();
 
                         let mut is_over_splitter = false;
-                        if session.workspace.sidebar_open && my >= tab_bar_h {
-                            let scale = session.renderer.scale_factor;
-                            let sidebar_px = session.workspace.sidebar_width * scale;
-                            if (mx - sidebar_px).abs() <= 5.0 * scale {
+                        if let Some(panel) = session.agent_panel_layout(tab_bar_h) {
+                            if panel.hit(mx, my) == AgentPanelHit::ResizeHandle {
                                 is_over_splitter = true;
                                 session.window.set_cursor(CursorIcon::ColResize);
                             }
@@ -2632,10 +2700,10 @@ impl ApplicationHandler<AppEvent> for App {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                // Inline Tab Bar handling (Windows/Linux only)
-                #[cfg(not(target_os = "macos"))]
+                // Inline Tab Bar handling (main window area only, excluding right sidebar)
                 if button == MouseButton::Left && state == ElementState::Pressed && tab_bar_h > 0.0
                 {
+                    #[allow(clippy::enum_variant_names)]
                     enum TabAction {
                         NewTab,
                         CloseTab(usize),
@@ -2645,17 +2713,24 @@ impl ApplicationHandler<AppEvent> for App {
                     let mut action = None;
                     if let Some(session) = self.sessions.get(&window_id) {
                         let (mx, my) = session.mouse_pos;
-                        if my <= tab_bar_h {
-                            let scale = session.renderer.scale_factor;
+                        let scale = session.renderer.scale_factor;
+                        let reserved_right = if session.workspace.sidebar_open {
+                            AgentPanelLayout::reserved_width(
+                                session.workspace.sidebar_width * scale,
+                                scale,
+                            )
+                        } else {
+                            0.0
+                        };
+                        let main_w =
+                            (session.renderer.config.width as f32 - reserved_right).max(0.0);
+
+                        if my <= tab_bar_h && mx < main_w {
                             let tabs_len = session.workspace.tabs.len();
                             let start_x = 8.0 * scale;
                             let plus_btn_w = 24.0 * scale;
                             let tab_gap = 4.0 * scale;
-                            let avail_w = (session.renderer.config.width as f32
-                                - start_x
-                                - plus_btn_w
-                                - 16.0 * scale)
-                                .max(80.0);
+                            let avail_w = (main_w - start_x - plus_btn_w - 16.0 * scale).max(80.0);
                             let total_gaps = (tabs_len.saturating_sub(1) as f32) * tab_gap;
                             let tab_w = ((avail_w - total_gaps) / tabs_len as f32)
                                 .clamp(75.0 * scale, 190.0 * scale);
@@ -2702,7 +2777,11 @@ impl ApplicationHandler<AppEvent> for App {
                                     let _ = session
                                         .workspace
                                         .new_tab_with_options(24, 80, scrollback, pty_opts);
-                                    session.sync_all_pane_sizes(tab_bar_h);
+                                    session.last_tab_label_refresh = None;
+                                }
+                                let new_tab_bar_h = self.get_tab_bar_height();
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    session.sync_all_pane_sizes(new_tab_bar_h);
                                     session.window.request_redraw();
                                 }
                             }
@@ -2710,10 +2789,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 let mut all_closed = false;
                                 if let Some(session) = self.sessions.get_mut(&window_id) {
                                     all_closed = session.workspace.close_tab_at(idx);
-                                    if !all_closed {
-                                        session.sync_all_pane_sizes(tab_bar_h);
-                                        session.window.request_redraw();
-                                    }
+                                    session.last_tab_label_refresh = None;
                                 }
                                 if all_closed {
                                     self.sessions.remove(&window_id);
@@ -2721,11 +2797,18 @@ impl ApplicationHandler<AppEvent> for App {
                                     if self.sessions.is_empty() {
                                         event_loop.exit();
                                     }
+                                } else {
+                                    let new_tab_bar_h = self.get_tab_bar_height();
+                                    if let Some(session) = self.sessions.get_mut(&window_id) {
+                                        session.sync_all_pane_sizes(new_tab_bar_h);
+                                        session.window.request_redraw();
+                                    }
                                 }
                             }
                             TabAction::SelectTab(idx) => {
                                 if let Some(session) = self.sessions.get_mut(&window_id) {
                                     session.workspace.select_tab(idx);
+                                    session.last_tab_label_refresh = None;
                                     session.window.request_redraw();
                                 }
                             }
@@ -2734,82 +2817,55 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
 
-                let mut toggle_sidebar_clicked = false;
+                let mut close_panel_clicked = false;
                 let mut clicked_agent_idx: Option<usize> = None;
                 let mut spawn_agent_pane = false;
+                let mut swallowed_by_panel = false;
 
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     let (mx, my) = session.mouse_pos;
 
                     if button == MouseButton::Left {
                         if state == ElementState::Pressed {
-                            let scale = session.renderer.scale_factor;
-
-                            // 0. Check Sidebar Resize Splitter click
-                            if session.workspace.sidebar_open && my >= tab_bar_h {
-                                let sidebar_px = session.workspace.sidebar_width * scale;
-                                if (mx - sidebar_px).abs() <= 5.0 * scale {
-                                    session.dragging_sidebar = true;
-                                    return;
-                                }
-                            }
-
-                            // 0. Check AI Sidebar Toggle Button click (in Tab Bar)
-                            if tab_bar_h > 0.0 && my <= tab_bar_h {
-                                let base_x = if cfg!(target_os = "macos") {
-                                    78.0 * scale
-                                } else {
-                                    8.0 * scale
-                                };
-                                let ai_btn_w = 34.0 * scale;
-                                if mx >= base_x && mx <= base_x + ai_btn_w {
-                                    toggle_sidebar_clicked = true;
-                                }
-                            }
-
-                            // 0.5 Check AI Sidebar Panel click when open
-                            if !toggle_sidebar_clicked && session.workspace.sidebar_open {
-                                let sidebar_px = session.workspace.sidebar_width * scale;
-                                if mx <= sidebar_px && my >= tab_bar_h {
-                                    let header_top = tab_bar_h;
-                                    let header_h = 38.0 * scale;
-
-                                    // Check "+ New" button click
-                                    let new_btn_w = 56.0 * scale;
-                                    let new_btn_h = 22.0 * scale;
-                                    let new_btn_x = sidebar_px - new_btn_w - 10.0 * scale;
-                                    let new_btn_y = header_top + (header_h - new_btn_h) / 2.0;
-                                    if mx >= new_btn_x
-                                        && mx <= new_btn_x + new_btn_w
-                                        && my >= new_btn_y
-                                        && my <= new_btn_y + new_btn_h
-                                    {
-                                        // Defer the spawn until the `session` borrow
-                                        // ends below: `build_pty_options` reads
-                                        // `self.sessions`, so it cannot be called here.
-                                        spawn_agent_pane = true;
-                                    } else {
-                                        // Check Agent Card click
-                                        let card_h = 66.0 * scale;
-                                        let card_gap = 6.0 * scale;
-                                        let list_start_y = header_top + header_h + 8.0 * scale;
-                                        if my >= list_start_y {
-                                            let idx = ((my - list_start_y) / (card_h + card_gap))
-                                                .floor()
-                                                as usize;
-                                            clicked_agent_idx = Some(idx);
-                                        } else {
-                                            let _ = session;
-                                            if self.editing_agent_pane.is_some() {
-                                                self.commit_agent_label_edit();
-                                            }
-                                            return;
-                                        }
+                            // 0. Check the global agents panel, whose geometry
+                            // comes from the same layout the renderer drew with.
+                            if let Some(panel) = session.agent_panel_layout(tab_bar_h) {
+                                match panel.hit(mx, my) {
+                                    AgentPanelHit::ResizeHandle => {
+                                        session.dragging_sidebar = true;
+                                        return;
                                     }
+                                    AgentPanelHit::CloseButton => {
+                                        close_panel_clicked = true;
+                                    }
+                                    // Defer the spawn until the `session`
+                                    // borrow ends below: `build_pty_options`
+                                    // reads `self.sessions`.
+                                    AgentPanelHit::NewButton => spawn_agent_pane = true,
+                                    AgentPanelHit::Card(idx) => clicked_agent_idx = Some(idx),
+                                    AgentPanelHit::Background => swallowed_by_panel = true,
+                                    AgentPanelHit::Outside => {}
                                 }
                             }
                         }
                     }
+                }
+
+                // Clicks on inert panel chrome must not fall through to the
+                // terminal and move the cursor or start a selection.
+                if swallowed_by_panel {
+                    if self.editing_agent_pane.is_some() {
+                        self.commit_agent_label_edit();
+                    }
+                    return;
+                }
+
+                if close_panel_clicked {
+                    if self.editing_agent_pane.is_some() {
+                        self.commit_agent_label_edit();
+                    }
+                    self.toggle_sidebar();
+                    return;
                 }
 
                 if spawn_agent_pane {
@@ -2842,14 +2898,6 @@ impl ApplicationHandler<AppEvent> for App {
                     if self.editing_agent_pane.is_some() {
                         self.commit_agent_label_edit();
                     }
-                    return;
-                }
-
-                if toggle_sidebar_clicked {
-                    if self.editing_agent_pane.is_some() {
-                        self.commit_agent_label_edit();
-                    }
-                    self.toggle_sidebar();
                     return;
                 }
 
@@ -2902,14 +2950,23 @@ impl ApplicationHandler<AppEvent> for App {
                             if let Some(s) = self.sessions.get(&window_id) {
                                 #[cfg(target_os = "macos")]
                                 {
+                                    // Position the native field over the card's
+                                    // title row using the same layout the panel
+                                    // was drawn with, converted back to points.
                                     let scale = s.renderer.scale_factor as f64;
-                                    let tab_bar_logical_h = (tab_bar_h as f64) / scale;
-                                    let list_start_y = tab_bar_logical_h + 38.0 + 8.0;
-                                    let card_y = list_start_y + (idx as f64) * (66.0 + 6.0);
-                                    let logical_x = 24.0;
-                                    let logical_y = card_y + 7.0;
-                                    let logical_w =
-                                        ((s.workspace.sidebar_width as f64) - 34.0).max(90.0);
+                                    let (logical_x, logical_y, logical_w) = match s
+                                        .agent_panel_layout(tab_bar_h)
+                                    {
+                                        Some(panel) => {
+                                            let card = panel.card_rect(idx);
+                                            (
+                                                (card.x as f64) / scale + 24.0,
+                                                (card.y as f64) / scale + 7.0,
+                                                (((card.w as f64) / scale) - 34.0).max(90.0),
+                                            )
+                                        }
+                                        None => (24.0, 24.0, 90.0),
+                                    };
                                     let logical_h = 22.0;
                                     let win = s.window.clone();
                                     let _ = s;
@@ -2968,6 +3025,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 .position(|t| t.id == agent.tab_id)
                             {
                                 target_session.workspace.select_tab(t_pos);
+                                target_session.last_tab_label_refresh = None;
                             }
                             if let Some(tab) = target_session.workspace.active_tab_mut() {
                                 tab.active_pane_id = agent.pane_id;
@@ -2977,6 +3035,10 @@ impl ApplicationHandler<AppEvent> for App {
                                     tab.zoomed_pane_id = Some(agent.pane_id);
                                 }
                             }
+                        }
+                        let new_tab_bar_h = self.get_tab_bar_height();
+                        if let Some(target_session) = self.sessions.get_mut(&target_wid) {
+                            target_session.sync_all_pane_sizes(new_tab_bar_h);
                             target_session.window.request_redraw();
                         }
                     }
@@ -3291,6 +3353,12 @@ impl ApplicationHandler<AppEvent> for App {
                     &self.cached_ai_agents
                 };
 
+                // The panel header states how many tabs the listing spans, which
+                // is what stops it reading as a feature of the selected tab. On
+                // macOS each session is one native tab, so sum across sessions.
+                let total_tab_count: usize =
+                    self.sessions.values().map(|s| s.workspace.tabs.len()).sum();
+
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     if self.editing_agent_pane.is_none()
                         && (!self.ime_preedit.is_empty()
@@ -3420,19 +3488,22 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
 
-                    let sidebar_px = if session.workspace.sidebar_open {
-                        session.workspace.sidebar_width * session.renderer.scale_factor
-                    } else {
-                        0.0
+                    let panel_state = AgentPanelState {
+                        open: session.workspace.sidebar_open,
+                        width_px: if session.workspace.sidebar_open {
+                            session.workspace.sidebar_width * session.renderer.scale_factor
+                        } else {
+                            0.0
+                        },
+                        agents,
+                        tab_count: total_tab_count,
                     };
 
-                    if let Err(e) = session.renderer.render_workspace_with_sidebar(
+                    if let Err(e) = session.renderer.render_workspace_with_agent_panel(
                         &tabs,
                         &render_panes,
                         tab_bar_h,
-                        session.workspace.sidebar_open,
-                        sidebar_px,
-                        agents,
+                        panel_state,
                         None::<
                             fn(
                                 &wgpu::Device,
@@ -3462,6 +3533,17 @@ impl ApplicationHandler<AppEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(target_os = "macos")]
         self.poll_macos_editor();
+
+        // The titlebar "AI" button is an AppKit control, so its clicks arrive
+        // outside winit's event stream. Pick them up here.
+        #[cfg(target_os = "macos")]
+        {
+            let clicks = crate::macos_titlebar::click_count();
+            if clicks != self.last_agent_toggle_click {
+                self.last_agent_toggle_click = clicks;
+                self.toggle_sidebar();
+            }
+        }
 
         // 1. Hot Reload Configuration
         if let Some(reloaded_cfg) = self.config_manager.check_reload().cloned() {
@@ -3511,7 +3593,6 @@ impl ApplicationHandler<AppEvent> for App {
             .and_then(|aid| self.sessions.get(&aid))
             .map(|s| get_nswindow(&s.window))
             .unwrap_or(std::ptr::null_mut());
-        #[cfg(target_os = "macos")]
         let configured_shell: Option<&str> = self
             .config_manager
             .current_config
@@ -3533,9 +3614,6 @@ impl ApplicationHandler<AppEvent> for App {
             } else {
                 let has_output = session.workspace.poll_all_ptys();
                 if has_output {
-                    // A macOS tab group shows exactly one of its windows at a
-                    // time, so output in any other session is output the user
-                    // cannot currently see. Flag it so the tab can say so.
                     if active_session != Some(*id) {
                         session.mark_unseen_output();
                     }
@@ -3543,13 +3621,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
 
-            // Refreshed here rather than in `RedrawRequested`: macOS orders out
-            // the tab windows that are not selected, so they stop receiving
-            // redraws and their labels would freeze at whatever they last
-            // showed -- exactly the tabs whose labels matter most.
-            #[cfg(target_os = "macos")]
             if let Some((label, tooltip)) = session.refresh_tab_label(configured_shell) {
-                let win_ptr = get_nswindow(&session.window);
                 let clean = label.strip_prefix("• ").unwrap_or(&label);
                 let win_title = if clean.is_empty() || clean == "skTerm" {
                     "skTerm".to_string()
@@ -3559,16 +3631,22 @@ impl ApplicationHandler<AppEvent> for App {
                 if session.window.title() != win_title {
                     session.window.set_title(&win_title);
                 }
-                unsafe {
-                    set_macos_tab_label(win_ptr, &label, &tooltip);
-                    center_macos_window_title(win_ptr);
-                    let target_active = if !active_win_ptr.is_null() {
-                        active_win_ptr
-                    } else {
-                        win_ptr
-                    };
-                    style_macos_tab_bar(target_active);
+                #[cfg(target_os = "macos")]
+                {
+                    let win_ptr = get_nswindow(&session.window);
+                    unsafe {
+                        set_macos_tab_label(win_ptr, &label, &tooltip);
+                        center_macos_window_title(win_ptr);
+                        let target_active = if !active_win_ptr.is_null() {
+                            active_win_ptr
+                        } else {
+                            win_ptr
+                        };
+                        style_macos_tab_bar(target_active);
+                    }
                 }
+                #[cfg(not(target_os = "macos"))]
+                let _ = tooltip;
             }
 
             // The scrollbar is shown for SCROLLBAR_FADE_AFTER after the last scroll and
