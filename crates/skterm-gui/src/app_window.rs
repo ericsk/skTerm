@@ -4,7 +4,7 @@
 #![allow(unexpected_cfgs)]
 
 use crate::config::{parse_hex_color, Config, ConfigManager, Theme};
-use crate::input::{check_tab_switch, encode_key_event};
+use crate::input::{check_tab_switch, encode_key_event, normalize_shortcut_char};
 use crate::layout::{PaneId, Rect, SplitDirection, Workspace};
 use crate::preferences_window::PreferencesWindow;
 use arboard::Clipboard;
@@ -2024,8 +2024,9 @@ impl ApplicationHandler<AppEvent> for App {
                         _ => {}
                     }
 
-                    if let Key::Character(ref s) = event.logical_key {
-                        let lower = s.to_lowercase();
+                    if let Some(lower) =
+                        normalize_shortcut_char(&event.logical_key, event.physical_key)
+                    {
                         match lower.as_str() {
                             "," => {
                                 self.open_preferences_window(event_loop);

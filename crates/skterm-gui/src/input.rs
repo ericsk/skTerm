@@ -270,3 +270,29 @@ pub fn check_tab_switch(event: &KeyEvent, modifiers: ModifiersState) -> Option<u
         is_macos,
     )
 }
+
+/// Normalize a key event into the character used for application shortcut matching.
+///
+/// Holding Shift changes the reported logical key (`[` becomes `{`, `]` becomes `}`),
+/// which would otherwise break shortcuts such as `Cmd/Ctrl+Shift+[`. Shifted brackets are
+/// therefore folded back onto their unshifted form, and non-ASCII layouts fall back to the
+/// physical bracket keys so the shortcut stays reachable on e.g. QWERTZ keyboards.
+pub fn normalize_shortcut_char(logical_key: &Key, physical_key: PhysicalKey) -> Option<String> {
+    if let Key::Character(ref s) = logical_key {
+        let lower = s.to_lowercase();
+        match lower.as_str() {
+            "{" => return Some("[".to_string()),
+            "}" => return Some("]".to_string()),
+            // Non-ASCII layouts, and control characters produced by Ctrl (some
+            // platforms report Ctrl+[ as ESC), fall through to the physical key below.
+            _ if lower.is_ascii() && !lower.chars().any(|c| c.is_control()) => return Some(lower),
+            _ => {}
+        }
+    }
+
+    match physical_key {
+        PhysicalKey::Code(KeyCode::BracketLeft) => Some("[".to_string()),
+        PhysicalKey::Code(KeyCode::BracketRight) => Some("]".to_string()),
+        _ => None,
+    }
+}

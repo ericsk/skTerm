@@ -61,7 +61,7 @@
 | `Cmd + Option + Arrow Keys` | `Ctrl + Alt + Arrow Keys` | **Resize Current Pane Ratio** |
 | `Cmd + Option + [` / `]` | `Ctrl + Alt + [` / `]` | **Move Current Tab Left / Right** |
 | `Cmd + ]` / `Cmd + [` | `Ctrl + ]` / `Ctrl + [` | **Focus Next / Previous Pane** |
-| `Cmd + Shift + ]` / `[` | `Ctrl + Tab` / `Ctrl + Shift + Tab` | **Switch to Next / Previous Tab** |
+| `Cmd + Shift + ]` / `[` | `Ctrl + Shift + ]` / `[` (or `Ctrl + Tab` / `Ctrl + Shift + Tab`) | **Switch to Next / Previous Tab** |
 | `Cmd + 1` ~ `9` | `Ctrl + 1` ~ `9` | **Switch Directly to Tab 1 ~ 9** |
 | `Cmd + C` | `Ctrl + Shift + C` | **Copy Selected Text to Clipboard** |
 | `Cmd + V` | `Ctrl + Shift + V` | **Paste Clipboard Text (Supports Bracketed Paste)** |

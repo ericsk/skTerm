@@ -574,6 +574,62 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_shortcut_char_shifted_brackets() {
+        use crate::input::normalize_shortcut_char;
+        use winit::keyboard::{Key, KeyCode, NativeKeyCode, PhysicalKey};
+
+        let unknown = PhysicalKey::Unidentified(NativeKeyCode::Unidentified);
+
+        // Shift+[ / Shift+] report "{" / "}" and must fold back to the unshifted form
+        // so that Cmd/Ctrl+Shift+[ and ] switch tabs.
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character("{".into()), unknown).as_deref(),
+            Some("[")
+        );
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character("}".into()), unknown).as_deref(),
+            Some("]")
+        );
+
+        // Unshifted brackets stay untouched.
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character("[".into()), unknown).as_deref(),
+            Some("[")
+        );
+
+        // Letters are lowercased, so shortcuts match regardless of Shift / Caps.
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character("D".into()), unknown).as_deref(),
+            Some("d")
+        );
+
+        // Non-ASCII layouts (e.g. QWERTZ "ü" on the US "[" position) fall back to the
+        // physical key, as do control characters such as Ctrl+[ reported as ESC.
+        assert_eq!(
+            normalize_shortcut_char(
+                &Key::Character("ü".into()),
+                PhysicalKey::Code(KeyCode::BracketLeft)
+            )
+            .as_deref(),
+            Some("[")
+        );
+        assert_eq!(
+            normalize_shortcut_char(
+                &Key::Character("\u{1b}".into()),
+                PhysicalKey::Code(KeyCode::BracketRight)
+            )
+            .as_deref(),
+            Some("]")
+        );
+
+        // Named keys without a bracket physical code yield nothing.
+        assert_eq!(
+            normalize_shortcut_char(&Key::Named(winit::keyboard::NamedKey::Enter), unknown),
+            None
+        );
+    }
+
+    #[test]
     fn test_parse_tab_switch_digit() {
         use winit::keyboard::{Key, KeyCode, PhysicalKey};
 
