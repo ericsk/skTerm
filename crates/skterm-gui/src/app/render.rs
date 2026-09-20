@@ -37,6 +37,8 @@ impl App {
         let total_tab_count: usize = self.sessions.values().map(|s| s.workspace.tabs.len()).sum();
 
         if let Some(session) = self.sessions.get_mut(&window_id) {
+            session.mark_frame_start();
+
             if self.editing_agent_pane.is_none()
                 && (!self.ime_preedit.is_empty()
                     || self

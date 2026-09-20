@@ -9,6 +9,7 @@ mod input_keyboard;
 mod input_mouse;
 #[cfg(target_os = "macos")]
 mod macos;
+mod pacer;
 mod render;
 mod session;
 mod theme;
@@ -260,8 +261,12 @@ impl ApplicationHandler<AppEvent> for App {
                     // Only repaint if something visible changed. Output in a
                     // background tab updates that tab's buffer and activity dot
                     // without touching what is currently on screen.
+                    //
+                    // Paced rather than immediate: this arm fires every few
+                    // milliseconds under load. `about_to_wait` runs straight after
+                    // `user_event` and arms the deadline for anything held back.
                     if outcome.needs_redraw() {
-                        session.window.request_redraw();
+                        session.request_output_redraw();
                     }
                 }
             }

@@ -2,7 +2,8 @@
 
 #[cfg(target_os = "macos")]
 use super::macos::{center_macos_window_title, get_nswindow, style_macos_tab_bar};
-use super::session::TerminalSession;
+use super::pacer::FramePacer;
+use super::session::{monitor_frame_interval, TerminalSession};
 use super::App;
 use crate::layout::Workspace;
 use skterm_render::TermRenderer;
@@ -179,6 +180,7 @@ impl App {
             cached_tab_label: String::new(),
             cached_tab_tooltip: String::new(),
             has_unseen_output: false,
+            pacer: FramePacer::new(monitor_frame_interval(&window), Instant::now()),
         };
 
         self.sessions.insert(window_id, session);

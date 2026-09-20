@@ -101,8 +101,16 @@ impl App {
                     session.mark_unseen_output();
                 }
                 if outcome.needs_redraw() {
-                    session.window.request_redraw();
+                    session.request_output_redraw();
                 }
+            }
+
+            // Whatever held a frame back -- this poll or the `PtyWakeup` arm --
+            // the deferred frame is owed a deadline, or output stopping mid-burst
+            // would leave the last chunk undrawn.
+            session.refresh_frame_interval();
+            if let Some(due) = session.flush_paced_redraw() {
+                arm(due);
             }
 
             if let Some((label, tooltip)) = session.refresh_tab_label(configured_shell) {

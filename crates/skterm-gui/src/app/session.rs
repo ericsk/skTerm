@@ -1,11 +1,12 @@
 //! Per-window terminal session state: tabs, panes, selection, search, and IME.
 
 use super::events::TAB_LABEL_REFRESH_INTERVAL;
+use super::pacer::{frame_interval_from_millihertz, FramePacer, PacerPoll};
 use crate::layout::{PaneId, Rect, SplitDirection, Workspace};
 use arboard::Clipboard;
 use skterm_render::{AgentPanelLayout, TermRenderer};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::info;
 use winit::dpi::{LogicalPosition, LogicalSize, Position, Size};
 use winit::window::Window;
@@ -56,9 +57,57 @@ pub struct TerminalSession {
     pub cached_tab_tooltip: String,
     /// PTY output arrived while this window was not the focused one.
     pub has_unseen_output: bool,
+    /// Keeps PTY-driven repaints down to what this window's monitor can show.
+    pub pacer: FramePacer,
+}
+
+/// Refresh period of the monitor `window` currently sits on.
+pub fn monitor_frame_interval(window: &Window) -> Duration {
+    frame_interval_from_millihertz(
+        window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz()),
+    )
 }
 
 impl TerminalSession {
+    /// Repaint because PTY output changed something visible, at most once per
+    /// refresh period. See [`FramePacer`] for why this is a leading-edge
+    /// throttle and what that has to do with typing latency.
+    pub fn request_output_redraw(&mut self) {
+        if self.pacer.on_output(Instant::now()) {
+            self.window.request_redraw();
+        }
+    }
+
+    /// Release a frame the pacer deferred, or report when it comes due so the
+    /// caller can arm the event loop's timer.
+    pub fn flush_paced_redraw(&mut self) -> Option<Instant> {
+        match self.pacer.poll(Instant::now()) {
+            PacerPoll::Idle => None,
+            PacerPoll::RedrawNow => {
+                self.window.request_redraw();
+                None
+            }
+            PacerPoll::WakeAt(due) => Some(due),
+        }
+    }
+
+    /// Record that a frame is starting, whatever caused it.
+    pub fn mark_frame_start(&mut self) {
+        self.pacer.on_frame_start(Instant::now());
+    }
+
+    /// Re-read the monitor's refresh rate if it is due, so a window dragged to a
+    /// faster display starts pacing to it.
+    pub fn refresh_frame_interval(&mut self) {
+        let now = Instant::now();
+        if self.pacer.interval_refresh_due(now) {
+            let interval = monitor_frame_interval(&self.window);
+            self.pacer.set_interval(interval, now);
+        }
+    }
+
     /// Note that output arrived while this session was not the visible one.
     ///
     /// Resetting the throttle makes the indicator show up on the next pass of
