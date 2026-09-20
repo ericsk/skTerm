@@ -58,9 +58,9 @@
 | `Cmd + Shift + D` | `Ctrl + Shift + H` | **Split Pane Horizontally (Top / Bottom)** |
 | `Cmd + Shift + Enter` / `Z` | `Ctrl + Shift + Enter` | **Toggle Pane Maximize / Zoom** |
 | `Cmd + Option + =` | `Ctrl + Alt + =` | **Equalize All Pane Sizes** |
-| `Cmd + Option + Arrow Keys` | `Ctrl + Alt + Arrow Keys` | **Resize Current Pane Ratio** |
-| `Cmd + Option + [` / `]` | `Ctrl + Alt + [` / `]` | **Move Current Tab Left / Right** |
-| `Cmd + ]` / `Cmd + [` | `Ctrl + ]` / `Ctrl + [` | **Focus Next / Previous Pane** |
+| `Cmd + Option + Arrow Keys` | `Ctrl + Shift + Alt + Arrow Keys` | **Resize Current Pane Ratio** |
+| `Cmd + Option + [` / `]` | `Ctrl + Shift + Alt + [` / `]` | **Move Current Tab Left / Right** |
+| `Cmd + ]` / `Cmd + [` | `Alt + ]` / `Alt + [` | **Focus Next / Previous Pane** |
 | `Cmd + Shift + ]` / `[` | `Ctrl + Shift + ]` / `[` (or `Ctrl + Tab` / `Ctrl + Shift + Tab`) | **Switch to Next / Previous Tab** |
 | `Cmd + 1` ~ `9` | `Ctrl + 1` ~ `9` | **Switch Directly to Tab 1 ~ 9** |
 | `Cmd + C` | `Ctrl + Shift + C` | **Copy Selected Text to Clipboard** |

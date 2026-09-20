@@ -1798,7 +1798,7 @@ impl ApplicationHandler<AppEvent> for App {
                             && self
                                 .sessions
                                 .get(&window_id)
-                                .map_or(true, |s| s.workspace.tabs.len() <= 1)
+                                .is_none_or(|s| s.workspace.tabs.len() <= 1)
                         {
                             let order_idx = if digit == 9 && self.session_order.len() < 9 {
                                 self.session_order.len() - 1
@@ -1913,6 +1913,34 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
 
+                // Focus panes with Alt + [ / ] on Windows and Linux. The Ctrl+Shift
+                // prefix below is already taken by tab switching, and plain Ctrl+[
+                // has to stay available as ESC for vi and readline users.
+                #[cfg(not(target_os = "macos"))]
+                if self.modifiers.alt_key()
+                    && !self.modifiers.control_key()
+                    && !self.modifiers.super_key()
+                {
+                    if let Some(ch) =
+                        normalize_shortcut_char(&event.logical_key, event.physical_key)
+                    {
+                        if ch == "[" || ch == "]" {
+                            if let Some(session) = self.sessions.get_mut(&window_id) {
+                                if let Some(tab) = session.workspace.active_tab_mut() {
+                                    if ch == "[" {
+                                        tab.focus_prev();
+                                    } else {
+                                        tab.focus_next();
+                                    }
+                                }
+                                session.sync_all_pane_sizes(tab_bar_h);
+                                session.window.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 #[cfg(target_os = "macos")]
                 let is_cmd = self.modifiers.super_key();
 
@@ -1920,6 +1948,17 @@ impl ApplicationHandler<AppEvent> for App {
                 let is_cmd = self.modifiers.control_key() && self.modifiers.shift_key();
 
                 let is_shift = self.modifiers.shift_key();
+
+                // Selects the alternate action of a shortcut (e.g. the other split
+                // axis). macOS prefixes with Cmd alone, so Shift is still free to make
+                // that choice; on Windows/Linux the prefix is Ctrl+Shift itself, which
+                // pins `is_shift` to true, so those platforms get their own bindings
+                // (such as Ctrl+Shift+H) instead of a Shift variant.
+                #[cfg(target_os = "macos")]
+                let is_alt_variant = is_shift;
+
+                #[cfg(not(target_os = "macos"))]
+                let is_alt_variant = false;
 
                 if is_cmd {
                     // Check NamedKey first (Enter, Arrow keys)
@@ -2095,8 +2134,9 @@ impl ApplicationHandler<AppEvent> for App {
                                 return;
                             }
                             "d" => {
-                                // Split Panes: Cmd+D = Left/Right, Cmd+Shift+D = Top/Bottom
-                                let dir = if is_shift {
+                                // Split Panes: Cmd+D / Ctrl+Shift+D = Left/Right,
+                                // Cmd+Shift+D on macOS and Ctrl+Shift+H elsewhere = Top/Bottom
+                                let dir = if is_alt_variant {
                                     SplitDirection::Vertical
                                 } else {
                                     SplitDirection::Horizontal
@@ -2108,6 +2148,26 @@ impl ApplicationHandler<AppEvent> for App {
                                     let _ = session
                                         .workspace
                                         .split_active_pane(dir, 24, 80, scrollback, pty_opts);
+                                    session.sync_all_pane_sizes(tab_bar_h);
+                                    session.window.request_redraw();
+                                }
+                                return;
+                            }
+                            // Ctrl+Shift+H stands in for macOS' Cmd+Shift+D, which cannot
+                            // be expressed here because the Ctrl+Shift prefix consumes Shift.
+                            #[cfg(not(target_os = "macos"))]
+                            "h" => {
+                                let pty_opts = self.build_pty_options();
+                                let scrollback =
+                                    self.config_manager.current_config.terminal.scrollback_lines;
+                                if let Some(session) = self.sessions.get_mut(&window_id) {
+                                    let _ = session.workspace.split_active_pane(
+                                        SplitDirection::Vertical,
+                                        24,
+                                        80,
+                                        scrollback,
+                                        pty_opts,
+                                    );
                                     session.sync_all_pane_sizes(tab_bar_h);
                                     session.window.request_redraw();
                                 }
@@ -2254,7 +2314,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // ignore the trailing KeyboardInput (e.g. Enter that confirmed the IME word)
                         let just_committed_ime = self
                             .last_ime_commit_time
-                            .map_or(false, |t| t.elapsed() < Duration::from_millis(20));
+                            .is_some_and(|t| t.elapsed() < Duration::from_millis(20));
                         if just_committed_ime {
                             return;
                         }
@@ -2372,7 +2432,7 @@ impl ApplicationHandler<AppEvent> for App {
                         if event.state == ElementState::Pressed {
                             let just_committed_ime = self
                                 .last_ime_commit_time
-                                .map_or(false, |t| t.elapsed() < Duration::from_millis(20));
+                                .is_some_and(|t| t.elapsed() < Duration::from_millis(20));
                             if !self.ime_preedit.is_empty() || just_committed_ime {
                                 return;
                             }
@@ -2826,8 +2886,8 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     let (mx, my) = session.mouse_pos;
 
-                    if button == MouseButton::Left {
-                        if state == ElementState::Pressed {
+                    if button == MouseButton::Left
+                        && state == ElementState::Pressed {
                             // 0. Check the global agents panel, whose geometry
                             // comes from the same layout the renderer drew with.
                             if let Some(panel) = session.agent_panel_layout(tab_bar_h) {
@@ -2849,7 +2909,6 @@ impl ApplicationHandler<AppEvent> for App {
                                 }
                             }
                         }
-                    }
                 }
 
                 // Clicks on inert panel chrome must not fall through to the
@@ -3046,11 +3105,10 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
 
-                if button == MouseButton::Left && state == ElementState::Pressed {
-                    if self.editing_agent_pane.is_some() {
+                if button == MouseButton::Left && state == ElementState::Pressed
+                    && self.editing_agent_pane.is_some() {
                         self.commit_agent_label_edit();
                     }
-                }
 
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     let (mx, my) = session.mouse_pos;
@@ -3365,7 +3423,7 @@ impl ApplicationHandler<AppEvent> for App {
                         && (!self.ime_preedit.is_empty()
                             || self
                                 .last_ime_commit_time
-                                .map_or(false, |t| t.elapsed() < Duration::from_millis(200)))
+                                .is_some_and(|t| t.elapsed() < Duration::from_millis(200)))
                     {
                         session.update_ime_position(tab_bar_h);
                     }
@@ -3454,10 +3512,10 @@ impl ApplicationHandler<AppEvent> for App {
                                 let is_scrollbar_dragging = session
                                     .dragging_scrollbar
                                     .as_ref()
-                                    .map_or(false, |d| d.pane_id == *id);
+                                    .is_some_and(|d| d.pane_id == *id);
                                 let is_recently_scrolled = session
                                     .last_scroll_time
-                                    .map_or(false, |t| t.elapsed() < SCROLLBAR_FADE_AFTER);
+                                    .is_some_and(|t| t.elapsed() < SCROLLBAR_FADE_AFTER);
 
                                 render_panes.push(PaneRenderItem {
                                     grid: t.grid(),
