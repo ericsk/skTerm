@@ -269,7 +269,10 @@ impl TermRenderer {
         // Prioritize non-blocking, low-latency presentation modes for maximum typing smoothness
         let present_mode = if surface_caps.present_modes.contains(&PresentMode::Mailbox) {
             PresentMode::Mailbox
-        } else if surface_caps.present_modes.contains(&PresentMode::AutoNoVsync) {
+        } else if surface_caps
+            .present_modes
+            .contains(&PresentMode::AutoNoVsync)
+        {
             PresentMode::AutoNoVsync
         } else if surface_caps.present_modes.contains(&PresentMode::Immediate) {
             PresentMode::Immediate
@@ -439,7 +442,9 @@ impl TermRenderer {
             if cur_x + cw > x + max_w {
                 break;
             }
-            if let Some(glyph_info) = self.atlas.get_or_insert_glyph(&self.queue, c, is_bold, false)
+            if let Some(glyph_info) = self
+                .atlas
+                .get_or_insert_glyph(&self.queue, c, is_bold, false)
             {
                 if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
                     glyph_instances.push(GlyphInstance {
@@ -692,8 +697,8 @@ impl TermRenderer {
                 false,
             );
 
-            let has_custom_task = !item.title_summary.is_empty()
-                && item.title_summary != "Double-click to name...";
+            let has_custom_task =
+                !item.title_summary.is_empty() && item.title_summary != "Double-click to name...";
             let status_str = if item.is_active_output {
                 "Running"
             } else {
@@ -1024,13 +1029,8 @@ impl TermRenderer {
 
         // 2.5 Global AI Agents Panel
         if sidebar_open && panel_state.width_px > 0.0 {
-            let layout = AgentPanelLayout::new(
-                screen_w,
-                screen_h,
-                tab_bar_h,
-                panel_state.width_px,
-                scale,
-            );
+            let layout =
+                AgentPanelLayout::new(screen_w, screen_h, tab_bar_h, panel_state.width_px, scale);
             self.draw_agent_panel(
                 &mut bg_instances,
                 &mut glyph_instances,

@@ -314,10 +314,8 @@ impl PreferencesGui {
                 {
                     let new_cfg = self.to_config(&config_manager.current_config);
                     if let Ok(toml_str) = toml::to_string_pretty(&new_cfg) {
-                        let _ = crate::config::write_config_atomically(
-                            &config_manager.path,
-                            &toml_str,
-                        );
+                        let _ =
+                            crate::config::write_config_atomically(&config_manager.path, &toml_str);
                         config_manager.current_config = new_cfg;
                         info!(
                             "Saved preferences directly from GUI to {:?}",
@@ -602,7 +600,10 @@ impl PreferencesGui {
                                         ui.painter().circle_stroke(
                                             egui::pos2(dot_x, dot_y),
                                             4.0,
-                                            egui::Stroke::new(0.5_f32, Color32::from_white_alpha(70)),
+                                            egui::Stroke::new(
+                                                0.5_f32,
+                                                Color32::from_white_alpha(70),
+                                            ),
                                         );
                                     }
 

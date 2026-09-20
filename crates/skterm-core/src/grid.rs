@@ -1021,7 +1021,8 @@ impl ScreenBuffer {
         let row = &mut self.grid[cur_row];
         // `copy_within` handles the overlap correctly, so this replaces the
         // reverse per-cell loop.
-        row.cells.copy_within(cur_col..cols - count, cur_col + count);
+        row.cells
+            .copy_within(cur_col..cols - count, cur_col + count);
         row.cells[cur_col..cur_col + count].fill(Cell::blank(bg));
         // A wide char pushed half-off the right edge leaves a dangling lead cell.
         if row.cells[cols - 1].flags.contains(CellFlags::WIDE_CHAR) {

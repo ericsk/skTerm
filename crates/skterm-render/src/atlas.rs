@@ -463,7 +463,10 @@ fn direct_candidate(clean_q: &str) -> Option<PathBuf> {
         ("menlo", "/System/Library/Fonts/Menlo.ttc"),
         ("monaco", "/System/Library/Fonts/Monaco.ttf"),
         ("sfmono", "/System/Library/Fonts/SFMono-Regular.otf"),
-        ("dejavusansmono", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"),
+        (
+            "dejavusansmono",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ),
         ("consolas", "C:\\Windows\\Fonts\\consola.ttf"),
     ];
     direct_candidates
@@ -804,10 +807,16 @@ mod tests {
     #[test]
     fn family_of_strips_only_style_segments() {
         // The picker lists one entry per family, so the style suffix has to go...
-        assert_eq!(family_of("NotoSansMNerdFontMono-SemiCondensedBlack"), "NotoSansMNerdFontMono");
+        assert_eq!(
+            family_of("NotoSansMNerdFontMono-SemiCondensedBlack"),
+            "NotoSansMNerdFontMono"
+        );
         assert_eq!(family_of("NotoSansTC-VariableFont_wght"), "NotoSansTC");
         assert_eq!(family_of("SFMono-Regular"), "SFMono");
-        assert_eq!(family_of("NotoSansMNerdFontMono-Italic"), "NotoSansMNerdFontMono");
+        assert_eq!(
+            family_of("NotoSansMNerdFontMono-Italic"),
+            "NotoSansMNerdFontMono"
+        );
         // ...but a dash that is part of the name itself must survive, otherwise
         // the family would be truncated to something that resolves elsewhere.
         assert_eq!(family_of("Andale Mono"), "Andale Mono");

@@ -203,7 +203,10 @@ fn test_vt_prompt_line_preservation_on_resize() {
     assert_eq!(term.grid().active().cursor.row, 1);
     assert_eq!(term.grid().active().cursor.col, 2);
 
-    let row0: String = term.grid().active().grid[0].cells[0..33].iter().map(|c| c.c).collect();
+    let row0: String = term.grid().active().grid[0].cells[0..33]
+        .iter()
+        .map(|c| c.c)
+        .collect();
     assert_eq!(row0, "=== Narrow Prompt Ruler 12345 ===");
 
     // Resize back to 80 cols
@@ -212,7 +215,10 @@ fn test_vt_prompt_line_preservation_on_resize() {
 
     // Shell repaints on 80 cols
     term.feed_bytes(b"\x1b[1A\r\x1b[K=== Wide Prompt Ruler Restored 1234567890 ===\r\n\x1b[K> ");
-    let row0_wide: String = term.grid().active().grid[0].cells[0..45].iter().map(|c| c.c).collect();
+    let row0_wide: String = term.grid().active().grid[0].cells[0..45]
+        .iter()
+        .map(|c| c.c)
+        .collect();
     assert_eq!(row0_wide, "=== Wide Prompt Ruler Restored 1234567890 ===");
 }
 
@@ -304,5 +310,3 @@ fn test_vt_cjk_wide_char_overwrite_and_backspace() {
     assert_eq!(cells[1].c, 'A');
     assert!(!cells[1].flags.contains(CellFlags::WIDE_CHAR_SPACER));
 }
-
-

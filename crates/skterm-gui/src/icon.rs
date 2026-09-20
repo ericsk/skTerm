@@ -40,7 +40,12 @@ pub fn configure_window_attributes(mut attrs: WindowAttributes) -> WindowAttribu
         attrs = attrs.with_window_icon(Some(icon));
     }
 
-    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android"), not(target_os = "ios")))]
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "android"),
+        not(target_os = "ios")
+    ))]
     {
         use winit::platform::wayland::WindowAttributesExtWayland;
         use winit::platform::x11::WindowAttributesExtX11;
@@ -65,7 +70,10 @@ mod tests {
     #[test]
     fn test_get_app_icon() {
         let icon = get_app_icon();
-        assert!(icon.is_some(), "Expected embedded app icon to load successfully");
+        assert!(
+            icon.is_some(),
+            "Expected embedded app icon to load successfully"
+        );
     }
 
     #[test]

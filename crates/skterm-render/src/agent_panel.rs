@@ -108,13 +108,7 @@ impl AgentPanelLayout {
     /// The panel spans the full window height from top (`PANEL_MARGIN`) to bottom
     /// (`screen_h - PANEL_MARGIN`), so its top edge is aligned with the top of
     /// the tab list rather than pushed below `tab_bar_h`.
-    pub fn new(
-        screen_w: f32,
-        screen_h: f32,
-        _tab_bar_h: f32,
-        panel_w: f32,
-        scale: f32,
-    ) -> Self {
+    pub fn new(screen_w: f32, screen_h: f32, _tab_bar_h: f32, panel_w: f32, scale: f32) -> Self {
         let margin = PANEL_MARGIN * scale;
         let panel = PanelRect::new(
             screen_w - panel_w - margin,
@@ -296,8 +290,14 @@ mod tests {
         let l = layout();
         let edge = l.panel.x;
         assert_eq!(l.hit(edge, 300.0), AgentPanelHit::ResizeHandle);
-        assert_eq!(l.hit(edge - RESIZE_HANDLE, 300.0), AgentPanelHit::ResizeHandle);
-        assert_eq!(l.hit(edge + RESIZE_HANDLE, 300.0), AgentPanelHit::ResizeHandle);
+        assert_eq!(
+            l.hit(edge - RESIZE_HANDLE, 300.0),
+            AgentPanelHit::ResizeHandle
+        );
+        assert_eq!(
+            l.hit(edge + RESIZE_HANDLE, 300.0),
+            AgentPanelHit::ResizeHandle
+        );
     }
 
     #[test]
@@ -306,10 +306,7 @@ mod tests {
         let card = l.card_rect(0);
         // Cards are inset far enough that their left edge clears the handle.
         assert!(card.x > l.panel.x + RESIZE_HANDLE);
-        assert_eq!(
-            l.hit(card.x + 1.0, card.y + 1.0),
-            AgentPanelHit::Card(0)
-        );
+        assert_eq!(l.hit(card.x + 1.0, card.y + 1.0), AgentPanelHit::Card(0));
     }
 
     #[test]
@@ -357,7 +354,10 @@ mod tests {
         let l = layout();
         assert_eq!(l.hit(100.0, 300.0), AgentPanelHit::Outside);
         // The gutter beside the card still belongs to the panel.
-        assert_eq!(l.hit(l.panel.x - PANEL_MARGIN + 1.0, 300.0), AgentPanelHit::Background);
+        assert_eq!(
+            l.hit(l.panel.x - PANEL_MARGIN + 1.0, 300.0),
+            AgentPanelHit::Background
+        );
     }
 
     #[test]
@@ -394,6 +394,4 @@ mod tests {
         assert_eq!(l.card_index_at(l.card_rect(n - 1).y + 1.0), Some(n - 1));
         assert_eq!(l.card_index_at(l.card_rect(n).y + 1.0), None);
     }
-
-
 }

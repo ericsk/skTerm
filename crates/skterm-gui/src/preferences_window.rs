@@ -912,14 +912,12 @@ impl PreferencesWindow {
                         .inner_margin(Margin::symmetric(26, 22)),
                 )
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        match self.active_category {
-                            PreferencesCategory::Appearance => self.render_appearance_view(ui),
-                            PreferencesCategory::Colors => self.render_colors_view(ui),
-                            PreferencesCategory::Terminal => self.render_terminal_view(ui),
-                            PreferencesCategory::Cursor => self.render_cursor_view(ui),
-                            PreferencesCategory::Keybindings => self.render_keybindings_view(ui),
-                        }
+                    egui::ScrollArea::vertical().show(ui, |ui| match self.active_category {
+                        PreferencesCategory::Appearance => self.render_appearance_view(ui),
+                        PreferencesCategory::Colors => self.render_colors_view(ui),
+                        PreferencesCategory::Terminal => self.render_terminal_view(ui),
+                        PreferencesCategory::Cursor => self.render_cursor_view(ui),
+                        PreferencesCategory::Keybindings => self.render_keybindings_view(ui),
                     });
                 });
         });
@@ -1173,16 +1171,15 @@ impl PreferencesWindow {
                                 );
 
                                 let mut pick: Option<String> = None;
-                                egui::ScrollArea::vertical().max_height(260.0).show(
-                                    ui,
-                                    |ui| {
+                                egui::ScrollArea::vertical()
+                                    .max_height(260.0)
+                                    .show(ui, |ui| {
                                         for f in matches {
                                             if ui.selectable_label(false, f).clicked() {
                                                 pick = Some(f.clone());
                                             }
                                         }
-                                    },
-                                );
+                                    });
                                 if let Some(f) = pick {
                                     append(&mut self.font_family_input, &f);
                                     self.font_family = self.font_family_input.trim().to_string();
@@ -1194,8 +1191,14 @@ impl PreferencesWindow {
                             .width(140.0)
                             .show_ui(ui, |ui| {
                                 let presets = [
-                                    ("NotoSansM Nerd Font (推薦 🚀)", "NotoSansMNerdFontMono, NotoSansTC, Menlo"),
-                                    ("JetBrainsMono Nerd Font", "JetBrainsMono Nerd Font, PingFang TC"),
+                                    (
+                                        "NotoSansM Nerd Font (推薦 🚀)",
+                                        "NotoSansMNerdFontMono, NotoSansTC, Menlo",
+                                    ),
+                                    (
+                                        "JetBrainsMono Nerd Font",
+                                        "JetBrainsMono Nerd Font, PingFang TC",
+                                    ),
                                     ("FiraCode Nerd Font", "FiraCode Nerd Font, PingFang TC"),
                                     ("Menlo (macOS Default)", "Menlo, PingFang TC"),
                                     ("SF Mono", "SF Mono, PingFang TC"),

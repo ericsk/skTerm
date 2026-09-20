@@ -499,7 +499,16 @@ mod tests {
 
         // Verify ScrollbarMetrics
         let metrics = ScrollbarMetrics::compute(
-            0.0, 0.0, 800.0, 600.0, 1.0, scrollback_len, 10, 20, false, false,
+            0.0,
+            0.0,
+            800.0,
+            600.0,
+            1.0,
+            scrollback_len,
+            10,
+            20,
+            false,
+            false,
         )
         .expect("ScrollbarMetrics should be computed");
 
@@ -559,7 +568,10 @@ mod tests {
         assert!(!is_tab_switch_modifier_for_os(ctrl_super, false));
         assert!(!is_tab_switch_modifier_for_os(super_key, false));
         assert!(!is_tab_switch_modifier_for_os(alt, false));
-        assert!(!is_tab_switch_modifier_for_os(ModifiersState::empty(), false));
+        assert!(!is_tab_switch_modifier_for_os(
+            ModifiersState::empty(),
+            false
+        ));
 
         // On macOS (is_macos = true):
         // Tab switching must trigger on CMD / Super (with or without Shift)
@@ -570,7 +582,10 @@ mod tests {
         assert!(!is_tab_switch_modifier_for_os(ctrl_super, true));
         assert!(!is_tab_switch_modifier_for_os(ctrl, true));
         assert!(!is_tab_switch_modifier_for_os(alt, true));
-        assert!(!is_tab_switch_modifier_for_os(ModifiersState::empty(), true));
+        assert!(!is_tab_switch_modifier_for_os(
+            ModifiersState::empty(),
+            true
+        ));
     }
 
     #[test]
@@ -642,7 +657,8 @@ mod tests {
 
         // 0 and non-digits should return None
         let logical_0 = Key::Character("0".into());
-        let dummy_physical = PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified);
+        let dummy_physical =
+            PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified);
         assert_eq!(parse_tab_switch_digit(&logical_0, dummy_physical), None);
 
         let logical_a = Key::Character("a".into());

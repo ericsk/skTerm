@@ -560,7 +560,9 @@ impl TerminalSession {
             let target_row = self.search_matches[idx].global_row;
             if let Some(tab) = self.workspace.active_tab_mut() {
                 if let Some(term) = tab.active_terminal_mut() {
-                    term.grid_mut().active_mut().scroll_to_global_row(target_row);
+                    term.grid_mut()
+                        .active_mut()
+                        .scroll_to_global_row(target_row);
                 }
             }
         }
@@ -578,7 +580,9 @@ impl TerminalSession {
         let target_row = self.search_matches[next].global_row;
         if let Some(tab) = self.workspace.active_tab_mut() {
             if let Some(term) = tab.active_terminal_mut() {
-                term.grid_mut().active_mut().scroll_to_global_row(target_row);
+                term.grid_mut()
+                    .active_mut()
+                    .scroll_to_global_row(target_row);
             }
         }
     }
@@ -601,7 +605,9 @@ impl TerminalSession {
         let target_row = self.search_matches[prev].global_row;
         if let Some(tab) = self.workspace.active_tab_mut() {
             if let Some(term) = tab.active_terminal_mut() {
-                term.grid_mut().active_mut().scroll_to_global_row(target_row);
+                term.grid_mut()
+                    .active_mut()
+                    .scroll_to_global_row(target_row);
             }
         }
     }
@@ -793,7 +799,6 @@ impl TerminalSession {
             scale,
         ))
     }
-
 }
 
 /// skTerm GUI Application instance managing multiple native window sessions or native tabs.
@@ -888,21 +893,15 @@ impl App {
                 } => {
                     let label = text.trim().to_string();
                     if let Some(target_s) = self.sessions.get_mut(&wid) {
-                        if let Some(t_pos) = target_s
-                            .workspace
-                            .tabs
-                            .iter()
-                            .position(|t| t.id == tab_id)
+                        if let Some(t_pos) =
+                            target_s.workspace.tabs.iter().position(|t| t.id == tab_id)
                         {
                             if let Some(term) = target_s.workspace.tabs[t_pos]
                                 .root
                                 .find_terminal_mut(pane_id)
                             {
-                                term.custom_label = if label.is_empty() {
-                                    None
-                                } else {
-                                    Some(label)
-                                };
+                                term.custom_label =
+                                    if label.is_empty() { None } else { Some(label) };
                             }
                         }
                         target_s.window.request_redraw();
@@ -971,11 +970,7 @@ impl App {
                         .root
                         .find_terminal_mut(edit_pane_id)
                     {
-                        term.custom_label = if label.is_empty() {
-                            None
-                        } else {
-                            Some(label)
-                        };
+                        term.custom_label = if label.is_empty() { None } else { Some(label) };
                     }
                 }
                 target_s.window.request_redraw();
@@ -1005,10 +1000,7 @@ impl App {
             // reflect it -- not just the one that was clicked.
             #[cfg(target_os = "macos")]
             unsafe {
-                crate::macos_titlebar::set_agent_toggle_state(
-                    get_nswindow(&session.window),
-                    open,
-                );
+                crate::macos_titlebar::set_agent_toggle_state(get_nswindow(&session.window), open);
             }
             session.window.request_redraw();
         }
@@ -1021,9 +1013,7 @@ impl App {
 
         for (s_idx, wid) in session_ids.iter().enumerate() {
             if let Some(session) = self.sessions.get_mut(wid) {
-                let mut agents = session
-                    .workspace
-                    .scan_ai_agents(&mut session.process_cache);
+                let mut agents = session.workspace.scan_ai_agents(&mut session.process_cache);
                 for agent in &mut agents {
                     if session_ids.len() > 1 {
                         agent.location_label =
@@ -1732,56 +1722,54 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
 
-            WindowEvent::Ime(ime_event) => {
-                match ime_event {
-                    Ime::Commit(text) => {
-                        let had_preedit = !self.ime_preedit.is_empty();
-                        self.last_ime_commit_time = Some(Instant::now());
-                        self.ime_preedit.clear();
-                        if self.editing_agent_pane.is_some() {
-                            self.insert_editing_text(&text);
-                            if let Some(session) = self.sessions.get(&window_id) {
-                                session.window.request_redraw();
-                            }
-                        } else if let Some(session) = self.sessions.get_mut(&window_id) {
-                            if session.search_open {
-                                session.search_query.push_str(&text);
-                                session.update_search_matches();
-                                session.window.request_redraw();
-                            } else if let Some(tab) = session.workspace.active_tab_mut() {
-                                if let Some(term) = tab.active_terminal_mut() {
-                                    let was_scrolled = term.grid().active().scroll_offset != 0;
-                                    term.grid_mut().active_mut().scroll_offset = 0;
-                                    let _ = term.write_to_pty(text.as_bytes());
-                                    if had_preedit || was_scrolled || term.poll_pty() {
-                                        session.window.request_redraw();
-                                    }
+            WindowEvent::Ime(ime_event) => match ime_event {
+                Ime::Commit(text) => {
+                    let had_preedit = !self.ime_preedit.is_empty();
+                    self.last_ime_commit_time = Some(Instant::now());
+                    self.ime_preedit.clear();
+                    if self.editing_agent_pane.is_some() {
+                        self.insert_editing_text(&text);
+                        if let Some(session) = self.sessions.get(&window_id) {
+                            session.window.request_redraw();
+                        }
+                    } else if let Some(session) = self.sessions.get_mut(&window_id) {
+                        if session.search_open {
+                            session.search_query.push_str(&text);
+                            session.update_search_matches();
+                            session.window.request_redraw();
+                        } else if let Some(tab) = session.workspace.active_tab_mut() {
+                            if let Some(term) = tab.active_terminal_mut() {
+                                let was_scrolled = term.grid().active().scroll_offset != 0;
+                                term.grid_mut().active_mut().scroll_offset = 0;
+                                let _ = term.write_to_pty(text.as_bytes());
+                                if had_preedit || was_scrolled || term.poll_pty() {
+                                    session.window.request_redraw();
                                 }
                             }
                         }
                     }
-                    Ime::Preedit(text, _cursor) => {
-                        self.ime_preedit = text;
-                        if self.editing_agent_pane.is_none() {
-                            if let Some(session) = self.sessions.get_mut(&window_id) {
-                                if !session.search_open {
-                                    if let Some(tab) = session.workspace.active_tab_mut() {
-                                        if let Some(term) = tab.active_terminal_mut() {
-                                            if term.grid().active().scroll_offset != 0 {
-                                                term.grid_mut().active_mut().scroll_offset = 0;
-                                            }
+                }
+                Ime::Preedit(text, _cursor) => {
+                    self.ime_preedit = text;
+                    if self.editing_agent_pane.is_none() {
+                        if let Some(session) = self.sessions.get_mut(&window_id) {
+                            if !session.search_open {
+                                if let Some(tab) = session.workspace.active_tab_mut() {
+                                    if let Some(term) = tab.active_terminal_mut() {
+                                        if term.grid().active().scroll_offset != 0 {
+                                            term.grid_mut().active_mut().scroll_offset = 0;
                                         }
                                     }
                                 }
-                                session.window.request_redraw();
                             }
-                        } else if let Some(session) = self.sessions.get(&window_id) {
                             session.window.request_redraw();
                         }
+                    } else if let Some(session) = self.sessions.get(&window_id) {
+                        session.window.request_redraw();
                     }
-                    _ => {}
                 }
-            }
+                _ => {}
+            },
 
             WindowEvent::KeyboardInput { ref event, .. } => {
                 if event.state != ElementState::Pressed {
@@ -1869,8 +1857,7 @@ impl ApplicationHandler<AppEvent> for App {
                 let is_zoom_or_reset = self.modifiers.super_key() && !self.modifiers.control_key();
 
                 #[cfg(not(target_os = "macos"))]
-                let is_zoom_or_reset =
-                    self.modifiers.control_key() && !self.modifiers.super_key();
+                let is_zoom_or_reset = self.modifiers.control_key() && !self.modifiers.super_key();
 
                 if is_zoom_or_reset {
                     if let Key::Character(ref s) = event.logical_key {
@@ -1891,9 +1878,8 @@ impl ApplicationHandler<AppEvent> for App {
                             "-" => {
                                 if let Some(session) = self.sessions.get_mut(&window_id) {
                                     let cur_pt = session.renderer.font_size_pt;
-                                    let _ = session
-                                        .renderer
-                                        .update_font_size((cur_pt - 1.0).max(8.0));
+                                    let _ =
+                                        session.renderer.update_font_size((cur_pt - 1.0).max(8.0));
                                     session.sync_all_pane_sizes(tab_bar_h);
                                     session.window.request_redraw();
                                 }
@@ -2085,11 +2071,8 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                             "t" => {
                                 let pty_opts = self.build_pty_options();
-                                let scrollback = self
-                                    .config_manager
-                                    .current_config
-                                    .terminal
-                                    .scrollback_lines;
+                                let scrollback =
+                                    self.config_manager.current_config.terminal.scrollback_lines;
                                 if let Some(session) = self.sessions.get_mut(&window_id) {
                                     let _ = session
                                         .workspace
@@ -2109,15 +2092,14 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                             "w" => {
                                 // Close Pane or Window Session
-                                let all_panes_closed = if let Some(session) =
-                                    self.sessions.get_mut(&window_id)
-                                {
-                                    let closed = session.workspace.close_active_pane();
-                                    session.last_tab_label_refresh = None;
-                                    closed
-                                } else {
-                                    false
-                                };
+                                let all_panes_closed =
+                                    if let Some(session) = self.sessions.get_mut(&window_id) {
+                                        let closed = session.workspace.close_active_pane();
+                                        session.last_tab_label_refresh = None;
+                                        closed
+                                    } else {
+                                        false
+                                    };
                                 if all_panes_closed {
                                     self.sessions.remove(&window_id);
                                     self.session_order.retain(|&id| id != window_id);
@@ -2379,8 +2361,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 return;
                             }
                             Key::Named(NamedKey::End) => {
-                                self.editing_agent_cursor =
-                                    self.editing_agent_text.chars().count();
+                                self.editing_agent_cursor = self.editing_agent_text.chars().count();
                                 if let Some(s) = self.sessions.get(&window_id) {
                                     s.window.request_redraw();
                                 }
@@ -2406,10 +2387,8 @@ impl ApplicationHandler<AppEvent> for App {
                                     }
                                 } else if !self.modifiers.super_key() {
                                     if let Some(ref text) = event.text {
-                                        let filtered: String = text
-                                            .chars()
-                                            .filter(|c| !c.is_control())
-                                            .collect();
+                                        let filtered: String =
+                                            text.chars().filter(|c| !c.is_control()).collect();
                                         if !filtered.is_empty() {
                                             self.insert_editing_text(&filtered);
                                             if let Some(s) = self.sessions.get(&window_id) {
@@ -2464,10 +2443,8 @@ impl ApplicationHandler<AppEvent> for App {
                                     if !self.modifiers.super_key() && !self.modifiers.control_key()
                                     {
                                         if let Some(ref text) = event.text {
-                                            let filtered: String = text
-                                                .chars()
-                                                .filter(|c| !c.is_control())
-                                                .collect();
+                                            let filtered: String =
+                                                text.chars().filter(|c| !c.is_control()).collect();
                                             if !filtered.is_empty() {
                                                 session.search_query.push_str(&filtered);
                                                 session.update_search_matches();
@@ -2579,14 +2556,12 @@ impl ApplicationHandler<AppEvent> for App {
                                 let scrollback_len = active_buf.scrollback.len();
                                 if scrollback_len > 0 && drag.travel > 0.0 {
                                     let target_thumb_y = my - drag.drag_offset_y;
-                                    let clamped_thumb_y =
-                                        target_thumb_y.clamp(drag.track_y, drag.track_y + drag.travel);
-                                    let progress =
-                                        (clamped_thumb_y - drag.track_y) / drag.travel;
+                                    let clamped_thumb_y = target_thumb_y
+                                        .clamp(drag.track_y, drag.track_y + drag.travel);
+                                    let progress = (clamped_thumb_y - drag.track_y) / drag.travel;
                                     let new_offset =
                                         ((1.0 - progress) * scrollback_len as f32).round() as usize;
-                                    active_buf.scroll_offset =
-                                        new_offset.min(scrollback_len);
+                                    active_buf.scroll_offset = new_offset.min(scrollback_len);
                                     session.last_scroll_time = Some(Instant::now());
                                     session.window.request_redraw();
                                 }
@@ -2657,12 +2632,9 @@ impl ApplicationHandler<AppEvent> for App {
 
                         // 3.0 Check Scrollbar Hover
                         let scale = session.renderer.scale_factor;
-                        let pane_rects = session.workspace.compute_active_pane_rects_with_scale(
-                            width,
-                            height,
-                            tab_bar_h,
-                            scale,
-                        );
+                        let pane_rects = session
+                            .workspace
+                            .compute_active_pane_rects_with_scale(width, height, tab_bar_h, scale);
 
                         let mut over_scrollbar_pane = None;
                         if let Some(active_tab) = session.workspace.active_tab() {
@@ -2886,29 +2858,28 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     let (mx, my) = session.mouse_pos;
 
-                    if button == MouseButton::Left
-                        && state == ElementState::Pressed {
-                            // 0. Check the global agents panel, whose geometry
-                            // comes from the same layout the renderer drew with.
-                            if let Some(panel) = session.agent_panel_layout(tab_bar_h) {
-                                match panel.hit(mx, my) {
-                                    AgentPanelHit::ResizeHandle => {
-                                        session.dragging_sidebar = true;
-                                        return;
-                                    }
-                                    AgentPanelHit::CloseButton => {
-                                        close_panel_clicked = true;
-                                    }
-                                    // Defer the spawn until the `session`
-                                    // borrow ends below: `build_pty_options`
-                                    // reads `self.sessions`.
-                                    AgentPanelHit::NewButton => spawn_agent_pane = true,
-                                    AgentPanelHit::Card(idx) => clicked_agent_idx = Some(idx),
-                                    AgentPanelHit::Background => swallowed_by_panel = true,
-                                    AgentPanelHit::Outside => {}
+                    if button == MouseButton::Left && state == ElementState::Pressed {
+                        // 0. Check the global agents panel, whose geometry
+                        // comes from the same layout the renderer drew with.
+                        if let Some(panel) = session.agent_panel_layout(tab_bar_h) {
+                            match panel.hit(mx, my) {
+                                AgentPanelHit::ResizeHandle => {
+                                    session.dragging_sidebar = true;
+                                    return;
                                 }
+                                AgentPanelHit::CloseButton => {
+                                    close_panel_clicked = true;
+                                }
+                                // Defer the spawn until the `session`
+                                // borrow ends below: `build_pty_options`
+                                // reads `self.sessions`.
+                                AgentPanelHit::NewButton => spawn_agent_pane = true,
+                                AgentPanelHit::Card(idx) => clicked_agent_idx = Some(idx),
+                                AgentPanelHit::Background => swallowed_by_panel = true,
+                                AgentPanelHit::Outside => {}
                             }
                         }
+                    }
                 }
 
                 // Clicks on inert panel chrome must not fall through to the
@@ -2933,11 +2904,7 @@ impl ApplicationHandler<AppEvent> for App {
                     // shell args, TERM and the whole env map, so doing it for every
                     // mouse press and release was pure waste.
                     let pty_opts = self.build_pty_options();
-                    let scrollback = self
-                        .config_manager
-                        .current_config
-                        .terminal
-                        .scrollback_lines;
+                    let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
 
                     if let Some(session) = self.sessions.get_mut(&window_id) {
                         let _ = session.workspace.split_active_pane(
@@ -2994,10 +2961,7 @@ impl ApplicationHandler<AppEvent> for App {
                                 .sessions
                                 .get(&target_wid)
                                 .and_then(|s| {
-                                    s.workspace
-                                        .tabs
-                                        .iter()
-                                        .find(|t| t.id == agent.tab_id)
+                                    s.workspace.tabs.iter().find(|t| t.id == agent.tab_id)
                                 })
                                 .and_then(|t| t.root.find_terminal(agent.pane_id))
                                 .and_then(|term| term.custom_label.clone())
@@ -3014,19 +2978,18 @@ impl ApplicationHandler<AppEvent> for App {
                                     // title row using the same layout the panel
                                     // was drawn with, converted back to points.
                                     let scale = s.renderer.scale_factor as f64;
-                                    let (logical_x, logical_y, logical_w) = match s
-                                        .agent_panel_layout(tab_bar_h)
-                                    {
-                                        Some(panel) => {
-                                            let card = panel.card_rect(idx);
-                                            (
-                                                (card.x as f64) / scale + 24.0,
-                                                (card.y as f64) / scale + 7.0,
-                                                (((card.w as f64) / scale) - 34.0).max(90.0),
-                                            )
-                                        }
-                                        None => (24.0, 24.0, 90.0),
-                                    };
+                                    let (logical_x, logical_y, logical_w) =
+                                        match s.agent_panel_layout(tab_bar_h) {
+                                            Some(panel) => {
+                                                let card = panel.card_rect(idx);
+                                                (
+                                                    (card.x as f64) / scale + 24.0,
+                                                    (card.y as f64) / scale + 7.0,
+                                                    (((card.w as f64) / scale) - 34.0).max(90.0),
+                                                )
+                                            }
+                                            None => (24.0, 24.0, 90.0),
+                                        };
                                     let logical_h = 22.0;
                                     let win = s.window.clone();
                                     let _ = s;
@@ -3105,10 +3068,12 @@ impl ApplicationHandler<AppEvent> for App {
                     return;
                 }
 
-                if button == MouseButton::Left && state == ElementState::Pressed
-                    && self.editing_agent_pane.is_some() {
-                        self.commit_agent_label_edit();
-                    }
+                if button == MouseButton::Left
+                    && state == ElementState::Pressed
+                    && self.editing_agent_pane.is_some()
+                {
+                    self.commit_agent_label_edit();
+                }
 
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     let (mx, my) = session.mouse_pos;
@@ -3161,9 +3126,8 @@ impl ApplicationHandler<AppEvent> for App {
 
                             // 2.5 Check Scrollbar Click / Drag Start
                             let mut scrollbar_clicked = false;
-                            let pane_rects = session
-                                .workspace
-                                .compute_active_pane_rects_with_scale(
+                            let pane_rects =
+                                session.workspace.compute_active_pane_rects_with_scale(
                                     width, height, tab_bar_h, scale,
                                 );
                             if let Some(active_tab) = session.workspace.active_tab_mut() {
@@ -3206,8 +3170,7 @@ impl ApplicationHandler<AppEvent> for App {
                                                     {
                                                         (metrics.thumb_y, my - metrics.thumb_y)
                                                     } else {
-                                                        let target_y = (my
-                                                            - metrics.thumb_h / 2.0)
+                                                        let target_y = (my - metrics.thumb_h / 2.0)
                                                             .clamp(
                                                                 metrics.track_y,
                                                                 metrics.track_y + metrics.travel,
@@ -3223,7 +3186,9 @@ impl ApplicationHandler<AppEvent> for App {
                                                             * scrollback_len as f32)
                                                             .round()
                                                             as usize;
-                                                        term.grid_mut().active_mut().scroll_offset =
+                                                        term.grid_mut()
+                                                            .active_mut()
+                                                            .scroll_offset =
                                                             new_offset.min(scrollback_len);
                                                     }
 
@@ -3234,8 +3199,7 @@ impl ApplicationHandler<AppEvent> for App {
                                                             travel: metrics.travel,
                                                             drag_offset_y,
                                                         });
-                                                    session.last_scroll_time =
-                                                        Some(Instant::now());
+                                                    session.last_scroll_time = Some(Instant::now());
                                                     session.window.request_redraw();
                                                     break;
                                                 }
@@ -3274,10 +3238,9 @@ impl ApplicationHandler<AppEvent> for App {
                                                 .grid_mut()
                                                 .active_mut()
                                                 .select_word_at(row, col),
-                                            3 => terminal
-                                                .grid_mut()
-                                                .active_mut()
-                                                .select_line_at(row),
+                                            3 => {
+                                                terminal.grid_mut().active_mut().select_line_at(row)
+                                            }
                                             _ => {
                                                 terminal.grid_mut().active_mut().selection =
                                                     Some(Selection::new(
@@ -3357,9 +3320,8 @@ impl ApplicationHandler<AppEvent> for App {
                                             let cb = (button + 32) as u8;
                                             let cx = (col.min(223) + 32) as u8;
                                             let cy = (row.min(223) + 32) as u8;
-                                            payload.extend_from_slice(&[
-                                                0x1b, b'[', b'M', cb, cx, cy,
-                                            ]);
+                                            payload
+                                                .extend_from_slice(&[0x1b, b'[', b'M', cb, cx, cy]);
                                         }
                                     }
                                     let _ = terminal.write_to_pty(&payload);
@@ -3475,7 +3437,6 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                         }
                     }
-
 
                     let tabs: Vec<TabItem> = session
                         .workspace
@@ -3744,9 +3705,9 @@ impl ApplicationHandler<AppEvent> for App {
                         Ok(toml_str) => {
                             let path = self.config_manager.path.clone();
                             std::thread::spawn(move || {
-                                if let Err(e) = crate::config::write_config_atomically(
-                                    &path, &toml_str,
-                                ) {
+                                if let Err(e) =
+                                    crate::config::write_config_atomically(&path, &toml_str)
+                                {
                                     error!("Failed to save config to {:?}: {}", path, e);
                                 }
                             });
@@ -3785,10 +3746,9 @@ impl ApplicationHandler<AppEvent> for App {
             self.pending_config_save = false;
             match toml::to_string_pretty(&self.config_manager.current_config) {
                 Ok(toml_str) => {
-                    if let Err(e) = crate::config::write_config_atomically(
-                        &self.config_manager.path,
-                        &toml_str,
-                    ) {
+                    if let Err(e) =
+                        crate::config::write_config_atomically(&self.config_manager.path, &toml_str)
+                    {
                         error!("Failed to flush config on exit: {}", e);
                     }
                 }

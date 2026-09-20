@@ -1102,9 +1102,7 @@ impl Workspace {
                         } else {
                             "Double-click to name...".to_string()
                         }
-                    } else if terminal.state.title != "skTerm"
-                        && !terminal.state.title.is_empty()
-                    {
+                    } else if terminal.state.title != "skTerm" && !terminal.state.title.is_empty() {
                         terminal.state.title.clone()
                     } else {
                         "Double-click to name...".to_string()
