@@ -1,6 +1,6 @@
 //! `skterm-gui`: Application window loop, input handling, config, tabs, and split panes multiplexer.
 
-pub mod app_window;
+pub mod app;
 pub mod config;
 pub mod egui_fonts;
 pub mod icon;
@@ -13,7 +13,7 @@ pub mod macos_titlebar;
 pub mod preferences_window;
 pub mod tab_title;
 
-pub use app_window::App;
+pub use app::App;
 pub use config::{default_config_template, parse_hex_color, Config, ConfigManager, Theme};
 pub use icon::{apply_window_icon, configure_window_attributes, get_app_icon};
 pub use input::{

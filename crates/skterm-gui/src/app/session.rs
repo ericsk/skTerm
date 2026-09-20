@@ -1,0 +1,408 @@
+//! Per-window terminal session state: tabs, panes, selection, search, and IME.
+
+use super::events::TAB_LABEL_REFRESH_INTERVAL;
+use crate::layout::{PaneId, Rect, SplitDirection, Workspace};
+use arboard::Clipboard;
+use skterm_render::{AgentPanelLayout, TermRenderer};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use tracing::info;
+use winit::dpi::{LogicalPosition, LogicalSize, Position, Size};
+use winit::window::Window;
+
+/// Active drag state when user clicks and drags a pane's scrollbar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollbarDragState {
+    pub pane_id: PaneId,
+    pub track_y: f32,
+    pub travel: f32,
+    pub drag_offset_y: f32,
+}
+
+/// Terminal Window Session representing an active window (or native macOS tab).
+pub struct TerminalSession {
+    pub window: Arc<Window>,
+    pub renderer: TermRenderer,
+    pub workspace: Workspace,
+    pub process_cache: crate::layout::ProcessTreeCache,
+    pub mouse_pos: (f32, f32),
+    pub is_mouse_down: bool,
+    pub last_click_time: Instant,
+    pub click_count: usize,
+    pub dragging_splitter: Option<(u32, SplitDirection, Rect)>,
+    /// When the panes were last reflowed during the current splitter drag.
+    ///
+    /// See [`RESIZE_REFLOW_DEBOUNCE`](super::events::RESIZE_REFLOW_DEBOUNCE). Reset on mouse-down so the first move of a
+    /// new drag is never swallowed by the tail of a previous one.
+    pub last_drag_reflow: Instant,
+    pub dragging_sidebar: bool,
+    pub dragging_scrollbar: Option<ScrollbarDragState>,
+    pub hovered_scrollbar_pane: Option<PaneId>,
+    pub last_scroll_time: Option<Instant>,
+    pub hovered_url: Option<String>,
+    pub scroll_pixel_accumulator: f64,
+    pub search_open: bool,
+    pub search_query: String,
+    pub search_matches: Vec<skterm_core::SearchMatch>,
+    pub active_search_idx: Option<usize>,
+    pub last_ime_cursor_area: Option<(i32, i32, i32, i32)>,
+    /// Last time the native tab label was recomputed.
+    ///
+    /// Building the label costs a foreground-process lookup plus a cwd lookup
+    /// per session. Cheap individually, but not worth paying every frame for a
+    /// string that changes only when the user runs something or cds.
+    pub last_tab_label_refresh: Option<Instant>,
+    pub cached_tab_label: String,
+    pub cached_tab_tooltip: String,
+    /// PTY output arrived while this window was not the focused one.
+    pub has_unseen_output: bool,
+}
+
+impl TerminalSession {
+    /// Note that output arrived while this session was not the visible one.
+    ///
+    /// Resetting the throttle makes the indicator show up on the next pass of
+    /// the event loop instead of up to [`TAB_LABEL_REFRESH_INTERVAL`] later.
+    pub fn mark_unseen_output(&mut self) {
+        if !self.has_unseen_output {
+            self.has_unseen_output = true;
+            self.last_tab_label_refresh = None;
+        }
+    }
+
+    /// The user is now looking at this session, so its output is no longer unseen.
+    pub fn clear_unseen_output(&mut self) {
+        if self.has_unseen_output {
+            self.has_unseen_output = false;
+            self.last_tab_label_refresh = None;
+        }
+    }
+
+    /// Recompute this window's native tab label, at most once per
+    /// [`TAB_LABEL_REFRESH_INTERVAL`].
+    ///
+    /// Returns `Some((label, tooltip))` **only when the text actually changed**.
+    /// In the steady state a terminal sits in one directory running one program,
+    /// so this returns `None` and the caller skips the AppKit round-trip
+    /// entirely.
+    pub fn refresh_tab_label(
+        &mut self,
+        configured_shell: Option<&str>,
+    ) -> Option<(String, String)> {
+        let due = match self.last_tab_label_refresh {
+            Some(t) => t.elapsed() >= TAB_LABEL_REFRESH_INTERVAL,
+            None => true,
+        };
+        if !due {
+            return None;
+        }
+        self.last_tab_label_refresh = Some(Instant::now());
+
+        let home = std::env::var("HOME").ok();
+        let active_idx = self.workspace.active_tab_idx;
+        let mut active_label = None;
+        let mut active_tooltip = None;
+        let mut any_tab_changed = false;
+
+        for (idx, tab) in self.workspace.tabs.iter_mut().enumerate() {
+            if let Some(terminal) = tab.active_terminal() {
+                let process = terminal.foreground_process_name();
+                let cwd = terminal.current_working_directory();
+                let fallback = format!("Tab {}", idx + 1);
+                let mut label = crate::tab_title::build_tab_label(
+                    process.as_deref(),
+                    cwd.as_deref(),
+                    home.as_deref(),
+                    configured_shell,
+                    &fallback,
+                );
+                if tab.has_unseen_output {
+                    label.insert_str(0, "• ");
+                }
+                if tab.title != label {
+                    tab.title = label.clone();
+                    any_tab_changed = true;
+                }
+                if idx == active_idx {
+                    let mut win_label = label;
+                    if self.has_unseen_output && !win_label.starts_with("• ") {
+                        win_label.insert_str(0, "• ");
+                    }
+                    let tooltip = cwd.unwrap_or_else(|| win_label.clone());
+                    active_label = Some(win_label);
+                    active_tooltip = Some(tooltip);
+                }
+            }
+        }
+
+        if any_tab_changed {
+            self.window.request_redraw();
+        }
+
+        let label = active_label?;
+        let tooltip = active_tooltip?;
+
+        if label == self.cached_tab_label && tooltip == self.cached_tab_tooltip {
+            return None;
+        }
+        self.cached_tab_label = label.clone();
+        self.cached_tab_tooltip = tooltip.clone();
+        Some((label, tooltip))
+    }
+
+    pub fn update_search_matches(&mut self) {
+        self.search_matches = self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.active_terminal())
+            .map(|term| term.grid().active().search(&self.search_query))
+            .unwrap_or_default();
+
+        if self.search_matches.is_empty() {
+            self.active_search_idx = None;
+        } else {
+            let idx = self.search_matches.len() - 1;
+            self.active_search_idx = Some(idx);
+            let target_row = self.search_matches[idx].global_row;
+            if let Some(tab) = self.workspace.active_tab_mut() {
+                if let Some(term) = tab.active_terminal_mut() {
+                    term.grid_mut()
+                        .active_mut()
+                        .scroll_to_global_row(target_row);
+                }
+            }
+        }
+    }
+
+    pub fn next_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let next = match self.active_search_idx {
+            Some(i) => (i + 1) % self.search_matches.len(),
+            None => 0,
+        };
+        self.active_search_idx = Some(next);
+        let target_row = self.search_matches[next].global_row;
+        if let Some(tab) = self.workspace.active_tab_mut() {
+            if let Some(term) = tab.active_terminal_mut() {
+                term.grid_mut()
+                    .active_mut()
+                    .scroll_to_global_row(target_row);
+            }
+        }
+    }
+
+    pub fn prev_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let prev = match self.active_search_idx {
+            Some(i) => {
+                if i == 0 {
+                    self.search_matches.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => self.search_matches.len() - 1,
+        };
+        self.active_search_idx = Some(prev);
+        let target_row = self.search_matches[prev].global_row;
+        if let Some(tab) = self.workspace.active_tab_mut() {
+            if let Some(term) = tab.active_terminal_mut() {
+                term.grid_mut()
+                    .active_mut()
+                    .scroll_to_global_row(target_row);
+            }
+        }
+    }
+    pub fn update_ime_position(&mut self, tab_bar_h: f32) {
+        if let Some(active_tab) = self.workspace.active_tab() {
+            if let Some(terminal) = active_tab.active_terminal() {
+                let pane_rects = self.workspace.compute_active_pane_rects_with_scale(
+                    self.renderer.config.width as f32,
+                    self.renderer.config.height as f32,
+                    tab_bar_h,
+                    self.renderer.scale_factor,
+                );
+
+                for (id, rect) in &pane_rects {
+                    if *id == active_tab.active_pane_id {
+                        let cursor = &terminal.grid().active().cursor;
+                        let cell_w = self.renderer.cell_width();
+                        let cell_h = self.renderer.cell_height();
+
+                        let cursor_px =
+                            rect.x + self.renderer.padding_x + (cursor.col as f32 * cell_w);
+                        let cursor_py =
+                            rect.y + self.renderer.padding_y + (cursor.row as f32 * cell_h);
+
+                        let scale = self.renderer.scale_factor as f64;
+                        let logical_pos = LogicalPosition::new(
+                            cursor_px as f64 / scale,
+                            cursor_py as f64 / scale,
+                        );
+                        let logical_size =
+                            LogicalSize::new(cell_w as f64 / scale, cell_h as f64 / scale);
+
+                        let area_key = (
+                            logical_pos.x.round() as i32,
+                            logical_pos.y.round() as i32,
+                            logical_size.width.round() as i32,
+                            logical_size.height.round() as i32,
+                        );
+                        if self.last_ime_cursor_area == Some(area_key) {
+                            break;
+                        }
+                        self.last_ime_cursor_area = Some(area_key);
+
+                        self.window.set_ime_cursor_area(
+                            Position::Logical(logical_pos),
+                            Size::Logical(logical_size),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn copy_to_clipboard(&self, clipboard: Option<&Arc<Mutex<Clipboard>>>) {
+        if let Some(active_tab) = self.workspace.active_tab() {
+            if let Some(terminal) = active_tab.active_terminal() {
+                let text = terminal.grid().active().extract_selected_text();
+                if !text.is_empty() {
+                    if let Some(cb) = clipboard {
+                        if let Ok(mut clip) = cb.lock() {
+                            let _ = clip.set_text(text);
+                            info!("Copied selected text to system clipboard");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn paste_from_clipboard(&mut self, clipboard: Option<&Arc<Mutex<Clipboard>>>) {
+        if let Some(cb) = clipboard {
+            if let Ok(mut clip) = cb.lock() {
+                let text_to_paste = if let Ok(text) = clip.get_text() {
+                    if !text.is_empty() {
+                        Some(text)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let final_text = if let Some(text) = text_to_paste {
+                    Some(text)
+                } else if let Ok(img_data) = clip.get_image() {
+                    // Save clipboard image to system temp directory as PNG and paste file path
+                    if let Some(rgba_img) = image::RgbaImage::from_raw(
+                        img_data.width as u32,
+                        img_data.height as u32,
+                        img_data.bytes.into_owned(),
+                    ) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default();
+                        let filename =
+                            format!("clipboard-{}-{:08X}.png", now.as_secs(), now.subsec_nanos());
+                        let temp_path = std::env::temp_dir().join(filename);
+                        if rgba_img.save(&temp_path).is_ok() {
+                            info!("Saved clipboard image to {:?}", temp_path);
+                            Some(temp_path.to_string_lossy().into_owned())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(text) = final_text {
+                    if let Some(active_tab) = self.workspace.active_tab_mut() {
+                        if let Some(terminal) = active_tab.active_terminal_mut() {
+                            terminal.grid_mut().active_mut().scroll_offset = 0;
+                            let bracketed = terminal.state.bracketed_paste;
+                            let payload = if bracketed {
+                                format!("\x1b[200~{}\x1b[201~", text)
+                            } else {
+                                text
+                            };
+                            let _ = terminal.write_to_pty(payload.as_bytes());
+                            self.window.request_redraw();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn get_pane_and_cell_at(
+        &self,
+        mouse_x: f32,
+        mouse_y: f32,
+        tab_bar_h: f32,
+    ) -> Option<(PaneId, usize, usize)> {
+        let pane_rects = self.workspace.compute_active_pane_rects_with_scale(
+            self.renderer.config.width as f32,
+            self.renderer.config.height as f32,
+            tab_bar_h,
+            self.renderer.scale_factor,
+        );
+
+        for (id, rect) in pane_rects {
+            if rect.contains(mouse_x, mouse_y) {
+                let cell_w = self.renderer.cell_width();
+                let cell_h = self.renderer.cell_height();
+                let pad_x = self.renderer.padding_x;
+                let pad_y = self.renderer.padding_y;
+
+                let rel_x = (mouse_x - rect.x - pad_x).max(0.0);
+                let rel_y = (mouse_y - rect.y - pad_y).max(0.0);
+
+                let col = (rel_x / cell_w).floor() as usize;
+                let row = (rel_y / cell_h).floor() as usize;
+
+                return Some((id, row, col));
+            }
+        }
+        None
+    }
+
+    pub fn sync_all_pane_sizes(&mut self, tab_bar_h: f32) {
+        self.workspace.sync_pane_sizes_with_scale(
+            self.renderer.config.width as f32,
+            self.renderer.config.height as f32,
+            self.renderer.cell_width(),
+            self.renderer.cell_height(),
+            self.renderer.padding_x,
+            self.renderer.padding_y,
+            tab_bar_h,
+            self.renderer.scale_factor,
+        );
+    }
+
+    /// Geometry of the global agents panel for this window, or `None` when it is
+    /// closed. Every hit-test goes through here so the clickable regions are the
+    /// ones the renderer actually drew.
+    pub fn agent_panel_layout(&self, tab_bar_h: f32) -> Option<AgentPanelLayout> {
+        if !self.workspace.sidebar_open {
+            return None;
+        }
+        let scale = self.renderer.scale_factor;
+        Some(AgentPanelLayout::new(
+            self.renderer.config.width as f32,
+            self.renderer.config.height as f32,
+            tab_bar_h,
+            self.workspace.sidebar_width * scale,
+            scale,
+        ))
+    }
+}
