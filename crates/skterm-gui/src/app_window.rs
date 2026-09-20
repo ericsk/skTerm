@@ -408,6 +408,18 @@ const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// Recomputing means two process lookups per session, and a tab label that lags
 /// a `cd` by half a second is not something a user can perceive.
 const TAB_LABEL_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+/// Minimum gap between pane reflows while a splitter is actively being dragged.
+///
+/// `Terminal::resize` already no-ops when the cell dimensions are unchanged, but a
+/// drag across the window still crosses one column boundary every `cell_w` pixels,
+/// and each crossing reflows the whole scrollback *and* fires a `SIGWINCH` at the
+/// child. Full-screen apps (vim, htop) repaint on every one of those, so a fast drag
+/// turns into dozens of full redraws in the child process.
+///
+/// The splitter itself still tracks the mouse at full rate -- only the terminal
+/// re-layout is throttled -- and `MouseInput`'s release arm always performs a final
+/// unthrottled sync, so the end state is exact.
+const RESIZE_REFLOW_DEBOUNCE: Duration = Duration::from_millis(50);
 
 /// Active drag state when user clicks and drags a pane's scrollbar.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -429,6 +441,11 @@ pub struct TerminalSession {
     pub last_click_time: Instant,
     pub click_count: usize,
     pub dragging_splitter: Option<(u32, SplitDirection, Rect)>,
+    /// When the panes were last reflowed during the current splitter drag.
+    ///
+    /// See [`RESIZE_REFLOW_DEBOUNCE`]. Reset on mouse-down so the first move of a
+    /// new drag is never swallowed by the tail of a previous one.
+    pub last_drag_reflow: Instant,
     pub dragging_sidebar: bool,
     pub dragging_scrollbar: Option<ScrollbarDragState>,
     pub hovered_scrollbar_pane: Option<PaneId>,
@@ -1516,6 +1533,7 @@ impl App {
             last_click_time: Instant::now(),
             click_count: 0,
             dragging_splitter: None,
+            last_drag_reflow: Instant::now(),
             dragging_sidebar: false,
             dragging_scrollbar: None,
             hovered_scrollbar_pane: None,
@@ -1550,10 +1568,14 @@ impl ApplicationHandler<AppEvent> for App {
                 self.pty_wakeup_pending.store(false, Ordering::Release);
                 let active_session = self.active_session_id;
                 for (id, session) in self.sessions.iter_mut() {
-                    if session.workspace.poll_all_ptys() {
-                        if active_session != Some(*id) {
-                            session.mark_unseen_output();
-                        }
+                    let outcome = session.workspace.poll_all_ptys();
+                    if outcome.any_output && active_session != Some(*id) {
+                        session.mark_unseen_output();
+                    }
+                    // Only repaint if something visible changed. Output in a
+                    // background tab updates that tab's buffer and activity dot
+                    // without touching what is currently on screen.
+                    if outcome.needs_redraw() {
                         session.window.request_redraw();
                     }
                 }
@@ -1606,9 +1628,14 @@ impl ApplicationHandler<AppEvent> for App {
                         if res.repaint {
                             pref.window.request_redraw();
                         }
-                        if let Some(new_cfg) = pref.check_changed(&self.config_manager) {
-                            self.apply_config_live(&new_cfg, true);
-                        }
+                        // No `check_changed` here on purpose. egui is immediate-mode:
+                        // the form fields can only be mutated while the UI closure
+                        // runs, which happens inside `render_frame` on the
+                        // `RedrawRequested` arm above -- and that already ends with a
+                        // `check_changed`. Calling it here as well compared state that
+                        // provably had not changed since the last frame, at the cost of
+                        // a full `Config` deep clone (15+ Strings plus the env map) on
+                        // every event, mouse motion included.
                         return;
                     }
                 }
@@ -1680,6 +1707,12 @@ impl ApplicationHandler<AppEvent> for App {
                     if new_cols != current_cols || new_rows != current_rows {
                         self.config_manager.current_config.window.columns = new_cols;
                         self.config_manager.current_config.window.rows = new_rows;
+                        // Keep an open preferences form in step with the geometry we
+                        // just derived. Without this its stale copy would be written
+                        // straight back over the resize on the next event.
+                        if let Some(pref) = self.preferences_window.as_mut() {
+                            pref.sync_window_geometry(new_cols, new_rows);
+                        }
                         self.pending_config_save = true;
                         self.last_config_change = Some(Instant::now());
                     }
@@ -2581,7 +2614,13 @@ impl ApplicationHandler<AppEvent> for App {
                             mx,
                             scale,
                         );
-                        session.sync_all_pane_sizes(tab_bar_h);
+                        // Same throttle as the splitter drag below: the panel edge
+                        // follows the pointer every event, the pane reflow does not.
+                        // The release arm performs the exact final sync.
+                        if session.last_drag_reflow.elapsed() >= RESIZE_REFLOW_DEBOUNCE {
+                            session.last_drag_reflow = Instant::now();
+                            session.sync_all_pane_sizes(tab_bar_h);
+                        }
                         session.window.request_redraw();
                         return;
                     }
@@ -2596,8 +2635,15 @@ impl ApplicationHandler<AppEvent> for App {
                                 ((my - parent_rect.y) / parent_rect.height).clamp(0.05, 0.95)
                             }
                         };
+                        // Cheap: just moves the divider, so the splitter tracks the
+                        // mouse with no lag.
                         session.workspace.set_split_ratio(split_id, new_ratio);
-                        session.sync_all_pane_sizes(tab_bar_h);
+                        // Expensive: reflows every pane and signals every child.
+                        // Throttled; the release arm does the exact final sync.
+                        if session.last_drag_reflow.elapsed() >= RESIZE_REFLOW_DEBOUNCE {
+                            session.last_drag_reflow = Instant::now();
+                            session.sync_all_pane_sizes(tab_bar_h);
+                        }
                         session.window.request_redraw();
                         return;
                     }
@@ -2865,6 +2911,10 @@ impl ApplicationHandler<AppEvent> for App {
                             match panel.hit(mx, my) {
                                 AgentPanelHit::ResizeHandle => {
                                     session.dragging_sidebar = true;
+                                    // See the splitter drag-start: make the first
+                                    // move of this drag reflow immediately.
+                                    session.last_drag_reflow =
+                                        Instant::now() - RESIZE_REFLOW_DEBOUNCE;
                                     return;
                                 }
                                 AgentPanelHit::CloseButton => {
@@ -3095,6 +3145,11 @@ impl ApplicationHandler<AppEvent> for App {
                                         splitter.direction,
                                         splitter.parent_rect,
                                     ));
+                                    // Backdate the clock so the very first move of
+                                    // this drag reflows immediately instead of
+                                    // inheriting the tail of an earlier drag.
+                                    session.last_drag_reflow =
+                                        Instant::now() - RESIZE_REFLOW_DEBOUNCE;
                                     return;
                                 }
                             }
@@ -3260,6 +3315,10 @@ impl ApplicationHandler<AppEvent> for App {
                                 session.dragging_scrollbar = None;
                                 session.window.request_redraw();
                             }
+                            // Both drags throttle their reflow while the button is
+                            // held (see `RESIZE_REFLOW_DEBOUNCE`), so these two
+                            // syncs are unconditional: they are what guarantees the
+                            // panes match the final divider position exactly.
                             if session.dragging_sidebar {
                                 session.dragging_sidebar = false;
                                 session.sync_all_pane_sizes(tab_bar_h);
@@ -3632,11 +3691,11 @@ impl ApplicationHandler<AppEvent> for App {
                     session.window.request_redraw();
                 }
             } else {
-                let has_output = session.workspace.poll_all_ptys();
-                if has_output {
-                    if active_session != Some(*id) {
-                        session.mark_unseen_output();
-                    }
+                let outcome = session.workspace.poll_all_ptys();
+                if outcome.any_output && active_session != Some(*id) {
+                    session.mark_unseen_output();
+                }
+                if outcome.needs_redraw() {
                     session.window.request_redraw();
                 }
             }

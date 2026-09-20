@@ -2,6 +2,7 @@
 
 pub mod app_window;
 pub mod config;
+pub mod egui_fonts;
 pub mod icon;
 pub mod input;
 pub mod layout;
@@ -9,7 +10,6 @@ pub mod layout;
 pub mod macos_textfield;
 #[cfg(target_os = "macos")]
 pub mod macos_titlebar;
-pub mod preferences_gui;
 pub mod preferences_window;
 pub mod tab_title;
 
@@ -20,8 +20,9 @@ pub use input::{
     check_tab_switch, check_tab_switch_for_os, encode_key, encode_key_event,
     is_tab_switch_modifier, is_tab_switch_modifier_for_os, parse_tab_switch_digit,
 };
-pub use layout::{PaneId, PaneNode, Rect, SplitDirection, SplitterBar, Tab, TabId, Workspace};
-pub use preferences_gui::{PreferencesGui, PreferencesTab};
+pub use layout::{
+    PaneId, PaneNode, PollOutcome, Rect, SplitDirection, SplitterBar, Tab, TabId, Workspace,
+};
 pub use preferences_window::{PreferencesCategory, PreferencesWindow};
 
 /// skterm-gui version and basic info
@@ -337,33 +338,6 @@ mod tests {
                 id
             );
         }
-    }
-
-    #[test]
-    fn test_preferences_gui_state() {
-        let mut gui = PreferencesGui::new();
-        assert!(!gui.is_open);
-
-        let default_cfg = Config::default();
-        gui.toggle(&default_cfg);
-        assert!(gui.is_open);
-        assert_eq!(gui.font_family, "Menlo");
-        assert_eq!(gui.columns, 80);
-        assert_eq!(gui.rows, 24);
-
-        gui.font_family = "Fira Code".to_string();
-        gui.font_size = 20.0;
-        gui.theme = "tokyo-night".to_string();
-        gui.columns = 120;
-
-        let modified_cfg = gui.to_config(&default_cfg);
-        assert_eq!(modified_cfg.font.family, "Fira Code");
-        assert_eq!(modified_cfg.font.size, 20.0);
-        assert_eq!(modified_cfg.colors.theme, "tokyo-night");
-        assert_eq!(modified_cfg.window.columns, 120);
-
-        gui.toggle(&default_cfg);
-        assert!(!gui.is_open);
     }
 
     #[test]

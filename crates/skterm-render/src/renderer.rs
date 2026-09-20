@@ -210,6 +210,22 @@ pub struct TermRenderer {
     pub opacity: f32,
     pub image_sampler: wgpu::Sampler,
     pub image_cache: HashMap<u32, (wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
+
+    // Per-frame instance scratch buffers.
+    //
+    // These are rebuilt from scratch every frame, but they are kept here rather than
+    // being locals so the allocation survives across frames: `clear()` retains
+    // capacity, so after the first few frames the draw path performs no allocation
+    // and no realloc-memcpy at all. A dense 200x50 pane pushes ~10k glyph instances
+    // (48 B each), which as a local `Vec` meant reallocating 4096 -> 8192 -> 16384
+    // and memcpying ~600 KB per frame purely to grow.
+    //
+    // They are `mem::take`n at the top of the draw call and put back at the end, so
+    // that building them doesn't hold a borrow on `self`.
+    bg_instances: Vec<BgInstance>,
+    glyph_instances: Vec<GlyphInstance>,
+    image_draw_calls: Vec<(u32, ImageInstance)>,
+    image_instances: Vec<ImageInstance>,
 }
 
 impl TermRenderer {
@@ -341,6 +357,12 @@ impl TermRenderer {
             opacity: 1.0,
             image_sampler,
             image_cache: HashMap::new(),
+            // Pre-sized for a dense ~200x50 pane so even the first frames avoid
+            // the realloc chain. These only ever grow to the high-water mark.
+            bg_instances: Vec::with_capacity(4096),
+            glyph_instances: Vec::with_capacity(12288),
+            image_draw_calls: Vec::new(),
+            image_instances: Vec::new(),
         })
     }
 
@@ -829,9 +851,15 @@ impl TermRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut bg_instances = Vec::with_capacity(1024);
-        let mut glyph_instances = Vec::with_capacity(4096);
-        let mut image_draw_calls: Vec<(u32, ImageInstance)> = Vec::new();
+        // Borrow the persistent scratch buffers for the duration of this frame.
+        // `take` leaves empty Vecs behind (no allocation) and we hand the buffers
+        // back at the end, so the capacity built up by previous frames is reused.
+        let mut bg_instances = std::mem::take(&mut self.bg_instances);
+        let mut glyph_instances = std::mem::take(&mut self.glyph_instances);
+        let mut image_draw_calls = std::mem::take(&mut self.image_draw_calls);
+        bg_instances.clear();
+        glyph_instances.clear();
+        image_draw_calls.clear();
 
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
@@ -1165,6 +1193,21 @@ impl TermRenderer {
                 let global_row = top_global_row + r_idx;
 
                 if let Some(row) = active_buf.get_visible_row(r_idx) {
+                    // `ScreenBuffer::search` emits matches in ascending `global_row`
+                    // order, so this row's matches are a contiguous subslice. Finding
+                    // it once per row turns the per-cell highlight test from
+                    // O(cells * total_matches) into O(cells * matches_on_this_row),
+                    // which is 0 or 1 for almost every row. Searching a common word
+                    // in a 10k-line scrollback used to make every frame scan
+                    // thousands of matches for each of ~30k visible cells.
+                    let row_match_start = pane
+                        .search_matches
+                        .partition_point(|m| m.global_row < global_row);
+                    let row_match_end = pane.search_matches[row_match_start..]
+                        .partition_point(|m| m.global_row == global_row)
+                        + row_match_start;
+                    let row_matches = &pane.search_matches[row_match_start..row_match_end];
+
                     for (c_idx, cell) in row.cells.iter().enumerate() {
                         let x = px + self.padding_x + (c_idx as f32 * cell_w);
                         if x + cell_w > px + pw {
@@ -1177,12 +1220,14 @@ impl TermRenderer {
                             .map(|s| s.contains(r_idx, c_idx))
                             .unwrap_or(false);
 
-                        // Fast-path: Skip default empty blank cells (typically 80-90% of screen)
+                        // Fast-path: Skip default empty blank cells (typically 80-90% of screen).
+                        // Gated on this row's matches, not the whole pane's: an active
+                        // search used to disable this fast path for the entire screen.
                         if cell.c == ' '
                             && cell.bg == Color::DefaultBg
                             && !cell.flags.contains(CellFlags::INVERSE)
                             && !is_selected
-                            && pane.search_matches.is_empty()
+                            && row_matches.is_empty()
                         {
                             continue;
                         }
@@ -1209,14 +1254,13 @@ impl TermRenderer {
                         }
 
                         // Highlight search matches
-                        if !pane.search_matches.is_empty() {
+                        if !row_matches.is_empty() {
                             let mut match_highlight = None;
-                            for (m_idx, m) in pane.search_matches.iter().enumerate() {
-                                if m.global_row == global_row
-                                    && c_idx >= m.start_col
-                                    && c_idx <= m.end_col
-                                {
-                                    if pane.active_search_idx == Some(m_idx) {
+                            for (i, m) in row_matches.iter().enumerate() {
+                                if c_idx >= m.start_col && c_idx <= m.end_col {
+                                    // `active_search_idx` indexes the full match list,
+                                    // so map this row-local index back.
+                                    if pane.active_search_idx == Some(row_match_start + i) {
                                         match_highlight = Some([0.98, 0.68, 0.12, 0.90]);
                                         break;
                                     } else {
@@ -1482,13 +1526,17 @@ impl TermRenderer {
         image_draw_calls.retain(|(id, _)| self.image_cache.contains_key(id));
         image_draw_calls.truncate(TerminalPipeline::MAX_IMAGE_INSTANCES);
         if !image_draw_calls.is_empty() {
-            let img_instances: Vec<ImageInstance> =
-                image_draw_calls.iter().map(|(_, inst)| *inst).collect();
+            // De-interleave into a reused buffer rather than `collect()`ing a fresh
+            // Vec, which allocated once per frame whenever any image was on screen.
+            let mut img_instances = std::mem::take(&mut self.image_instances);
+            img_instances.clear();
+            img_instances.extend(image_draw_calls.iter().map(|(_, inst)| *inst));
             self.queue.write_buffer(
                 &self.pipeline.image_instance_buffer,
                 0,
                 bytemuck::cast_slice(&img_instances),
             );
+            self.image_instances = img_instances;
         }
 
         let mut encoder = self
@@ -1558,6 +1606,11 @@ impl TermRenderer {
         }
 
         output.present();
+
+        // Hand the buffers back so the next frame reuses this frame's capacity.
+        self.bg_instances = bg_instances;
+        self.glyph_instances = glyph_instances;
+        self.image_draw_calls = image_draw_calls;
 
         Ok(())
     }

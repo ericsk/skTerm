@@ -556,7 +556,7 @@ impl PreferencesWindow {
         surface.configure(&device, &config);
 
         let egui_ctx = Context::default();
-        crate::preferences_gui::setup_egui_cjk_fonts(&egui_ctx);
+        crate::egui_fonts::setup_egui_cjk_fonts(&egui_ctx);
         Self::apply_macos_hig_theme(&egui_ctx);
 
         let scale = window.scale_factor() as f32;
@@ -677,6 +677,23 @@ impl PreferencesWindow {
         visuals.selection.stroke = Stroke::NONE;
 
         ctx.set_visuals(visuals);
+    }
+
+    /// Re-sync the runtime-derived window geometry into the form.
+    ///
+    /// `window.columns` / `window.rows` are unusual among the preferences: the form
+    /// can edit them, but the terminal *also* writes them back whenever the user
+    /// resizes the window. Because the form was only ever populated once (at
+    /// construction), a resize left `self.columns` / `self.rows` stale, and the very
+    /// next `check_changed` would compare the stale form value against the fresh
+    /// config, report a difference, and push the *old* size back over the user's
+    /// resize -- on every event, including mere mouse movement over the prefs window.
+    ///
+    /// Keeping the form in step with external geometry changes removes both the
+    /// size-reverting bug and the resulting re-layout storm.
+    pub fn sync_window_geometry(&mut self, columns: u16, rows: u16) {
+        self.columns = columns;
+        self.rows = rows;
     }
 
     pub fn load_from_config(&mut self, config: &Config) {

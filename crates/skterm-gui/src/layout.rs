@@ -677,6 +677,28 @@ impl Tab {
     }
 }
 
+/// What a `Workspace::poll_all_ptys` sweep actually changed.
+///
+/// Separating "some pane produced bytes" from "something the user can see
+/// changed" is what lets the event loop skip redraws for background tabs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PollOutcome {
+    /// The visible tab produced output, so terminal content changed.
+    pub active_tab_dirty: bool,
+    /// A background tab's activity dot just turned on, so the tab bar changed.
+    pub tab_bar_dirty: bool,
+    /// Any pane at all produced output, visible or not. Used for window-level
+    /// activity tracking, not for deciding whether to repaint.
+    pub any_output: bool,
+}
+
+impl PollOutcome {
+    /// Whether anything currently on screen changed and a repaint is warranted.
+    pub fn needs_redraw(&self) -> bool {
+        self.active_tab_dirty || self.tab_bar_dirty
+    }
+}
+
 /// Workspace holding multiple tabs and managing global layouts.
 pub struct Workspace {
     pub tabs: Vec<Tab>,
@@ -924,18 +946,31 @@ impl Workspace {
         }
     }
 
-    pub fn poll_all_ptys(&mut self) -> bool {
-        let mut any_data = false;
+    /// Drain every pane's PTY in this workspace and report what actually changed
+    /// *on screen*.
+    ///
+    /// The distinction matters for idle power: output in a background tab is not
+    /// visible, so it must not drive a full GPU re-render of the tab the user is
+    /// actually looking at. A `tail -f` or `cargo watch` in a background tab used
+    /// to pin the render path continuously.
+    pub fn poll_all_ptys(&mut self) -> PollOutcome {
+        let mut outcome = PollOutcome::default();
         let active_idx = self.active_tab_idx;
         for (idx, tab) in self.tabs.iter_mut().enumerate() {
             if tab.root.poll_all_ptys() {
-                if idx != active_idx {
+                outcome.any_output = true;
+                if idx == active_idx {
+                    outcome.active_tab_dirty = true;
+                } else if !tab.has_unseen_output {
+                    // The activity dot is turning on for the first time, which is
+                    // itself a visible change to the tab bar. Further output while
+                    // the dot is already lit changes nothing on screen.
                     tab.has_unseen_output = true;
+                    outcome.tab_bar_dirty = true;
                 }
-                any_data = true;
             }
         }
-        any_data
+        outcome
     }
 
     pub fn content_bounds(

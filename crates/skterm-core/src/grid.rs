@@ -553,6 +553,21 @@ impl ScreenBuffer {
                 false
             };
 
+            // Fast path: a grid line that occupied exactly one physical row is kept
+            // on exactly one physical row, even when it no longer fits.
+            //
+            // NOTE: this deliberately *truncates* content past `new_cols` rather than
+            // wrapping it onto a continuation row. Wrapping would push every following
+            // row down, which moves the cursor's row; a shell that repaints its prompt
+            // after SIGWINCH with a relative `ESC[1A` then lands on the wrong line and
+            // corrupts the display. `test_vt_prompt_line_preservation_on_resize` pins
+            // that behaviour.
+            //
+            // The cost is real: narrowing the window destroys the tail of any visible
+            // line longer than the new width (scrollback lines are re-wrapped normally
+            // by the loop below). Changing this is a product decision, not a local fix
+            // -- it needs a cursor-anchoring strategy so that re-wrapping the prompt
+            // block does not shift the cursor row.
             if in_grid && !line.was_soft_wrapped {
                 let row_idx = new_physical_rows.len();
                 if first_new_grid_row.is_none() {
@@ -1218,6 +1233,16 @@ impl ScreenBuffer {
 
     /// Case-insensitive search across scrollback history and active screen buffer.
     /// Returns matches ordered from oldest scrollback line to bottom active row.
+    ///
+    /// The ordering is part of the contract, not an accident: results are sorted by
+    /// `global_row` and then `start_col`, and the renderer relies on it to
+    /// `partition_point` out just the matches on the row it is currently drawing.
+    /// See `search_results_are_sorted_by_row_then_column`.
+    ///
+    /// This runs on every keystroke in the find bar, over the whole scrollback, so
+    /// the per-row work matters: at 10k lines x 200 cols the previous version
+    /// allocated a fresh `Vec<char>` per row (10k allocations) and called the full
+    /// Unicode `to_lowercase()` on every cell (2M calls) for each character typed.
     pub fn search(&self, query: &str) -> Vec<SearchMatch> {
         let q = query.trim();
         if q.is_empty() {
@@ -1230,6 +1255,9 @@ impl ScreenBuffer {
         let total_scrollback = self.scrollback.len();
         let total_lines = total_scrollback + self.rows;
 
+        // One buffer reused for every row rather than one allocation per row.
+        let mut row_chars: Vec<char> = Vec::with_capacity(self.cols);
+
         for global_row in 0..total_lines {
             let row_ref = if global_row < total_scrollback {
                 self.scrollback.get(global_row)
@@ -1237,27 +1265,42 @@ impl ScreenBuffer {
                 self.grid.get(global_row - total_scrollback)
             };
 
-            if let Some(row) = row_ref {
-                let row_chars: Vec<char> = row
-                    .cells
-                    .iter()
-                    .map(|c| c.c.to_lowercase().next().unwrap_or(c.c))
-                    .collect();
+            let Some(row) = row_ref else { continue };
 
-                if row_chars.len() >= q_len {
-                    let mut c_idx = 0;
-                    while c_idx + q_len <= row_chars.len() {
-                        if row_chars[c_idx..c_idx + q_len] == q_lower[..] {
-                            matches.push(SearchMatch {
-                                global_row,
-                                start_col: c_idx,
-                                end_col: c_idx + q_len - 1,
-                            });
-                            c_idx += q_len;
-                        } else {
-                            c_idx += 1;
-                        }
-                    }
+            // `q` is trimmed, so its last character is not whitespace and a match can
+            // never end inside the blank tail of a row. That makes `content_len` a
+            // safe scan bound, and lets wholly-blank or too-short rows skip entirely
+            // (the common case for most of a long scrollback).
+            let scan_len = row.content_len().min(row.cells.len());
+            if scan_len < q_len {
+                continue;
+            }
+
+            row_chars.clear();
+            row_chars.extend(row.cells[..scan_len].iter().map(|cell| {
+                let c = cell.c;
+                if c.is_ascii() {
+                    // Avoids the full Unicode lowercase mapping for the overwhelming
+                    // majority of terminal content.
+                    c.to_ascii_lowercase()
+                } else {
+                    c.to_lowercase().next().unwrap_or(c)
+                }
+            }));
+
+            let first = q_lower[0];
+            let mut c_idx = 0;
+            while c_idx + q_len <= row_chars.len() {
+                // Cheap first-character reject before the full slice compare.
+                if row_chars[c_idx] == first && row_chars[c_idx..c_idx + q_len] == q_lower[..] {
+                    matches.push(SearchMatch {
+                        global_row,
+                        start_col: c_idx,
+                        end_col: c_idx + q_len - 1,
+                    });
+                    c_idx += q_len;
+                } else {
+                    c_idx += 1;
                 }
             }
         }
@@ -1383,6 +1426,16 @@ impl ScreenGrid {
 }
 
 /// Helper to detect URLs in a row of terminal cells at a target column.
+///
+/// Runs on every `CursorMoved` event, so it avoids allocating until it has
+/// actually found a URL to return.
+///
+/// Everything here is indexed in **characters**, matching `cells`. An earlier
+/// version built a `String` for the row and used `str::find`, which returns a
+/// *byte* offset; feeding that back into the char-indexed array silently compared
+/// the wrong boundary character on any row containing non-ASCII text, and panicked
+/// outright once the byte offset exceeded the row's character count (roughly 30+
+/// CJK characters ahead of a URL on an 80-column row).
 pub fn detect_url_in_row(cells: &[Cell], target_col: usize) -> Option<String> {
     if target_col >= cells.len() {
         return None;
@@ -1393,72 +1446,555 @@ pub fn detect_url_in_row(cells: &[Cell], target_col: usize) -> Option<String> {
         return None;
     }
 
-    let chars: Vec<char> = cells.iter().map(|c| c.c).collect();
-    let total_len = chars.len();
-    let row_str: String = chars.iter().collect();
-
-    let prefixes = [
+    const PREFIXES: [&str; 8] = [
         "https://", "http://", "ftp://", "file://", "ssh://", "git://", "mailto:", "www.",
     ];
 
-    for prefix in &prefixes {
-        let mut search_from = 0;
-        while let Some(start_idx) = row_str[search_from..].find(prefix) {
-            let actual_start = search_from + start_idx;
-            // Check word boundary before the prefix
-            if actual_start > 0 {
-                let prev_c = chars[actual_start - 1];
-                if prev_c.is_alphanumeric() || prev_c == '/' || prev_c == '.' {
-                    search_from = actual_start + prefix.len();
-                    continue;
-                }
-            }
+    let total_len = cells.len();
 
-            // Find end of URL
-            let mut end_idx = actual_start + prefix.len();
-            while end_idx < total_len {
-                let c = chars[end_idx];
-                if c.is_whitespace()
-                    || c == '\0'
-                    || c == '"'
-                    || c == '\''
-                    || c == '`'
-                    || c == '<'
-                    || c == '>'
-                    || c == '^'
-                    || c == '{'
-                    || c == '}'
-                    || c == '|'
-                {
-                    break;
-                }
-                end_idx += 1;
-            }
+    // Every prefix contains either ':' or is "www.", so a row with neither cannot
+    // hold a URL. One cheap pass rejects the vast majority of hovered rows before
+    // any real work.
+    let mut has_colon = false;
+    let mut has_w = false;
+    for cell in cells {
+        match cell.c {
+            ':' => has_colon = true,
+            'w' => has_w = true,
+            _ => {}
+        }
+    }
+    if !has_colon && !has_w {
+        return None;
+    }
 
-            // Trim trailing punctuation marks like '.', ',', ';', '!', '?'
-            while end_idx > actual_start {
-                let last_c = chars[end_idx - 1];
-                if matches!(last_c, '.' | ',' | ';' | '!' | '?')
-                    || (last_c == ')' && !chars[actual_start..end_idx].contains(&'('))
-                    || (last_c == ']' && !chars[actual_start..end_idx].contains(&'['))
-                {
-                    end_idx -= 1;
-                } else {
-                    break;
-                }
-            }
+    // Case-sensitive prefix compare at a char offset, matching the previous
+    // `str::find` behaviour.
+    let prefix_matches_at = |start: usize, prefix: &str| -> Option<usize> {
+        let plen = prefix.chars().count();
+        if start + plen > total_len {
+            return None;
+        }
+        prefix
+            .chars()
+            .zip(cells[start..start + plen].iter())
+            .all(|(pc, cell)| cell.c == pc)
+            .then_some(plen)
+    };
 
-            if actual_start <= target_col && target_col < end_idx {
-                let mut url: String = chars[actual_start..end_idx].iter().collect();
-                if url.starts_with("www.") {
-                    url = format!("https://{}", url);
-                }
-                return Some(url);
+    for start in 0..total_len {
+        // Word boundary before the prefix.
+        if start > 0 {
+            let prev_c = cells[start - 1].c;
+            if prev_c.is_alphanumeric() || prev_c == '/' || prev_c == '.' {
+                continue;
             }
+        }
 
-            search_from = actual_start + prefix.len();
+        let Some(prefix_len) = PREFIXES.iter().find_map(|p| prefix_matches_at(start, p)) else {
+            continue;
+        };
+
+        // Find end of URL.
+        let mut end_idx = start + prefix_len;
+        while end_idx < total_len {
+            let c = cells[end_idx].c;
+            if c.is_whitespace()
+                || c == '\0'
+                || c == '"'
+                || c == '\''
+                || c == '`'
+                || c == '<'
+                || c == '>'
+                || c == '^'
+                || c == '{'
+                || c == '}'
+                || c == '|'
+            {
+                break;
+            }
+            end_idx += 1;
+        }
+
+        // Trim trailing punctuation marks like '.', ',', ';', '!', '?'.
+        while end_idx > start {
+            let last_c = cells[end_idx - 1].c;
+            let unbalanced_close = |open: char| !cells[start..end_idx].iter().any(|c| c.c == open);
+            if matches!(last_c, '.' | ',' | ';' | '!' | '?')
+                || (last_c == ')' && unbalanced_close('('))
+                || (last_c == ']' && unbalanced_close('['))
+            {
+                end_idx -= 1;
+            } else {
+                break;
+            }
+        }
+
+        if start <= target_col && target_col < end_idx {
+            let url: String = cells[start..end_idx].iter().map(|c| c.c).collect();
+            if url.starts_with("www.") {
+                return Some(format!("https://{}", url));
+            }
+            return Some(url);
         }
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a row of `cols` cells whose leading characters come from `s`.
+    fn row_from(s: &str, cols: usize) -> Vec<Cell> {
+        let mut cells = vec![Cell::default(); cols];
+        for (i, c) in s.chars().take(cols).enumerate() {
+            cells[i].c = c;
+        }
+        cells
+    }
+
+    /// Write `s` into the buffer starting at (row, 0), like a program printing a line.
+    fn put_line(buf: &mut ScreenBuffer, row: usize, s: &str) {
+        for (i, c) in s.chars().enumerate() {
+            if i >= buf.cols {
+                break;
+            }
+            buf.grid[row].cells[i].c = c;
+        }
+    }
+
+    // ---------------------------------------------------------------- URL detection
+
+    #[test]
+    fn url_detected_at_hovered_column() {
+        let cells = row_from("see https://example.com now", 80);
+        // Hover somewhere inside the URL.
+        assert_eq!(
+            detect_url_in_row(&cells, 10).as_deref(),
+            Some("https://example.com")
+        );
+        // Hovering the leading word must not produce a URL.
+        assert_eq!(detect_url_in_row(&cells, 1), None);
+    }
+
+    #[test]
+    fn url_www_prefix_gets_scheme() {
+        let cells = row_from("go to www.example.com", 40);
+        assert_eq!(
+            detect_url_in_row(&cells, 8).as_deref(),
+            Some("https://www.example.com")
+        );
+    }
+
+    #[test]
+    fn url_trailing_punctuation_is_trimmed() {
+        let cells = row_from("see https://example.com.", 40);
+        assert_eq!(
+            detect_url_in_row(&cells, 10).as_deref(),
+            Some("https://example.com")
+        );
+
+        // A closing paren is kept when the URL itself opened one.
+        let balanced = row_from("https://en.wikipedia.org/wiki/Foo_(bar)", 60);
+        assert_eq!(
+            detect_url_in_row(&balanced, 5).as_deref(),
+            Some("https://en.wikipedia.org/wiki/Foo_(bar)")
+        );
+
+        // ...and dropped when it did not.
+        let unbalanced = row_from("(https://example.com)", 40);
+        assert_eq!(
+            detect_url_in_row(&unbalanced, 5).as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn url_requires_word_boundary_before_prefix() {
+        // The prefix is glued to preceding alphanumerics, so it is not a URL start.
+        let cells = row_from("xhttps://example.com", 40);
+        assert_eq!(detect_url_in_row(&cells, 12), None);
+    }
+
+    #[test]
+    fn url_blank_and_out_of_range_columns_are_rejected() {
+        let cells = row_from("https://example.com", 40);
+        // Past the text, inside the blank padding.
+        assert_eq!(detect_url_in_row(&cells, 30), None);
+        // Past the row entirely.
+        assert_eq!(detect_url_in_row(&cells, 999), None);
+    }
+
+    /// Regression: `detect_url_in_row` used to build a `String` for the row and use
+    /// `str::find`, whose *byte* offset was then used to index the *char* array. With
+    /// enough CJK ahead of the URL the byte offset exceeds the row's char count and
+    /// the lookup panicked -- reachable just by moving the mouse over such a row.
+    #[test]
+    fn url_after_many_cjk_chars_does_not_panic() {
+        let text = format!("{} https://example.com", "中".repeat(30));
+        let cells = row_from(&text, 80);
+
+        // 30 CJK chars + 1 space => the URL starts at char index 31.
+        let url_start = 31;
+        assert_eq!(cells[url_start].c, 'h', "test fixture is misaligned");
+
+        assert_eq!(
+            detect_url_in_row(&cells, url_start + 4).as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn url_detection_handles_cjk_without_url() {
+        let cells = row_from(&"中文測試".repeat(10), 80);
+        for col in 0..40 {
+            assert_eq!(detect_url_in_row(&cells, col), None);
+        }
+    }
+
+    // ---------------------------------------------------------------- search
+
+    #[test]
+    fn search_is_case_insensitive_and_ordered() {
+        let mut buf = ScreenBuffer::new(3, 20, 100);
+        put_line(&mut buf, 0, "Hello World");
+        put_line(&mut buf, 1, "nothing here");
+        put_line(&mut buf, 2, "hello again");
+
+        let matches = buf.search("HELLO");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].global_row, 0);
+        assert_eq!(matches[0].start_col, 0);
+        assert_eq!(matches[0].end_col, 4);
+        assert_eq!(matches[1].global_row, 2);
+    }
+
+    #[test]
+    fn search_finds_multiple_matches_per_row() {
+        let mut buf = ScreenBuffer::new(1, 30, 100);
+        put_line(&mut buf, 0, "ab ab ab");
+
+        let matches = buf.search("ab");
+        assert_eq!(matches.len(), 3);
+        assert_eq!(
+            matches.iter().map(|m| m.start_col).collect::<Vec<_>>(),
+            vec![0, 3, 6]
+        );
+    }
+
+    #[test]
+    fn search_empty_query_returns_nothing() {
+        let mut buf = ScreenBuffer::new(1, 20, 100);
+        put_line(&mut buf, 0, "content");
+        assert!(buf.search("").is_empty());
+        assert!(buf.search("   ").is_empty());
+    }
+
+    #[test]
+    fn search_spans_scrollback_and_grid() {
+        let mut buf = ScreenBuffer::new(2, 20, 100);
+        put_line(&mut buf, 0, "needle one");
+        put_line(&mut buf, 1, "filler");
+        // Push the first line into scrollback.
+        buf.scroll_up(1);
+        put_line(&mut buf, 1, "needle two");
+
+        let matches = buf.search("needle");
+        assert_eq!(
+            matches.len(),
+            2,
+            "expected one hit in scrollback and one in grid"
+        );
+        // Scrollback rows sort before grid rows.
+        assert!(matches[0].global_row < matches[1].global_row);
+    }
+
+    #[test]
+    fn search_does_not_match_in_blank_padding() {
+        let mut buf = ScreenBuffer::new(1, 40, 100);
+        put_line(&mut buf, 0, "a");
+        // The row is padded with spaces; a space query is trimmed to empty.
+        assert!(buf.search(" ").is_empty());
+        assert_eq!(buf.search("a").len(), 1);
+    }
+
+    #[test]
+    fn search_matches_non_ascii() {
+        let mut buf = ScreenBuffer::new(1, 20, 100);
+        put_line(&mut buf, 0, "中文測試");
+        let matches = buf.search("文測");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].start_col, 1);
+        assert_eq!(matches[0].end_col, 2);
+    }
+
+    /// The renderer binary-searches this list per row (`partition_point` on
+    /// `global_row`) so it only scans the handful of matches on the row it is
+    /// drawing instead of all of them. That is only correct if the list is sorted
+    /// by `global_row`, then by `start_col`. Pin the invariant here so a future
+    /// rewrite of `search` cannot silently break highlighting.
+    #[test]
+    fn search_results_are_sorted_by_row_then_column() {
+        let mut buf = ScreenBuffer::new(4, 40, 100);
+        put_line(&mut buf, 0, "hit and hit again");
+        put_line(&mut buf, 1, "nothing here");
+        put_line(&mut buf, 2, "hit hit hit");
+        // Push the first two lines into scrollback so both halves of the scan
+        // contribute. This also slides "hit hit hit" from row 2 up to row 0.
+        buf.scroll_up(2);
+        put_line(&mut buf, 2, "hit once more");
+
+        let matches = buf.search("hit");
+        // 2 in scrollback + 3 on grid row 0 + 1 on grid row 2.
+        assert_eq!(matches.len(), 6, "unexpected fixture: {matches:?}");
+        assert!(
+            matches
+                .windows(2)
+                .all(|w| (w[0].global_row, w[0].start_col) < (w[1].global_row, w[1].start_col)),
+            "search results are not sorted: {matches:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------- resize / reflow
+
+    /// Collect the visible grid as trimmed strings, for readable assertions.
+    fn grid_lines(buf: &ScreenBuffer) -> Vec<String> {
+        buf.grid
+            .iter()
+            .map(|r| {
+                r.cells
+                    .iter()
+                    .map(|c| c.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resize_wider_preserves_content() {
+        let mut buf = ScreenBuffer::new(3, 10, 100);
+        put_line(&mut buf, 0, "hello");
+        put_line(&mut buf, 1, "world");
+
+        buf.resize(3, 20);
+
+        assert_eq!(buf.cols, 20);
+        assert_eq!(buf.rows, 3);
+        let lines = grid_lines(&buf);
+        assert!(lines.contains(&"hello".to_string()), "got {lines:?}");
+        assert!(lines.contains(&"world".to_string()), "got {lines:?}");
+        // Every row must be physically resized, not just logically.
+        assert!(buf.grid.iter().all(|r| r.cells.len() == 20));
+    }
+
+    /// Narrowing keeps each visible line on a single row, truncating the overflow.
+    ///
+    /// This documents a deliberate trade-off rather than an ideal: wrapping would
+    /// preserve the text but shift every following row, moving the cursor's row and
+    /// breaking a shell's relative prompt repaint after SIGWINCH (see
+    /// `test_vt_prompt_line_preservation_on_resize`). The visible tail is lost.
+    #[test]
+    fn narrowing_truncates_visible_lines_but_keeps_rows_stable() {
+        let mut buf = ScreenBuffer::new(3, 20, 100);
+        put_line(&mut buf, 0, "abcdefghij");
+
+        buf.resize(6, 5);
+
+        assert_eq!(buf.cols, 5);
+        assert!(buf.grid.iter().all(|r| r.cells.len() == 5));
+
+        let row0: String = buf.grid[0].cells.iter().map(|c| c.c).collect();
+        assert_eq!(
+            row0, "abcde",
+            "visible line should be truncated to the new width"
+        );
+        assert!(
+            !buf.grid[0].is_wrapped,
+            "the line must not be marked wrapped"
+        );
+    }
+
+    /// A line that always fits survives a narrow-then-widen roundtrip intact.
+    #[test]
+    fn resize_roundtrip_preserves_a_fitting_line() {
+        let mut buf = ScreenBuffer::new(4, 20, 100);
+        put_line(&mut buf, 0, "short");
+
+        buf.resize(4, 10);
+        buf.resize(4, 20);
+
+        let row0: String = buf.grid[0].cells.iter().map(|c| c.c).collect();
+        assert_eq!(row0.trim_end(), "short");
+    }
+
+    #[test]
+    fn resize_keeps_cursor_in_bounds() {
+        let mut buf = ScreenBuffer::new(10, 40, 100);
+        buf.cursor.row = 9;
+        buf.cursor.col = 39;
+
+        buf.resize(4, 10);
+
+        assert!(
+            buf.cursor.row < buf.rows,
+            "cursor row {} escaped {} rows",
+            buf.cursor.row,
+            buf.rows
+        );
+        assert!(
+            buf.cursor.col <= buf.cols,
+            "cursor col {} escaped {} cols",
+            buf.cursor.col,
+            buf.cols
+        );
+    }
+
+    #[test]
+    fn resize_to_one_column_does_not_panic() {
+        let mut buf = ScreenBuffer::new(3, 20, 100);
+        put_line(&mut buf, 0, "some text here");
+        buf.resize(3, 1);
+        assert_eq!(buf.cols, 1);
+        assert!(buf.grid.iter().all(|r| r.cells.len() == 1));
+    }
+
+    /// Dragging a splitter back and forth must never panic or corrupt the
+    /// geometry invariants, however many intermediate widths we pass through.
+    ///
+    /// Note this deliberately does *not* assert that text survives the round
+    /// trip: narrowing truncates long unwrapped grid lines on purpose (see
+    /// [`narrowing_truncates_long_visible_lines`]), so a 26-character line is
+    /// expected to lose its tail once we squeeze down to 10 columns.
+    #[test]
+    fn repeated_one_column_resizes_are_stable() {
+        let mut buf = ScreenBuffer::new(5, 40, 1000);
+        put_line(&mut buf, 0, "drag me across the divider");
+
+        for cols in (10..40).rev() {
+            buf.resize(5, cols);
+        }
+        for cols in 10..40 {
+            buf.resize(5, cols);
+        }
+
+        assert_eq!(buf.cols, 39);
+        assert_eq!(buf.grid.len(), 5, "grid must stay exactly `rows` tall");
+        assert!(buf.grid.iter().all(|r| r.cells.len() == 39));
+        assert!(buf.cursor.row < buf.rows);
+        assert!(buf.cursor.col <= buf.cols);
+        // Whatever survived must still be a prefix of what we wrote.
+        let first: String = buf.grid[0].cells.iter().map(|c| c.c).collect();
+        assert!(
+            "drag me across the divider".starts_with(first.trim_end()),
+            "row 0 became {first:?}, which is not a prefix of the original line"
+        );
+    }
+
+    /// Characterization test: narrowing **truncates** a long, unwrapped, visible
+    /// line rather than re-wrapping it. This is a deliberate trade-off, not an
+    /// oversight — do not "fix" it without reading this comment.
+    ///
+    /// `reflow` has a fast path for a logical line that is inside the grid and was
+    /// not soft-wrapped: it copies `total_cells.min(new_cols)` cells and drops the
+    /// remainder. Scrollback lines *are* re-wrapped correctly, so the asymmetry
+    /// looks like a bug, and narrowing 80 -> 40 really does destroy the tail of
+    /// every visible line longer than 40 characters.
+    ///
+    /// Making the grid re-wrap too breaks
+    /// `vt_compat_tests::test_vt_prompt_line_preservation_on_resize`, which asserts
+    /// the cursor stays on row 1 after narrowing. A 50-character prompt ruler that
+    /// wraps pushes the cursor down a row, and the shell's post-SIGWINCH relative
+    /// repaint (`ESC[1A`) then lands on the wrong line and corrupts the display.
+    /// You cannot fit 50 characters in 40 columns on one row, so this is a genuine
+    /// either/or: preserve the bytes, or preserve the cursor anchor. Today we
+    /// preserve the anchor. A real fix needs a cursor-anchoring strategy (e.g.
+    /// pushing the overflow row into scrollback so `cursor.row` stays put).
+    #[test]
+    fn narrowing_truncates_long_visible_lines() {
+        let mut buf = ScreenBuffer::new(10, 80, 1000);
+        let line = "A".repeat(60);
+        put_line(&mut buf, 0, &line);
+
+        buf.resize(10, 40);
+
+        let preserved = buf
+            .scrollback
+            .iter()
+            .chain(buf.grid.iter())
+            .flat_map(|r| r.cells.iter())
+            .filter(|c| c.c == 'A')
+            .count();
+
+        assert_eq!(
+            preserved, 40,
+            "expected the documented truncate-to-new-width behaviour"
+        );
+    }
+
+    /// The counterpart to [`narrowing_truncates_long_visible_lines`]: a line that
+    /// already lives in scrollback *is* re-wrapped losslessly, because no cursor is
+    /// anchored to it.
+    #[test]
+    fn narrowing_rewraps_scrollback_lines_losslessly() {
+        let mut buf = ScreenBuffer::new(3, 80, 1000);
+        put_line(&mut buf, 0, &"A".repeat(60));
+        // Push the line out of the grid and into scrollback.
+        for _ in 0..3 {
+            buf.scroll_up(1);
+        }
+        assert!(!buf.scrollback.is_empty(), "line should be in scrollback");
+
+        buf.resize(3, 40);
+
+        let preserved = buf
+            .scrollback
+            .iter()
+            .chain(buf.grid.iter())
+            .flat_map(|r| r.cells.iter())
+            .filter(|c| c.c == 'A')
+            .count();
+
+        assert_eq!(preserved, 60, "scrollback re-wrap must not lose characters");
+    }
+
+    #[test]
+    fn resize_no_reflow_keeps_dimensions() {
+        let mut buf = ScreenBuffer::new(5, 20, 0);
+        put_line(&mut buf, 0, "alt screen");
+
+        buf.resize_no_reflow(8, 30);
+
+        assert_eq!(buf.rows, 8);
+        assert_eq!(buf.cols, 30);
+        assert_eq!(buf.grid.len(), 8);
+        assert!(buf.grid.iter().all(|r| r.cells.len() == 30));
+    }
+
+    #[test]
+    fn scrollback_is_capped_at_max() {
+        let mut buf = ScreenBuffer::new(2, 10, 5);
+        for i in 0..20 {
+            put_line(&mut buf, 0, &format!("line{i}"));
+            buf.scroll_up(1);
+        }
+        assert!(
+            buf.scrollback.len() <= 5,
+            "scrollback grew to {}",
+            buf.scrollback.len()
+        );
+    }
+
+    #[test]
+    fn scroll_up_recycles_rows_without_growing_grid() {
+        let mut buf = ScreenBuffer::new(4, 10, 2);
+        for _ in 0..50 {
+            buf.scroll_up(1);
+        }
+        assert_eq!(buf.grid.len(), 4, "grid must stay exactly `rows` tall");
+        assert!(buf.grid.iter().all(|r| r.cells.len() == 10));
+    }
 }

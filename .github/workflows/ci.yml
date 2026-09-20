@@ -5,14 +5,23 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+
+# A force-push to a PR should not leave three OSes worth of superseded builds
+# running. Cancel the previous run for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # Some tests spawn real PTYs; without a cap a hung shell could burn hours.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -23,15 +32,44 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Without this every run rebuilds wgpu, naga, winit and egui from scratch
+      # on all three OSes.
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
+
       - name: Linux Dependencies (Ubuntu)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libasound2-dev fonts-noto-cjk fonts-dejavu-core
 
+      # `--all-targets` also compiles the examples, which otherwise silently rot.
       - name: Run Tests
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --all-targets --verbose
+
+  lint:
+    name: Lint (clippy + rustfmt)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
+
+      - name: Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libasound2-dev
+
+      # The workspace is clippy-clean as of this commit; -D warnings keeps it that way.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Check Formatting
         run: cargo fmt --all -- --check
-        continue-on-error: true
