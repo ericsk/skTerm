@@ -14,21 +14,33 @@ use winit::window::WindowId;
 impl App {
     /// Handles `WindowEvent::RedrawRequested` for a terminal window.
     pub(crate) fn handle_redraw_requested(&mut self, window_id: WindowId, tab_bar_h: f32) {
-        let local_agents;
-        // The agent list is only ever drawn inside the sidebar, and scanning walks
-        // the whole process tree (plus an `lsof` on cache miss). Skip it outright
-        // when the sidebar is hidden, otherwise this runs on every single frame.
+        let edited_agents;
+        // The panel is always drawn from the cached list, never from a fresh
+        // scan. Two reasons. Correctness: cards are clicked by index, so drawing
+        // one list and hit-testing another is how a click ended up renaming the
+        // wrong pane. Cost: the old fallback fired whenever the cache was empty,
+        // which is the normal state with no agents running, so an open sidebar
+        // walked the entire process tree on *every frame*.
+        //
+        // That leaves one obligation: whoever opens the sidebar fills the cache.
+        // `toggle_sidebar` is the only path, and it does.
+        debug_assert!(
+            !self.sidebar_open || self.last_ai_agent_scan.is_some(),
+            "sidebar is open but the agent cache was never filled -- see toggle_sidebar"
+        );
         let agents: &[skterm_render::AgentSidebarItem] = if !self.sidebar_open {
             &[]
-        } else if self.editing_agent_pane.is_some() || self.cached_ai_agents.is_empty() {
-            local_agents = self
-                .scan_all_ai_agents()
-                .into_iter()
-                .map(|(_, a)| a)
-                .collect::<Vec<_>>();
-            &local_agents
+        } else if self.editing_agent_pane.is_some() {
+            // A rename has to track each keystroke, which the 1.5 s cache cadence
+            // cannot. Decorating a copy costs one clone of a short list per frame
+            // and only while the editor is open -- the scan it replaces cost a
+            // process-tree walk plus an `lsof`.
+            let mut items = self.cached_ai_agents.items().to_vec();
+            self.decorate_editing_card(&mut items, self.cached_ai_agents.owners());
+            edited_agents = items;
+            &edited_agents
         } else {
-            &self.cached_ai_agents
+            self.cached_ai_agents.items()
         };
 
         // The panel header states how many tabs the listing spans, which

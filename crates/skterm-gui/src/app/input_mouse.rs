@@ -1,6 +1,7 @@
 //! Pointer event handling: selection, splitters, scrollbars, tab bar, and hyperlinks.
 
-use super::events::RESIZE_REFLOW_DEBOUNCE;
+use super::agents::is_repeat_click;
+use super::events::{DOUBLE_CLICK_INTERVAL, RESIZE_REFLOW_DEBOUNCE};
 #[cfg(target_os = "macos")]
 use super::macos::get_nswindow;
 use super::session::ScrollbarDragState;
@@ -8,7 +9,7 @@ use super::App;
 use crate::layout::SplitDirection;
 use skterm_core::{Selection, SelectionMode};
 use skterm_render::{AgentPanelHit, AgentPanelLayout, ScrollbarMetrics};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{error, info};
 use winit::dpi::PhysicalPosition;
 #[cfg(not(target_os = "macos"))]
@@ -447,22 +448,28 @@ impl App {
         }
 
         if let Some(idx) = clicked_agent_idx {
-            let all_agents = self.scan_all_ai_agents();
-            if let Some((target_wid, agent)) = all_agents.get(idx).cloned() {
-                let is_same_editing =
-                    self.editing_agent_pane == Some((target_wid, agent.tab_id, agent.pane_id));
+            // Resolve against the list the panel was *drawn* from. Re-scanning
+            // here used to mean the index could refer to a different agent than
+            // the card under the cursor, because the cache the panel was drawn
+            // from is up to AGENT_SCAN_INTERVAL old: one agent starting or exiting
+            // in between shifts every index after it. It also walked the whole
+            // process tree on every single card click.
+            //
+            // A card whose pane has since gone away simply resolves to nothing
+            // below, which is the right way to fail.
+            if let Some((target_wid, tab_id, pane_id)) = self.cached_ai_agents.owner(idx) {
+                // Named to keep it clear of the grid `row` used elsewhere in
+                // this handler.
+                let card = (target_wid, tab_id, pane_id);
+                let is_same_editing = self.editing_agent_pane == Some(card);
 
-                let is_double_or_right_click = if button == MouseButton::Right {
-                    true
-                } else if let Some(s) = self.sessions.get(&window_id) {
-                    Instant::now().duration_since(s.last_click_time) < Duration::from_millis(400)
-                } else {
-                    false
-                };
-
-                if let Some(s) = self.sessions.get_mut(&window_id) {
-                    s.last_click_time = Instant::now();
-                }
+                // Tracked separately from the terminal's click-count state
+                // machine, and keyed on the card rather than its index: two
+                // single clicks on different cards are not a double click.
+                let now = Instant::now();
+                let is_double_or_right_click = button == MouseButton::Right
+                    || is_repeat_click(self.last_agent_card_click, card, now);
+                self.last_agent_card_click = Some((card, now));
 
                 if is_same_editing && !is_double_or_right_click {
                     return;
@@ -477,12 +484,12 @@ impl App {
                     let current = self
                         .sessions
                         .get(&target_wid)
-                        .and_then(|s| s.workspace.tabs.iter().find(|t| t.id == agent.tab_id))
-                        .and_then(|t| t.root.find_terminal(agent.pane_id))
+                        .and_then(|s| s.workspace.tabs.iter().find(|t| t.id == tab_id))
+                        .and_then(|t| t.root.find_terminal(pane_id))
                         .and_then(|term| term.custom_label.clone())
                         .unwrap_or_default();
 
-                    self.editing_agent_pane = Some((target_wid, agent.tab_id, agent.pane_id));
+                    self.editing_agent_pane = Some(card);
                     self.editing_agent_text = current;
                     self.editing_agent_cursor = self.editing_agent_text.chars().count();
                     if let Some(s) = self.sessions.get(&window_id) {
@@ -509,7 +516,7 @@ impl App {
                             let _ = s;
                             self.macos_editor.open_for_card(
                                 &win,
-                                (target_wid, agent.tab_id, agent.pane_id),
+                                card,
                                 &self.editing_agent_text,
                                 logical_x,
                                 logical_y,
@@ -559,16 +566,15 @@ impl App {
                         .workspace
                         .tabs
                         .iter()
-                        .position(|t| t.id == agent.tab_id)
+                        .position(|t| t.id == tab_id)
                     {
                         target_session.workspace.select_tab(t_pos);
                         target_session.last_tab_label_refresh = None;
                     }
                     if let Some(tab) = target_session.workspace.active_tab_mut() {
-                        tab.active_pane_id = agent.pane_id;
-                        if tab.zoomed_pane_id.is_some() && tab.zoomed_pane_id != Some(agent.pane_id)
-                        {
-                            tab.zoomed_pane_id = Some(agent.pane_id);
+                        tab.active_pane_id = pane_id;
+                        if tab.zoomed_pane_id.is_some() && tab.zoomed_pane_id != Some(pane_id) {
+                            tab.zoomed_pane_id = Some(pane_id);
                         }
                     }
                 }
@@ -734,9 +740,10 @@ impl App {
                             tab.active_pane_id = pane_id;
 
                             let now = Instant::now();
-                            if now.duration_since(session.last_click_time)
-                                < Duration::from_millis(400)
-                            {
+                            // Same threshold as the agent panel's rename gesture,
+                            // but deliberately separate state -- see
+                            // `App::last_agent_card_click`.
+                            if now.duration_since(session.last_click_time) < DOUBLE_CLICK_INTERVAL {
                                 session.click_count += 1;
                             } else {
                                 session.click_count = 1;

@@ -25,6 +25,12 @@ pub(crate) const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// Recomputing means two process lookups per session, and a tab label that lags
 /// a `cd` by half a second is not something a user can perceive.
 pub(crate) const TAB_LABEL_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+/// Longest gap between two clicks that still counts as a double click.
+///
+/// Shared by the terminal's click-count state machine and the agent panel's
+/// rename gesture, but they track their *timestamps* separately -- see
+/// [`App::last_agent_card_click`](super::App::last_agent_card_click).
+pub(crate) const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 /// Minimum gap between pane reflows while a splitter is actively being dragged.
 ///
 /// `Terminal::resize` already no-ops when the cell dimensions are unchanged, but a

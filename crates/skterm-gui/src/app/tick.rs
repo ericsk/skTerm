@@ -46,12 +46,7 @@ impl App {
                 None => true,
             };
             if need_scan {
-                self.last_ai_agent_scan = Some(Instant::now());
-                self.cached_ai_agents = self
-                    .scan_all_ai_agents()
-                    .into_iter()
-                    .map(|(_, a)| a)
-                    .collect();
+                self.refresh_agent_cache();
             }
         }
 

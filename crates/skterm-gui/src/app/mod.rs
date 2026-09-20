@@ -16,6 +16,7 @@ mod theme;
 mod tick;
 mod window;
 
+pub use agents::{AgentList, AgentRow};
 pub use events::AppEvent;
 pub use input_mouse::open_url_in_browser;
 #[cfg(target_os = "macos")]
@@ -60,7 +61,7 @@ pub struct App {
     /// only ever one writer, debounced by `last_config_change`.
     pub pending_config_save: bool,
     pub last_config_change: Option<Instant>,
-    pub editing_agent_pane: Option<(WindowId, u32, u32)>,
+    pub editing_agent_pane: Option<AgentRow>,
     pub editing_agent_text: String,
     pub editing_agent_cursor: usize,
     pub ime_preedit: String,
@@ -70,8 +71,17 @@ pub struct App {
     /// loop when it drains. Ensures at most one `PtyWakeup` is in flight at a time
     /// instead of one per 64 KiB read.
     pub pty_wakeup_pending: Arc<AtomicBool>,
-    pub cached_ai_agents: Vec<skterm_render::AgentSidebarItem>,
+    /// The agent list the sidebar is drawn from *and* hit-tested against.
+    pub cached_ai_agents: AgentList,
     pub last_ai_agent_scan: Option<Instant>,
+    /// The agent card last clicked, and when, for the rename double-click.
+    ///
+    /// Deliberately not `TerminalSession::last_click_time`. Sharing that one made
+    /// the two gestures interfere: clicking a card stamped it without touching
+    /// `click_count`, so a following click in the terminal within the double-click
+    /// window saw a "recent" click, bumped the count to 2 and selected a word from
+    /// what the user meant as a single click.
+    pub last_agent_card_click: Option<(AgentRow, Instant)>,
     #[cfg(target_os = "macos")]
     pub macos_editor: crate::macos_textfield::NativeSidebarEditor,
 }
@@ -114,7 +124,8 @@ impl App {
             last_ime_commit_time: None,
             event_proxy: None,
             pty_wakeup_pending: Arc::new(AtomicBool::new(false)),
-            cached_ai_agents: Vec::new(),
+            cached_ai_agents: AgentList::default(),
+            last_agent_card_click: None,
             last_ai_agent_scan: None,
             #[cfg(target_os = "macos")]
             macos_editor: crate::macos_textfield::NativeSidebarEditor::new(),
