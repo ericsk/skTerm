@@ -24,11 +24,10 @@ pub fn draw_custom_block_or_box_char(
         return true;
     }
 
-    if (0x2500..=0x257F).contains(&code) {
-        if draw_box_drawing(code, x, y, w, h, color, instances) {
+    if (0x2500..=0x257F).contains(&code)
+        && draw_box_drawing(code, x, y, w, h, color, instances) {
             return true;
         }
-    }
 
     false
 }

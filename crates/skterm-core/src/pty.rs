@@ -356,7 +356,7 @@ impl PtyProcess {
         // Suppressing the match costs only the rare case of running this
         // terminal inside itself, which then falls back to showing the
         // directory -- exactly what an idle shell already shows.
-        if self_process_name().as_deref() == Some(name.as_str()) {
+        if self_process_name() == Some(name.as_str()) {
             return None;
         }
         Some(name)

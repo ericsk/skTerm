@@ -1131,12 +1131,15 @@ impl Workspace {
     }
 }
 
+/// Parent PID -> its child `(pid, process name)` pairs, shared with the
+/// background refresh thread that repopulates the tree off the UI thread.
+type ChildrenMap =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Vec<(u32, String)>>>>;
+
 /// Cached system process tree and CWD lookups for low-overhead AI Agent discovery.
 pub struct ProcessTreeCache {
     last_refresh: Option<std::time::Instant>,
-    children_map: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<u32, Vec<(u32, String)>>>,
-    >,
+    children_map: ChildrenMap,
     is_refreshing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     cwd_cache: std::collections::HashMap<u32, String>,
 }

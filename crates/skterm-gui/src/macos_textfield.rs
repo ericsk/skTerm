@@ -2,8 +2,6 @@
 //! Provides 100% native macOS IME (Bopomofo/Pinyin), Cmd+A/C/V/X/Z, mouse text selection,
 //! and native Enter/Escape/focus-loss handling.
 
-#![cfg(target_os = "macos")]
-
 use std::ffi::{c_void, CStr, CString};
 use std::sync::Once;
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -212,6 +210,9 @@ impl NativeSidebarEditor {
     }
 
     /// Spawn a native macOS NSTextField overlay directly over the sidebar card.
+    // The trailing four arguments are the logical rect handed straight to AppKit;
+    // keeping them flat mirrors the NSRect the caller already has on hand.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_for_card(
         &mut self,
         window: &Window,

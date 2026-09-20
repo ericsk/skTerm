@@ -69,6 +69,10 @@ pub struct ScrollbarMetrics {
 }
 
 impl ScrollbarMetrics {
+    // The scrollbar geometry is derived from the pane rect, the scale, and the
+    // scroll state, all of which are plain scalars supplied by the caller at the
+    // call site. Wrapping them in a struct would just relocate the same list.
+    #[allow(clippy::too_many_arguments)]
     pub fn compute(
         rect_x: f32,
         rect_y: f32,
