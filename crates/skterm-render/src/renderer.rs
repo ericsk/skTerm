@@ -226,6 +226,130 @@ pub struct TermRenderer {
     glyph_instances: Vec<GlyphInstance>,
     image_draw_calls: Vec<(u32, ImageInstance)>,
     image_instances: Vec<ImageInstance>,
+
+    perf: FrameProfiler,
+}
+
+/// Opt-in per-frame timing, enabled by setting the `SKTERM_PERF` environment
+/// variable to the number of frames to average over (or to `1` for the default).
+///
+/// This exists to answer one specific question with data instead of intuition: how
+/// much of a frame is actually spent building the instance buffers on the CPU? That
+/// is the only part that per-row dirty tracking could remove, so it sets the ceiling
+/// on what incremental rendering could ever buy. Everything else in a frame -- the
+/// surface acquire, the buffer uploads, the render pass and the present -- has to
+/// happen whether or not any cell changed.
+///
+/// Disabled by default and costs nothing when off: the timing calls are behind
+/// `enabled`, so a normal build never reads the clock.
+#[derive(Default)]
+struct FrameProfiler {
+    enabled: bool,
+    window: u32,
+    frames: u32,
+    acquire_ns: u128,
+    build_ns: u128,
+    upload_and_submit_ns: u128,
+    present_ns: u128,
+    total_ns: u128,
+    glyph_instances: u64,
+    bg_instances: u64,
+}
+
+impl FrameProfiler {
+    fn from_env() -> Self {
+        match std::env::var("SKTERM_PERF") {
+            Ok(v) => {
+                let window = v.trim().parse::<u32>().unwrap_or(1).max(1);
+                // `1` is the natural thing to type for "just turn it on", but a
+                // per-frame log line would be unreadable, so treat it as "use a
+                // sensible default window".
+                let window = if window == 1 { 120 } else { window };
+                info!("SKTERM_PERF enabled: reporting every {window} frames");
+                Self {
+                    enabled: true,
+                    window,
+                    ..Default::default()
+                }
+            }
+            Err(_) => Self::default(),
+        }
+    }
+
+    #[inline]
+    fn now(&self) -> Option<std::time::Instant> {
+        self.enabled.then(std::time::Instant::now)
+    }
+
+    #[inline]
+    fn since(&self, t: Option<std::time::Instant>) -> u128 {
+        t.map(|t| t.elapsed().as_nanos()).unwrap_or(0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        acquire_ns: u128,
+        build_ns: u128,
+        upload_and_submit_ns: u128,
+        present_ns: u128,
+        total_ns: u128,
+        glyphs: usize,
+        bgs: usize,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.frames += 1;
+        self.acquire_ns += acquire_ns;
+        self.build_ns += build_ns;
+        self.upload_and_submit_ns += upload_and_submit_ns;
+        self.present_ns += present_ns;
+        self.total_ns += total_ns;
+        self.glyph_instances += glyphs as u64;
+        self.bg_instances += bgs as u64;
+
+        if self.frames < self.window {
+            return;
+        }
+
+        let n = self.frames as f64;
+        let us = |ns: u128| ns as f64 / n / 1000.0;
+        let total_us = us(self.total_ns);
+        let pct = |v: f64| {
+            if total_us > 0.0 {
+                v / total_us * 100.0
+            } else {
+                0.0
+            }
+        };
+        let build_us = us(self.build_ns);
+        info!(
+            "perf: {:.0} fps | frame {:.0}us = acquire {:.0}us ({:.0}%) + build {:.0}us ({:.0}%) \
+             + upload/submit {:.0}us ({:.0}%) + present {:.0}us ({:.0}%) | {:.0} glyphs, {:.0} bg",
+            1_000_000.0 / total_us.max(0.001),
+            total_us,
+            us(self.acquire_ns),
+            pct(us(self.acquire_ns)),
+            build_us,
+            pct(build_us),
+            us(self.upload_and_submit_ns),
+            pct(us(self.upload_and_submit_ns)),
+            us(self.present_ns),
+            pct(us(self.present_ns)),
+            self.glyph_instances as f64 / n,
+            self.bg_instances as f64 / n,
+        );
+
+        self.frames = 0;
+        self.acquire_ns = 0;
+        self.build_ns = 0;
+        self.upload_and_submit_ns = 0;
+        self.present_ns = 0;
+        self.total_ns = 0;
+        self.glyph_instances = 0;
+        self.bg_instances = 0;
+    }
 }
 
 impl TermRenderer {
@@ -363,6 +487,7 @@ impl TermRenderer {
             glyph_instances: Vec::with_capacity(12288),
             image_draw_calls: Vec::new(),
             image_instances: Vec::new(),
+            perf: FrameProfiler::from_env(),
         })
     }
 
@@ -833,6 +958,8 @@ impl TermRenderer {
     where
         F: FnOnce(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration),
     {
+        let frame_start = self.perf.now();
+
         let output = match self.surface.get_current_texture() {
             Ok(texture) => texture,
             Err(wgpu::SurfaceError::Lost) => {
@@ -851,6 +978,10 @@ impl TermRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // `get_current_texture` is where a GPU-bound frame actually blocks: it waits
+        // for the compositor to hand back a free swapchain image.
+        let acquire_ns = self.perf.since(frame_start);
+
         // Borrow the persistent scratch buffers for the duration of this frame.
         // `take` leaves empty Vecs behind (no allocation) and we hand the buffers
         // back at the end, so the capacity built up by previous frames is reused.
@@ -860,6 +991,10 @@ impl TermRenderer {
         bg_instances.clear();
         glyph_instances.clear();
         image_draw_calls.clear();
+
+        // Everything from here to the "Upload instances to GPU buffers" marker is the
+        // CPU-side instance build -- the only part dirty tracking could skip.
+        let build_start = self.perf.now();
 
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
@@ -1495,6 +1630,9 @@ impl TermRenderer {
         }
 
         // Upload instances to GPU buffers
+        let build_ns = self.perf.since(build_start);
+        let gpu_start = self.perf.now();
+
         let required_capacity = bg_instances.len().max(glyph_instances.len());
         self.pipeline
             .ensure_bg_capacity(&self.device, required_capacity);
@@ -1605,7 +1743,20 @@ impl TermRenderer {
             overlay(&self.device, &self.queue, &view, &self.config);
         }
 
+        let upload_and_submit_ns = self.perf.since(gpu_start);
+        let present_start = self.perf.now();
+
         output.present();
+
+        self.perf.record(
+            acquire_ns,
+            build_ns,
+            upload_and_submit_ns,
+            self.perf.since(present_start),
+            self.perf.since(frame_start),
+            glyph_instances.len(),
+            bg_instances.len(),
+        );
 
         // Hand the buffers back so the next frame reuses this frame's capacity.
         self.bg_instances = bg_instances;

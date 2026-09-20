@@ -527,6 +527,15 @@ impl ScreenBuffer {
         let mut new_physical_rows: Vec<Row> = Vec::new();
         let mut new_cursor: Option<(usize, usize)> = None;
         let mut first_new_grid_row: Option<usize> = None;
+        // Extra physical rows that appeared *above the cursor* purely because a
+        // visible, previously-unwrapped line had to be re-wrapped to fit the new
+        // width. These get scrolled off the top so the cursor keeps its row --
+        // see the anchoring block after this loop.
+        //
+        // Deliberately counts *only* those lines. A line that was already
+        // soft-wrapped changes its row count on every reflow by design, and the
+        // cursor is supposed to move with it (`test_buffer_reflow_on_resize`).
+        let mut anchor_debt: usize = 0;
 
         for (line_idx, line) in logical_lines.iter().enumerate() {
             let total_cells = line.cells.len();
@@ -553,22 +562,18 @@ impl ScreenBuffer {
                 false
             };
 
-            // Fast path: a grid line that occupied exactly one physical row is kept
-            // on exactly one physical row, even when it no longer fits.
+            // Fast path: a line that already fits in the new width keeps its own
+            // single physical row.
             //
-            // NOTE: this deliberately *truncates* content past `new_cols` rather than
-            // wrapping it onto a continuation row. Wrapping would push every following
-            // row down, which moves the cursor's row; a shell that repaints its prompt
-            // after SIGWINCH with a relative `ESC[1A` then lands on the wrong line and
-            // corrupts the display. `test_vt_prompt_line_preservation_on_resize` pins
-            // that behaviour.
-            //
-            // The cost is real: narrowing the window destroys the tail of any visible
-            // line longer than the new width (scrollback lines are re-wrapped normally
-            // by the loop below). Changing this is a product decision, not a local fix
-            // -- it needs a cursor-anchoring strategy so that re-wrapping the prompt
-            // block does not shift the cursor row.
-            if in_grid && !line.was_soft_wrapped {
+            // Lines that do *not* fit fall through to the wrapping loop below. That
+            // used to truncate here instead, to stop the extra continuation rows from
+            // pushing the cursor down the screen -- a shell repainting relative to the
+            // cursor after SIGWINCH (`ESC[1A`) would then write to the wrong line.
+            // The cursor is now anchored by pushing the overflow into scrollback
+            // during the split at the end of this function, so wrapping is safe and
+            // nothing is destroyed. See `anchor` there, and
+            // `test_vt_prompt_line_preservation_on_resize`.
+            if in_grid && !line.was_soft_wrapped && total_cells <= new_cols {
                 let row_idx = new_physical_rows.len();
                 if first_new_grid_row.is_none() {
                     first_new_grid_row = Some(row_idx);
@@ -590,6 +595,13 @@ impl ScreenBuffer {
                 new_physical_rows.push(row);
                 continue;
             }
+
+            // This line only owes anchor debt if it is one the fast path above would
+            // have kept on a single row before, i.e. a visible line that simply got
+            // too wide. Everything else re-wraps as it always has.
+            let owes_anchor_debt = in_grid && !line.was_soft_wrapped;
+            let rows_before_line = new_physical_rows.len();
+            let cursor_placed_before_line = new_cursor.is_some();
 
             let mut i = 0;
             while i < total_cells {
@@ -652,12 +664,62 @@ impl ScreenBuffer {
                     .min(new_cols.saturating_sub(1));
                 new_cursor = Some((last_idx, last_col));
             }
+
+            if owes_anchor_debt && !cursor_placed_before_line {
+                // Count only the continuation rows this line inserted *above* the
+                // cursor; rows below it do not move the cursor.
+                let extra = match new_cursor {
+                    // The cursor landed on this line: everything before its chunk.
+                    Some((cursor_row, _)) if cursor_row >= rows_before_line => {
+                        cursor_row - rows_before_line
+                    }
+                    // The cursor is still ahead of us, so this whole line sits above
+                    // it. One row is the line's own; the rest are new.
+                    _ => new_physical_rows.len() - rows_before_line - 1,
+                };
+                anchor_debt += extra;
+            }
         }
 
         let total_new = new_physical_rows.len();
         let (cursor_row_abs, cursor_col_final) =
             new_cursor.unwrap_or((total_new.saturating_sub(1), 0));
-        let first_grid_row = first_new_grid_row.unwrap_or(0).min(cursor_row_abs);
+        let natural_first_grid_row = first_new_grid_row.unwrap_or(0).min(cursor_row_abs);
+
+        // Cursor anchoring.
+        //
+        // Re-wrapping a line that no longer fits creates extra physical rows. Where
+        // those rows land above the cursor, the cursor slides down the screen -- and a
+        // shell that repaints relative to the cursor after SIGWINCH (`ESC[1A`) then
+        // writes to the wrong line and corrupts the display. That is why this function
+        // used to truncate such lines outright.
+        //
+        // Instead of dropping the overflow, scroll it off the top: start the grid
+        // `anchor_debt` rows further down, so the cursor keeps the row it had and the
+        // displaced rows become scrollback. Nothing is lost -- the user can scroll up
+        // to see it -- and the cursor stays where the shell expects.
+        //
+        // `anchor_debt` counts only rows introduced by re-wrapping a previously
+        // unwrapped visible line. Ordinary re-wrapping of already-wrapped lines is
+        // untouched, so the cursor still tracks its logical line the way it always did.
+        let first_grid_row = (natural_first_grid_row + anchor_debt).min(cursor_row_abs);
+
+        if first_grid_row > natural_first_grid_row {
+            // Sever the soft-wrap link across the new scrollback/grid boundary.
+            //
+            // The row we just pushed off the top may be flagged as continuing into the
+            // row that is now the top of the grid. Left alone, a later widening would
+            // coalesce the two back into one logical line -- but by then the shell has
+            // repainted the visible row in response to SIGWINCH, so the join would fuse
+            // the stale prefix onto unrelated new content. Declaring the split line
+            // hard keeps the resize idempotent.
+            //
+            // This only affects rows displaced by the anchoring above. Rows that reach
+            // scrollback by ordinary scrolling keep their flag and still re-join
+            // correctly.
+            new_physical_rows[first_grid_row - 1].is_wrapped = false;
+        }
+
         let grid_content_count = total_new.saturating_sub(first_grid_row);
 
         if grid_content_count <= new_rows {
@@ -1791,14 +1853,10 @@ mod tests {
         assert!(buf.grid.iter().all(|r| r.cells.len() == 20));
     }
 
-    /// Narrowing keeps each visible line on a single row, truncating the overflow.
-    ///
-    /// This documents a deliberate trade-off rather than an ideal: wrapping would
-    /// preserve the text but shift every following row, moving the cursor's row and
-    /// breaking a shell's relative prompt repaint after SIGWINCH (see
-    /// `test_vt_prompt_line_preservation_on_resize`). The visible tail is lost.
+    /// Narrowing wraps a visible line across continuation rows instead of cutting
+    /// it off at the new width.
     #[test]
-    fn narrowing_truncates_visible_lines_but_keeps_rows_stable() {
+    fn narrowing_wraps_visible_lines_across_rows() {
         let mut buf = ScreenBuffer::new(3, 20, 100);
         put_line(&mut buf, 0, "abcdefghij");
 
@@ -1808,13 +1866,16 @@ mod tests {
         assert!(buf.grid.iter().all(|r| r.cells.len() == 5));
 
         let row0: String = buf.grid[0].cells.iter().map(|c| c.c).collect();
-        assert_eq!(
-            row0, "abcde",
-            "visible line should be truncated to the new width"
+        let row1: String = buf.grid[1].cells.iter().map(|c| c.c).collect();
+        assert_eq!(row0, "abcde");
+        assert_eq!(row1, "fghij");
+        assert!(
+            buf.grid[0].is_wrapped,
+            "the first chunk must be marked as continuing"
         );
         assert!(
-            !buf.grid[0].is_wrapped,
-            "the line must not be marked wrapped"
+            !buf.grid[1].is_wrapped,
+            "the last chunk ends the logical line"
         );
     }
 
@@ -1862,17 +1923,13 @@ mod tests {
         assert!(buf.grid.iter().all(|r| r.cells.len() == 1));
     }
 
-    /// Dragging a splitter back and forth must never panic or corrupt the
-    /// geometry invariants, however many intermediate widths we pass through.
-    ///
-    /// Note this deliberately does *not* assert that text survives the round
-    /// trip: narrowing truncates long unwrapped grid lines on purpose (see
-    /// [`narrowing_truncates_long_visible_lines`]), so a 26-character line is
-    /// expected to lose its tail once we squeeze down to 10 columns.
+    /// Dragging a splitter back and forth must never panic, corrupt the geometry
+    /// invariants, or lose text, however many intermediate widths we pass through.
     #[test]
     fn repeated_one_column_resizes_are_stable() {
+        const TEXT: &str = "drag me across the divider";
         let mut buf = ScreenBuffer::new(5, 40, 1000);
-        put_line(&mut buf, 0, "drag me across the divider");
+        put_line(&mut buf, 0, TEXT);
 
         for cols in (10..40).rev() {
             buf.resize(5, cols);
@@ -1886,38 +1943,28 @@ mod tests {
         assert!(buf.grid.iter().all(|r| r.cells.len() == 39));
         assert!(buf.cursor.row < buf.rows);
         assert!(buf.cursor.col <= buf.cols);
-        // Whatever survived must still be a prefix of what we wrote.
-        let first: String = buf.grid[0].cells.iter().map(|c| c.c).collect();
+
+        let all: String = buf
+            .scrollback
+            .iter()
+            .chain(buf.grid.iter())
+            .flat_map(|r| r.cells.iter().map(|c| c.c))
+            .collect();
         assert!(
-            "drag me across the divider".starts_with(first.trim_end()),
-            "row 0 became {first:?}, which is not a prefix of the original line"
+            all.replace(' ', "").contains(&TEXT.replace(' ', "")),
+            "content lost after repeated resizes"
         );
     }
 
-    /// Characterization test: narrowing **truncates** a long, unwrapped, visible
-    /// line rather than re-wrapping it. This is a deliberate trade-off, not an
-    /// oversight — do not "fix" it without reading this comment.
+    /// Narrowing re-wraps a long visible line instead of truncating it.
     ///
-    /// `reflow` has a fast path for a logical line that is inside the grid and was
-    /// not soft-wrapped: it copies `total_cells.min(new_cols)` cells and drops the
-    /// remainder. Scrollback lines *are* re-wrapped correctly, so the asymmetry
-    /// looks like a bug, and narrowing 80 -> 40 really does destroy the tail of
-    /// every visible line longer than 40 characters.
-    ///
-    /// Making the grid re-wrap too breaks
-    /// `vt_compat_tests::test_vt_prompt_line_preservation_on_resize`, which asserts
-    /// the cursor stays on row 1 after narrowing. A 50-character prompt ruler that
-    /// wraps pushes the cursor down a row, and the shell's post-SIGWINCH relative
-    /// repaint (`ESC[1A`) then lands on the wrong line and corrupts the display.
-    /// You cannot fit 50 characters in 40 columns on one row, so this is a genuine
-    /// either/or: preserve the bytes, or preserve the cursor anchor. Today we
-    /// preserve the anchor. A real fix needs a cursor-anchoring strategy (e.g.
-    /// pushing the overflow row into scrollback so `cursor.row` stays put).
+    /// This used to drop everything past the new width. The overflow rows are now
+    /// pushed into scrollback so the cursor keeps its row (see the anchoring block
+    /// in `reflow`), which means nothing is destroyed.
     #[test]
-    fn narrowing_truncates_long_visible_lines() {
+    fn narrowing_rewraps_long_visible_lines_losslessly() {
         let mut buf = ScreenBuffer::new(10, 80, 1000);
-        let line = "A".repeat(60);
-        put_line(&mut buf, 0, &line);
+        put_line(&mut buf, 0, &"A".repeat(60));
 
         buf.resize(10, 40);
 
@@ -1930,14 +1977,54 @@ mod tests {
             .count();
 
         assert_eq!(
-            preserved, 40,
-            "expected the documented truncate-to-new-width behaviour"
+            preserved,
+            60,
+            "narrowing dropped {} of 60 characters",
+            60 - preserved
         );
     }
 
-    /// The counterpart to [`narrowing_truncates_long_visible_lines`]: a line that
-    /// already lives in scrollback *is* re-wrapped losslessly, because no cursor is
-    /// anchored to it.
+    /// The reason the truncation existed in the first place: re-wrapping must not
+    /// slide the cursor down the screen, because shells repaint relative to it
+    /// after SIGWINCH.
+    ///
+    /// Here row 0 holds a 60-character line that becomes two rows at 40 columns.
+    /// The cursor sits on row 1 and must stay on row 1; the displaced row belongs
+    /// in scrollback.
+    #[test]
+    fn narrowing_anchors_the_cursor_row_by_scrolling_overflow_off() {
+        let mut buf = ScreenBuffer::new(10, 80, 1000);
+        put_line(&mut buf, 0, &"A".repeat(60));
+        put_line(&mut buf, 1, "> ");
+        buf.cursor.row = 1;
+        buf.cursor.col = 2;
+
+        buf.resize(10, 40);
+
+        assert_eq!(buf.cursor.row, 1, "cursor row must survive the reflow");
+        assert_eq!(buf.cursor.col, 2);
+        assert_eq!(
+            buf.scrollback.len(),
+            1,
+            "the displaced wrap row belongs in scrollback"
+        );
+        // The severed prefix must be a hard line, so a later widening cannot fuse it
+        // onto whatever the shell repaints into the top grid row.
+        assert!(!buf.scrollback[0].is_wrapped);
+        // Still lossless.
+        let preserved = buf
+            .scrollback
+            .iter()
+            .chain(buf.grid.iter())
+            .flat_map(|r| r.cells.iter())
+            .filter(|c| c.c == 'A')
+            .count();
+        assert_eq!(preserved, 60);
+    }
+
+    /// The counterpart to [`narrowing_rewraps_long_visible_lines_losslessly`]: a
+    /// line that already lives in scrollback *is* re-wrapped losslessly, because no
+    /// cursor is anchored to it.
     #[test]
     fn narrowing_rewraps_scrollback_lines_losslessly() {
         let mut buf = ScreenBuffer::new(3, 80, 1000);
@@ -1996,5 +2083,119 @@ mod tests {
         }
         assert_eq!(buf.grid.len(), 4, "grid must stay exactly `rows` tall");
         assert!(buf.grid.iter().all(|r| r.cells.len() == 10));
+    }
+    // ------------------------------------------------------- reflow stress / invariants
+
+    /// Deterministic xorshift so failures are reproducible without a dev-dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn in_range(&mut self, lo: usize, hi: usize) -> usize {
+            lo + (self.next() as usize) % (hi - lo + 1)
+        }
+    }
+
+    /// Reflow is the most intricate function in this file and is driven directly by
+    /// mouse movement (splitter drags), so it sees far stranger sequences of sizes
+    /// than any hand-written case. Hammer it and assert the structural invariants
+    /// every caller depends on.
+    #[test]
+    fn reflow_survives_random_resize_sequences() {
+        let mut rng = Rng(0x5eed_1234_9876_abcd);
+
+        for round in 0..200 {
+            let rows0 = rng.in_range(1, 24);
+            let cols0 = rng.in_range(1, 60);
+            let mut buf = ScreenBuffer::new(rows0, cols0, rng.in_range(0, 200));
+
+            for r in 0..rows0 {
+                let len = rng.in_range(0, cols0);
+                if len > 0 {
+                    let text: String = (0..len)
+                        .map(|i| char::from(b'a' + ((i + r) % 26) as u8))
+                        .collect();
+                    put_line(&mut buf, r, &text);
+                }
+            }
+            buf.cursor.row = rng.in_range(0, rows0 - 1);
+            buf.cursor.col = rng.in_range(0, cols0.saturating_sub(1));
+
+            for step in 0..20 {
+                let rows = rng.in_range(1, 24);
+                let cols = rng.in_range(1, 60);
+                buf.resize(rows, cols);
+
+                let ctx = format!("round {round} step {step} -> {rows}x{cols}");
+                assert_eq!(buf.rows, rows, "{ctx}: rows field");
+                assert_eq!(buf.cols, cols, "{ctx}: cols field");
+                assert_eq!(buf.grid.len(), rows, "{ctx}: grid height");
+                assert!(
+                    buf.grid.iter().all(|r| r.cells.len() == cols),
+                    "{ctx}: a grid row has the wrong width"
+                );
+                assert!(
+                    buf.scrollback.iter().all(|r| r.cells.len() == cols),
+                    "{ctx}: a scrollback row has the wrong width"
+                );
+                assert!(buf.cursor.row < rows, "{ctx}: cursor row escaped");
+                assert!(buf.cursor.col <= cols, "{ctx}: cursor col escaped");
+                assert!(
+                    buf.scrollback.len() <= buf.max_scrollback,
+                    "{ctx}: scrollback over cap"
+                );
+                assert_eq!(buf.scroll_region, (0, rows - 1), "{ctx}: scroll region");
+            }
+        }
+    }
+
+    /// With scrollback large enough that nothing can be evicted, no sequence of
+    /// resizes may destroy a character. This is the invariant the old truncating
+    /// fast path violated.
+    #[test]
+    fn reflow_never_loses_characters_when_scrollback_is_ample() {
+        let mut rng = Rng(0xabcd_ef01_2345_6789);
+
+        for round in 0..100 {
+            let cols0 = rng.in_range(10, 60);
+            let mut buf = ScreenBuffer::new(8, cols0, 100_000);
+
+            // `put_line` clips at one row, so spread the marker over several
+            // full-width unwrapped rows. Narrowing then has to wrap every one of
+            // them -- exactly the case the old fast path truncated.
+            let mut planted = 0;
+            for r in 0..4 {
+                let len = rng.in_range(1, cols0);
+                put_line(&mut buf, r, &"Z".repeat(len));
+                planted += len;
+            }
+
+            let count = |b: &ScreenBuffer| {
+                b.scrollback
+                    .iter()
+                    .chain(b.grid.iter())
+                    .flat_map(|r| r.cells.iter())
+                    .filter(|c| c.c == 'Z')
+                    .count()
+            };
+            let expected = count(&buf);
+            assert_eq!(expected, planted, "fixture did not land as expected");
+
+            for step in 0..15 {
+                let cols = rng.in_range(1, 60);
+                buf.resize(rng.in_range(1, 20), cols);
+                assert_eq!(
+                    count(&buf),
+                    expected,
+                    "round {round} step {step}: resize to {cols} cols lost characters"
+                );
+            }
+        }
     }
 }
