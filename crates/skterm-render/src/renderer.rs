@@ -1671,6 +1671,9 @@ impl TermRenderer {
             }
         }
 
+        let normal_bg_len = bg_instances.len();
+        let normal_glyph_len = glyph_instances.len();
+
         // Floating Top Dropdown Menu Overlay
         if let Some(menu) = top_menu {
             let row_h = 24.0 * scale;
@@ -1684,15 +1687,36 @@ impl TermRenderer {
                 }
             }
 
-            // Drop shadow / border outline
+            // Layer 1: Ambient deep drop shadow
+            bg_instances.push(BgInstance {
+                rect: [
+                    menu.x - 4.0 * scale,
+                    menu.y - 1.0,
+                    menu.width + 8.0 * scale,
+                    total_h + 8.0 * scale,
+                ],
+                color: [0.0, 0.0, 0.0, 0.35],
+            });
+            // Layer 2: Soft direct shadow
+            bg_instances.push(BgInstance {
+                rect: [
+                    menu.x - 2.0 * scale,
+                    menu.y - 0.5,
+                    menu.width + 4.0 * scale,
+                    total_h + 4.0 * scale,
+                ],
+                color: [0.0, 0.0, 0.0, 0.45],
+            });
+
+            // Layer 3: Crisp 1px border outline
             bg_instances.push(BgInstance {
                 rect: [menu.x - 1.0, menu.y - 1.0, menu.width + 2.0, total_h + 2.0],
-                color: [0.28, 0.32, 0.44, 0.9],
+                color: [0.28, 0.31, 0.40, 1.0],
             });
-            // Opaque dark acrylic background
+            // Layer 4: 100% Solid opaque dark background (no transparency, zero bleed-through)
             bg_instances.push(BgInstance {
                 rect: [menu.x, menu.y, menu.width, total_h],
-                color: [0.12, 0.13, 0.18, 0.98],
+                color: [0.11, 0.12, 0.16, 1.0],
             });
 
             let mut cur_y = menu.y + 3.0 * scale;
@@ -1705,7 +1729,7 @@ impl TermRenderer {
                             menu.width - 16.0 * scale,
                             1.0,
                         ],
-                        color: [0.22, 0.25, 0.34, 0.8],
+                        color: [0.22, 0.25, 0.33, 1.0],
                     });
                     cur_y += sep_h;
                 } else {
@@ -1713,14 +1737,14 @@ impl TermRenderer {
                     if is_hovered {
                         bg_instances.push(BgInstance {
                             rect: [menu.x + 3.0 * scale, cur_y, menu.width - 6.0 * scale, row_h],
-                            color: [0.20, 0.28, 0.45, 0.95],
+                            color: [0.22, 0.32, 0.52, 1.0],
                         });
                     }
 
                     let text_color = if is_hovered {
                         [1.0, 1.0, 1.0, 1.0]
                     } else {
-                        [0.88, 0.90, 0.96, 1.0]
+                        [0.90, 0.92, 0.96, 1.0]
                     };
 
                     self.draw_text_line(
@@ -1741,7 +1765,11 @@ impl TermRenderer {
                             menu.x + menu.width - sc_w - 10.0 * scale,
                             cur_y + (row_h - cell_h) / 2.0,
                             sc_w + 4.0,
-                            [0.55, 0.60, 0.72, 0.9],
+                            if is_hovered {
+                                [0.85, 0.90, 1.0, 1.0]
+                            } else {
+                                [0.60, 0.65, 0.78, 1.0]
+                            },
                             false,
                         );
                     }
@@ -1828,11 +1856,11 @@ impl TermRenderer {
 
             render_pass.set_bind_group(0, &self.pipeline.bind_group, &[]);
 
-            // 1. Draw Background Quads
-            if !bg_instances.is_empty() {
+            // 1. Draw Base Background Quads (cells, selections, scrollbars, tab bar, agent panel)
+            if normal_bg_len > 0 {
                 render_pass.set_pipeline(&self.pipeline.bg_pipeline);
                 render_pass.set_vertex_buffer(0, self.pipeline.bg_instance_buffer.slice(..));
-                render_pass.draw(0..6, 0..bg_instances.len() as u32);
+                render_pass.draw(0..6, 0..normal_bg_len as u32);
             }
 
             // 2. Draw Graphic Images (Sixel / Kitty)
@@ -1851,11 +1879,25 @@ impl TermRenderer {
                 }
             }
 
-            // 3. Draw Text Glyphs
-            if !glyph_instances.is_empty() {
+            // 3. Draw Base Text Glyphs (terminal text, tab bar text, agent panel text)
+            if normal_glyph_len > 0 {
                 render_pass.set_pipeline(&self.pipeline.glyph_pipeline);
                 render_pass.set_vertex_buffer(0, self.pipeline.glyph_instance_buffer.slice(..));
-                render_pass.draw(0..6, 0..glyph_instances.len() as u32);
+                render_pass.draw(0..6, 0..normal_glyph_len as u32);
+            }
+
+            // 4. Floating Top Dropdown Menu Overlay
+            // Drawn strictly AFTER all base backgrounds, images, and text glyphs so that
+            // terminal characters behind the menu can never show through or occlude the menu.
+            if bg_instances.len() > normal_bg_len {
+                render_pass.set_pipeline(&self.pipeline.bg_pipeline);
+                render_pass.set_vertex_buffer(0, self.pipeline.bg_instance_buffer.slice(..));
+                render_pass.draw(0..6, normal_bg_len as u32..bg_instances.len() as u32);
+            }
+            if glyph_instances.len() > normal_glyph_len {
+                render_pass.set_pipeline(&self.pipeline.glyph_pipeline);
+                render_pass.set_vertex_buffer(0, self.pipeline.glyph_instance_buffer.slice(..));
+                render_pass.draw(0..6, normal_glyph_len as u32..glyph_instances.len() as u32);
             }
         }
 
