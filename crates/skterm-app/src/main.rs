@@ -1,9 +1,22 @@
 //! `skterm`: Main application entry point for skTerm cross-platform terminal emulator.
 
+#![windows_subsystem = "windows"]
+
 use skterm_gui::App;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn AttachConsole(dwProcessId: u32) -> i32;
+        }
+        // Attach to parent console if started from CMD/PowerShell,
+        // so CLI logging still works when run from a command prompt.
+        let _ = AttachConsole(0xFFFFFFFF);
+    }
+
     tracing_subscriber::fmt::init();
     info!("Starting skTerm GPU-accelerated terminal emulator...");
 
