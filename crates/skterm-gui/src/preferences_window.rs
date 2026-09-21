@@ -1639,7 +1639,10 @@ impl PreferencesWindow {
                         .selected_text(&current_label)
                         .show_ui(ui, |ui| {
                             if ui
-                                .selectable_label(!self.custom_shell_enabled, "系統預設 (System Default)")
+                                .selectable_label(
+                                    !self.custom_shell_enabled,
+                                    "系統預設 (System Default)",
+                                )
                                 .clicked()
                             {
                                 self.custom_shell_enabled = false;
@@ -1650,7 +1653,10 @@ impl PreferencesWindow {
                                 let is_sel = self.custom_shell_enabled
                                     && (self.shell_program.eq_ignore_ascii_case(&p.program)
                                         || self.shell_program.eq_ignore_ascii_case(&p.id)
-                                        || self.shell_program.to_lowercase().ends_with(&format!("{}.exe", p.id)));
+                                        || self
+                                            .shell_program
+                                            .to_lowercase()
+                                            .ends_with(&format!("{}.exe", p.id)));
                                 let label_text = if p.is_available {
                                     p.name.clone()
                                 } else {
@@ -1666,9 +1672,15 @@ impl PreferencesWindow {
                                 && !presets.iter().any(|p| {
                                     self.shell_program.eq_ignore_ascii_case(&p.program)
                                         || self.shell_program.eq_ignore_ascii_case(&p.id)
-                                        || self.shell_program.to_lowercase().ends_with(&format!("{}.exe", p.id))
+                                        || self
+                                            .shell_program
+                                            .to_lowercase()
+                                            .ends_with(&format!("{}.exe", p.id))
                                 });
-                            if ui.selectable_label(is_custom, "自訂 Shell (Custom...)").clicked() {
+                            if ui
+                                .selectable_label(is_custom, "自訂 Shell (Custom...)")
+                                .clicked()
+                            {
                                 self.custom_shell_enabled = true;
                             }
                         });
@@ -1700,7 +1712,8 @@ impl PreferencesWindow {
                         };
                         if ui.button(pwsh_btn).clicked() {
                             self.custom_shell_enabled = true;
-                            self.shell_program = pwsh_found.unwrap_or_else(|| "pwsh.exe".to_string());
+                            self.shell_program =
+                                pwsh_found.unwrap_or_else(|| "pwsh.exe".to_string());
                             self.shell_args = "-NoLogo".to_string();
                         }
                     });

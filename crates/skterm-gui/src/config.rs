@@ -656,9 +656,7 @@ impl ConfigManager {
 
         #[cfg(target_os = "windows")]
         {
-            let _ = Command::new("explorer")
-                .arg(&self.path)
-                .spawn();
+            let _ = Command::new("explorer").arg(&self.path).spawn();
         }
     }
 }

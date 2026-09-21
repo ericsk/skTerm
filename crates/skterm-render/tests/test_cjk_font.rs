@@ -128,14 +128,19 @@ fn test_font_baseline_centering() {
             if let Ok(font) = Font::from_bytes(bytes.as_slice(), FontSettings::default()) {
                 let font_size = 16.0;
                 let m_metrics = font.metrics('M', font_size);
-                let line_metrics = font.horizontal_line_metrics(font_size).unwrap_or(fontdue::LineMetrics {
-                    ascent: font_size,
-                    descent: -font_size * 0.25,
-                    line_gap: 0.0,
-                    new_line_size: font_size * 1.25,
-                });
+                let line_metrics =
+                    font.horizontal_line_metrics(font_size)
+                        .unwrap_or(fontdue::LineMetrics {
+                            ascent: font_size,
+                            descent: -font_size * 0.25,
+                            line_gap: 0.0,
+                            new_line_size: font_size * 1.25,
+                        });
                 let cell_width = m_metrics.advance_width.ceil().max(1.0);
-                let cell_height = (line_metrics.ascent - line_metrics.descent + line_metrics.line_gap).ceil().max(1.0);
+                let cell_height = (line_metrics.ascent - line_metrics.descent
+                    + line_metrics.line_gap)
+                    .ceil()
+                    .max(1.0);
                 let font_ascent = line_metrics.ascent;
 
                 let gt_metric = font.metrics('>', font_size);
@@ -159,7 +164,8 @@ fn test_font_baseline_centering() {
 
                 let (gt_metrics, _) = font.rasterize('>', font_size);
                 if gt_metrics.height > 0 {
-                    let gt_top = baseline_offset - gt_metrics.ymin as f32 - gt_metrics.height as f32;
+                    let gt_top =
+                        baseline_offset - gt_metrics.ymin as f32 - gt_metrics.height as f32;
                     let gt_bottom = baseline_offset - gt_metrics.ymin as f32;
                     let top_margin = gt_top;
                     let bottom_margin = cell_height - gt_bottom;
@@ -181,7 +187,3 @@ fn test_font_baseline_centering() {
         println!("Note: No candidate font found on this environment, skipped gracefully.");
     }
 }
-
-
-
-

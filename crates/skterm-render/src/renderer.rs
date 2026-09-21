@@ -1528,7 +1528,6 @@ impl TermRenderer {
                             cell_w,
                             (2.0 * self.scale_factor).max(1.0),
                         ),
-
                     };
 
                     bg_instances.push(BgInstance {
