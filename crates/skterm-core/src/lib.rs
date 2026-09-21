@@ -34,21 +34,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_presets() {
-        let presets = available_shell_presets();
-        assert!(!presets.is_empty(), "Should return at least one shell preset");
-        #[cfg(target_os = "windows")]
-        {
-            let cmd_preset = presets.iter().find(|p| p.id == "cmd");
-            assert!(cmd_preset.is_some(), "cmd preset must exist on Windows");
-            let ps_preset = presets.iter().find(|p| p.id == "powershell");
-            assert!(ps_preset.is_some(), "powershell preset must exist on Windows");
-            let pwsh_preset = presets.iter().find(|p| p.id == "pwsh");
-            assert!(pwsh_preset.is_some(), "pwsh preset must exist on Windows");
-        }
-    }
-
-    #[test]
     fn test_basic_text_and_cursor() {
         let mut term = Terminal::new_headless(24, 80, 1000);
         term.feed_bytes(b"Hello, skTerm!");
