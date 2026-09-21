@@ -1,19 +1,28 @@
 //! `skterm-gui`: Application window loop, input handling, config, tabs, and split panes multiplexer.
 
-pub mod app_window;
+pub mod app;
 pub mod config;
+pub mod egui_fonts;
+pub mod icon;
 pub mod input;
 pub mod layout;
 #[cfg(target_os = "macos")]
 pub mod macos_textfield;
-pub mod preferences_gui;
+#[cfg(target_os = "macos")]
+pub mod macos_titlebar;
 pub mod preferences_window;
+pub mod tab_title;
 
-pub use app_window::App;
+pub use app::{build_top_dropdown_menu, hit_test_dropdown_menu, App, TopMenuAction};
 pub use config::{default_config_template, parse_hex_color, Config, ConfigManager, Theme};
-pub use input::{encode_key, encode_key_event};
-pub use layout::{PaneId, PaneNode, Rect, SplitDirection, SplitterBar, Tab, TabId, Workspace};
-pub use preferences_gui::{PreferencesGui, PreferencesTab};
+pub use icon::{apply_window_icon, configure_window_attributes, get_app_icon};
+pub use input::{
+    check_tab_switch, check_tab_switch_for_os, encode_key, encode_key_event,
+    is_tab_switch_modifier, is_tab_switch_modifier_for_os, parse_tab_switch_digit,
+};
+pub use layout::{
+    PaneId, PaneNode, PollOutcome, Rect, SplitDirection, SplitterBar, Tab, TabId, Workspace,
+};
 pub use preferences_window::{PreferencesCategory, PreferencesWindow};
 
 /// skterm-gui version and basic info
@@ -279,39 +288,79 @@ mod tests {
         assert_eq!(ws.tabs.len(), 1);
     }
 
-
+    /// Regression test: splitting a pane that lives in the `first` subtree of an
+    /// existing split used to hand the new pane a `Terminal::new_headless(..)` dummy
+    /// (via a `clone_dummy()` call made to satisfy the by-value recursion), silently
+    /// dropping the real PTY-backed terminal. The result was an empty, permanently
+    /// dead pane. Every leaf must own a live PTY.
     #[test]
-    fn test_preferences_gui_state() {
-        let mut gui = PreferencesGui::new();
-        assert!(!gui.is_open);
+    fn test_split_in_first_subtree_keeps_real_pty() {
+        let mut ws = Workspace::new(24, 80).expect("Failed to create workspace");
 
-        let default_cfg = Config::default();
-        gui.toggle(&default_cfg);
-        assert!(gui.is_open);
-        assert_eq!(gui.font_family, "Menlo");
-        assert_eq!(gui.columns, 80);
-        assert_eq!(gui.rows, 24);
+        // First split: root becomes Split { first: Leaf(0), second: Leaf(1) }.
+        ws.split_active_pane(
+            SplitDirection::Horizontal,
+            24,
+            80,
+            1000,
+            skterm_core::PtySpawnOptions::default(),
+        )
+        .expect("first split failed");
 
-        gui.font_family = "Fira Code".to_string();
-        gui.font_size = 20.0;
-        gui.theme = "tokyo-night".to_string();
-        gui.columns = 120;
+        // Focus the pane in the `first` subtree -- this is what triggered the bug.
+        let tab = ws.active_tab_mut().expect("no active tab");
+        let leaves = tab.root.all_leaf_ids();
+        assert_eq!(leaves.len(), 2);
+        tab.active_pane_id = leaves[0];
 
-        let modified_cfg = gui.to_config(&default_cfg);
-        assert_eq!(modified_cfg.font.family, "Fira Code");
-        assert_eq!(modified_cfg.font.size, 20.0);
-        assert_eq!(modified_cfg.colors.theme, "tokyo-night");
-        assert_eq!(modified_cfg.window.columns, 120);
+        // Second split, now nested inside `first`.
+        ws.split_active_pane(
+            SplitDirection::Vertical,
+            24,
+            80,
+            1000,
+            skterm_core::PtySpawnOptions::default(),
+        )
+        .expect("second split failed");
 
-        gui.toggle(&default_cfg);
-        assert!(!gui.is_open);
+        let tab = ws.active_tab().expect("no active tab");
+        let leaves = tab.root.all_leaf_ids();
+        assert_eq!(leaves.len(), 3, "expected three panes after two splits");
+
+        for id in leaves {
+            let term = tab
+                .root
+                .find_terminal(id)
+                .unwrap_or_else(|| panic!("pane {} missing from tree", id));
+            assert!(
+                term.process_id().is_some(),
+                "pane {} has no PTY -- a headless dummy terminal was installed",
+                id
+            );
+        }
     }
 
     #[test]
-    fn test_preferences_window_font_scan() {
-        let fonts = preferences_window::scan_available_monospace_fonts();
-        // Even if empty on minimal CI container, it should safely return a Vec<String>
-        assert!(fonts.len() <= 30);
+    fn test_installed_font_families_are_deduplicated() {
+        let families = skterm_render::atlas::installed_font_families();
+        // A minimal CI container may have no fonts at all, so only assert the
+        // invariant that matters: one entry per family, not one per file.
+        // Must match the case-insensitive key the implementation dedups on,
+        // otherwise "Foo" and "FOO" would look distinct here and the assertion
+        // would pass vacuously.
+        let mut cleaned: Vec<String> = families
+            .iter()
+            .map(|f| {
+                f.chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .collect::<String>()
+                    .to_lowercase()
+            })
+            .collect();
+        let before = cleaned.len();
+        cleaned.sort();
+        cleaned.dedup();
+        assert_eq!(before, cleaned.len(), "family list contains duplicates");
     }
 
     #[test]
@@ -424,7 +473,16 @@ mod tests {
 
         // Verify ScrollbarMetrics
         let metrics = ScrollbarMetrics::compute(
-            0.0, 0.0, 800.0, 600.0, 1.0, scrollback_len, 10, 20, false, false,
+            0.0,
+            0.0,
+            800.0,
+            600.0,
+            1.0,
+            scrollback_len,
+            10,
+            20,
+            false,
+            false,
         )
         .expect("ScrollbarMetrics should be computed");
 
@@ -442,5 +500,447 @@ mod tests {
         assert_eq!(term.grid().active().scroll_offset, 20);
         term.grid_mut().active_mut().scroll_offset = 0;
         assert_eq!(term.grid().active().scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_tab_switch_modifiers_windows_linux_vs_macos() {
+        let mut ctrl = ModifiersState::empty();
+        ctrl.insert(ModifiersState::CONTROL);
+
+        let mut super_key = ModifiersState::empty();
+        super_key.insert(ModifiersState::SUPER);
+
+        let mut alt = ModifiersState::empty();
+        alt.insert(ModifiersState::ALT);
+
+        let mut ctrl_shift = ModifiersState::empty();
+        ctrl_shift.insert(ModifiersState::CONTROL);
+        ctrl_shift.insert(ModifiersState::SHIFT);
+
+        let mut super_shift = ModifiersState::empty();
+        super_shift.insert(ModifiersState::SUPER);
+        super_shift.insert(ModifiersState::SHIFT);
+
+        let mut ctrl_alt = ModifiersState::empty();
+        ctrl_alt.insert(ModifiersState::CONTROL);
+        ctrl_alt.insert(ModifiersState::ALT);
+
+        let mut super_alt = ModifiersState::empty();
+        super_alt.insert(ModifiersState::SUPER);
+        super_alt.insert(ModifiersState::ALT);
+
+        let mut ctrl_super = ModifiersState::empty();
+        ctrl_super.insert(ModifiersState::CONTROL);
+        ctrl_super.insert(ModifiersState::SUPER);
+
+        // On Windows and Linux (is_macos = false):
+        // Tab switching must trigger on CTRL (with or without Shift)
+        // Must NOT trigger with Alt or Super
+        assert!(is_tab_switch_modifier_for_os(ctrl, false));
+        assert!(is_tab_switch_modifier_for_os(ctrl_shift, false));
+        assert!(!is_tab_switch_modifier_for_os(ctrl_alt, false));
+        assert!(!is_tab_switch_modifier_for_os(ctrl_super, false));
+        assert!(!is_tab_switch_modifier_for_os(super_key, false));
+        assert!(!is_tab_switch_modifier_for_os(alt, false));
+        assert!(!is_tab_switch_modifier_for_os(
+            ModifiersState::empty(),
+            false
+        ));
+
+        // On macOS (is_macos = true):
+        // Tab switching must trigger on CMD / Super (with or without Shift)
+        // Must NOT trigger with Ctrl or Alt
+        assert!(is_tab_switch_modifier_for_os(super_key, true));
+        assert!(is_tab_switch_modifier_for_os(super_shift, true));
+        assert!(!is_tab_switch_modifier_for_os(super_alt, true));
+        assert!(!is_tab_switch_modifier_for_os(ctrl_super, true));
+        assert!(!is_tab_switch_modifier_for_os(ctrl, true));
+        assert!(!is_tab_switch_modifier_for_os(alt, true));
+        assert!(!is_tab_switch_modifier_for_os(
+            ModifiersState::empty(),
+            true
+        ));
+    }
+
+    #[test]
+    fn test_normalize_shortcut_char_shifted_brackets() {
+        use crate::input::normalize_shortcut_char;
+        use winit::keyboard::{Key, KeyCode, NativeKeyCode, PhysicalKey};
+
+        let unknown = PhysicalKey::Unidentified(NativeKeyCode::Unidentified);
+
+        // Shift+[ / Shift+] report "{" / "}" and must fold back to the unshifted form
+        // so that Cmd/Ctrl+Shift+[ and ] switch tabs.
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character("{".into()), unknown).as_deref(),
+            Some("[")
+        );
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character("}".into()), unknown).as_deref(),
+            Some("]")
+        );
+
+        // Unshifted brackets stay untouched.
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character("[".into()), unknown).as_deref(),
+            Some("[")
+        );
+
+        // Letters are lowercased, so shortcuts match regardless of Shift / Caps.
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character("D".into()), unknown).as_deref(),
+            Some("d")
+        );
+
+        // Non-ASCII layouts (e.g. QWERTZ "ü" on the US "[" position) fall back to the
+        // physical key, as do control characters such as Ctrl+[ reported as ESC.
+        assert_eq!(
+            normalize_shortcut_char(
+                &Key::Character("ü".into()),
+                PhysicalKey::Code(KeyCode::BracketLeft)
+            )
+            .as_deref(),
+            Some("[")
+        );
+        assert_eq!(
+            normalize_shortcut_char(
+                &Key::Character("\u{1b}".into()),
+                PhysicalKey::Code(KeyCode::BracketRight)
+            )
+            .as_deref(),
+            Some("]")
+        );
+
+        // Named keys without a bracket physical code yield nothing.
+        assert_eq!(
+            normalize_shortcut_char(&Key::Named(winit::keyboard::NamedKey::Enter), unknown),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_tab_switch_digit() {
+        use winit::keyboard::{Key, KeyCode, PhysicalKey};
+
+        // 1. Logical key digits 1..=9
+        for d in 1..=9 {
+            let logical = Key::Character(d.to_string().into());
+            let physical = PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified);
+            assert_eq!(parse_tab_switch_digit(&logical, physical), Some(d));
+        }
+
+        // 0 and non-digits should return None
+        let logical_0 = Key::Character("0".into());
+        let dummy_physical =
+            PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified);
+        assert_eq!(parse_tab_switch_digit(&logical_0, dummy_physical), None);
+
+        let logical_a = Key::Character("a".into());
+        let physical_a = PhysicalKey::Code(KeyCode::KeyA);
+        assert_eq!(parse_tab_switch_digit(&logical_a, physical_a), None);
+
+        // 2. Physical key digits (e.g. AZERTY top row where logical key might be shifted symbols, or numpad)
+        let keycodes = [
+            (KeyCode::Digit1, 1),
+            (KeyCode::Digit2, 2),
+            (KeyCode::Digit3, 3),
+            (KeyCode::Digit4, 4),
+            (KeyCode::Digit5, 5),
+            (KeyCode::Digit6, 6),
+            (KeyCode::Digit7, 7),
+            (KeyCode::Digit8, 8),
+            (KeyCode::Digit9, 9),
+            (KeyCode::Numpad1, 1),
+            (KeyCode::Numpad2, 2),
+            (KeyCode::Numpad3, 3),
+            (KeyCode::Numpad4, 4),
+            (KeyCode::Numpad5, 5),
+            (KeyCode::Numpad6, 6),
+            (KeyCode::Numpad7, 7),
+            (KeyCode::Numpad8, 8),
+            (KeyCode::Numpad9, 9),
+        ];
+
+        let dummy_logical = Key::Character("&".into()); // e.g. unshifted top row symbol on AZERTY
+        for (code, expected_digit) in keycodes {
+            assert_eq!(
+                parse_tab_switch_digit(&dummy_logical, PhysicalKey::Code(code)),
+                Some(expected_digit)
+            );
+        }
+
+        // Digit0 and Numpad0 should return None
+        assert_eq!(
+            parse_tab_switch_digit(&dummy_logical, PhysicalKey::Code(KeyCode::Digit0)),
+            None
+        );
+        assert_eq!(
+            parse_tab_switch_digit(&dummy_logical, PhysicalKey::Code(KeyCode::Numpad0)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_check_tab_switch_cross_platform() {
+        use winit::keyboard::{Key, KeyCode, PhysicalKey};
+
+        let mut ctrl = ModifiersState::empty();
+        ctrl.insert(ModifiersState::CONTROL);
+
+        let mut cmd = ModifiersState::empty();
+        cmd.insert(ModifiersState::SUPER);
+
+        let logical_3 = Key::Character("3".into());
+        let physical_3 = PhysicalKey::Code(KeyCode::Digit3);
+
+        // Windows & Linux:
+        // Ctrl+3 Pressed -> Some(3)
+        assert_eq!(
+            check_tab_switch_for_os(&logical_3, physical_3, ElementState::Pressed, ctrl, false),
+            Some(3)
+        );
+        // Cmd+3 on Linux/Win -> None
+        assert_eq!(
+            check_tab_switch_for_os(&logical_3, physical_3, ElementState::Pressed, cmd, false),
+            None
+        );
+        // Released key -> None
+        assert_eq!(
+            check_tab_switch_for_os(&logical_3, physical_3, ElementState::Released, ctrl, false),
+            None
+        );
+
+        // macOS:
+        // Cmd+3 Pressed -> Some(3)
+        assert_eq!(
+            check_tab_switch_for_os(&logical_3, physical_3, ElementState::Pressed, cmd, true),
+            Some(3)
+        );
+        // Ctrl+3 on Mac -> None
+        assert_eq!(
+            check_tab_switch_for_os(&logical_3, physical_3, ElementState::Pressed, ctrl, true),
+            None
+        );
+        // Released key -> None
+        assert_eq!(
+            check_tab_switch_for_os(&logical_3, physical_3, ElementState::Released, cmd, true),
+            None
+        );
+    }
+
+    #[test]
+    fn test_workspace_select_tab_direct_index() {
+        let mut ws = Workspace::new(24, 80).expect("Failed to create workspace");
+        ws.new_tab(24, 80).expect("Failed to create tab 2");
+        ws.new_tab(24, 80).expect("Failed to create tab 3");
+        assert_eq!(ws.tabs.len(), 3);
+        assert_eq!(ws.active_tab_idx, 2);
+
+        // Switch to Tab 1 (index 0)
+        ws.select_tab(0);
+        assert_eq!(ws.active_tab_idx, 0);
+
+        // Switch to Tab 2 (index 1)
+        ws.select_tab(1);
+        assert_eq!(ws.active_tab_idx, 1);
+
+        // Switch to Tab 3 (index 2)
+        ws.select_tab(2);
+        assert_eq!(ws.active_tab_idx, 2);
+
+        // Attempt to switch to out-of-range Tab (e.g. index 8 for Tab 9) -> index remains unchanged
+        ws.select_tab(8);
+        assert_eq!(ws.active_tab_idx, 2);
+    }
+    /// The bug these cover: `fs::write` truncates in place and then streams the
+    /// body, so the preference autosave and the geometry autosave could interleave
+    /// inside `config.toml` and leave invalid TOML behind -- after which startup
+    /// silently fell back to defaults and the user's font setting looked ignored.
+    ///
+    /// Note the payload sizes below. A ~1 KB config is usually written in a single
+    /// syscall, which hides the bug; these use a config big enough that the write
+    /// is necessarily split, which is what makes the tests actually fail against
+    /// the old `fs::write` implementation.
+    mod config_persistence {
+        use super::*;
+        use crate::config::write_config_atomically;
+
+        fn temp_dir(tag: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "skterm-cfg-test-{}-{}-{}",
+                tag,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// A config whose serialized form is `filler_len` bytes larger than default.
+        fn bulky_config(family: &str, filler_len: usize) -> Config {
+            let mut cfg = Config::default();
+            cfg.font.family = family.to_string();
+            cfg.terminal
+                .env
+                .insert("SKTERM_TEST_FILLER".to_string(), "a".repeat(filler_len));
+            cfg
+        }
+
+        #[test]
+        fn concurrent_writes_never_leave_invalid_toml() {
+            let dir = temp_dir("concurrent");
+            let path = dir.join("config.toml");
+
+            // Different families AND different lengths: a torn file shows up either
+            // as unparseable TOML or as a blend of the two documents.
+            let small = bulky_config("Menlo", 64 * 1024);
+            let large = bulky_config("JetBrains Mono", 192 * 1024);
+            let small_toml = toml::to_string_pretty(&small).unwrap();
+            let large_toml = toml::to_string_pretty(&large).unwrap();
+
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let path = path.clone();
+                    let body = if i % 2 == 0 {
+                        small_toml.clone()
+                    } else {
+                        large_toml.clone()
+                    };
+                    std::thread::spawn(move || {
+                        for _ in 0..40 {
+                            write_config_atomically(&path, &body).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            let parsed = toml::from_str::<Config>(&content)
+                .expect("config.toml must always be valid TOML after concurrent writes");
+            assert!(
+                parsed == small || parsed == large,
+                "file contains a blend of two different writes"
+            );
+
+            // The temp file must be cleaned up, not left next to the config.
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n != "config.toml")
+                .collect();
+            assert!(leftovers.is_empty(), "stray temp files: {:?}", leftovers);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn reader_never_observes_a_partial_file() {
+            // This is what the file watcher does: read the config whenever it
+            // changes. It must never parse a half-written document.
+            let dir = temp_dir("reader");
+            let path = dir.join("config.toml");
+            let cfg = bulky_config("Menlo", 256 * 1024);
+            let body = toml::to_string_pretty(&cfg).unwrap();
+            write_config_atomically(&path, &body).unwrap();
+
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer_done = done.clone();
+            let writer_path = path.clone();
+            let writer_body = body.clone();
+            let writer = std::thread::spawn(move || {
+                for _ in 0..100 {
+                    write_config_atomically(&writer_path, &writer_body).unwrap();
+                }
+                writer_done.store(true, std::sync::atomic::Ordering::Release);
+            });
+
+            let mut reads = 0usize;
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    assert_eq!(
+                        content.len(),
+                        body.len(),
+                        "reader saw a partially written config ({} of {} bytes)",
+                        content.len(),
+                        body.len()
+                    );
+                    reads += 1;
+                }
+            }
+            writer.join().unwrap();
+            assert!(reads > 0, "test did not actually read anything");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn test_normalize_shortcut_char_comma() {
+        use crate::input::normalize_shortcut_char;
+        use winit::keyboard::{Key, KeyCode, NativeKeyCode, PhysicalKey};
+
+        let unknown = PhysicalKey::Unidentified(NativeKeyCode::Unidentified);
+
+        // Standard comma
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character(",".into()), unknown).as_deref(),
+            Some(",")
+        );
+
+        // Shift+, reports "<"
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character("<".into()), unknown).as_deref(),
+            Some(",")
+        );
+
+        // CJK IME full-width comma
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character("，".into()), unknown).as_deref(),
+            Some(",")
+        );
+
+        // Physical comma fallback
+        assert_eq!(
+            normalize_shortcut_char(
+                &Key::Character("，".into()),
+                PhysicalKey::Code(KeyCode::Comma)
+            )
+            .as_deref(),
+            Some(",")
+        );
+    }
+
+    #[test]
+    fn test_build_and_hit_test_top_dropdown_menu() {
+        let (menu, actions) = build_top_dropdown_menu(1.0, 100.0, 36.0, None);
+        assert!(!menu.items.is_empty());
+        assert_eq!(menu.items.len(), actions.len());
+
+        // First item is Preferences
+        assert_eq!(actions[0], Some(TopMenuAction::OpenPreferences));
+        assert!(menu.items[0].label.contains("偏好設定"));
+
+        // Second item is separator
+        assert!(menu.items[1].is_separator);
+        assert_eq!(actions[1], None);
+
+        // Hit test inside the menu bounds
+        let row_h = 24.0;
+        let item0_hit = hit_test_dropdown_menu(&menu, 1.0, 120.0, 36.0 + 3.0 + 5.0);
+        assert_eq!(item0_hit, Some(0));
+
+        // Hit test on separator should return None
+        let sep_hit = hit_test_dropdown_menu(&menu, 1.0, 120.0, 36.0 + 3.0 + row_h + 2.0);
+        assert_eq!(sep_hit, None);
+
+        // Hit test outside menu width
+        let outside_hit = hit_test_dropdown_menu(&menu, 1.0, 50.0, 45.0);
+        assert_eq!(outside_hit, None);
     }
 }

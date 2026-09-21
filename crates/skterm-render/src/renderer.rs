@@ -1,5 +1,6 @@
 //! Main Terminal Renderer combining wgpu Device, Queue, Surface, Atlas, Graphics Images, and Pipelines.
 
+use crate::agent_panel::AgentPanelLayout;
 use crate::atlas::GlyphAtlas;
 use crate::box_drawing::draw_custom_block_or_box_char;
 use crate::pipeline::{color_to_rgba, BgInstance, GlyphInstance, ImageInstance, TerminalPipeline};
@@ -68,6 +69,10 @@ pub struct ScrollbarMetrics {
 }
 
 impl ScrollbarMetrics {
+    // The scrollbar geometry is derived from the pane rect, the scale, and the
+    // scroll state, all of which are plain scalars supplied by the caller at the
+    // call site. Wrapping them in a struct would just relocate the same list.
+    #[allow(clippy::too_many_arguments)]
     pub fn compute(
         rect_x: f32,
         rect_y: f32,
@@ -146,7 +151,7 @@ pub struct TabItem {
     pub is_active: bool,
 }
 
-/// Render descriptor for an AI Agent item in the left sidebar
+/// Render descriptor for an AI Agent item in the global agents panel
 #[derive(Debug, Clone)]
 pub struct AgentSidebarItem {
     pub tab_id: u32,
@@ -157,6 +162,34 @@ pub struct AgentSidebarItem {
     pub title_summary: String,
     pub is_active_output: bool,
     pub is_focused: bool,
+}
+
+/// Everything the renderer needs to draw the global AI agents panel.
+///
+/// Bundled into one struct rather than passed as loose arguments so the panel's
+/// scope (`tab_count`) travels with its contents -- the header advertises that
+/// the listing spans every tab, which is what keeps the panel from reading as a
+/// feature of the selected tab.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentPanelState<'a> {
+    pub open: bool,
+    /// Panel card width in physical pixels.
+    pub width_px: f32,
+    pub agents: &'a [AgentSidebarItem],
+    /// Total number of tabs the listing covers, across every window.
+    pub tab_count: usize,
+}
+
+impl AgentPanelState<'_> {
+    /// A closed panel, for render paths that have no agents UI at all.
+    pub fn closed() -> Self {
+        Self {
+            open: false,
+            width_px: 0.0,
+            agents: &[],
+            tab_count: 0,
+        }
+    }
 }
 
 /// Descriptor for an item in the top dropdown menu.
@@ -195,6 +228,146 @@ pub struct TermRenderer {
     pub opacity: f32,
     pub image_sampler: wgpu::Sampler,
     pub image_cache: HashMap<u32, (wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
+
+    // Per-frame instance scratch buffers.
+    //
+    // These are rebuilt from scratch every frame, but they are kept here rather than
+    // being locals so the allocation survives across frames: `clear()` retains
+    // capacity, so after the first few frames the draw path performs no allocation
+    // and no realloc-memcpy at all. A dense 200x50 pane pushes ~10k glyph instances
+    // (48 B each), which as a local `Vec` meant reallocating 4096 -> 8192 -> 16384
+    // and memcpying ~600 KB per frame purely to grow.
+    //
+    // They are `mem::take`n at the top of the draw call and put back at the end, so
+    // that building them doesn't hold a borrow on `self`.
+    bg_instances: Vec<BgInstance>,
+    glyph_instances: Vec<GlyphInstance>,
+    image_draw_calls: Vec<(u32, ImageInstance)>,
+    image_instances: Vec<ImageInstance>,
+
+    perf: FrameProfiler,
+}
+
+/// Opt-in per-frame timing, enabled by setting the `SKTERM_PERF` environment
+/// variable to the number of frames to average over (or to `1` for the default).
+///
+/// This exists to answer one specific question with data instead of intuition: how
+/// much of a frame is actually spent building the instance buffers on the CPU? That
+/// is the only part that per-row dirty tracking could remove, so it sets the ceiling
+/// on what incremental rendering could ever buy. Everything else in a frame -- the
+/// surface acquire, the buffer uploads, the render pass and the present -- has to
+/// happen whether or not any cell changed.
+///
+/// Disabled by default and costs nothing when off: the timing calls are behind
+/// `enabled`, so a normal build never reads the clock.
+#[derive(Default)]
+struct FrameProfiler {
+    enabled: bool,
+    window: u32,
+    frames: u32,
+    acquire_ns: u128,
+    build_ns: u128,
+    upload_and_submit_ns: u128,
+    present_ns: u128,
+    total_ns: u128,
+    glyph_instances: u64,
+    bg_instances: u64,
+}
+
+impl FrameProfiler {
+    fn from_env() -> Self {
+        match std::env::var("SKTERM_PERF") {
+            Ok(v) => {
+                let window = v.trim().parse::<u32>().unwrap_or(1).max(1);
+                // `1` is the natural thing to type for "just turn it on", but a
+                // per-frame log line would be unreadable, so treat it as "use a
+                // sensible default window".
+                let window = if window == 1 { 120 } else { window };
+                info!("SKTERM_PERF enabled: reporting every {window} frames");
+                Self {
+                    enabled: true,
+                    window,
+                    ..Default::default()
+                }
+            }
+            Err(_) => Self::default(),
+        }
+    }
+
+    #[inline]
+    fn now(&self) -> Option<std::time::Instant> {
+        self.enabled.then(std::time::Instant::now)
+    }
+
+    #[inline]
+    fn since(&self, t: Option<std::time::Instant>) -> u128 {
+        t.map(|t| t.elapsed().as_nanos()).unwrap_or(0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        acquire_ns: u128,
+        build_ns: u128,
+        upload_and_submit_ns: u128,
+        present_ns: u128,
+        total_ns: u128,
+        glyphs: usize,
+        bgs: usize,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.frames += 1;
+        self.acquire_ns += acquire_ns;
+        self.build_ns += build_ns;
+        self.upload_and_submit_ns += upload_and_submit_ns;
+        self.present_ns += present_ns;
+        self.total_ns += total_ns;
+        self.glyph_instances += glyphs as u64;
+        self.bg_instances += bgs as u64;
+
+        if self.frames < self.window {
+            return;
+        }
+
+        let n = self.frames as f64;
+        let us = |ns: u128| ns as f64 / n / 1000.0;
+        let total_us = us(self.total_ns);
+        let pct = |v: f64| {
+            if total_us > 0.0 {
+                v / total_us * 100.0
+            } else {
+                0.0
+            }
+        };
+        let build_us = us(self.build_ns);
+        info!(
+            "perf: {:.0} fps | frame {:.0}us = acquire {:.0}us ({:.0}%) + build {:.0}us ({:.0}%) \
+             + upload/submit {:.0}us ({:.0}%) + present {:.0}us ({:.0}%) | {:.0} glyphs, {:.0} bg",
+            1_000_000.0 / total_us.max(0.001),
+            total_us,
+            us(self.acquire_ns),
+            pct(us(self.acquire_ns)),
+            build_us,
+            pct(build_us),
+            us(self.upload_and_submit_ns),
+            pct(us(self.upload_and_submit_ns)),
+            us(self.present_ns),
+            pct(us(self.present_ns)),
+            self.glyph_instances as f64 / n,
+            self.bg_instances as f64 / n,
+        );
+
+        self.frames = 0;
+        self.acquire_ns = 0;
+        self.build_ns = 0;
+        self.upload_and_submit_ns = 0;
+        self.present_ns = 0;
+        self.total_ns = 0;
+        self.glyph_instances = 0;
+        self.bg_instances = 0;
+    }
 }
 
 impl TermRenderer {
@@ -254,7 +427,10 @@ impl TermRenderer {
         // Prioritize non-blocking, low-latency presentation modes for maximum typing smoothness
         let present_mode = if surface_caps.present_modes.contains(&PresentMode::Mailbox) {
             PresentMode::Mailbox
-        } else if surface_caps.present_modes.contains(&PresentMode::AutoNoVsync) {
+        } else if surface_caps
+            .present_modes
+            .contains(&PresentMode::AutoNoVsync)
+        {
             PresentMode::AutoNoVsync
         } else if surface_caps.present_modes.contains(&PresentMode::Immediate) {
             PresentMode::Immediate
@@ -323,6 +499,13 @@ impl TermRenderer {
             opacity: 1.0,
             image_sampler,
             image_cache: HashMap::new(),
+            // Pre-sized for a dense ~200x50 pane so even the first frames avoid
+            // the realloc chain. These only ever grow to the high-water mark.
+            bg_instances: Vec::with_capacity(4096),
+            glyph_instances: Vec::with_capacity(12288),
+            image_draw_calls: Vec::new(),
+            image_instances: Vec::new(),
+            perf: FrameProfiler::from_env(),
         })
     }
 
@@ -424,7 +607,9 @@ impl TermRenderer {
             if cur_x + cw > x + max_w {
                 break;
             }
-            if let Some(glyph_info) = self.atlas.get_or_insert_glyph(&self.queue, c, is_bold, false)
+            if let Some(glyph_info) = self
+                .atlas
+                .get_or_insert_glyph(&self.queue, c, is_bold, false)
             {
                 if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
                     glyph_instances.push(GlyphInstance {
@@ -448,6 +633,301 @@ impl TermRenderer {
         }
     }
 
+    /// Draws the global AI agents panel: a floating card docked to the right
+    /// edge, deliberately detached from the tab strip so it reads as an
+    /// application-wide listing rather than something owned by the active tab.
+    fn draw_agent_panel(
+        &mut self,
+        bg: &mut Vec<BgInstance>,
+        glyphs: &mut Vec<GlyphInstance>,
+        layout: &AgentPanelLayout,
+        state: &AgentPanelState<'_>,
+    ) {
+        let scale = layout.scale;
+        let cell_w = self.atlas.cell_width;
+        let cell_h = self.atlas.cell_height;
+        let panel = layout.panel;
+        let accent = [0.039, 0.518, 1.00, 1.0];
+
+        // Drop shadow: concentric translucent rings that lift the card off the
+        // terminal underneath it. Without this the card just looks like another
+        // region of the tab's content.
+        for i in 1..=3 {
+            let spread = i as f32 * 2.0 * scale;
+            bg.push(BgInstance {
+                rect: [
+                    panel.x - spread,
+                    panel.y - spread,
+                    panel.w + spread * 2.0,
+                    panel.h + spread * 2.0,
+                ],
+                color: [0.0, 0.0, 0.0, 0.10],
+            });
+        }
+
+        // Card body + 1px outline on all four sides.
+        bg.push(BgInstance {
+            rect: panel.as_array(),
+            color: [0.055, 0.065, 0.085, 0.985],
+        });
+        let outline = [0.22, 0.25, 0.33, 0.95];
+        bg.push(BgInstance {
+            rect: [panel.x, panel.y, panel.w, 1.0],
+            color: outline,
+        });
+        bg.push(BgInstance {
+            rect: [panel.x, panel.bottom() - 1.0, panel.w, 1.0],
+            color: outline,
+        });
+        bg.push(BgInstance {
+            rect: [panel.x, panel.y, 1.0, panel.h],
+            color: outline,
+        });
+        bg.push(BgInstance {
+            rect: [panel.right() - 1.0, panel.y, 1.0, panel.h],
+            color: outline,
+        });
+
+        // Accent strip across the top of the card -- a window-level affordance,
+        // matching nothing in the per-tab chrome.
+        bg.push(BgInstance {
+            rect: [panel.x, panel.y, panel.w, 2.0 * scale],
+            color: accent,
+        });
+
+        // Header row 1: title, plus the close button on the right.
+        let title = format!("ALL AGENTS ({})", state.agents.len());
+        self.draw_text_line(
+            glyphs,
+            &title,
+            panel.x + 12.0 * scale,
+            panel.y + 7.0 * scale,
+            (layout.close_btn.x - panel.x - 16.0 * scale).max(20.0),
+            [0.92, 0.95, 1.0, 1.0],
+            true,
+        );
+
+        let close = layout.close_btn;
+        bg.push(BgInstance {
+            rect: close.as_array(),
+            color: [0.14, 0.16, 0.21, 0.9],
+        });
+        self.draw_text_line(
+            glyphs,
+            "×",
+            close.x + (close.w - cell_w) / 2.0,
+            close.y + (close.h - cell_h) / 2.0,
+            close.w,
+            [0.72, 0.76, 0.85, 0.95],
+            false,
+        );
+
+        // Header row 2: the scope line. This is the sentence that tells the user
+        // the panel is not about the current tab.
+        let scope = if state.tab_count > 1 {
+            format!("Global · across {} tabs", state.tab_count)
+        } else {
+            "Global · all tabs".to_string()
+        };
+        self.draw_text_line(
+            glyphs,
+            &scope,
+            panel.x + 12.0 * scale,
+            layout.new_btn.y + (layout.new_btn.h - cell_h) / 2.0,
+            (layout.new_btn.x - panel.x - 16.0 * scale).max(20.0),
+            [0.52, 0.58, 0.70, 0.95],
+            false,
+        );
+
+        let new_btn = layout.new_btn;
+        bg.push(BgInstance {
+            rect: new_btn.as_array(),
+            color: [0.10, 0.36, 0.72, 0.9],
+        });
+        let new_label = "+ New";
+        self.draw_text_line(
+            glyphs,
+            new_label,
+            new_btn.x + (new_btn.w - new_label.chars().count() as f32 * cell_w) / 2.0,
+            new_btn.y + (new_btn.h - cell_h) / 2.0,
+            new_btn.w,
+            [0.98, 0.98, 1.0, 1.0],
+            true,
+        );
+
+        // Divider under the header.
+        bg.push(BgInstance {
+            rect: [
+                panel.x + 1.0,
+                layout.header.bottom() - 1.0,
+                panel.w - 2.0,
+                1.0,
+            ],
+            color: [0.18, 0.21, 0.28, 0.9],
+        });
+
+        if state.agents.is_empty() {
+            self.draw_text_line(
+                glyphs,
+                "No active CLI agents",
+                panel.x + 12.0 * scale,
+                layout.list_top + 8.0 * scale,
+                layout.card_w,
+                [0.50, 0.54, 0.62, 0.9],
+                false,
+            );
+            self.draw_text_line(
+                glyphs,
+                "Click '+ New' to spawn",
+                panel.x + 12.0 * scale,
+                layout.list_top + 8.0 * scale + cell_h + 4.0 * scale,
+                layout.card_w,
+                [0.42, 0.46, 0.54, 0.85],
+                false,
+            );
+            return;
+        }
+
+        let max_cards = layout.visible_cards();
+        for (idx, item) in state.agents.iter().enumerate() {
+            if idx >= max_cards {
+                break;
+            }
+            let card = layout.card_rect(idx);
+            let cy = card.y;
+
+            bg.push(BgInstance {
+                rect: card.as_array(),
+                color: if item.is_focused {
+                    [0.13, 0.21, 0.34, 0.95]
+                } else {
+                    [0.09, 0.11, 0.15, 0.9]
+                },
+            });
+            let border_col = if item.is_focused {
+                accent
+            } else {
+                [0.20, 0.23, 0.30, 0.6]
+            };
+            bg.push(BgInstance {
+                rect: [card.x, cy, card.w, 1.0],
+                color: border_col,
+            });
+            bg.push(BgInstance {
+                rect: [card.x, card.bottom() - 1.0, card.w, 1.0],
+                color: border_col,
+            });
+            if item.is_focused {
+                bg.push(BgInstance {
+                    rect: [card.x, cy, 3.0 * scale, card.h],
+                    color: accent,
+                });
+            }
+
+            // Status dot (Green = Active/Thinking, Yellow = Waiting/Idle)
+            let dot_size = 7.0 * scale;
+            let dot_x = card.x + 10.0 * scale;
+            let dot_y = cy + 9.0 * scale + (cell_h - dot_size) / 2.0;
+            bg.push(BgInstance {
+                rect: [dot_x, dot_y, dot_size, dot_size],
+                color: if item.is_active_output {
+                    [0.18, 0.88, 0.46, 1.0]
+                } else {
+                    [0.96, 0.76, 0.22, 1.0]
+                },
+            });
+
+            // Location pill ("Tab 2 · #3"): says which tab owns this agent, so a
+            // listing spanning several tabs is self-explanatory.
+            let pill_text_w = item.location_label.chars().count() as f32 * cell_w;
+            let pill_w = pill_text_w + 10.0 * scale;
+            let pill_h = cell_h + 4.0 * scale;
+            let pill_x = card.right() - pill_w - 8.0 * scale;
+            let pill_y = cy + 6.0 * scale;
+            bg.push(BgInstance {
+                rect: [pill_x, pill_y, pill_w, pill_h],
+                color: if item.is_focused {
+                    [0.16, 0.30, 0.50, 0.95]
+                } else {
+                    [0.14, 0.16, 0.22, 0.95]
+                },
+            });
+            self.draw_text_line(
+                glyphs,
+                &item.location_label,
+                pill_x + 5.0 * scale,
+                pill_y + (pill_h - cell_h) / 2.0,
+                pill_text_w,
+                [0.68, 0.78, 0.94, 1.0],
+                false,
+            );
+
+            let has_custom_task =
+                !item.title_summary.is_empty() && item.title_summary != "Double-click to name...";
+            let status_str = if item.is_active_output {
+                "Running"
+            } else {
+                "Idle"
+            };
+            let (top_title, bottom_subtitle) = if has_custom_task {
+                (
+                    item.title_summary.as_str(),
+                    format!("{} • {}", item.agent_name, status_str),
+                )
+            } else {
+                (
+                    item.agent_name.as_str(),
+                    format!("{} • Double-click to name...", status_str),
+                )
+            };
+
+            // Line 1: task name (or agent name when unnamed)
+            let text_x = dot_x + dot_size + 6.0 * scale;
+            self.draw_text_line(
+                glyphs,
+                top_title,
+                text_x,
+                cy + 8.0 * scale,
+                (pill_x - text_x - 6.0 * scale).max(20.0),
+                [0.98, 0.99, 1.0, 1.0],
+                true,
+            );
+            // Line 2: project / directory
+            self.draw_text_line(
+                glyphs,
+                &format!("▸ {}", item.project_name),
+                card.x + 10.0 * scale,
+                cy + 27.0 * scale,
+                card.w - 16.0 * scale,
+                [0.45, 0.82, 0.96, 0.95],
+                false,
+            );
+            // Line 3: agent type • status
+            self.draw_text_line(
+                glyphs,
+                &bottom_subtitle,
+                card.x + 10.0 * scale,
+                cy + 46.0 * scale,
+                card.w - 16.0 * scale,
+                [0.58, 0.63, 0.72, 0.88],
+                false,
+            );
+        }
+
+        // Tell the user when the list is clipped rather than silently hiding rows.
+        if state.agents.len() > max_cards {
+            self.draw_text_line(
+                glyphs,
+                &format!("+{} more", state.agents.len() - max_cards),
+                layout.card_x + 4.0 * scale,
+                (panel.bottom() - cell_h - 6.0 * scale).max(layout.list_top),
+                layout.card_w,
+                [0.55, 0.60, 0.70, 0.9],
+                false,
+            );
+        }
+    }
+
     /// Render tabs, split panes, graphic images (Sixel/Kitty), separators, and text grids
     pub fn render_workspace(
         &mut self,
@@ -455,13 +935,11 @@ impl TermRenderer {
         panes: &[PaneRenderItem],
         tab_bar_h: f32,
     ) -> anyhow::Result<()> {
-        self.render_workspace_with_sidebar(
+        self.render_workspace_with_agent_panel(
             tabs,
             panes,
             tab_bar_h,
-            false,
-            0.0,
-            &[],
+            AgentPanelState::closed(),
             None,
             None::<fn(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration)>,
         )
@@ -478,25 +956,31 @@ impl TermRenderer {
     where
         F: FnOnce(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration),
     {
-        self.render_workspace_with_sidebar(tabs, panes, tab_bar_h, false, 0.0, &[], None, overlay_fn)
+        self.render_workspace_with_agent_panel(
+            tabs,
+            panes,
+            tab_bar_h,
+            AgentPanelState::closed(),
+            None,
+            overlay_fn,
+        )
     }
 
-    /// Render workspace with AI Agents Sidebar and optional overlay.
-    #[allow(clippy::too_many_arguments)]
-    pub fn render_workspace_with_sidebar<F>(
+    /// Render workspace with the global AI agents panel, floating top dropdown menu, and an optional overlay.
+    pub fn render_workspace_with_agent_panel<F>(
         &mut self,
         tabs: &[TabItem],
         panes: &[PaneRenderItem],
         tab_bar_h: f32,
-        sidebar_open: bool,
-        sidebar_w: f32,
-        agents: &[AgentSidebarItem],
+        panel_state: AgentPanelState<'_>,
         top_menu: Option<&TopDropdownMenu>,
         overlay_fn: Option<F>,
     ) -> anyhow::Result<()>
     where
         F: FnOnce(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration),
     {
+        let frame_start = self.perf.now();
+
         let output = match self.surface.get_current_texture() {
             Ok(texture) => texture,
             Err(wgpu::SurfaceError::Lost) => {
@@ -515,9 +999,23 @@ impl TermRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut bg_instances = Vec::with_capacity(1024);
-        let mut glyph_instances = Vec::with_capacity(4096);
-        let mut image_draw_calls: Vec<(u32, ImageInstance)> = Vec::new();
+        // `get_current_texture` is where a GPU-bound frame actually blocks: it waits
+        // for the compositor to hand back a free swapchain image.
+        let acquire_ns = self.perf.since(frame_start);
+
+        // Borrow the persistent scratch buffers for the duration of this frame.
+        // `take` leaves empty Vecs behind (no allocation) and we hand the buffers
+        // back at the end, so the capacity built up by previous frames is reused.
+        let mut bg_instances = std::mem::take(&mut self.bg_instances);
+        let mut glyph_instances = std::mem::take(&mut self.glyph_instances);
+        let mut image_draw_calls = std::mem::take(&mut self.image_draw_calls);
+        bg_instances.clear();
+        glyph_instances.clear();
+        image_draw_calls.clear();
+
+        // Everything from here to the "Upload instances to GPU buffers" marker is the
+        // CPU-side instance build -- the only part dirty tracking could skip.
+        let build_start = self.perf.now();
 
         let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
@@ -525,6 +1023,7 @@ impl TermRenderer {
         let scale = self.scale_factor;
         let screen_w = self.config.width as f32;
         let screen_h = self.config.height as f32;
+        let sidebar_open = panel_state.open;
 
         // 1. Full Screen Background
         let mut full_bg = self.theme.default_bg;
@@ -535,67 +1034,35 @@ impl TermRenderer {
             color: full_bg,
         });
 
-        // 2. Tab Bar
+        // 2. Tab Bar (splits only the main window area, excluding the right sidebar)
         if tab_bar_h > 0.0 && !tabs.is_empty() {
+            let reserved_right = if sidebar_open && panel_state.width_px > 0.0 {
+                AgentPanelLayout::reserved_width(panel_state.width_px, scale)
+            } else {
+                0.0
+            };
+            let main_w = (screen_w - reserved_right).max(0.0);
+
             // 2.1 Tab Bar Header Background (Deep translucent frosted bar)
             bg_instances.push(BgInstance {
-                rect: [0.0, 0.0, screen_w, tab_bar_h],
+                rect: [0.0, 0.0, main_w, tab_bar_h],
                 color: [0.06, 0.07, 0.09, 1.0],
             });
 
             // Bottom 1px subtle divider
             bg_instances.push(BgInstance {
-                rect: [0.0, tab_bar_h - 1.0, screen_w, 1.0],
+                rect: [0.0, tab_bar_h - 1.0, main_w, 1.0],
                 color: [0.18, 0.20, 0.26, 0.8],
             });
 
-            // 2.1.5 AI Sidebar Toggle Button on the left (after macOS window controls)
-            let base_x = if cfg!(target_os = "macos") {
-                78.0 * scale
-            } else {
-                8.0 * scale
-            };
-            let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);
-            let tab_y = (tab_bar_h - tab_h) / 2.0;
-            let ai_btn_w = 34.0 * scale;
-
-            let ai_btn_bg = if sidebar_open {
-                [0.08, 0.38, 0.78, 0.95]
-            } else if !agents.is_empty() {
-                [0.12, 0.24, 0.42, 0.85]
-            } else {
-                [0.12, 0.14, 0.18, 0.7]
-            };
-            bg_instances.push(BgInstance {
-                rect: [base_x, tab_y, ai_btn_w, tab_h],
-                color: ai_btn_bg,
-            });
-            bg_instances.push(BgInstance {
-                rect: [base_x, tab_y, ai_btn_w, 1.0],
-                color: [0.28, 0.35, 0.48, 0.8],
-            });
-            let ai_label = if agents.is_empty() {
-                "AI".to_string()
-            } else {
-                format!("AI{}", agents.len())
-            };
-            let ai_text_x = base_x + (ai_btn_w - (ai_label.len() as f32 * cell_w)) / 2.0;
-            let ai_text_y = (tab_bar_h - cell_h) / 2.0;
-            self.draw_text_line(
-                &mut glyph_instances,
-                &ai_label,
-                ai_text_x,
-                ai_text_y,
-                ai_btn_w,
-                [0.95, 0.97, 1.0, 1.0],
-                true,
-            );
+            // 2.1.5 Tab capsules start at a clean left margin inside the main area.
+            let base_x = 8.0 * scale;
 
             // 2.2 Calculate Tab Capsule Geometry
-            let start_x = base_x + ai_btn_w + 6.0 * scale;
+            let start_x = base_x;
             let plus_btn_w = 24.0 * scale;
             let tab_gap = 4.0 * scale;
-            let avail_w = (screen_w - start_x - plus_btn_w - 16.0 * scale).max(80.0);
+            let avail_w = (main_w - start_x - plus_btn_w - 16.0 * scale).max(80.0);
             let total_gaps = (tabs.len().saturating_sub(1) as f32) * tab_gap;
             let tab_w =
                 ((avail_w - total_gaps) / tabs.len() as f32).clamp(75.0 * scale, 190.0 * scale);
@@ -743,258 +1210,38 @@ impl TermRenderer {
                 }
             }
 
-            // 2.4 Dropdown Menu Button "v" (Chevron)
-            let menu_btn_w = 20.0 * scale;
-            let menu_btn_x = plus_btn_x + plus_btn_w + 3.0 * scale;
-            let menu_btn_y = plus_btn_y;
-            let is_menu_open = top_menu.is_some();
-
+            // Dropdown Menu chevron "v" Button
+            let chevron_w = 20.0 * scale;
+            let chevron_x = plus_btn_x + plus_btn_w + 2.0 * scale;
             bg_instances.push(BgInstance {
-                rect: [menu_btn_x, menu_btn_y, menu_btn_w, plus_btn_w],
-                color: if is_menu_open {
-                    [0.22, 0.28, 0.42, 0.95]
-                } else {
-                    [0.12, 0.14, 0.18, 0.7]
-                },
+                rect: [chevron_x, plus_btn_y, chevron_w, plus_btn_w],
+                color: [0.12, 0.14, 0.18, 0.7],
             });
             bg_instances.push(BgInstance {
-                rect: [menu_btn_x, menu_btn_y, menu_btn_w, 1.0],
+                rect: [chevron_x, plus_btn_y, chevron_w, 1.0],
                 color: [0.22, 0.25, 0.33, 0.6],
             });
-
-            if let Some(glyph_info) = self
-                .atlas
-                .get_or_insert_glyph(&self.queue, 'v', false, false)
-            {
-                if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
-                    let draw_x = menu_btn_x + (menu_btn_w - glyph_info.size[0]) / 2.0;
-                    let draw_y = menu_btn_y + (plus_btn_w - glyph_info.size[1]) / 2.0;
-                    glyph_instances.push(GlyphInstance {
-                        rect: [draw_x, draw_y, glyph_info.size[0], glyph_info.size[1]],
-                        uv: [
-                            glyph_info.uv_min[0],
-                            glyph_info.uv_min[1],
-                            glyph_info.uv_max[0],
-                            glyph_info.uv_max[1],
-                        ],
-                        color: if is_menu_open {
-                            [1.0, 1.0, 1.0, 1.0]
-                        } else {
-                            [0.80, 0.84, 0.94, 0.9]
-                        },
-                    });
-                }
-            }
+            self.draw_text_line(
+                &mut glyph_instances,
+                "v",
+                chevron_x + (chevron_w - cell_w) / 2.0,
+                plus_btn_y + (plus_btn_w - cell_h) / 2.0,
+                chevron_w,
+                [0.7, 0.75, 0.85, 1.0],
+                false,
+            );
         }
 
-        // 2.5 AI Agents Sidebar Panel
-        if sidebar_open && sidebar_w > 0.0 {
-            let panel_y = tab_bar_h;
-            let panel_h = (screen_h - tab_bar_h).max(0.0);
-
-            // Sidebar background
-            bg_instances.push(BgInstance {
-                rect: [0.0, panel_y, sidebar_w, panel_h],
-                color: [0.04, 0.05, 0.07, 0.98],
-            });
-            // Right border divider line
-            bg_instances.push(BgInstance {
-                rect: [sidebar_w - 1.0, panel_y, 1.0, panel_h],
-                color: [0.18, 0.20, 0.26, 0.9],
-            });
-
-            // Header section
-            let header_top = panel_y;
-            let header_h = 38.0 * scale;
-            bg_instances.push(BgInstance {
-                rect: [0.0, header_top + header_h - 1.0, sidebar_w, 1.0],
-                color: [0.15, 0.17, 0.22, 0.8],
-            });
-
-            let header_title = format!("AGENTS ({})", agents.len());
-            self.draw_text_line(
+        // 2.5 Global AI Agents Panel
+        if sidebar_open && panel_state.width_px > 0.0 {
+            let layout =
+                AgentPanelLayout::new(screen_w, screen_h, tab_bar_h, panel_state.width_px, scale);
+            self.draw_agent_panel(
+                &mut bg_instances,
                 &mut glyph_instances,
-                &header_title,
-                12.0 * scale,
-                header_top + (header_h - cell_h) / 2.0,
-                sidebar_w - 78.0 * scale,
-                [0.75, 0.80, 0.90, 1.0],
-                true,
+                &layout,
+                &panel_state,
             );
-
-            // "+ New" button in sidebar header
-            let new_btn_w = 56.0 * scale;
-            let new_btn_h = 22.0 * scale;
-            let new_btn_x = sidebar_w - new_btn_w - 10.0 * scale;
-            let new_btn_y = header_top + (header_h - new_btn_h) / 2.0;
-            bg_instances.push(BgInstance {
-                rect: [new_btn_x, new_btn_y, new_btn_w, new_btn_h],
-                color: [0.10, 0.36, 0.72, 0.9],
-            });
-            let new_label = "+ New";
-            let new_label_x = new_btn_x + (new_btn_w - (new_label.len() as f32 * cell_w)) / 2.0;
-            self.draw_text_line(
-                &mut glyph_instances,
-                new_label,
-                new_label_x,
-                new_btn_y + (new_btn_h - cell_h) / 2.0,
-                new_btn_w,
-                [0.98, 0.98, 1.0, 1.0],
-                true,
-            );
-
-            // Agent Cards List
-            let card_h = 66.0 * scale;
-            let card_gap = 6.0 * scale;
-            let list_start_y = header_top + header_h + 8.0 * scale;
-            let card_x = 8.0 * scale;
-            let card_w = (sidebar_w - 16.0 * scale).max(20.0);
-
-            if agents.is_empty() {
-                self.draw_text_line(
-                    &mut glyph_instances,
-                    "No active CLI agents",
-                    12.0 * scale,
-                    list_start_y + 12.0 * scale,
-                    card_w - 8.0 * scale,
-                    [0.50, 0.54, 0.62, 0.9],
-                    false,
-                );
-                self.draw_text_line(
-                    &mut glyph_instances,
-                    "Click '+ New' to spawn",
-                    12.0 * scale,
-                    list_start_y + 12.0 * scale + cell_h + 4.0 * scale,
-                    card_w - 8.0 * scale,
-                    [0.42, 0.46, 0.54, 0.85],
-                    false,
-                );
-            } else {
-                for (idx, item) in agents.iter().enumerate() {
-                    let cy = list_start_y + idx as f32 * (card_h + card_gap);
-                    if cy + card_h > screen_h {
-                        break;
-                    }
-
-                    let card_bg = if item.is_focused {
-                        [0.13, 0.21, 0.34, 0.95]
-                    } else {
-                        [0.09, 0.11, 0.15, 0.9]
-                    };
-                    bg_instances.push(BgInstance {
-                        rect: [card_x, cy, card_w, card_h],
-                        color: card_bg,
-                    });
-
-                    // Border
-                    let border_col = if item.is_focused {
-                        [0.039, 0.518, 1.00, 0.9]
-                    } else {
-                        [0.20, 0.23, 0.30, 0.6]
-                    };
-                    bg_instances.push(BgInstance {
-                        rect: [card_x, cy, card_w, 1.0],
-                        color: border_col,
-                    });
-                    bg_instances.push(BgInstance {
-                        rect: [card_x, cy + card_h - 1.0, card_w, 1.0],
-                        color: border_col,
-                    });
-
-                    // Left active accent bar
-                    if item.is_focused {
-                        bg_instances.push(BgInstance {
-                            rect: [card_x, cy, 3.0 * scale, card_h],
-                            color: [0.039, 0.518, 1.00, 1.0],
-                        });
-                    }
-
-                    // Status dot (Green = Active/Thinking, Yellow = Waiting/Idle)
-                    let dot_size = 7.0 * scale;
-                    let dot_x = card_x + 10.0 * scale;
-                    let dot_y = cy + 9.0 * scale + (cell_h - dot_size) / 2.0;
-                    let dot_color = if item.is_active_output {
-                        [0.18, 0.88, 0.46, 1.0]
-                    } else {
-                        [0.96, 0.76, 0.22, 1.0]
-                    };
-                    bg_instances.push(BgInstance {
-                        rect: [dot_x, dot_y, dot_size, dot_size],
-                        color: dot_color,
-                    });
-
-                    // Determine if a custom task name or active rename is present
-                    let has_custom_task = !item.title_summary.is_empty()
-                        && item.title_summary != "Double-click to name...";
-
-                    let (top_title, bottom_subtitle) = if has_custom_task {
-                        let status_str = if item.is_active_output {
-                            "Running"
-                        } else {
-                            "Idle"
-                        };
-                        (
-                            item.title_summary.as_str(),
-                            format!("{} • {}", item.agent_name, status_str),
-                        )
-                    } else {
-                        let status_str = if item.is_active_output {
-                            "Running"
-                        } else {
-                            "Idle"
-                        };
-                        (
-                            item.agent_name.as_str(),
-                            format!("{} • Double-click to name...", status_str),
-                        )
-                    };
-
-                    // Line 1 (Prominent Title): Custom Task Name (or Agent Name if unnamed) + Location label
-                    let text_x = dot_x + dot_size + 6.0 * scale;
-                    let loc_w = (item.location_label.len() as f32 * cell_w) + 8.0 * scale;
-                    self.draw_text_line(
-                        &mut glyph_instances,
-                        top_title,
-                        text_x,
-                        cy + 6.0 * scale,
-                        (card_w - (text_x - card_x) - loc_w).max(20.0),
-                        [0.98, 0.99, 1.0, 1.0],
-                        true,
-                    );
-                    self.draw_text_line(
-                        &mut glyph_instances,
-                        &item.location_label,
-                        card_x + card_w - loc_w + 2.0 * scale,
-                        cy + 6.0 * scale,
-                        loc_w,
-                        [0.65, 0.75, 0.90, 0.9],
-                        false,
-                    );
-
-                    // Line 2: Project / Directory Name
-                    let proj_label = format!("▸ {}", item.project_name);
-                    self.draw_text_line(
-                        &mut glyph_instances,
-                        &proj_label,
-                        card_x + 10.0 * scale,
-                        cy + 24.0 * scale,
-                        card_w - 16.0 * scale,
-                        [0.45, 0.82, 0.96, 0.95],
-                        false,
-                    );
-
-                    // Line 3 (Smaller/Subtler Subtitle): Agent Type • Status
-                    self.draw_text_line(
-                        &mut glyph_instances,
-                        &bottom_subtitle,
-                        card_x + 10.0 * scale,
-                        cy + 42.0 * scale,
-                        card_w - 16.0 * scale,
-                        [0.58, 0.63, 0.72, 0.88],
-                        false,
-                    );
-                }
-            }
         }
 
         // 3. Panes and Images
@@ -1123,6 +1370,21 @@ impl TermRenderer {
                 let global_row = top_global_row + r_idx;
 
                 if let Some(row) = active_buf.get_visible_row(r_idx) {
+                    // `ScreenBuffer::search` emits matches in ascending `global_row`
+                    // order, so this row's matches are a contiguous subslice. Finding
+                    // it once per row turns the per-cell highlight test from
+                    // O(cells * total_matches) into O(cells * matches_on_this_row),
+                    // which is 0 or 1 for almost every row. Searching a common word
+                    // in a 10k-line scrollback used to make every frame scan
+                    // thousands of matches for each of ~30k visible cells.
+                    let row_match_start = pane
+                        .search_matches
+                        .partition_point(|m| m.global_row < global_row);
+                    let row_match_end = pane.search_matches[row_match_start..]
+                        .partition_point(|m| m.global_row == global_row)
+                        + row_match_start;
+                    let row_matches = &pane.search_matches[row_match_start..row_match_end];
+
                     for (c_idx, cell) in row.cells.iter().enumerate() {
                         let x = px + self.padding_x + (c_idx as f32 * cell_w);
                         if x + cell_w > px + pw {
@@ -1135,12 +1397,14 @@ impl TermRenderer {
                             .map(|s| s.contains(r_idx, c_idx))
                             .unwrap_or(false);
 
-                        // Fast-path: Skip default empty blank cells (typically 80-90% of screen)
+                        // Fast-path: Skip default empty blank cells (typically 80-90% of screen).
+                        // Gated on this row's matches, not the whole pane's: an active
+                        // search used to disable this fast path for the entire screen.
                         if cell.c == ' '
                             && cell.bg == Color::DefaultBg
                             && !cell.flags.contains(CellFlags::INVERSE)
                             && !is_selected
-                            && pane.search_matches.is_empty()
+                            && row_matches.is_empty()
                         {
                             continue;
                         }
@@ -1167,14 +1431,13 @@ impl TermRenderer {
                         }
 
                         // Highlight search matches
-                        if !pane.search_matches.is_empty() {
+                        if !row_matches.is_empty() {
                             let mut match_highlight = None;
-                            for (m_idx, m) in pane.search_matches.iter().enumerate() {
-                                if m.global_row == global_row
-                                    && c_idx >= m.start_col
-                                    && c_idx <= m.end_col
-                                {
-                                    if pane.active_search_idx == Some(m_idx) {
+                            for (i, m) in row_matches.iter().enumerate() {
+                                if c_idx >= m.start_col && c_idx <= m.end_col {
+                                    // `active_search_idx` indexes the full match list,
+                                    // so map this row-local index back.
+                                    if pane.active_search_idx == Some(row_match_start + i) {
                                         match_highlight = Some([0.98, 0.68, 0.12, 0.90]);
                                         break;
                                     } else {
@@ -1437,7 +1700,12 @@ impl TermRenderer {
             for (idx, item) in menu.items.iter().enumerate() {
                 if item.is_separator {
                     bg_instances.push(BgInstance {
-                        rect: [menu.x + 8.0 * scale, cur_y + sep_h / 2.0, menu.width - 16.0 * scale, 1.0],
+                        rect: [
+                            menu.x + 8.0 * scale,
+                            cur_y + sep_h / 2.0,
+                            menu.width - 16.0 * scale,
+                            1.0,
+                        ],
                         color: [0.22, 0.25, 0.34, 0.8],
                     });
                     cur_y += sep_h;
@@ -1485,6 +1753,9 @@ impl TermRenderer {
         }
 
         // Upload instances to GPU buffers
+        let build_ns = self.perf.since(build_start);
+        let gpu_start = self.perf.now();
+
         let required_capacity = bg_instances.len().max(glyph_instances.len());
         self.pipeline
             .ensure_bg_capacity(&self.device, required_capacity);
@@ -1503,6 +1774,30 @@ impl TermRenderer {
                 0,
                 bytemuck::cast_slice(&glyph_instances),
             );
+        }
+
+        // Images must have ALL their instances uploaded *before* the render pass.
+        //
+        // `Queue::write_buffer` is not ordered with respect to commands recorded into a
+        // command encoder: every queued write is flushed before the submitted command
+        // buffer executes. Writing one instance at a time inside the pass would therefore
+        // leave only the last write visible, and every image would be drawn at the last
+        // image's rect. Instead we upload the whole array once and select per draw via
+        // the instance index.
+        image_draw_calls.retain(|(id, _)| self.image_cache.contains_key(id));
+        image_draw_calls.truncate(TerminalPipeline::MAX_IMAGE_INSTANCES);
+        if !image_draw_calls.is_empty() {
+            // De-interleave into a reused buffer rather than `collect()`ing a fresh
+            // Vec, which allocated once per frame whenever any image was on screen.
+            let mut img_instances = std::mem::take(&mut self.image_instances);
+            img_instances.clear();
+            img_instances.extend(image_draw_calls.iter().map(|(_, inst)| *inst));
+            self.queue.write_buffer(
+                &self.pipeline.image_instance_buffer,
+                0,
+                bytemuck::cast_slice(&img_instances),
+            );
+            self.image_instances = img_instances;
         }
 
         let mut encoder = self
@@ -1542,17 +1837,18 @@ impl TermRenderer {
             }
 
             // 2. Draw Graphic Images (Sixel / Kitty)
-            for (id, img_inst) in &image_draw_calls {
-                if let Some((_, _, img_bg)) = self.image_cache.get(id) {
-                    self.queue.write_buffer(
-                        &self.pipeline.image_instance_buffer,
-                        0,
-                        bytemuck::cast_slice(&[*img_inst]),
-                    );
-                    render_pass.set_pipeline(&self.pipeline.image_pipeline);
-                    render_pass.set_bind_group(1, img_bg, &[]);
-                    render_pass.set_vertex_buffer(0, self.pipeline.image_instance_buffer.slice(..));
-                    render_pass.draw(0..6, 0..1);
+            // Each image owns its own bind group, so we still need one draw per image,
+            // but the pipeline and vertex buffer are bound once and each draw selects
+            // its instance by index into the array uploaded above.
+            if !image_draw_calls.is_empty() {
+                render_pass.set_pipeline(&self.pipeline.image_pipeline);
+                render_pass.set_vertex_buffer(0, self.pipeline.image_instance_buffer.slice(..));
+                for (idx, (id, _)) in image_draw_calls.iter().enumerate() {
+                    if let Some((_, _, img_bg)) = self.image_cache.get(id) {
+                        render_pass.set_bind_group(1, img_bg, &[]);
+                        let idx = idx as u32;
+                        render_pass.draw(0..6, idx..idx + 1);
+                    }
                 }
             }
 
@@ -1570,7 +1866,25 @@ impl TermRenderer {
             overlay(&self.device, &self.queue, &view, &self.config);
         }
 
+        let upload_and_submit_ns = self.perf.since(gpu_start);
+        let present_start = self.perf.now();
+
         output.present();
+
+        self.perf.record(
+            acquire_ns,
+            build_ns,
+            upload_and_submit_ns,
+            self.perf.since(present_start),
+            self.perf.since(frame_start),
+            glyph_instances.len(),
+            bg_instances.len(),
+        );
+
+        // Hand the buffers back so the next frame reuses this frame's capacity.
+        self.bg_instances = bg_instances;
+        self.glyph_instances = glyph_instances;
+        self.image_draw_calls = image_draw_calls;
 
         Ok(())
     }

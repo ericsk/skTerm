@@ -7,8 +7,6 @@ use egui::{
     Align, Color32, Context, CornerRadius, Frame, Layout, Margin, RichText, Sense, Stroke, Ui,
     Visuals,
 };
-use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 use wgpu::{
@@ -74,6 +72,49 @@ impl<'a> InsetCardBuilder<'a> {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 content(ui);
             });
+        });
+
+        self.ui.add_space(6.0);
+        self.row_count += 1;
+    }
+
+    /// A row whose content spans the full card width, stacked under the label.
+    ///
+    /// `row` puts the content in a right-aligned column, which is fine for a
+    /// slider or a checkbox but far too cramped for a font list.
+    pub fn block<F>(&mut self, label: &str, subtitle: Option<&str>, content: F)
+    where
+        F: FnOnce(&mut Ui),
+    {
+        if self.row_count > 0 {
+            self.ui.add_space(4.0);
+            let avail_w = self.ui.available_width().max(10.0);
+            let min_pos = self.ui.cursor().min;
+            let end_pos = min_pos + egui::vec2(avail_w, 0.0);
+            self.ui.painter().line_segment(
+                [min_pos, end_pos],
+                Stroke::new(1.0_f32, Color32::from_rgb(46, 49, 63)),
+            );
+            self.ui.add_space(8.0);
+        } else {
+            self.ui.add_space(2.0);
+        }
+
+        self.ui.vertical(|ui| {
+            ui.label(
+                RichText::new(label)
+                    .color(Color32::from_rgb(230, 234, 242))
+                    .size(13.5),
+            );
+            if let Some(sub) = subtitle {
+                ui.label(
+                    RichText::new(sub)
+                        .color(Color32::from_rgb(135, 142, 160))
+                        .size(11.0),
+                );
+            }
+            ui.add_space(6.0);
+            content(ui);
         });
 
         self.ui.add_space(6.0);
@@ -390,7 +431,24 @@ pub struct PreferencesWindow {
     pub detected_fonts: Vec<String>,
 
     // Editable form state
+    /// Committed value, compared against the live config to detect changes.
     pub font_family: String,
+    /// What the user is currently typing.
+    ///
+    /// Kept separate from `font_family` because every edit to the committed value
+    /// reloads the font chain and rebuilds the glyph atlas in every window. Typing
+    /// "Menlo" would do that five times, and the intermediate "M"/"Me"/"Men" would
+    /// each resolve to some unrelated font, so the terminal would flicker through
+    /// them. Copied across on Enter or focus loss instead.
+    pub font_family_input: String,
+    /// Cached `family -> resolved file` rows shown under the input.
+    pub font_preview: Vec<(String, Option<String>)>,
+    /// The input string `font_preview` was built from, so it is only recomputed
+    /// when the text actually changes rather than every frame.
+    pub font_preview_src: String,
+    /// Search box inside the "add installed font" picker. There are a few hundred
+    /// families on a typical machine, so an unfiltered list is unusable.
+    pub font_picker_filter: String,
     pub font_size: f32,
     pub line_height: f32,
     pub columns: u16,
@@ -420,8 +478,6 @@ pub struct PreferencesWindow {
     pub cursor_shape: String,
     pub cursor_blink: bool,
     pub blink_interval_ms: u64,
-
-    pub last_synced_snap: String,
 }
 
 impl PreferencesWindow {
@@ -444,7 +500,10 @@ impl PreferencesWindow {
             window_attrs.with_title_hidden(false)
         };
 
+        let window_attrs = crate::icon::configure_window_attributes(window_attrs);
+
         let window = Arc::new(event_loop.create_window(window_attrs)?);
+        crate::icon::apply_window_icon(&window);
 
         let instance = Instance::new(&InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone())?;
@@ -497,7 +556,7 @@ impl PreferencesWindow {
         surface.configure(&device, &config);
 
         let egui_ctx = Context::default();
-        crate::preferences_gui::setup_egui_cjk_fonts(&egui_ctx);
+        crate::egui_fonts::setup_egui_cjk_fonts(&egui_ctx);
         Self::apply_macos_hig_theme(&egui_ctx);
 
         let scale = window.scale_factor() as f32;
@@ -512,7 +571,11 @@ impl PreferencesWindow {
 
         let egui_renderer = egui_wgpu::Renderer::new(&device, surface_format, None, 1, false);
 
-        let detected_fonts = scan_available_monospace_fonts();
+        // Family names from the same index the renderer resolves against, so the
+        // list offers things that will actually load. The old scan returned raw
+        // file stems truncated to 30 entries, which on a machine with a large Nerd
+        // Font family was 30 style variants of one family and nothing else.
+        let detected_fonts = skterm_render::atlas::installed_font_families();
 
         let mut instance = Self {
             window,
@@ -527,6 +590,10 @@ impl PreferencesWindow {
             detected_fonts,
 
             font_family: String::new(),
+            font_family_input: String::new(),
+            font_preview: Vec::new(),
+            font_preview_src: String::new(),
+            font_picker_filter: String::new(),
             font_size: 16.0,
             line_height: 1.2,
             columns: 80,
@@ -556,12 +623,9 @@ impl PreferencesWindow {
             cursor_shape: "block".to_string(),
             cursor_blink: true,
             blink_interval_ms: 500,
-            last_synced_snap: String::new(),
         };
 
         instance.load_from_config(initial_config);
-        let snap = instance.snapshot_values();
-        instance.last_synced_snap = snap;
         Ok(instance)
     }
 
@@ -577,11 +641,19 @@ impl PreferencesWindow {
         }
     }
 
+    /// Returns the form's configuration if it differs from what is currently applied.
+    ///
+    /// This compares whole `Config` values rather than a hand-written list of fields.
+    /// The previous string-snapshot approach silently omitted `decorations`,
+    /// `working_directory`, `scrollback_lines`, `option_as_alt` and `bell`, so editing
+    /// those controls had no effect.
+    ///
+    /// Comparing against `current_config` (rather than a stored baseline) also means
+    /// the check cannot drift when the base config is updated elsewhere.
     pub fn check_changed(&mut self, config_manager: &ConfigManager) -> Option<Config> {
-        let cur = self.snapshot_values();
-        if cur != self.last_synced_snap {
-            self.last_synced_snap = cur;
-            Some(self.to_config(&config_manager.current_config))
+        let cur = self.to_config(&config_manager.current_config);
+        if cur != config_manager.current_config {
+            Some(cur)
         } else {
             None
         }
@@ -607,8 +679,26 @@ impl PreferencesWindow {
         ctx.set_visuals(visuals);
     }
 
+    /// Re-sync the runtime-derived window geometry into the form.
+    ///
+    /// `window.columns` / `window.rows` are unusual among the preferences: the form
+    /// can edit them, but the terminal *also* writes them back whenever the user
+    /// resizes the window. Because the form was only ever populated once (at
+    /// construction), a resize left `self.columns` / `self.rows` stale, and the very
+    /// next `check_changed` would compare the stale form value against the fresh
+    /// config, report a difference, and push the *old* size back over the user's
+    /// resize -- on every event, including mere mouse movement over the prefs window.
+    ///
+    /// Keeping the form in step with external geometry changes removes both the
+    /// size-reverting bug and the resulting re-layout storm.
+    pub fn sync_window_geometry(&mut self, columns: u16, rows: u16) {
+        self.columns = columns;
+        self.rows = rows;
+    }
+
     pub fn load_from_config(&mut self, config: &Config) {
         self.font_family = config.font.family.clone();
+        self.font_family_input = config.font.family.clone();
         self.font_size = config.font.size;
         self.line_height = config.font.line_height;
         self.columns = config.window.columns;
@@ -721,7 +811,6 @@ impl PreferencesWindow {
     /// Render Preferences Window UI and return Option<Config> if any values were modified (for Live Sync).
     pub fn render_frame(&mut self, config_manager: &ConfigManager) -> Option<Config> {
         let raw_input = self.egui_state.take_egui_input(&self.window);
-        let mut changed = false;
 
         let egui_ctx = self.egui_ctx.clone();
         let full_output = egui_ctx.run(raw_input, |ctx| {
@@ -818,7 +907,6 @@ impl PreferencesWindow {
                             .clicked()
                         {
                             self.load_from_config(&Config::default());
-                            changed = true;
                         }
                         ui.add_space(8.0);
                         let (divider_rect, _) = ui.allocate_exact_size(
@@ -841,19 +929,12 @@ impl PreferencesWindow {
                         .inner_margin(Margin::symmetric(26, 22)),
                 )
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        let prev_snap = self.snapshot_values();
-                        match self.active_category {
-                            PreferencesCategory::Appearance => self.render_appearance_view(ui),
-                            PreferencesCategory::Colors => self.render_colors_view(ui),
-                            PreferencesCategory::Terminal => self.render_terminal_view(ui),
-                            PreferencesCategory::Cursor => self.render_cursor_view(ui),
-                            PreferencesCategory::Keybindings => self.render_keybindings_view(ui),
-                        }
-                        let next_snap = self.snapshot_values();
-                        if prev_snap != next_snap {
-                            changed = true;
-                        }
+                    egui::ScrollArea::vertical().show(ui, |ui| match self.active_category {
+                        PreferencesCategory::Appearance => self.render_appearance_view(ui),
+                        PreferencesCategory::Colors => self.render_colors_view(ui),
+                        PreferencesCategory::Terminal => self.render_terminal_view(ui),
+                        PreferencesCategory::Cursor => self.render_cursor_view(ui),
+                        PreferencesCategory::Keybindings => self.render_keybindings_view(ui),
                     });
                 });
         });
@@ -866,11 +947,9 @@ impl PreferencesWindow {
             Ok(t) => t,
             Err(e) => {
                 info!("Surface error in preferences window: {:?}", e);
-                return if changed {
-                    Some(self.to_config(&config_manager.current_config))
-                } else {
-                    None
-                };
+                // Still report edits made this frame, via the same detection path
+                // used by the normal return below.
+                return self.check_changed(config_manager);
             }
         };
 
@@ -982,55 +1061,178 @@ impl PreferencesWindow {
     // 1. Appearance Tab View
     fn render_appearance_view(&mut self, ui: &mut Ui) {
         render_inset_card(ui, "字型與排版 (Typography)", |b| {
-            b.row(
-                "主要等寬字型",
-                Some("支援複合 Nerd Fonts 與 CJK 字型混合鏈"),
+            b.block(
+                "字型家族 (Font Family)",
+                Some("以逗號分隔，依序套用；前面的字型缺少的字元會自動往後遞補。"),
                 |ui| {
-                    egui::ComboBox::from_id_salt("detected_font_cb")
-                        .selected_text(if self.font_family.is_empty() {
-                            "選擇或自訂字型..."
-                        } else {
-                            &self.font_family
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.font_family,
-                                "NotoSansMNerdFontMono, NotoSansTC, Menlo".to_string(),
-                                "NotoSansM Nerd Font (推薦 🚀)",
-                            );
-                            ui.selectable_value(
-                                &mut self.font_family,
-                                "JetBrainsMono Nerd Font, PingFang TC".to_string(),
-                                "JetBrainsMono Nerd Font",
-                            );
-                            ui.selectable_value(
-                                &mut self.font_family,
-                                "FiraCode Nerd Font, PingFang TC".to_string(),
-                                "FiraCode Nerd Font",
-                            );
-                            ui.selectable_value(
-                                &mut self.font_family,
-                                "Menlo, PingFang TC".to_string(),
-                                "Menlo (macOS Default)",
-                            );
-                            ui.selectable_value(
-                                &mut self.font_family,
-                                "SF Mono, PingFang TC".to_string(),
-                                "SF Mono",
-                            );
-                            ui.separator();
-                            for f in &self.detected_fonts {
-                                ui.selectable_value(&mut self.font_family, f.clone(), f);
-                            }
-                        });
-                },
-            );
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.font_family_input)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("例如：NotoSansMNerdFontMono, NotoSansTC, Menlo")
+                            .font(egui::TextStyle::Monospace),
+                    );
 
-            b.row(
-                "自訂字型名稱",
-                Some("直接輸入字型家族名稱"),
-                |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.font_family).desired_width(180.0));
+                    // Commit on Enter or when focus leaves (egui reports both as
+                    // `lost_focus`). Applying per keystroke would rebuild the glyph
+                    // atlas in every window on every character, and partial names
+                    // resolve to unrelated fonts, so the terminal would flicker.
+                    if resp.lost_focus() {
+                        self.font_family = self.font_family_input.trim().to_string();
+                    }
+
+                    ui.add_space(6.0);
+
+                    // Resolution preview. Recomputed only when the text changes;
+                    // `resolve_font_path` scores the cached index and never reads a
+                    // font file, so this stays cheap while typing.
+                    if self.font_preview_src != self.font_family_input {
+                        self.font_preview_src = self.font_family_input.clone();
+                        self.font_preview = self
+                            .font_family_input
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(|name| {
+                                let resolved =
+                                    skterm_render::atlas::resolve_font_path(name).map(|p| {
+                                        p.file_name()
+                                            .map(|f| f.to_string_lossy().into_owned())
+                                            .unwrap_or_default()
+                                    });
+                                (name.to_string(), resolved)
+                            })
+                            .collect();
+                    }
+
+                    if self.font_preview.is_empty() {
+                        ui.label(
+                            RichText::new("尚未設定字型，將使用系統預設等寬字型。")
+                                .size(11.0)
+                                .color(Color32::from_rgb(135, 142, 160)),
+                        );
+                    } else {
+                        for (idx, (name, resolved)) in self.font_preview.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("{}.", idx + 1))
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(110, 118, 135)),
+                                );
+                                match resolved {
+                                    Some(file) => {
+                                        ui.label(
+                                            RichText::new("●")
+                                                .size(10.0)
+                                                .color(Color32::from_rgb(90, 200, 120)),
+                                        );
+                                        ui.label(RichText::new(name).size(11.5));
+                                        ui.label(
+                                            RichText::new(format!("→ {}", file))
+                                                .size(11.0)
+                                                .color(Color32::from_rgb(135, 142, 160)),
+                                        );
+                                    }
+                                    None => {
+                                        ui.label(
+                                            RichText::new("●")
+                                                .size(10.0)
+                                                .color(Color32::from_rgb(230, 120, 110)),
+                                        );
+                                        ui.label(RichText::new(name).size(11.5));
+                                        ui.label(
+                                            RichText::new("→ 找不到，將略過")
+                                                .size(11.0)
+                                                .color(Color32::from_rgb(230, 120, 110)),
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let append = |list: &mut String, name: &str| {
+                            if list.trim().is_empty() {
+                                *list = name.to_string();
+                            } else {
+                                list.push_str(", ");
+                                list.push_str(name);
+                            }
+                        };
+
+                        egui::ComboBox::from_id_salt("append_font_cb")
+                            .selected_text("+ 加入已安裝字型")
+                            .width(190.0)
+                            .show_ui(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.font_picker_filter)
+                                        .hint_text("搜尋字型…")
+                                        .desired_width(220.0),
+                                );
+                                ui.add_space(4.0);
+
+                                let needle = self.font_picker_filter.to_lowercase();
+                                let matches: Vec<&String> = self
+                                    .detected_fonts
+                                    .iter()
+                                    .filter(|f| {
+                                        needle.is_empty() || f.to_lowercase().contains(&needle)
+                                    })
+                                    .collect();
+
+                                ui.label(
+                                    RichText::new(format!("{} 個字型家族", matches.len()))
+                                        .size(10.5)
+                                        .color(Color32::from_rgb(120, 128, 145)),
+                                );
+
+                                let mut pick: Option<String> = None;
+                                egui::ScrollArea::vertical()
+                                    .max_height(260.0)
+                                    .show(ui, |ui| {
+                                        for f in matches {
+                                            if ui.selectable_label(false, f).clicked() {
+                                                pick = Some(f.clone());
+                                            }
+                                        }
+                                    });
+                                if let Some(f) = pick {
+                                    append(&mut self.font_family_input, &f);
+                                    self.font_family = self.font_family_input.trim().to_string();
+                                }
+                            });
+
+                        egui::ComboBox::from_id_salt("font_preset_cb")
+                            .selected_text("套用範本")
+                            .width(140.0)
+                            .show_ui(ui, |ui| {
+                                let presets = [
+                                    (
+                                        "NotoSansM Nerd Font (推薦 🚀)",
+                                        "NotoSansMNerdFontMono, NotoSansTC, Menlo",
+                                    ),
+                                    (
+                                        "JetBrainsMono Nerd Font",
+                                        "JetBrainsMono Nerd Font, PingFang TC",
+                                    ),
+                                    ("FiraCode Nerd Font", "FiraCode Nerd Font, PingFang TC"),
+                                    ("Menlo (macOS Default)", "Menlo, PingFang TC"),
+                                    ("SF Mono", "SF Mono, PingFang TC"),
+                                ];
+                                for (label, value) in presets {
+                                    if ui.selectable_label(false, label).clicked() {
+                                        self.font_family_input = value.to_string();
+                                        self.font_family = value.to_string();
+                                    }
+                                }
+                            });
+
+                        if ui.button("清除").clicked() {
+                            self.font_family_input.clear();
+                            self.font_family.clear();
+                        }
+                    });
                 },
             );
 
@@ -1323,21 +1525,111 @@ impl PreferencesWindow {
             );
 
             let presets = skterm_core::available_shell_presets();
-            let current_label = if !self.custom_shell_enabled || self.shell_program.trim().is_empty() {
-                "系統預設 (System Default)".to_string()
-            } else {
-                let prog_lower = self.shell_program.to_lowercase();
-                if let Some(p) = presets.iter().find(|p| {
-                    prog_lower == p.program.to_lowercase()
-                        || prog_lower == p.id
-                        || prog_lower.ends_with(&format!("{}.exe", p.id))
-                        || prog_lower.ends_with(&format!("\\{}", p.id))
-                }) {
-                    p.name.clone()
+            let current_label =
+                if !self.custom_shell_enabled || self.shell_program.trim().is_empty() {
+                    "系統預設 (System Default)".to_string()
                 } else {
-                    "自訂 Shell 程式 (Custom)".to_string()
-                }
-            };
+                    let prog_lower = self.shell_program.to_lowercase();
+                    if let Some(p) = presets.iter().find(|p| {
+                        prog_lower == p.program.to_lowercase()
+                            || prog_lower == p.id
+                            || prog_lower.ends_with(&format!("{}.exe", p.id))
+                            || prog_lower.ends_with(&format!("\\{}", p.id))
+                    }) {
+                        p.name.clone()
+                    } else {
+                        "自訂 Shell 程式 (Custom)".to_string()
+                    }
+                };
+
+            b.row(
+                "預設 Shell 核心",
+                Some("自由切換命令提示字元、Windows PowerShell 或自訂安裝的 PowerShell"),
+                |ui| {
+                    egui::ComboBox::from_id_salt("pref_window_shell_preset")
+                        .selected_text(&current_label)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(
+                                    !self.custom_shell_enabled,
+                                    "系統預設 (System Default)",
+                                )
+                                .clicked()
+                            {
+                                self.custom_shell_enabled = false;
+                                self.shell_program.clear();
+                                self.shell_args.clear();
+                            }
+                            for p in &presets {
+                                let is_sel = self.custom_shell_enabled
+                                    && (self.shell_program.eq_ignore_ascii_case(&p.program)
+                                        || self.shell_program.eq_ignore_ascii_case(&p.id)
+                                        || self
+                                            .shell_program
+                                            .to_lowercase()
+                                            .ends_with(&format!("{}.exe", p.id)));
+                                let label_text = if p.is_available {
+                                    p.name.clone()
+                                } else {
+                                    format!("{} (未安裝)", p.name)
+                                };
+                                if ui.selectable_label(is_sel, label_text).clicked() {
+                                    self.custom_shell_enabled = true;
+                                    self.shell_program = p.program.clone();
+                                    self.shell_args = p.args.join(" ");
+                                }
+                            }
+                            let is_custom = self.custom_shell_enabled
+                                && !presets.iter().any(|p| {
+                                    self.shell_program.eq_ignore_ascii_case(&p.program)
+                                        || self.shell_program.eq_ignore_ascii_case(&p.id)
+                                        || self
+                                            .shell_program
+                                            .to_lowercase()
+                                            .ends_with(&format!("{}.exe", p.id))
+                                });
+                            if ui
+                                .selectable_label(is_custom, "自訂 Shell (Custom...)")
+                                .clicked()
+                            {
+                                self.custom_shell_enabled = true;
+                            }
+                        });
+                },
+            );
+
+            #[cfg(target_os = "windows")]
+            b.row(
+                "快速切換常用 Shell",
+                Some("點擊按鈕一鍵切換預設 Shell"),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("💻 命令提示字元").clicked() {
+                            self.custom_shell_enabled = true;
+                            self.shell_program = skterm_core::find_cmd();
+                            self.shell_args.clear();
+                        }
+                        if ui.button("⚡ Windows PowerShell").clicked() {
+                            self.custom_shell_enabled = true;
+                            self.shell_program = skterm_core::find_windows_powershell()
+                                .unwrap_or_else(|| "powershell.exe".to_string());
+                            self.shell_args = "-NoLogo".to_string();
+                        }
+                        let pwsh_found = skterm_core::find_pwsh_path();
+                        let pwsh_btn = if pwsh_found.is_some() {
+                            "🚀 PowerShell 7 (pwsh)"
+                        } else {
+                            "🚀 pwsh.exe"
+                        };
+                        if ui.button(pwsh_btn).clicked() {
+                            self.custom_shell_enabled = true;
+                            self.shell_program =
+                                pwsh_found.unwrap_or_else(|| "pwsh.exe".to_string());
+                            self.shell_args = "-NoLogo".to_string();
+                        }
+                    });
+                },
+            );
 
             b.row(
                 "預設 Shell 核心",
@@ -1424,29 +1716,21 @@ impl PreferencesWindow {
             );
 
             if self.custom_shell_enabled {
-                b.row(
-                    "執行檔路徑 (Program)",
-                    Some("可輸入完整路徑或系統命令 (如 powershell.exe, pwsh.exe, cmd.exe)"),
-                    |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.shell_program)
-                                .hint_text("powershell.exe / pwsh.exe / cmd.exe")
-                                .desired_width(220.0),
-                        );
-                    },
-                );
+                b.row("執行檔路徑", None, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.shell_program)
+                            .hint_text("powershell.exe / pwsh.exe / cmd.exe")
+                            .desired_width(200.0),
+                    );
+                });
 
-                b.row(
-                    "啟動參數 (Args)",
-                    Some("啟動參數以空格隔開 (例如 -NoLogo)"),
-                    |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.shell_args)
-                                .hint_text("-NoLogo")
-                                .desired_width(220.0),
-                        );
-                    },
-                );
+                b.row("啟動參數 (Args)", None, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.shell_args)
+                            .hint_text("-NoLogo")
+                            .desired_width(200.0),
+                    );
+                });
             }
 
             b.row(
@@ -1557,7 +1841,7 @@ impl PreferencesWindow {
     fn render_keybindings_view(&mut self, ui: &mut Ui) {
         render_inset_card(ui, "常用快捷鍵速查 (macOS HIG Cheatsheet)", |b| {
             let shortcuts: &[(&str, &[&str], &[&str])] = &[
-                ("開啟偏好設定視窗", &["⌘", "，"], &["Ctrl", "Shift", "，"]),
+                ("開啟偏好設定視窗", &["⌘", "，"], &["Ctrl", "，"]),
                 ("新增分頁 (New Tab)", &["⌘", "T"], &["Ctrl", "Shift", "T"]),
                 ("關閉分頁 / 窗格", &["⌘", "W"], &["Ctrl", "Shift", "W"]),
                 ("左右垂直切分窗格", &["⌘", "D"], &["Ctrl", "Shift", "D"]),
@@ -1602,34 +1886,6 @@ impl PreferencesWindow {
             }
         });
     }
-
-    fn snapshot_values(&self) -> String {
-        format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-            self.font_family,
-            self.font_size,
-            self.line_height,
-            self.columns,
-            self.rows,
-            self.padding_x,
-            self.padding_y,
-            self.opacity,
-            self.startup_mode,
-            self.tab_bar_style,
-            self.theme,
-            self.fg_override,
-            self.bg_override,
-            self.cursor_override,
-            self.selection_override,
-            self.term,
-            self.custom_shell_enabled,
-            self.shell_program,
-            self.shell_args,
-            self.cursor_shape,
-            self.cursor_blink,
-            self.blink_interval_ms
-        )
-    }
 }
 
 fn parse_hex_color(hex: &str) -> Option<Color32> {
@@ -1642,46 +1898,4 @@ fn parse_hex_color(hex: &str) -> Option<Color32> {
     } else {
         None
     }
-}
-
-/// Scan system font directories to detect installed monospace fonts for autocomplete
-pub fn scan_available_monospace_fonts() -> Vec<String> {
-    let mut search_dirs = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        let home_p = PathBuf::from(home);
-        search_dirs.push(home_p.join("Library/Fonts"));
-        search_dirs.push(home_p.join(".local/share/fonts"));
-    }
-    search_dirs.push(PathBuf::from("/Library/Fonts"));
-    search_dirs.push(PathBuf::from("/System/Library/Fonts"));
-    search_dirs.push(PathBuf::from("/usr/share/fonts"));
-
-    let mut fonts = Vec::new();
-    for dir in search_dirs {
-        if dir.exists() {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        let ext_l = ext.to_lowercase();
-                        if ext_l == "ttf" || ext_l == "otf" || ext_l == "ttc" {
-                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                                let stem_l = stem.to_lowercase();
-                                if (stem_l.contains("mono")
-                                    || stem_l.contains("nerd")
-                                    || stem_l.contains("code"))
-                                    && !fonts.contains(&stem.to_string())
-                                {
-                                    fonts.push(stem.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    fonts.sort();
-    fonts.truncate(30);
-    fonts
 }

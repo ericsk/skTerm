@@ -203,7 +203,10 @@ fn test_vt_prompt_line_preservation_on_resize() {
     assert_eq!(term.grid().active().cursor.row, 1);
     assert_eq!(term.grid().active().cursor.col, 2);
 
-    let row0: String = term.grid().active().grid[0].cells[0..33].iter().map(|c| c.c).collect();
+    let row0: String = term.grid().active().grid[0].cells[0..33]
+        .iter()
+        .map(|c| c.c)
+        .collect();
     assert_eq!(row0, "=== Narrow Prompt Ruler 12345 ===");
 
     // Resize back to 80 cols
@@ -212,8 +215,84 @@ fn test_vt_prompt_line_preservation_on_resize() {
 
     // Shell repaints on 80 cols
     term.feed_bytes(b"\x1b[1A\r\x1b[K=== Wide Prompt Ruler Restored 1234567890 ===\r\n\x1b[K> ");
-    let row0_wide: String = term.grid().active().grid[0].cells[0..45].iter().map(|c| c.c).collect();
+    let row0_wide: String = term.grid().active().grid[0].cells[0..45]
+        .iter()
+        .map(|c| c.c)
+        .collect();
     assert_eq!(row0_wide, "=== Wide Prompt Ruler Restored 1234567890 ===");
+}
+
+/// Narrowing must not destroy output, and widening must put it back.
+///
+/// `reflow` used to keep every visible unwrapped line on exactly one row and drop
+/// whatever no longer fit, so shrinking a pane silently ate the tail of every long
+/// line. It now wraps them and scrolls the surplus rows off the top, which keeps the
+/// cursor on the row the shell expects (see
+/// `test_vt_prompt_line_preservation_on_resize`) without losing anything.
+#[test]
+fn test_vt_narrow_and_widen_roundtrip_preserves_output() {
+    const LONG: &str = "-rw-r--r--  1 eric  staff   12345 Jan  1 00:00 a-rather-long-filename.txt";
+    const CMD: &str = "$ ls -la /some/very/long/path/that/goes/on";
+
+    let mut term = Terminal::new_headless(10, 80, 1000);
+    term.feed_bytes(format!("{CMD}\r\n{LONG}\r\n$ ").as_bytes());
+    assert_eq!(term.grid().active().cursor.row, 2);
+    assert_eq!(term.grid().active().cursor.col, 2);
+
+    // Everything visible on one line each, collapsed to a single searchable string.
+    let flatten = |term: &Terminal| -> String {
+        let b = term.grid().active();
+        b.scrollback
+            .iter()
+            .chain(b.grid.iter())
+            .flat_map(|r| r.cells.iter().map(|c| c.c))
+            .collect::<String>()
+            .replace(' ', "")
+    };
+    let squash = |s: &str| s.replace(' ', "");
+
+    term.resize(10, 40).unwrap();
+
+    let after_narrow = flatten(&term);
+    assert!(
+        after_narrow.contains(&squash(LONG)),
+        "narrowing destroyed the long line"
+    );
+    assert!(
+        after_narrow.contains(&squash(CMD)),
+        "narrowing destroyed the command line"
+    );
+    // The prompt must not have slid down the screen, or the shell's relative
+    // repaint after SIGWINCH would land on the wrong row.
+    assert_eq!(
+        term.grid().active().cursor.row,
+        2,
+        "cursor row must be anchored across the narrow"
+    );
+    assert_eq!(term.grid().active().cursor.col, 2);
+    // The surplus rows went to scrollback rather than being dropped.
+    assert!(!term.grid().active().scrollback.is_empty());
+
+    term.resize(10, 80).unwrap();
+
+    // Widening re-joins the wrapped fragments back into the original lines.
+    let b = term.grid().active();
+    let long_again: String = b.grid[0].cells.iter().map(|c| c.c).collect();
+    assert_eq!(
+        long_again.trim_end(),
+        LONG,
+        "widening did not restore the long line intact"
+    );
+    let cmd_again: String = b.scrollback[b.scrollback.len() - 1]
+        .cells
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(
+        cmd_again.trim_end(),
+        CMD,
+        "widening did not restore the command line intact"
+    );
 }
 
 #[test]
@@ -304,5 +383,3 @@ fn test_vt_cjk_wide_char_overwrite_and_backspace() {
     assert_eq!(cells[1].c, 'A');
     assert!(!cells[1].flags.contains(CellFlags::WIDE_CHAR_SPACER));
 }
-
-

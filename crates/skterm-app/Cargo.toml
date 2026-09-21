@@ -11,12 +11,12 @@ name = "skterm"
 path = "src/main.rs"
 
 [dependencies]
-skterm-core = { workspace = true }
-skterm-render = { workspace = true }
 skterm-gui = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 
+# Only the examples pull these in; the `skterm` binary itself needs neither.
 [dev-dependencies]
+skterm-core = { workspace = true }
 base64 = { workspace = true }

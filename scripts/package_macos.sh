@@ -56,4 +56,10 @@ PLIST
 echo "=== Signing macOS App Bundle ==="
 codesign --force --deep --sign - "${BUNDLE_DIR}"
 
+if [ -d "/Applications/${APP_NAME}" ]; then
+    echo "=== Updating /Applications/${APP_NAME} ==="
+    rm -rf "/Applications/${APP_NAME}"
+    cp -R "${BUNDLE_DIR}" "/Applications/${APP_NAME}"
+fi
+
 echo "Successfully built macOS App Bundle at ${BUNDLE_DIR}"

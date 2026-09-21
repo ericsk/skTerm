@@ -131,6 +131,17 @@ impl PaneNode {
         dead
     }
 
+    /// Whether any leaf in this subtree has a dead child process.
+    ///
+    /// Short-circuits and allocates nothing, unlike `find_dead_panes().is_empty()`.
+    /// This is polled frequently, so the "nothing died" answer must be cheap.
+    pub fn any_dead(&self) -> bool {
+        match self {
+            PaneNode::Leaf { terminal, .. } => !terminal.is_child_alive(),
+            PaneNode::Split { first, second, .. } => first.any_dead() || second.any_dead(),
+        }
+    }
+
     fn collect_dead_panes(&self, out: &mut Vec<PaneId>) {
         match self {
             PaneNode::Leaf { id, terminal } => {
@@ -145,17 +156,27 @@ impl PaneNode {
         }
     }
 
+    /// Splits the pane identified by `target_id`.
+    ///
+    /// `new_terminal` is passed as `&mut Option<Terminal>` so that ownership of the
+    /// (PTY-backed) terminal is transferred exactly once, at the matching leaf. Passing
+    /// it by value would require cloning it down every recursion branch, and `Terminal`
+    /// cannot be meaningfully cloned because it owns a PTY.
     pub fn split_pane(
         &mut self,
         target_id: PaneId,
         direction: SplitDirection,
         new_id: PaneId,
-        new_terminal: Terminal,
+        new_terminal: &mut Option<Terminal>,
         split_id: u32,
     ) -> bool {
         match self {
             PaneNode::Leaf { id, terminal } => {
                 if *id == target_id {
+                    let Some(new_terminal) = new_terminal.take() else {
+                        // Already consumed by an earlier branch; nothing left to install.
+                        return false;
+                    };
                     let old_id = *id;
                     let old_terminal = std::mem::replace(terminal, Terminal::new_headless(1, 1, 0));
 
@@ -178,17 +199,8 @@ impl PaneNode {
                 }
             }
             PaneNode::Split { first, second, .. } => {
-                if first.split_pane(
-                    target_id,
-                    direction,
-                    new_id,
-                    new_terminal.clone_dummy(),
-                    split_id,
-                ) {
-                    true
-                } else {
-                    second.split_pane(target_id, direction, new_id, new_terminal, split_id)
-                }
+                first.split_pane(target_id, direction, new_id, new_terminal, split_id)
+                    || second.split_pane(target_id, direction, new_id, new_terminal, split_id)
             }
         }
     }
@@ -436,16 +448,6 @@ impl PaneNode {
     }
 }
 
-trait TerminalDummy {
-    fn clone_dummy(&self) -> Terminal;
-}
-
-impl TerminalDummy for Terminal {
-    fn clone_dummy(&self) -> Terminal {
-        Terminal::new_headless(self.grid().active().rows, self.grid().active().cols, 100)
-    }
-}
-
 /// A single tab containing a BSP tree of panes.
 pub struct Tab {
     pub id: TabId,
@@ -454,6 +456,7 @@ pub struct Tab {
     pub active_pane_id: PaneId,
     pub zoomed_pane_id: Option<PaneId>,
     pub next_split_id: u32,
+    pub has_unseen_output: bool,
 }
 
 impl Tab {
@@ -495,6 +498,7 @@ impl Tab {
             active_pane_id: pane_id,
             zoomed_pane_id: None,
             next_split_id: 1,
+            has_unseen_output: false,
         })
     }
 
@@ -539,13 +543,18 @@ impl Tab {
         self.next_split_id += 1;
 
         let new_terminal = Terminal::new_with_options(rows, cols, scrollback_lines, options)?;
-        self.root.split_pane(
+        let mut new_terminal = Some(new_terminal);
+        let installed = self.root.split_pane(
             self.active_pane_id,
             direction,
             new_id,
-            new_terminal,
+            &mut new_terminal,
             split_id,
         );
+        if !installed {
+            // Target pane vanished; don't leave a phantom pane id behind.
+            anyhow::bail!("split target pane {} not found", self.active_pane_id);
+        }
         self.active_pane_id = new_id;
         self.zoomed_pane_id = None;
         Ok(new_id)
@@ -665,6 +674,28 @@ impl Tab {
 
     pub fn equalize_panes(&mut self) {
         self.root.equalize_ratios();
+    }
+}
+
+/// What a `Workspace::poll_all_ptys` sweep actually changed.
+///
+/// Separating "some pane produced bytes" from "something the user can see
+/// changed" is what lets the event loop skip redraws for background tabs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PollOutcome {
+    /// The visible tab produced output, so terminal content changed.
+    pub active_tab_dirty: bool,
+    /// A background tab's activity dot just turned on, so the tab bar changed.
+    pub tab_bar_dirty: bool,
+    /// Any pane at all produced output, visible or not. Used for window-level
+    /// activity tracking, not for deciding whether to repaint.
+    pub any_output: bool,
+}
+
+impl PollOutcome {
+    /// Whether anything currently on screen changed and a repaint is warranted.
+    pub fn needs_redraw(&self) -> bool {
+        self.active_tab_dirty || self.tab_bar_dirty
     }
 }
 
@@ -810,12 +841,7 @@ impl Workspace {
     }
 
     pub fn has_dead_sessions(&self) -> bool {
-        for tab in &self.tabs {
-            if !tab.root.find_dead_panes().is_empty() {
-                return true;
-            }
-        }
-        false
+        self.tabs.iter().any(|tab| tab.root.any_dead())
     }
 
     pub fn cleanup_dead_sessions(&mut self) -> bool {
@@ -837,12 +863,14 @@ impl Workspace {
     pub fn select_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
             self.active_tab_idx = idx;
+            self.tabs[idx].has_unseen_output = false;
         }
     }
 
     pub fn next_tab(&mut self) {
         if !self.tabs.is_empty() {
             self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
+            self.tabs[self.active_tab_idx].has_unseen_output = false;
         }
     }
 
@@ -853,6 +881,7 @@ impl Workspace {
             } else {
                 self.active_tab_idx - 1
             };
+            self.tabs[self.active_tab_idx].has_unseen_output = false;
         }
     }
 
@@ -917,14 +946,31 @@ impl Workspace {
         }
     }
 
-    pub fn poll_all_ptys(&mut self) -> bool {
-        let mut any_data = false;
-        for tab in &mut self.tabs {
+    /// Drain every pane's PTY in this workspace and report what actually changed
+    /// *on screen*.
+    ///
+    /// The distinction matters for idle power: output in a background tab is not
+    /// visible, so it must not drive a full GPU re-render of the tab the user is
+    /// actually looking at. A `tail -f` or `cargo watch` in a background tab used
+    /// to pin the render path continuously.
+    pub fn poll_all_ptys(&mut self) -> PollOutcome {
+        let mut outcome = PollOutcome::default();
+        let active_idx = self.active_tab_idx;
+        for (idx, tab) in self.tabs.iter_mut().enumerate() {
             if tab.root.poll_all_ptys() {
-                any_data = true;
+                outcome.any_output = true;
+                if idx == active_idx {
+                    outcome.active_tab_dirty = true;
+                } else if !tab.has_unseen_output {
+                    // The activity dot is turning on for the first time, which is
+                    // itself a visible change to the tab bar. Further output while
+                    // the dot is already lit changes nothing on screen.
+                    tab.has_unseen_output = true;
+                    outcome.tab_bar_dirty = true;
+                }
             }
         }
-        any_data
+        outcome
     }
 
     pub fn content_bounds(
@@ -934,15 +980,21 @@ impl Workspace {
         tab_bar_h: f32,
         scale_factor: f32,
     ) -> Rect {
-        let sidebar_px = if self.sidebar_open {
-            self.sidebar_width * scale_factor
+        // The agents panel is docked to the right as a floating card, so the
+        // terminal keeps the left edge and gives up the card plus the gutters on
+        // either side of it.
+        let reserved = if self.sidebar_open {
+            skterm_render::AgentPanelLayout::reserved_width(
+                self.sidebar_width * scale_factor,
+                scale_factor,
+            )
         } else {
             0.0
         };
         Rect::new(
-            sidebar_px,
+            0.0,
             tab_bar_h,
-            (screen_w - sidebar_px).max(0.0),
+            (screen_w - reserved).max(0.0),
             (screen_h - tab_bar_h).max(0.0),
         )
     }
@@ -1074,7 +1126,7 @@ impl Workspace {
                         "workspace".to_string()
                     };
 
-                    let location_label = format!("T{}•#{}", tab_idx + 1, pane_id);
+                    let location_label = format!("Tab {} · #{}", tab_idx + 1, pane_id);
                     let title_summary = if let Some(ref custom) = terminal.custom_label {
                         if !custom.trim().is_empty() {
                             custom.clone()
@@ -1085,9 +1137,7 @@ impl Workspace {
                         } else {
                             "Double-click to name...".to_string()
                         }
-                    } else if terminal.state.title != "skTerm"
-                        && !terminal.state.title.is_empty()
-                    {
+                    } else if terminal.state.title != "skTerm" && !terminal.state.title.is_empty() {
                         terminal.state.title.clone()
                     } else {
                         "Double-click to name...".to_string()
@@ -1114,12 +1164,15 @@ impl Workspace {
     }
 }
 
+/// Parent PID -> its child `(pid, process name)` pairs, shared with the
+/// background refresh thread that repopulates the tree off the UI thread.
+type ChildrenMap =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Vec<(u32, String)>>>>;
+
 /// Cached system process tree and CWD lookups for low-overhead AI Agent discovery.
 pub struct ProcessTreeCache {
     last_refresh: Option<std::time::Instant>,
-    children_map: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<u32, Vec<(u32, String)>>>,
-    >,
+    children_map: ChildrenMap,
     is_refreshing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     cwd_cache: std::collections::HashMap<u32, String>,
 }

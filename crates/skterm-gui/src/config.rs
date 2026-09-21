@@ -5,9 +5,12 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use tracing::{info, warn};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
 
 /// Root Configuration
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -485,11 +488,74 @@ pub fn parse_hex_color(hex: &str) -> Option<[f32; 4]> {
     }
 }
 
+/// Callback used by the file watcher to wake a sleeping event loop.
+pub type ConfigWakeup = Arc<dyn Fn() + Send + Sync>;
+
+/// Serialises config writes across threads.
+///
+/// Persisting happens on background threads from more than one place (live
+/// preference edits and the debounced geometry autosave). `fs::write` opens with
+/// `O_TRUNC` and then writes, so two of those overlapping would interleave their
+/// bytes in the same file -- which is how a `config.toml` ends up with a
+/// half-finished key like `l_ms = 500` and a duplicated table header.
+static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Write `contents` to `path` atomically.
+///
+/// Writes a sibling temp file, flushes it to disk, then `rename`s it over the
+/// target. `rename` within a directory is atomic, so readers -- including our own
+/// file watcher -- only ever observe the complete old or the complete new file,
+/// never a partial one.
+pub fn write_config_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    // Poisoning only means some other writer panicked; the file itself is still
+    // consistent because that writer never renamed a partial temp file into place.
+    let _guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Keep the temp file in the same directory so the rename stays on one
+    // filesystem. The watcher matches on the exact config path, so it ignores it.
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    let result = (|| {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Copy an unparseable config aside so the user can recover their settings.
+/// Returns the path it was copied to (or the original path if the copy failed).
+fn backup_unreadable_config(path: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = path.with_extension(format!("toml.invalid.{}", stamp));
+    match fs::copy(path, &backup) {
+        Ok(_) => backup,
+        Err(e) => {
+            warn!("Could not back up invalid config: {}", e);
+            path.to_path_buf()
+        }
+    }
+}
+
 /// Hot-reloading configuration manager
 pub struct ConfigManager {
     pub current_config: Config,
     pub path: PathBuf,
     rx: Receiver<Config>,
+    /// Installed once the winit event-loop proxy exists (i.e. after construction),
+    /// hence the `OnceLock` indirection shared with the watcher closure.
+    wakeup: Arc<OnceLock<ConfigWakeup>>,
     _watcher: Option<RecommendedWatcher>,
 }
 
@@ -506,9 +572,14 @@ impl ConfigManager {
                         cfg
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to parse config at {:?}: {:?}. Using default.",
-                            path, e
+                        // Falling back to defaults silently is dangerous: the next
+                        // autosave would write those defaults over the file and
+                        // destroy whatever the user actually had. Keep a copy.
+                        let backup = backup_unreadable_config(&path);
+                        error!(
+                            "Config at {:?} is not valid TOML and was ignored: {}. \
+                             A copy was kept at {:?}. Starting from defaults.",
+                            path, e, backup
                         );
                         Config::default()
                     }
@@ -523,32 +594,42 @@ impl ConfigManager {
             }
         } else {
             let default_cfg = Config::default();
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
             let template = default_config_template();
-            if fs::write(&path, template).is_ok() {
+            if write_config_atomically(&path, template).is_ok() {
                 info!("Created default config with template at {:?}", path);
             }
             default_cfg
         };
 
         let watch_path = path.clone();
-        let watcher = setup_watcher(watch_path, tx);
+        let wakeup: Arc<OnceLock<ConfigWakeup>> = Arc::new(OnceLock::new());
+        let watcher = setup_watcher(watch_path, tx, Arc::clone(&wakeup));
 
         Self {
             current_config: config,
             path,
             rx,
+            wakeup,
             _watcher: watcher,
         }
+    }
+
+    /// Install the event-loop wakeup used by the watcher thread. Only the first
+    /// call takes effect.
+    pub fn set_wakeup(&self, cb: ConfigWakeup) {
+        let _ = self.wakeup.set(cb);
     }
 
     pub fn check_reload(&mut self) -> Option<&Config> {
         let mut updated = false;
         while let Ok(new_cfg) = self.rx.try_recv() {
-            self.current_config = new_cfg;
-            updated = true;
+            // Ignore no-op reloads. Besides saving a full re-apply (fonts, themes, pane
+            // resizes), this is what stops our own auto-save from bouncing back through
+            // the watcher as a "change".
+            if new_cfg != self.current_config {
+                self.current_config = new_cfg;
+                updated = true;
+            }
         }
         if updated {
             Some(&self.current_config)
@@ -560,10 +641,7 @@ impl ConfigManager {
     /// Open configuration file in default text editor
     pub fn open_in_editor(&self) {
         if !self.path.exists() {
-            if let Some(parent) = self.path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let _ = fs::write(&self.path, default_config_template());
+            let _ = write_config_atomically(&self.path, default_config_template());
         }
 
         #[cfg(target_os = "macos")]
@@ -585,15 +663,41 @@ impl ConfigManager {
     }
 }
 
-fn setup_watcher(path: PathBuf, tx: Sender<Config>) -> Option<RecommendedWatcher> {
+fn setup_watcher(
+    path: PathBuf,
+    tx: Sender<Config>,
+    wakeup: Arc<OnceLock<ConfigWakeup>>,
+) -> Option<RecommendedWatcher> {
     let watch_target = path.clone();
+    // Editors emit several events per save (and atomic "write temp + rename" saves show
+    // up as Create rather than Modify), so we accept both kinds and collapse bursts.
+    const DEBOUNCE: Duration = Duration::from_millis(150);
+    let mut last_emit: Option<Instant> = None;
+
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res {
-            if event.kind.is_modify() {
-                if let Ok(content) = fs::read_to_string(&watch_target) {
-                    if let Ok(new_config) = toml::from_str::<Config>(&content) {
-                        info!("Config hot-reloaded successfully from {:?}", watch_target);
-                        let _ = tx.send(new_config);
+            if !(event.kind.is_modify() || event.kind.is_create()) {
+                return;
+            }
+            // We watch the parent directory, so ignore unrelated files next to it.
+            if !event.paths.iter().any(|p| p == &watch_target) {
+                return;
+            }
+            let now = Instant::now();
+            if let Some(prev) = last_emit {
+                if now.duration_since(prev) < DEBOUNCE {
+                    return;
+                }
+            }
+            if let Ok(content) = fs::read_to_string(&watch_target) {
+                if let Ok(new_config) = toml::from_str::<Config>(&content) {
+                    info!("Config hot-reloaded successfully from {:?}", watch_target);
+                    last_emit = Some(now);
+                    let _ = tx.send(new_config);
+                    // The event loop may be parked in `ControlFlow::Wait`; nudge it
+                    // so the reload is applied now rather than on the next input.
+                    if let Some(cb) = wakeup.get() {
+                        cb();
                     }
                 }
             }

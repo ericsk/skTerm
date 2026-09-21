@@ -1,11 +1,12 @@
 //! Cross-platform PTY subprocess management using portable-pty.
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use tracing::{error, info};
 
 /// Events produced by the background PTY reader thread.
@@ -46,6 +47,8 @@ pub struct PtyProcess {
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     event_rx: Receiver<PtyEvent>,
     has_exited: Arc<std::sync::atomic::AtomicBool>,
+    /// Rate-limits the `waitpid` backstop in [`PtyProcess::is_alive`].
+    last_liveness_probe: Mutex<Instant>,
     pid: Option<u32>,
     _reader_thread: thread::JoinHandle<()>,
 }
@@ -201,7 +204,13 @@ impl PtyProcess {
         let mut reader = pair.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
 
-        let (event_tx, event_rx): (Sender<PtyEvent>, Receiver<PtyEvent>) = unbounded();
+        // Bounded, not unbounded: a producer that outruns the ~60 Hz consumer (`yes`,
+        // `cat /dev/urandom`, a runaway build log) would otherwise grow this queue
+        // without limit and blow up RSS. Blocking the reader here backpressures through
+        // the pty to the child, which is the correct behaviour for a terminal.
+        const EVENT_QUEUE_DEPTH: usize = 256;
+        let (event_tx, event_rx): (Sender<PtyEvent>, Receiver<PtyEvent>) =
+            bounded(EVENT_QUEUE_DEPTH);
 
         let wakeup_cb = options.wakeup_cb;
         let has_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -210,7 +219,9 @@ impl PtyProcess {
         let reader_thread = thread::Builder::new()
             .name("skterm-pty-reader".to_string())
             .spawn(move || {
-                let mut buf = [0u8; 8192];
+                // 64 KiB rather than 8 KiB: under heavy output this cuts the number of
+                // read syscalls, channel sends and per-chunk allocations by 8x.
+                let mut buf = [0u8; 65536];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => {
@@ -259,6 +270,7 @@ impl PtyProcess {
             child,
             event_rx,
             has_exited,
+            last_liveness_probe: Mutex::new(Instant::now()),
             pid,
             _reader_thread: reader_thread,
         })
@@ -292,14 +304,36 @@ impl PtyProcess {
     }
 
     /// Check if the child process has exited.
+    ///
+    /// The reader thread is the primary exit signal (it sets `has_exited` on EOF or
+    /// read error). The `try_wait` below is only a backstop for a child that exits
+    /// while some other process still holds the pty open, so it is rate-limited:
+    /// callers poll this per pane per frame, and an unthrottled `waitpid` there costs
+    /// a syscall every time.
     pub fn is_alive(&self) -> bool {
+        const LIVENESS_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
         if self.has_exited.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
+
+        match self.last_liveness_probe.lock() {
+            Ok(mut last) => {
+                if last.elapsed() < LIVENESS_PROBE_INTERVAL {
+                    // Assume still alive; `has_exited` above would have caught a
+                    // reader-observed exit already.
+                    return true;
+                }
+                *last = Instant::now();
+            }
+            Err(_) => return true,
+        }
+
         if let Ok(mut child) = self.child.lock() {
             match child.try_wait() {
                 Ok(Some(_)) => {
-                    self.has_exited.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.has_exited
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     false
                 }
                 Ok(None) => true,
@@ -313,6 +347,126 @@ impl PtyProcess {
     /// Return the OS process ID of the spawned shell/child process.
     pub fn process_id(&self) -> Option<u32> {
         self.pid
+    }
+
+    /// Name of the process currently in the foreground of this pty.
+    ///
+    /// This is the terminal's own notion of "what is running right now" -- the
+    /// kernel tracks it as the pty's foreground process group, so running `vim`
+    /// reports `vim` and quitting it reports the shell again, with no process
+    /// tree walking.
+    ///
+    /// Two cheap syscalls (`tcgetpgrp` plus a name lookup); no subprocess. Still
+    /// worth throttling if called from a render loop.
+    #[cfg(unix)]
+    pub fn foreground_process_name(&self) -> Option<String> {
+        let pgid = self.master.process_group_leader()?;
+        if pgid <= 0 {
+            return None;
+        }
+        let name = process_name(pgid)?;
+        // portable-pty hands back the child's pid as soon as it forks, which is
+        // before the child has exec'd the shell. For that window (~12ms on every
+        // spawn) the child is still a copy of us and reports *our* name, which
+        // would label a brand new tab with the application's own name.
+        //
+        // Suppressing the match costs only the rare case of running this
+        // terminal inside itself, which then falls back to showing the
+        // directory -- exactly what an idle shell already shows.
+        if self_process_name() == Some(name.as_str()) {
+            return None;
+        }
+        Some(name)
+    }
+
+    #[cfg(not(unix))]
+    pub fn foreground_process_name(&self) -> Option<String> {
+        None
+    }
+}
+
+/// This process's own name, resolved once.
+///
+/// Used to recognise a forked-but-not-yet-exec'd child, which still carries our
+/// name. Looked up through the same path as any other pid so the two results are
+/// directly comparable.
+#[cfg(unix)]
+fn self_process_name() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static SELF_NAME: OnceLock<Option<String>> = OnceLock::new();
+    SELF_NAME
+        .get_or_init(|| process_name(unsafe { libc::getpid() }))
+        .as_deref()
+}
+
+/// The current working directory of `pid`, via a single syscall.
+///
+/// The alternative is shelling out to `lsof`. That matters here because the tab
+/// label asks for the cwd on a timer, and macOS's stock `zshrc` only emits the
+/// OSC 7 that would make this unnecessary when `TERM_PROGRAM` is
+/// `Apple_Terminal` -- so for us this is the normal path, not a rare fallback.
+#[cfg(target_os = "macos")]
+pub fn process_cwd(pid: libc::pid_t) -> Option<String> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    // A short write means the kernel did not populate the struct, e.g. the
+    // process is gone or we are not allowed to look at it.
+    if written < size {
+        return None;
+    }
+    // libc declares this as `[[c_char; 32]; 32]` rather than `[c_char; MAXPATHLEN]`
+    // to work around an old-rustc limitation, so flatten it back out.
+    let bytes: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .iter()
+        .flatten()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    if bytes.is_empty() {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Look up a process name by pid.
+#[cfg(target_os = "macos")]
+fn process_name(pid: libc::pid_t) -> Option<String> {
+    // PROC_PIDPATHINFO_MAXSIZE is 4 * MAXPATHLEN; `proc_name` only ever writes a
+    // short basename, but oversizing the buffer costs nothing on the stack.
+    let mut buf = [0u8; 256];
+    let len =
+        unsafe { libc::proc_name(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
+    if len <= 0 {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&buf[..len as usize]).into_owned();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Look up a process name by pid.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn process_name(pid: libc::pid_t) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid)).ok()?;
+    let name = comm.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
     }
 }
 
@@ -342,10 +496,12 @@ fn default_shell() -> String {
 
     #[cfg(target_os = "windows")]
     {
-        if let Ok(powershell) = std::env::var("COMSPEC") {
-            return powershell;
+        if let Ok(comspec) = std::env::var("COMSPEC") {
+            if !comspec.is_empty() {
+                return comspec;
+            }
         }
-        "powershell.exe".to_string()
+        find_cmd()
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -371,25 +527,38 @@ pub fn find_pwsh_path() -> Option<String> {
     {
         // 1. Program Files
         if let Ok(pf) = std::env::var("ProgramFiles") {
-            let p = std::path::PathBuf::from(&pf).join("PowerShell").join("7").join("pwsh.exe");
+            let p = std::path::PathBuf::from(&pf)
+                .join("PowerShell")
+                .join("7")
+                .join("pwsh.exe");
             if p.exists() {
                 return Some(p.to_string_lossy().to_string());
             }
         }
         // 2. Program Files (x86)
         if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
-            let p = std::path::PathBuf::from(&pf86).join("PowerShell").join("7").join("pwsh.exe");
+            let p = std::path::PathBuf::from(&pf86)
+                .join("PowerShell")
+                .join("7")
+                .join("pwsh.exe");
             if p.exists() {
                 return Some(p.to_string_lossy().to_string());
             }
         }
         // 3. LocalAppData \ Programs \ PowerShell \ 7 \ pwsh.exe
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let p = std::path::PathBuf::from(&local).join("Programs").join("PowerShell").join("7").join("pwsh.exe");
+            let p = std::path::PathBuf::from(&local)
+                .join("Programs")
+                .join("PowerShell")
+                .join("7")
+                .join("pwsh.exe");
             if p.exists() {
                 return Some(p.to_string_lossy().to_string());
             }
-            let p_ms = std::path::PathBuf::from(&local).join("Microsoft").join("WindowsApps").join("pwsh.exe");
+            let p_ms = std::path::PathBuf::from(&local)
+                .join("Microsoft")
+                .join("WindowsApps")
+                .join("pwsh.exe");
             if p_ms.exists() {
                 return Some(p_ms.to_string_lossy().to_string());
             }
@@ -447,19 +616,29 @@ pub fn find_git_bash_path() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         if let Ok(pf) = std::env::var("ProgramFiles") {
-            let p = std::path::PathBuf::from(&pf).join("Git").join("bin").join("bash.exe");
+            let p = std::path::PathBuf::from(&pf)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
             if p.exists() {
                 return Some(p.to_string_lossy().to_string());
             }
         }
         if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
-            let p = std::path::PathBuf::from(&pf86).join("Git").join("bin").join("bash.exe");
+            let p = std::path::PathBuf::from(&pf86)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
             if p.exists() {
                 return Some(p.to_string_lossy().to_string());
             }
         }
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let p = std::path::PathBuf::from(&local).join("Programs").join("Git").join("bin").join("bash.exe");
+            let p = std::path::PathBuf::from(&local)
+                .join("Programs")
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
             if p.exists() {
                 return Some(p.to_string_lossy().to_string());
             }
@@ -559,7 +738,12 @@ pub fn available_shell_presets() -> Vec<ShellPresetInfo> {
                 description: "系統內建 GNU Bash".to_string(),
             });
         }
-        for candidate in ["/opt/homebrew/bin/fish", "/usr/local/bin/fish", "/opt/homebrew/bin/zsh", "/opt/homebrew/bin/bash"] {
+        for candidate in [
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+            "/opt/homebrew/bin/zsh",
+            "/opt/homebrew/bin/bash",
+        ] {
             if std::path::Path::new(candidate).exists() {
                 let name = candidate.rsplit('/').next().unwrap_or("shell");
                 presets.push(ShellPresetInfo {
@@ -578,7 +762,14 @@ pub fn available_shell_presets() -> Vec<ShellPresetInfo> {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let mut presets = Vec::new();
-        for candidate in ["/bin/bash", "/usr/bin/bash", "/bin/zsh", "/usr/bin/zsh", "/usr/bin/fish", "/bin/sh"] {
+        for candidate in [
+            "/bin/bash",
+            "/usr/bin/bash",
+            "/bin/zsh",
+            "/usr/bin/zsh",
+            "/usr/bin/fish",
+            "/bin/sh",
+        ] {
             if std::path::Path::new(candidate).exists() {
                 let name = candidate.rsplit('/').next().unwrap_or("shell");
                 presets.push(ShellPresetInfo {

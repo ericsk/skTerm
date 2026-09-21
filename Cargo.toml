@@ -7,6 +7,21 @@ members = [
     "crates/skterm-app",
 ]
 
+# The hot paths here are per-cell/per-byte loops that cross crate boundaries
+# (skterm-core grid + VT -> skterm-render draw loop). The default release profile
+# (lto = false, codegen-units = 16) blocks that inlining entirely.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
+# Dependencies are optimized even in debug builds: a GPU terminal is unusable when
+# wgpu/cosmic-text/image run unoptimized. Our own crates stay unoptimized so that
+# debugging and incremental rebuilds remain fast.
+[profile.dev.package."*"]
+opt-level = 2
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -23,7 +38,6 @@ skterm-gui = { path = "crates/skterm-gui" }
 # Logging and error handling
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = "2.0"
 anyhow = "1.0"
 
 # Async & threading
@@ -42,7 +56,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 winit = { version = "0.30", features = ["rwh_06"] }
 wgpu = "24.0"
 bytemuck = { version = "1.21", features = ["derive"] }
-cosmic-text = "0.12"
 fontdue = "0.9"
 
 # GUI & Preferences UI

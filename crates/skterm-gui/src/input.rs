@@ -1,7 +1,7 @@
 //! Keyboard and mouse input event mapping and escape sequence encoding.
 
 use winit::event::{ElementState, KeyEvent};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 /// Calculate xterm parameter code for modifier combinations.
 /// Shift = 2, Alt = 3, Shift+Alt = 4, Ctrl = 5, Shift+Ctrl = 6, Alt+Ctrl = 7, Shift+Alt+Ctrl = 8.
@@ -178,4 +178,123 @@ pub fn encode_key_event(
         modifiers,
         app_cursor_keys,
     )
+}
+
+/// Parse a tab switch digit (1..=9) from logical and physical key inputs.
+/// Checks both the logical key and physical key so it works reliably across various keyboard layouts
+/// (including US, AZERTY, QWERTZ, and numpads).
+pub fn parse_tab_switch_digit(logical_key: &Key, physical_key: PhysicalKey) -> Option<usize> {
+    // 1. Check logical key as character
+    if let Key::Character(ref s) = logical_key {
+        if let Ok(digit) = s.parse::<usize>() {
+            if (1..=9).contains(&digit) {
+                return Some(digit);
+            }
+        }
+    }
+
+    // 2. Fall back to physical key (e.g. AZERTY top row or numpad)
+    match physical_key {
+        PhysicalKey::Code(KeyCode::Digit1 | KeyCode::Numpad1) => Some(1),
+        PhysicalKey::Code(KeyCode::Digit2 | KeyCode::Numpad2) => Some(2),
+        PhysicalKey::Code(KeyCode::Digit3 | KeyCode::Numpad3) => Some(3),
+        PhysicalKey::Code(KeyCode::Digit4 | KeyCode::Numpad4) => Some(4),
+        PhysicalKey::Code(KeyCode::Digit5 | KeyCode::Numpad5) => Some(5),
+        PhysicalKey::Code(KeyCode::Digit6 | KeyCode::Numpad6) => Some(6),
+        PhysicalKey::Code(KeyCode::Digit7 | KeyCode::Numpad7) => Some(7),
+        PhysicalKey::Code(KeyCode::Digit8 | KeyCode::Numpad8) => Some(8),
+        PhysicalKey::Code(KeyCode::Digit9 | KeyCode::Numpad9) => Some(9),
+        _ => None,
+    }
+}
+
+/// Determine if the given modifier state matches the tab switching shortcut for the specified OS:
+/// - Windows & Linux: CTRL (without Alt, Super)
+/// - macOS: CMD (Super) (without Ctrl, Alt)
+pub fn is_tab_switch_modifier_for_os(modifiers: ModifiersState, is_macos: bool) -> bool {
+    if is_macos {
+        modifiers.super_key() && !modifiers.control_key() && !modifiers.alt_key()
+    } else {
+        modifiers.control_key() && !modifiers.super_key() && !modifiers.alt_key()
+    }
+}
+
+/// Determine if the current modifiers match the tab switching shortcut for the current target OS:
+/// - Windows & Linux: CTRL (without Alt, Super)
+/// - macOS: CMD (Super) (without Ctrl, Alt)
+pub fn is_tab_switch_modifier(modifiers: ModifiersState) -> bool {
+    #[cfg(target_os = "macos")]
+    let is_macos = true;
+    #[cfg(not(target_os = "macos"))]
+    let is_macos = false;
+
+    is_tab_switch_modifier_for_os(modifiers, is_macos)
+}
+
+/// Check if a keyboard event is a tab switch shortcut for the specified OS.
+/// Returns `Some(tab_number)` (1..=9) if matching:
+/// - Windows & Linux: CTRL + 1..=9
+/// - macOS: CMD + 1..=9
+pub fn check_tab_switch_for_os(
+    logical_key: &Key,
+    physical_key: PhysicalKey,
+    state: ElementState,
+    modifiers: ModifiersState,
+    is_macos: bool,
+) -> Option<usize> {
+    if state != ElementState::Pressed {
+        return None;
+    }
+    if is_tab_switch_modifier_for_os(modifiers, is_macos) {
+        parse_tab_switch_digit(logical_key, physical_key)
+    } else {
+        None
+    }
+}
+
+/// Check if a keyboard event is a tab switch shortcut for the current target OS.
+/// Returns `Some(tab_number)` (1..=9) if matching:
+/// - Windows & Linux: CTRL + 1..=9
+/// - macOS: CMD + 1..=9
+pub fn check_tab_switch(event: &KeyEvent, modifiers: ModifiersState) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    let is_macos = true;
+    #[cfg(not(target_os = "macos"))]
+    let is_macos = false;
+
+    check_tab_switch_for_os(
+        &event.logical_key,
+        event.physical_key,
+        event.state,
+        modifiers,
+        is_macos,
+    )
+}
+
+/// Normalize a key event into the character used for application shortcut matching.
+///
+/// Holding Shift changes the reported logical key (`[` becomes `{`, `]` becomes `}`),
+/// which would otherwise break shortcuts such as `Cmd/Ctrl+Shift+[`. Shifted brackets are
+/// therefore folded back onto their unshifted form, and non-ASCII layouts fall back to the
+/// physical bracket keys so the shortcut stays reachable on e.g. QWERTZ keyboards.
+pub fn normalize_shortcut_char(logical_key: &Key, physical_key: PhysicalKey) -> Option<String> {
+    if let Key::Character(ref s) = logical_key {
+        let lower = s.to_lowercase();
+        match lower.as_str() {
+            "{" => return Some("[".to_string()),
+            "}" => return Some("]".to_string()),
+            "<" | "，" => return Some(",".to_string()),
+            // Non-ASCII layouts, and control characters produced by Ctrl (some
+            // platforms report Ctrl+[ as ESC), fall through to the physical key below.
+            _ if lower.is_ascii() && !lower.chars().any(|c| c.is_control()) => return Some(lower),
+            _ => {}
+        }
+    }
+
+    match physical_key {
+        PhysicalKey::Code(KeyCode::BracketLeft) => Some("[".to_string()),
+        PhysicalKey::Code(KeyCode::BracketRight) => Some("]".to_string()),
+        PhysicalKey::Code(KeyCode::Comma) => Some(",".to_string()),
+        _ => None,
+    }
 }

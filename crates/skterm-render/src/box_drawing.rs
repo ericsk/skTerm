@@ -24,10 +24,8 @@ pub fn draw_custom_block_or_box_char(
         return true;
     }
 
-    if (0x2500..=0x257F).contains(&code) {
-        if draw_box_drawing(code, x, y, w, h, color, instances) {
-            return true;
-        }
+    if (0x2500..=0x257F).contains(&code) && draw_box_drawing(code, x, y, w, h, color, instances) {
+        return true;
     }
 
     false
@@ -273,9 +271,25 @@ mod tests {
         let color = [1.0, 1.0, 1.0, 1.0];
 
         // Upper half block '▀' (U+2580)
-        assert!(draw_custom_block_or_box_char('▀', x, y, w, h, color, &mut instances));
+        assert!(draw_custom_block_or_box_char(
+            '▀',
+            x,
+            y,
+            w,
+            h,
+            color,
+            &mut instances
+        ));
         // Lower half block '▄' (U+2584)
-        assert!(draw_custom_block_or_box_char('▄', x, y, w, h, color, &mut instances));
+        assert!(draw_custom_block_or_box_char(
+            '▄',
+            x,
+            y,
+            w,
+            h,
+            color,
+            &mut instances
+        ));
 
         assert_eq!(instances.len(), 2);
         let top = instances[0].rect;
