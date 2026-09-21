@@ -81,6 +81,12 @@ impl Terminal {
     /// Feed byte stream (from PTY or test) into the VTE parser to update state.
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.state, bytes);
+        if self.pty.is_some() {
+            let responses = self.state.take_pending_responses();
+            for resp in responses {
+                let _ = self.write_to_pty(&resp);
+            }
+        }
     }
 
     /// Drain available output from the PTY process and update terminal state.
@@ -99,6 +105,7 @@ impl Terminal {
         buf.clear();
 
         if let Some(pty) = &self.pty {
+            // 1. Initial non-blocking drain of all currently available PTY chunks
             while buf.len() < MAX_BYTES_PER_POLL {
                 match pty.try_recv() {
                     Some(PtyEvent::Output(bytes)) => buf.extend_from_slice(&bytes),
@@ -111,12 +118,51 @@ impl Terminal {
                     None => break,
                 }
             }
+
+            // 2. Burst coalescence: If output was received, gather trailing chunks
+            // from the same burst (e.g. PSReadLine multi-chunk ANSI escape sequences
+            // for cursor hiding, syntax highlighting, and cursor repositioning that arrive
+            // within 1-2ms of each other).
+            // A short coalescing window (up to ~3ms) merges the entire burst into a single buffer,
+            // preventing slicing a single keystroke's echo into 5-7 separate frames and VSync waits!
+            if !buf.is_empty() && !self.has_exited {
+                let burst_start = std::time::Instant::now();
+                const MAX_BURST_DURATION: std::time::Duration = std::time::Duration::from_millis(3);
+                const QUIET_WINDOW: std::time::Duration = std::time::Duration::from_micros(600);
+                let mut last_chunk_time = burst_start;
+
+                while burst_start.elapsed() < MAX_BURST_DURATION && buf.len() < MAX_BYTES_PER_POLL {
+                    match pty.try_recv() {
+                        Some(PtyEvent::Output(bytes)) => {
+                            buf.extend_from_slice(&bytes);
+                            last_chunk_time = std::time::Instant::now();
+                        }
+                        Some(PtyEvent::Exit(code)) => {
+                            self.exit_code = Some(code);
+                            self.has_exited = true;
+                            break;
+                        }
+                        None => {
+                            if last_chunk_time.elapsed() >= QUIET_WINDOW {
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+            }
         }
 
         let had_data = !buf.is_empty();
         if had_data {
             self.last_output_time = std::time::Instant::now();
             self.parser.advance(&mut self.state, &buf);
+
+            // Send any VT query responses (DA1, DA2, DSR, CPR, window size) back to the PTY
+            let responses = self.state.take_pending_responses();
+            for resp in responses {
+                let _ = self.write_to_pty(&resp);
+            }
         }
 
         // Return the buffer so its capacity is reused next poll.
@@ -219,10 +265,10 @@ impl Terminal {
             }
         }
 
-        if let Some(pid) = self.process_id() {
+        if let Some(_pid) = self.process_id() {
             #[cfg(target_os = "macos")]
             {
-                if let Some(path) = crate::pty::process_cwd(pid as libc::pid_t) {
+                if let Some(path) = crate::pty::process_cwd(_pid as libc::pid_t) {
                     if std::path::Path::new(&path).exists() {
                         return Some(path);
                     }
@@ -230,7 +276,7 @@ impl Terminal {
             }
             #[cfg(target_os = "linux")]
             {
-                if let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", pid)) {
+                if let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", _pid)) {
                     if path.exists() {
                         return Some(path.to_string_lossy().into_owned());
                     }

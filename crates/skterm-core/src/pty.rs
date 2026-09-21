@@ -479,14 +479,292 @@ fn default_shell() -> String {
 
     #[cfg(target_os = "windows")]
     {
-        if let Ok(powershell) = std::env::var("COMSPEC") {
-            return powershell;
+        if let Ok(comspec) = std::env::var("COMSPEC") {
+            if !comspec.is_empty() {
+                return comspec;
+            }
         }
-        "powershell.exe".to_string()
+        find_cmd()
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "/bin/sh".to_string()
+    }
+}
+
+/// Preset information for installed or supported shells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellPresetInfo {
+    pub id: String,
+    pub name: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub is_available: bool,
+    pub description: String,
+}
+
+/// Find installed PowerShell 7 / Core (pwsh.exe) path on Windows.
+pub fn find_pwsh_path() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        // 1. Program Files
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            let p = std::path::PathBuf::from(&pf)
+                .join("PowerShell")
+                .join("7")
+                .join("pwsh.exe");
+            if p.exists() {
+                return Some(p.to_string_lossy().to_string());
+            }
+        }
+        // 2. Program Files (x86)
+        if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+            let p = std::path::PathBuf::from(&pf86)
+                .join("PowerShell")
+                .join("7")
+                .join("pwsh.exe");
+            if p.exists() {
+                return Some(p.to_string_lossy().to_string());
+            }
+        }
+        // 3. LocalAppData \ Programs \ PowerShell \ 7 \ pwsh.exe
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let p = std::path::PathBuf::from(&local)
+                .join("Programs")
+                .join("PowerShell")
+                .join("7")
+                .join("pwsh.exe");
+            if p.exists() {
+                return Some(p.to_string_lossy().to_string());
+            }
+            let p_ms = std::path::PathBuf::from(&local)
+                .join("Microsoft")
+                .join("WindowsApps")
+                .join("pwsh.exe");
+            if p_ms.exists() {
+                return Some(p_ms.to_string_lossy().to_string());
+            }
+        }
+        // 4. PATH search
+        if let Ok(path) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let p = dir.join("pwsh.exe");
+                if p.exists() {
+                    return Some(p.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find built-in Windows PowerShell (powershell.exe) path on Windows.
+pub fn find_windows_powershell() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(sysroot) = std::env::var("SystemRoot") {
+            let p = std::path::PathBuf::from(sysroot)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe");
+            if p.exists() {
+                return Some(p.to_string_lossy().to_string());
+            }
+        }
+        Some("powershell.exe".to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+/// Find Windows Command Prompt (cmd.exe) path on Windows.
+pub fn find_cmd() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(comspec) = std::env::var("COMSPEC") {
+            if !comspec.is_empty() {
+                return comspec;
+            }
+        }
+    }
+    "cmd.exe".to_string()
+}
+
+/// Find Git Bash on Windows.
+pub fn find_git_bash_path() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            let p = std::path::PathBuf::from(&pf)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
+            if p.exists() {
+                return Some(p.to_string_lossy().to_string());
+            }
+        }
+        if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+            let p = std::path::PathBuf::from(&pf86)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
+            if p.exists() {
+                return Some(p.to_string_lossy().to_string());
+            }
+        }
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let p = std::path::PathBuf::from(&local)
+                .join("Programs")
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
+            if p.exists() {
+                return Some(p.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Query system for available shell presets.
+pub fn available_shell_presets() -> Vec<ShellPresetInfo> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut presets = Vec::new();
+
+        // 1. Command Prompt (cmd.exe)
+        let cmd_path = find_cmd();
+        presets.push(ShellPresetInfo {
+            id: "cmd".to_string(),
+            name: "命令提示字元 (cmd.exe)".to_string(),
+            program: cmd_path,
+            args: Vec::new(),
+            is_available: true,
+            description: "Windows 系統預設命令提示字元 (cmd.exe)".to_string(),
+        });
+
+        // 2. Windows PowerShell (powershell.exe)
+        let ps_path = find_windows_powershell().unwrap_or_else(|| "powershell.exe".to_string());
+        presets.push(ShellPresetInfo {
+            id: "powershell".to_string(),
+            name: "Windows PowerShell (powershell.exe)".to_string(),
+            program: ps_path,
+            args: vec!["-NoLogo".to_string()],
+            is_available: true,
+            description: "Windows 內建 PowerShell 5.1 (powershell.exe)".to_string(),
+        });
+
+        // 3. PowerShell 7+ (pwsh.exe)
+        let pwsh_found = find_pwsh_path();
+        let (pwsh_prog, pwsh_avail) = if let Some(path) = pwsh_found {
+            (path, true)
+        } else {
+            ("pwsh.exe".to_string(), false)
+        };
+        let pwsh_desc = if pwsh_avail {
+            "自訂安裝的最新 PowerShell 7+ (已偵測到)".to_string()
+        } else {
+            "自訂安裝的最新 PowerShell 7+ (未偵測到，需自行安裝)".to_string()
+        };
+        presets.push(ShellPresetInfo {
+            id: "pwsh".to_string(),
+            name: if pwsh_avail {
+                "PowerShell 7+ (pwsh.exe - 已偵測)".to_string()
+            } else {
+                "PowerShell 7+ (pwsh.exe)".to_string()
+            },
+            program: pwsh_prog,
+            args: vec!["-NoLogo".to_string()],
+            is_available: pwsh_avail,
+            description: pwsh_desc,
+        });
+
+        // 4. Git Bash (bash.exe)
+        if let Some(git_bash) = find_git_bash_path() {
+            presets.push(ShellPresetInfo {
+                id: "git_bash".to_string(),
+                name: "Git Bash (bash.exe)".to_string(),
+                program: git_bash,
+                args: vec!["--login".to_string(), "-i".to_string()],
+                is_available: true,
+                description: "Git for Windows 隨附 Bash 終端".to_string(),
+            });
+        }
+
+        presets
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut presets = Vec::new();
+        if std::path::Path::new("/bin/zsh").exists() {
+            presets.push(ShellPresetInfo {
+                id: "zsh".to_string(),
+                name: "Zsh (/bin/zsh)".to_string(),
+                program: "/bin/zsh".to_string(),
+                args: vec!["-l".to_string()],
+                is_available: true,
+                description: "macOS 系統預設 Zsh".to_string(),
+            });
+        }
+        if std::path::Path::new("/bin/bash").exists() {
+            presets.push(ShellPresetInfo {
+                id: "bash".to_string(),
+                name: "Bash (/bin/bash)".to_string(),
+                program: "/bin/bash".to_string(),
+                args: vec!["-l".to_string()],
+                is_available: true,
+                description: "系統內建 GNU Bash".to_string(),
+            });
+        }
+        for candidate in [
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+            "/opt/homebrew/bin/zsh",
+            "/opt/homebrew/bin/bash",
+        ] {
+            if std::path::Path::new(candidate).exists() {
+                let name = candidate.rsplit('/').next().unwrap_or("shell");
+                presets.push(ShellPresetInfo {
+                    id: name.to_string(),
+                    name: format!("{} ({})", name, candidate),
+                    program: candidate.to_string(),
+                    args: vec!["-l".to_string()],
+                    is_available: true,
+                    description: "Homebrew 套件管理安裝之 Shell".to_string(),
+                });
+            }
+        }
+        presets
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let mut presets = Vec::new();
+        for candidate in [
+            "/bin/bash",
+            "/usr/bin/bash",
+            "/bin/zsh",
+            "/usr/bin/zsh",
+            "/usr/bin/fish",
+            "/bin/sh",
+        ] {
+            if std::path::Path::new(candidate).exists() {
+                let name = candidate.rsplit('/').next().unwrap_or("shell");
+                presets.push(ShellPresetInfo {
+                    id: name.to_string(),
+                    name: format!("{} ({})", name, candidate),
+                    program: candidate.to_string(),
+                    args: vec!["-l".to_string()],
+                    is_available: true,
+                    description: "Linux 系統 Shell".to_string(),
+                });
+            }
+        }
+        presets
     }
 }

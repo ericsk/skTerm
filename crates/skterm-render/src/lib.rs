@@ -12,7 +12,7 @@ pub use atlas::{GlyphAtlas, GlyphInfo, GlyphKey};
 pub use pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
 pub use renderer::{
     color_to_rgba_themed, AgentPanelState, AgentSidebarItem, PaneRenderItem, RenderTheme,
-    ScrollbarMetrics, TabItem, TermRenderer,
+    ScrollbarMetrics, TabItem, TermRenderer, TopDropdownMenu, TopDropdownMenuItem,
 };
 
 /// skterm-render version and basic info

@@ -181,6 +181,8 @@ impl App {
             cached_tab_tooltip: String::new(),
             has_unseen_output: false,
             pacer: FramePacer::new(monitor_frame_interval(&window), Instant::now()),
+            menu_open: false,
+            menu_hovered_idx: None,
         };
 
         self.sessions.insert(window_id, session);

@@ -1524,6 +1524,113 @@ impl PreferencesWindow {
                 },
             );
 
+            let presets = skterm_core::available_shell_presets();
+            let current_label =
+                if !self.custom_shell_enabled || self.shell_program.trim().is_empty() {
+                    "系統預設 (System Default)".to_string()
+                } else {
+                    let prog_lower = self.shell_program.to_lowercase();
+                    if let Some(p) = presets.iter().find(|p| {
+                        prog_lower == p.program.to_lowercase()
+                            || prog_lower == p.id
+                            || prog_lower.ends_with(&format!("{}.exe", p.id))
+                            || prog_lower.ends_with(&format!("\\{}", p.id))
+                    }) {
+                        p.name.clone()
+                    } else {
+                        "自訂 Shell 程式 (Custom)".to_string()
+                    }
+                };
+
+            b.row(
+                "預設 Shell 核心",
+                Some("自由切換命令提示字元、Windows PowerShell 或自訂安裝的 PowerShell"),
+                |ui| {
+                    egui::ComboBox::from_id_salt("pref_window_shell_preset")
+                        .selected_text(&current_label)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(
+                                    !self.custom_shell_enabled,
+                                    "系統預設 (System Default)",
+                                )
+                                .clicked()
+                            {
+                                self.custom_shell_enabled = false;
+                                self.shell_program.clear();
+                                self.shell_args.clear();
+                            }
+                            for p in &presets {
+                                let is_sel = self.custom_shell_enabled
+                                    && (self.shell_program.eq_ignore_ascii_case(&p.program)
+                                        || self.shell_program.eq_ignore_ascii_case(&p.id)
+                                        || self
+                                            .shell_program
+                                            .to_lowercase()
+                                            .ends_with(&format!("{}.exe", p.id)));
+                                let label_text = if p.is_available {
+                                    p.name.clone()
+                                } else {
+                                    format!("{} (未安裝)", p.name)
+                                };
+                                if ui.selectable_label(is_sel, label_text).clicked() {
+                                    self.custom_shell_enabled = true;
+                                    self.shell_program = p.program.clone();
+                                    self.shell_args = p.args.join(" ");
+                                }
+                            }
+                            let is_custom = self.custom_shell_enabled
+                                && !presets.iter().any(|p| {
+                                    self.shell_program.eq_ignore_ascii_case(&p.program)
+                                        || self.shell_program.eq_ignore_ascii_case(&p.id)
+                                        || self
+                                            .shell_program
+                                            .to_lowercase()
+                                            .ends_with(&format!("{}.exe", p.id))
+                                });
+                            if ui
+                                .selectable_label(is_custom, "自訂 Shell (Custom...)")
+                                .clicked()
+                            {
+                                self.custom_shell_enabled = true;
+                            }
+                        });
+                },
+            );
+
+            #[cfg(target_os = "windows")]
+            b.row(
+                "快速切換常用 Shell",
+                Some("點擊按鈕一鍵切換預設 Shell"),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("💻 命令提示字元").clicked() {
+                            self.custom_shell_enabled = true;
+                            self.shell_program = skterm_core::find_cmd();
+                            self.shell_args.clear();
+                        }
+                        if ui.button("⚡ Windows PowerShell").clicked() {
+                            self.custom_shell_enabled = true;
+                            self.shell_program = skterm_core::find_windows_powershell()
+                                .unwrap_or_else(|| "powershell.exe".to_string());
+                            self.shell_args = "-NoLogo".to_string();
+                        }
+                        let pwsh_found = skterm_core::find_pwsh_path();
+                        let pwsh_btn = if pwsh_found.is_some() {
+                            "🚀 PowerShell 7 (pwsh)"
+                        } else {
+                            "🚀 pwsh.exe"
+                        };
+                        if ui.button(pwsh_btn).clicked() {
+                            self.custom_shell_enabled = true;
+                            self.shell_program =
+                                pwsh_found.unwrap_or_else(|| "pwsh.exe".to_string());
+                            self.shell_args = "-NoLogo".to_string();
+                        }
+                    });
+                },
+            );
+
             b.row(
                 "指定自訂 Shell 程式",
                 Some("覆蓋系統預設 $SHELL"),
@@ -1536,16 +1643,16 @@ impl PreferencesWindow {
                 b.row("執行檔路徑", None, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.shell_program)
-                            .hint_text("/bin/zsh")
-                            .desired_width(180.0),
+                            .hint_text("powershell.exe / pwsh.exe / cmd.exe")
+                            .desired_width(200.0),
                     );
                 });
 
                 b.row("啟動參數 (Args)", None, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.shell_args)
-                            .hint_text("--login")
-                            .desired_width(180.0),
+                            .hint_text("-NoLogo")
+                            .desired_width(200.0),
                     );
                 });
             }
@@ -1658,7 +1765,7 @@ impl PreferencesWindow {
     fn render_keybindings_view(&mut self, ui: &mut Ui) {
         render_inset_card(ui, "常用快捷鍵速查 (macOS HIG Cheatsheet)", |b| {
             let shortcuts: &[(&str, &[&str], &[&str])] = &[
-                ("開啟偏好設定視窗", &["⌘", "，"], &["Ctrl", "Shift", "，"]),
+                ("開啟偏好設定視窗", &["⌘", "，"], &["Ctrl", "，"]),
                 ("新增分頁 (New Tab)", &["⌘", "T"], &["Ctrl", "Shift", "T"]),
                 ("關閉分頁 / 窗格", &["⌘", "W"], &["Ctrl", "Shift", "W"]),
                 ("左右垂直切分窗格", &["⌘", "D"], &["Ctrl", "Shift", "D"]),

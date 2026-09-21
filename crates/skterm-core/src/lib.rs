@@ -11,7 +11,10 @@ pub use grid::{
     Cell, CellFlags, Color, Cursor, CursorShape, NamedColor, Row, ScreenBuffer, ScreenGrid,
     SearchMatch, Selection, SelectionMode,
 };
-pub use pty::{PtyEvent, PtyProcess, PtySpawnOptions};
+pub use pty::{
+    available_shell_presets, find_cmd, find_git_bash_path, find_pwsh_path, find_windows_powershell,
+    PtyEvent, PtyProcess, PtySpawnOptions, ShellPresetInfo,
+};
 pub use terminal::Terminal;
 pub use vt::{MouseFormat, MouseProtocol, TerminalState};
 
@@ -605,5 +608,51 @@ mod tests {
                 std::fs::canonicalize(&expected).expect("canonicalize expected"),
             );
         }
+    }
+
+    #[test]
+    fn test_shell_presets() {
+        let presets = available_shell_presets();
+        assert!(
+            !presets.is_empty(),
+            "available_shell_presets should never be empty"
+        );
+        #[cfg(target_os = "windows")]
+        {
+            let has_cmd = presets.iter().any(|p| {
+                p.name.contains("命令提示字元") || p.program.to_lowercase().ends_with("cmd.exe")
+            });
+            assert!(has_cmd, "cmd.exe preset must be present on Windows");
+        }
+    }
+
+    #[test]
+    fn test_vt_query_responses() {
+        let mut term = Terminal::new_headless(24, 80, 1000);
+
+        // DA1 query: CSI c
+        term.feed_bytes(b"\x1b[c");
+        let resp = term.state.take_pending_responses();
+        assert_eq!(resp, vec![b"\x1b[?1;2c".to_vec()]);
+
+        // DA2 query: CSI > c
+        term.feed_bytes(b"\x1b[>c");
+        let resp = term.state.take_pending_responses();
+        assert_eq!(resp, vec![b"\x1b[>0;10;0c".to_vec()]);
+
+        // DSR query: CSI 5 n
+        term.feed_bytes(b"\x1b[5n");
+        let resp = term.state.take_pending_responses();
+        assert_eq!(resp, vec![b"\x1b[0n".to_vec()]);
+
+        // CPR query: CSI 6 n
+        term.feed_bytes(b"\x1b[10;20H\x1b[6n");
+        let resp = term.state.take_pending_responses();
+        assert_eq!(resp, vec![b"\x1b[10;20R".to_vec()]);
+
+        // Window size query in characters: CSI 18 t
+        term.feed_bytes(b"\x1b[18t");
+        let resp = term.state.take_pending_responses();
+        assert_eq!(resp, vec![b"\x1b[8;24;80t".to_vec()]);
     }
 }

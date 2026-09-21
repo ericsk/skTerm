@@ -13,7 +13,7 @@ pub mod macos_titlebar;
 pub mod preferences_window;
 pub mod tab_title;
 
-pub use app::App;
+pub use app::{build_top_dropdown_menu, hit_test_dropdown_menu, App, TopMenuAction};
 pub use config::{default_config_template, parse_hex_color, Config, ConfigManager, Theme};
 pub use icon::{apply_window_icon, configure_window_attributes, get_app_icon};
 pub use input::{
@@ -878,5 +878,69 @@ mod tests {
             assert!(reads > 0, "test did not actually read anything");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn test_normalize_shortcut_char_comma() {
+        use crate::input::normalize_shortcut_char;
+        use winit::keyboard::{Key, KeyCode, NativeKeyCode, PhysicalKey};
+
+        let unknown = PhysicalKey::Unidentified(NativeKeyCode::Unidentified);
+
+        // Standard comma
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character(",".into()), unknown).as_deref(),
+            Some(",")
+        );
+
+        // Shift+, reports "<"
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character("<".into()), unknown).as_deref(),
+            Some(",")
+        );
+
+        // CJK IME full-width comma
+        assert_eq!(
+            normalize_shortcut_char(&Key::Character("，".into()), unknown).as_deref(),
+            Some(",")
+        );
+
+        // Physical comma fallback
+        assert_eq!(
+            normalize_shortcut_char(
+                &Key::Character("，".into()),
+                PhysicalKey::Code(KeyCode::Comma)
+            )
+            .as_deref(),
+            Some(",")
+        );
+    }
+
+    #[test]
+    fn test_build_and_hit_test_top_dropdown_menu() {
+        let (menu, actions) = build_top_dropdown_menu(1.0, 100.0, 36.0, None);
+        assert!(!menu.items.is_empty());
+        assert_eq!(menu.items.len(), actions.len());
+
+        // First item is Preferences
+        assert_eq!(actions[0], Some(TopMenuAction::OpenPreferences));
+        assert!(menu.items[0].label.contains("偏好設定"));
+
+        // Second item is separator
+        assert!(menu.items[1].is_separator);
+        assert_eq!(actions[1], None);
+
+        // Hit test inside the menu bounds
+        let row_h = 24.0;
+        let item0_hit = hit_test_dropdown_menu(&menu, 1.0, 120.0, 36.0 + 3.0 + 5.0);
+        assert_eq!(item0_hit, Some(0));
+
+        // Hit test on separator should return None
+        let sep_hit = hit_test_dropdown_menu(&menu, 1.0, 120.0, 36.0 + 3.0 + row_h + 2.0);
+        assert_eq!(sep_hit, None);
+
+        // Hit test outside menu width
+        let outside_hit = hit_test_dropdown_menu(&menu, 1.0, 50.0, 45.0);
+        assert_eq!(outside_hit, None);
     }
 }

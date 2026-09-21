@@ -192,6 +192,24 @@ impl AgentPanelState<'_> {
     }
 }
 
+/// Descriptor for an item in the top dropdown menu.
+#[derive(Debug, Clone)]
+pub struct TopDropdownMenuItem {
+    pub label: String,
+    pub shortcut: Option<String>,
+    pub is_separator: bool,
+}
+
+/// Descriptor for the floating top dropdown menu.
+#[derive(Debug, Clone)]
+pub struct TopDropdownMenu {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub items: Vec<TopDropdownMenuItem>,
+    pub hovered_idx: Option<usize>,
+}
+
 pub struct TermRenderer {
     pub window: Arc<Window>,
     pub surface: Surface<'static>,
@@ -922,6 +940,7 @@ impl TermRenderer {
             panes,
             tab_bar_h,
             AgentPanelState::closed(),
+            None,
             None::<fn(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration)>,
         )
     }
@@ -942,17 +961,19 @@ impl TermRenderer {
             panes,
             tab_bar_h,
             AgentPanelState::closed(),
+            None,
             overlay_fn,
         )
     }
 
-    /// Render workspace with the global AI agents panel and an optional overlay.
+    /// Render workspace with the global AI agents panel, floating top dropdown menu, and an optional overlay.
     pub fn render_workspace_with_agent_panel<F>(
         &mut self,
         tabs: &[TabItem],
         panes: &[PaneRenderItem],
         tab_bar_h: f32,
         panel_state: AgentPanelState<'_>,
+        top_menu: Option<&TopDropdownMenu>,
         overlay_fn: Option<F>,
     ) -> anyhow::Result<()>
     where
@@ -1188,6 +1209,27 @@ impl TermRenderer {
                     });
                 }
             }
+
+            // Dropdown Menu chevron "v" Button
+            let chevron_w = 20.0 * scale;
+            let chevron_x = plus_btn_x + plus_btn_w + 2.0 * scale;
+            bg_instances.push(BgInstance {
+                rect: [chevron_x, plus_btn_y, chevron_w, plus_btn_w],
+                color: [0.12, 0.14, 0.18, 0.7],
+            });
+            bg_instances.push(BgInstance {
+                rect: [chevron_x, plus_btn_y, chevron_w, 1.0],
+                color: [0.22, 0.25, 0.33, 0.6],
+            });
+            self.draw_text_line(
+                &mut glyph_instances,
+                "v",
+                chevron_x + (chevron_w - cell_w) / 2.0,
+                plus_btn_y + (plus_btn_w - cell_h) / 2.0,
+                chevron_w,
+                [0.7, 0.75, 0.85, 1.0],
+                false,
+            );
         }
 
         // 2.5 Global AI Agents Panel
@@ -1625,6 +1667,86 @@ impl TermRenderer {
                             color: thumb_color,
                         });
                     }
+                }
+            }
+        }
+
+        // Floating Top Dropdown Menu Overlay
+        if let Some(menu) = top_menu {
+            let row_h = 24.0 * scale;
+            let sep_h = 6.0 * scale;
+            let mut total_h = 6.0 * scale;
+            for item in &menu.items {
+                if item.is_separator {
+                    total_h += sep_h;
+                } else {
+                    total_h += row_h;
+                }
+            }
+
+            // Drop shadow / border outline
+            bg_instances.push(BgInstance {
+                rect: [menu.x - 1.0, menu.y - 1.0, menu.width + 2.0, total_h + 2.0],
+                color: [0.28, 0.32, 0.44, 0.9],
+            });
+            // Opaque dark acrylic background
+            bg_instances.push(BgInstance {
+                rect: [menu.x, menu.y, menu.width, total_h],
+                color: [0.12, 0.13, 0.18, 0.98],
+            });
+
+            let mut cur_y = menu.y + 3.0 * scale;
+            for (idx, item) in menu.items.iter().enumerate() {
+                if item.is_separator {
+                    bg_instances.push(BgInstance {
+                        rect: [
+                            menu.x + 8.0 * scale,
+                            cur_y + sep_h / 2.0,
+                            menu.width - 16.0 * scale,
+                            1.0,
+                        ],
+                        color: [0.22, 0.25, 0.34, 0.8],
+                    });
+                    cur_y += sep_h;
+                } else {
+                    let is_hovered = menu.hovered_idx == Some(idx);
+                    if is_hovered {
+                        bg_instances.push(BgInstance {
+                            rect: [menu.x + 3.0 * scale, cur_y, menu.width - 6.0 * scale, row_h],
+                            color: [0.20, 0.28, 0.45, 0.95],
+                        });
+                    }
+
+                    let text_color = if is_hovered {
+                        [1.0, 1.0, 1.0, 1.0]
+                    } else {
+                        [0.88, 0.90, 0.96, 1.0]
+                    };
+
+                    self.draw_text_line(
+                        &mut glyph_instances,
+                        &item.label,
+                        menu.x + 10.0 * scale,
+                        cur_y + (row_h - cell_h) / 2.0,
+                        menu.width - 20.0 * scale,
+                        text_color,
+                        is_hovered,
+                    );
+
+                    if let Some(ref sc) = item.shortcut {
+                        let sc_w = sc.len() as f32 * cell_w;
+                        self.draw_text_line(
+                            &mut glyph_instances,
+                            sc,
+                            menu.x + menu.width - sc_w - 10.0 * scale,
+                            cur_y + (row_h - cell_h) / 2.0,
+                            sc_w + 4.0,
+                            [0.55, 0.60, 0.72, 0.9],
+                            false,
+                        );
+                    }
+
+                    cur_y += row_h;
                 }
             }
         }

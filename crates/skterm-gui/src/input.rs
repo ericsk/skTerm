@@ -283,6 +283,7 @@ pub fn normalize_shortcut_char(logical_key: &Key, physical_key: PhysicalKey) -> 
         match lower.as_str() {
             "{" => return Some("[".to_string()),
             "}" => return Some("]".to_string()),
+            "<" | "，" => return Some(",".to_string()),
             // Non-ASCII layouts, and control characters produced by Ctrl (some
             // platforms report Ctrl+[ as ESC), fall through to the physical key below.
             _ if lower.is_ascii() && !lower.chars().any(|c| c.is_control()) => return Some(lower),
@@ -293,6 +294,7 @@ pub fn normalize_shortcut_char(logical_key: &Key, physical_key: PhysicalKey) -> 
     match physical_key {
         PhysicalKey::Code(KeyCode::BracketLeft) => Some("[".to_string()),
         PhysicalKey::Code(KeyCode::BracketRight) => Some("]".to_string()),
+        PhysicalKey::Code(KeyCode::Comma) => Some(",".to_string()),
         _ => None,
     }
 }
