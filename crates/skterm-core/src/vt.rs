@@ -333,8 +333,7 @@ impl Perform for TerminalState {
                         .copied()
                         .filter(|b| !b.is_ascii_whitespace())
                         .collect();
-                    if let Ok(decoded) =
-                        base64::engine::general_purpose::STANDARD.decode(&cleaned)
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&cleaned)
                     {
                         if let Ok(text) = String::from_utf8(decoded) {
                             self.pending_clipboard = Some(text);
@@ -598,11 +597,8 @@ impl Perform for TerminalState {
 fn parse_osc7_uri(uri: &str) -> Option<String> {
     let raw_path = if let Some(after_scheme) = uri.strip_prefix("file://") {
         // Skip hostname up to first '/'
-        if let Some(idx) = after_scheme.find('/') {
-            &after_scheme[idx..]
-        } else {
-            return None;
-        }
+        let idx = after_scheme.find('/')?;
+        &after_scheme[idx..]
     } else if uri.starts_with('/') {
         uri
     } else {

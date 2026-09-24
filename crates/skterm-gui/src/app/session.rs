@@ -473,7 +473,9 @@ impl TerminalSession {
             self.renderer.scale_factor,
         );
 
-        let (_, rect) = pane_rects.into_iter().find(|(id, _)| *id == active_pane_id)?;
+        let (_, rect) = pane_rects
+            .into_iter()
+            .find(|(id, _)| *id == active_pane_id)?;
         let cell_w = self.renderer.cell_width().max(1.0);
         let cell_h = self.renderer.cell_height().max(1.0);
         let pad_x = self.renderer.padding_x;

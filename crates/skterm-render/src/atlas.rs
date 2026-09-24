@@ -208,22 +208,15 @@ impl GlyphAtlas {
         }
 
         // 1. Check primary font
-        let has_glyph = if is_bold && self.bold_font.is_some() {
-            self.bold_font.as_ref().unwrap().lookup_glyph_index(c) != 0
-        } else if is_italic && self.italic_font.is_some() {
-            self.italic_font.as_ref().unwrap().lookup_glyph_index(c) != 0
+        let primary = if let (true, Some(bold)) = (is_bold, self.bold_font.as_ref()) {
+            bold
+        } else if let (true, Some(italic)) = (is_italic, self.italic_font.as_ref()) {
+            italic
         } else {
-            self.regular_font.lookup_glyph_index(c) != 0
+            &self.regular_font
         };
 
-        let (metrics, bitmap) = if has_glyph {
-            let primary = if is_bold && self.bold_font.is_some() {
-                self.bold_font.as_ref().unwrap()
-            } else if is_italic && self.italic_font.is_some() {
-                self.italic_font.as_ref().unwrap()
-            } else {
-                &self.regular_font
-            };
+        let (metrics, bitmap) = if primary.lookup_glyph_index(c) != 0 {
             primary.rasterize(c, self.font_size)
         } else {
             // 2. Check configured fallback chain

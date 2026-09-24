@@ -335,7 +335,7 @@ impl SixelSink for BufferSink<'_> {
         let Some(row) = self.buf.get_mut(start..start + len * 4) else {
             return;
         };
-        for pixel in row.chunks_exact_mut(4) {
+        for pixel in row.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&color);
         }
     }
@@ -433,7 +433,7 @@ impl KittyGraphicsParser {
                 // RGB Raw Format
                 if width > 0 && height > 0 && data.len() >= (width * height * 3) as usize {
                     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-                    for chunk in data.chunks_exact(3) {
+                    for chunk in data.as_chunks::<3>().0 {
                         rgba.push(chunk[0]);
                         rgba.push(chunk[1]);
                         rgba.push(chunk[2]);

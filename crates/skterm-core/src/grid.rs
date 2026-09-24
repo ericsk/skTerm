@@ -587,9 +587,11 @@ impl ScreenBuffer {
                         new_cursor = Some((row_idx, c));
                     }
                 }
-                if line.cursor_offset.is_some() && new_cursor.is_none() {
-                    let cur_c = line.cursor_offset.unwrap().min(new_cols.saturating_sub(1));
-                    new_cursor = Some((row_idx, cur_c));
+                if let Some(cursor_offset) = line.cursor_offset {
+                    if new_cursor.is_none() {
+                        let cur_c = cursor_offset.min(new_cols.saturating_sub(1));
+                        new_cursor = Some((row_idx, cur_c));
+                    }
                 }
                 row.is_wrapped = false;
                 new_physical_rows.push(row);
@@ -1386,22 +1388,18 @@ impl ScreenBuffer {
         }
 
         let mut end_row = row;
-        let mut end_col = if target_cell.flags.contains(CellFlags::WIDE_CHAR)
-            && base_col + 1 < r.cells.len()
-        {
-            base_col + 1
-        } else {
-            base_col
-        };
+        let mut end_col =
+            if target_cell.flags.contains(CellFlags::WIDE_CHAR) && base_col + 1 < r.cells.len() {
+                base_col + 1
+            } else {
+                base_col
+            };
 
         loop {
             let r_ref = self.get_visible_row(end_row).unwrap();
             if end_col + 1 < r_ref.cells.len() {
                 let next_col = end_col + 1;
-                if r_ref.cells[next_col]
-                    .flags
-                    .contains(CellFlags::WRAP_SPACER)
-                {
+                if r_ref.cells[next_col].flags.contains(CellFlags::WRAP_SPACER) {
                     if r_ref.is_wrapped && end_row + 1 < self.rows {
                         if let Some(next_r) = self.get_visible_row(end_row + 1) {
                             if !next_r.cells.is_empty() {
@@ -1484,10 +1482,7 @@ impl ScreenBuffer {
 
         let mut end_row = row.min(self.rows.saturating_sub(1));
         while end_row + 1 < self.rows {
-            if self
-                .get_visible_row(end_row)
-                .is_some_and(|r| r.is_wrapped)
-            {
+            if self.get_visible_row(end_row).is_some_and(|r| r.is_wrapped) {
                 end_row += 1;
             } else {
                 break;

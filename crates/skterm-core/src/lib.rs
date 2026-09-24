@@ -183,20 +183,14 @@ mod tests {
         // 1. Selecting across wrapped rows joins them without inserting artificial '\n'
         // and preserves intentional spaces at the end of soft-wrapped rows.
         active.selection = Some(Selection::new((0, 0), (2, 4), SelectionMode::Simple));
-        assert_eq!(
-            active.extract_selected_text(),
-            "hello world wrapped line!"
-        );
+        assert_eq!(active.extract_selected_text(), "hello world wrapped line!");
 
         // 2. Triple-click (select_line_at) on any part of the wrapped line selects all wrapped rows,
         // and simulated winit mouseUp CursorMoved (`extend_selection_to` at click cell `(0, 0)`)
         // must preserve the full multi-row Line selection instead of collapsing `end` to `(0, 0)`.
         active.select_line_at(1);
         active.extend_selection_to((1, 0), (1, 0));
-        assert_eq!(
-            active.extract_selected_text(),
-            "hello world wrapped line!"
-        );
+        assert_eq!(active.extract_selected_text(), "hello world wrapped line!");
 
         // 3. Double-click (select_word_at) on a word that wraps across row 0 and row 1 ("world" at cols 6..10 + col 0)
         active.select_word_at(0, 7);
@@ -212,7 +206,9 @@ mod tests {
         term.feed_bytes("123456789中文".as_bytes());
 
         let active = term.grid_mut().active_mut();
-        assert!(active.grid[0].cells[9].flags.contains(CellFlags::WRAP_SPACER));
+        assert!(active.grid[0].cells[9]
+            .flags
+            .contains(CellFlags::WRAP_SPACER));
 
         active.selection = Some(Selection::new((0, 0), (1, 3), SelectionMode::Simple));
         assert_eq!(
