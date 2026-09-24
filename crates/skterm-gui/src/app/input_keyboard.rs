@@ -19,6 +19,18 @@ impl App {
                 let had_preedit = !self.ime_preedit.is_empty();
                 self.last_ime_commit_time = Some(Instant::now());
                 self.ime_preedit.clear();
+                if self.modifiers.super_key() {
+                    if text.eq_ignore_ascii_case("c") {
+                        if let Some(session) = self.sessions.get(&window_id) {
+                            session.copy_to_clipboard(self.clipboard.as_ref());
+                        }
+                    } else if text.eq_ignore_ascii_case("v") {
+                        if let Some(session) = self.sessions.get_mut(&window_id) {
+                            session.paste_from_clipboard(self.clipboard.as_ref());
+                        }
+                    }
+                    return;
+                }
                 if self.editing_agent_pane.is_some() {
                     self.insert_editing_text(&text);
                     if let Some(session) = self.sessions.get(&window_id) {
@@ -160,7 +172,7 @@ impl App {
         let is_zoom_or_reset = self.modifiers.control_key() && !self.modifiers.super_key();
 
         if is_zoom_or_reset {
-            if let Key::Character(ref s) = event.logical_key {
+            if let Some(s) = normalize_shortcut_char(&event.logical_key, event.physical_key) {
                 match s.as_str() {
                     "+" | "=" => {
                         if let Some(session) = self.sessions.get_mut(&window_id) {
@@ -242,6 +254,7 @@ impl App {
         let is_alt_variant = false;
 
         if is_cmd {
+            self.ime_preedit.clear();
             // Check NamedKey first (Enter, Arrow keys)
             match event.logical_key {
                 Key::Named(NamedKey::Enter) if is_shift => {
@@ -568,6 +581,9 @@ impl App {
                     _ => {}
                 }
             }
+
+            #[cfg(target_os = "macos")]
+            return;
         }
 
         // Handle Agent Task Label Inline Rename input when editing_agent_pane is active

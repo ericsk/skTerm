@@ -266,6 +266,9 @@ impl ApplicationHandler<AppEvent> for App {
                 let active_session = self.active_session_id;
                 for (id, session) in self.sessions.iter_mut() {
                     let outcome = session.workspace.poll_all_ptys();
+                    if outcome.any_output {
+                        session.flush_osc52_clipboard(self.clipboard.as_ref());
+                    }
                     if outcome.any_output && active_session != Some(*id) {
                         session.mark_unseen_output();
                     }
@@ -302,6 +305,10 @@ impl ApplicationHandler<AppEvent> for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if let WindowEvent::ModifiersChanged(ref new_modifiers) = event {
+            self.modifiers = new_modifiers.state();
+        }
+
         // 1. Route to Preferences Window if event belongs to it
         if let Some(pref) = &mut self.preferences_window {
             if pref.id() == window_id {

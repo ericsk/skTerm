@@ -28,6 +28,8 @@ pub struct TerminalSession {
     pub process_cache: crate::layout::ProcessTreeCache,
     pub mouse_pos: (f32, f32),
     pub is_mouse_down: bool,
+    pub selection_anchor: Option<(usize, usize)>,
+    pub has_dragged_selection: bool,
     pub last_click_time: Instant,
     pub click_count: usize,
     pub dragging_splitter: Option<(u32, SplitDirection, Rect)>,
@@ -333,6 +335,23 @@ impl TerminalSession {
         }
     }
 
+    pub fn flush_osc52_clipboard(&mut self, clipboard: Option<&Arc<Mutex<Clipboard>>>) {
+        for tab in &mut self.workspace.tabs {
+            for id in tab.root.all_leaf_ids() {
+                if let Some(terminal) = tab.root.find_terminal_mut(id) {
+                    if let Some(text) = terminal.take_pending_clipboard() {
+                        if let Some(cb) = clipboard {
+                            if let Ok(mut clip) = cb.lock() {
+                                let _ = clip.set_text(text);
+                                info!("Copied OSC 52 text to system clipboard");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn paste_from_clipboard(&mut self, clipboard: Option<&Arc<Mutex<Clipboard>>>) {
         if let Some(cb) = clipboard {
             if let Ok(mut clip) = cb.lock() {
@@ -406,6 +425,8 @@ impl TerminalSession {
             self.renderer.scale_factor,
         );
 
+        let active_tab = self.workspace.active_tab();
+
         for (id, rect) in pane_rects {
             if rect.contains(mouse_x, mouse_y) {
                 let cell_w = self.renderer.cell_width();
@@ -416,13 +437,55 @@ impl TerminalSession {
                 let rel_x = (mouse_x - rect.x - pad_x).max(0.0);
                 let rel_y = (mouse_y - rect.y - pad_y).max(0.0);
 
-                let col = (rel_x / cell_w).floor() as usize;
-                let row = (rel_y / cell_h).floor() as usize;
+                let mut col = (rel_x / cell_w).floor() as usize;
+                let mut row = (rel_y / cell_h).floor() as usize;
+
+                if let Some(term) = active_tab.and_then(|t| t.root.find_terminal(id)) {
+                    let buf = term.grid().active();
+                    col = col.min(buf.cols.saturating_sub(1));
+                    row = row.min(buf.rows.saturating_sub(1));
+                }
 
                 return Some((id, row, col));
             }
         }
         None
+    }
+
+    /// Resolve `(mouse_x, mouse_y)` into `(row, col)` clamped to the active pane's bounds,
+    /// used while dragging a text selection so dragging past the right/bottom edge still
+    /// selects to the end of wrapped lines.
+    pub fn get_active_pane_cell_clamped(
+        &self,
+        mouse_x: f32,
+        mouse_y: f32,
+        tab_bar_h: f32,
+    ) -> Option<(usize, usize)> {
+        let active_tab = self.workspace.active_tab()?;
+        let active_pane_id = active_tab.active_pane_id;
+        let term = active_tab.root.find_terminal(active_pane_id)?;
+        let buf = term.grid().active();
+
+        let pane_rects = self.workspace.compute_active_pane_rects_with_scale(
+            self.renderer.config.width as f32,
+            self.renderer.config.height as f32,
+            tab_bar_h,
+            self.renderer.scale_factor,
+        );
+
+        let (_, rect) = pane_rects.into_iter().find(|(id, _)| *id == active_pane_id)?;
+        let cell_w = self.renderer.cell_width().max(1.0);
+        let cell_h = self.renderer.cell_height().max(1.0);
+        let pad_x = self.renderer.padding_x;
+        let pad_y = self.renderer.padding_y;
+
+        let rel_x = (mouse_x - rect.x - pad_x).max(0.0);
+        let rel_y = (mouse_y - rect.y - pad_y).max(0.0);
+
+        let col = ((rel_x / cell_w).floor() as usize).min(buf.cols.saturating_sub(1));
+        let row = ((rel_y / cell_h).floor() as usize).min(buf.rows.saturating_sub(1));
+
+        Some((row, col))
     }
 
     pub fn sync_all_pane_sizes(&mut self, tab_bar_h: f32) {

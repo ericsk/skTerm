@@ -616,6 +616,73 @@ mod tests {
             normalize_shortcut_char(&Key::Named(winit::keyboard::NamedKey::Enter), unknown),
             None
         );
+
+        // Non-ASCII IME layouts (e.g. macOS Zhuyin/Bopomofo where physical KeyC reports "ㄏ")
+        // must normalize to Some("c") so Cmd+C triggers copy instead of falling through to PTY.
+        assert_eq!(
+            normalize_shortcut_char(
+                &Key::Character("ㄏ".into()),
+                PhysicalKey::Code(KeyCode::KeyC)
+            )
+            .as_deref(),
+            Some("c")
+        );
+        assert_eq!(
+            normalize_shortcut_char(
+                &Key::Character("ㄒ".into()),
+                PhysicalKey::Code(KeyCode::KeyV)
+            )
+            .as_deref(),
+            Some("v")
+        );
+    }
+
+    #[test]
+    fn test_cmd_c_never_encodes_to_pty() {
+        use winit::keyboard::{Key, KeyCode, PhysicalKey};
+
+        let mut cmd = ModifiersState::empty();
+        cmd.insert(ModifiersState::SUPER);
+
+        // Even if Cmd+C reaches encode_key (e.g. when no text is selected or in vim),
+        // it must NEVER encode `b"c"` (`0x63`) to the PTY.
+        let encoded_ascii = encode_key(
+            &Key::Character("c".into()),
+            Some("c"),
+            ElementState::Pressed,
+            cmd,
+            false,
+        );
+        assert_eq!(encoded_ascii, None);
+
+        // And under Zhuyin/CJK IME where logical_key is "ㄏ" and event.text is Some("c"),
+        // it must also return None when Command (SUPER) is held.
+        let encoded_ime = encode_key(
+            &Key::Character("ㄏ".into()),
+            Some("c"),
+            ElementState::Pressed,
+            cmd,
+            false,
+        );
+        assert_eq!(encoded_ime, None);
+
+        // Ctrl+C under Zhuyin/CJK IME (logical_key = "ㄏ", physical_key = KeyC)
+        // normalizes via physical key to "c" and encodes SIGINT (0x03).
+        let mut ctrl = ModifiersState::empty();
+        ctrl.insert(ModifiersState::CONTROL);
+        let norm = crate::input::normalize_shortcut_char(
+            &Key::Character("ㄏ".into()),
+            PhysicalKey::Code(KeyCode::KeyC),
+        )
+        .unwrap();
+        let ctrl_c_ime = encode_key(
+            &Key::Character(norm.into()),
+            None,
+            ElementState::Pressed,
+            ctrl,
+            false,
+        );
+        assert_eq!(ctrl_c_ime, Some(vec![0x03]));
     }
 
     #[test]

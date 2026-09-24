@@ -30,7 +30,7 @@ pub fn encode_key(
     modifiers: ModifiersState,
     app_cursor_keys: bool,
 ) -> Option<Vec<u8>> {
-    if state != ElementState::Pressed {
+    if state != ElementState::Pressed || modifiers.super_key() {
         return None;
     }
 
@@ -171,6 +171,22 @@ pub fn encode_key_event(
     modifiers: ModifiersState,
     app_cursor_keys: bool,
 ) -> Option<Vec<u8>> {
+    if event.state != ElementState::Pressed || modifiers.super_key() {
+        return None;
+    }
+
+    // Physical key fallback for Ctrl + Letter when a non-ASCII IME/layout is active
+    if modifiers.control_key() && !modifiers.alt_key() {
+        if let Some(norm) = normalize_shortcut_char(&event.logical_key, event.physical_key) {
+            if norm.len() == 1 {
+                let ch = norm.as_bytes()[0];
+                if ch.is_ascii_lowercase() {
+                    return Some(vec![ch - b'a' + 1]);
+                }
+            }
+        }
+    }
+
     encode_key(
         &event.logical_key,
         event.text.as_deref(),
@@ -275,8 +291,9 @@ pub fn check_tab_switch(event: &KeyEvent, modifiers: ModifiersState) -> Option<u
 ///
 /// Holding Shift changes the reported logical key (`[` becomes `{`, `]` becomes `}`),
 /// which would otherwise break shortcuts such as `Cmd/Ctrl+Shift+[`. Shifted brackets are
-/// therefore folded back onto their unshifted form, and non-ASCII layouts fall back to the
-/// physical bracket keys so the shortcut stays reachable on e.g. QWERTZ keyboards.
+/// therefore folded back onto their unshifted form, and non-ASCII layouts (such as macOS
+/// Zhuyin/Bopomofo, Cangjie, Pinyin, etc.) fall back to the physical key code so shortcuts
+/// like `Cmd+C`, `Cmd+V`, `Cmd+T`, `Cmd+W` always work regardless of active IME.
 pub fn normalize_shortcut_char(logical_key: &Key, physical_key: PhysicalKey) -> Option<String> {
     if let Key::Character(ref s) = logical_key {
         let lower = s.to_lowercase();
@@ -290,9 +307,55 @@ pub fn normalize_shortcut_char(logical_key: &Key, physical_key: PhysicalKey) -> 
         }
     }
 
-    match physical_key {
-        PhysicalKey::Code(KeyCode::BracketLeft) => Some("[".to_string()),
-        PhysicalKey::Code(KeyCode::BracketRight) => Some("]".to_string()),
-        _ => None,
-    }
+    let code = match physical_key {
+        PhysicalKey::Code(KeyCode::KeyA) => "a",
+        PhysicalKey::Code(KeyCode::KeyB) => "b",
+        PhysicalKey::Code(KeyCode::KeyC) => "c",
+        PhysicalKey::Code(KeyCode::KeyD) => "d",
+        PhysicalKey::Code(KeyCode::KeyE) => "e",
+        PhysicalKey::Code(KeyCode::KeyF) => "f",
+        PhysicalKey::Code(KeyCode::KeyG) => "g",
+        PhysicalKey::Code(KeyCode::KeyH) => "h",
+        PhysicalKey::Code(KeyCode::KeyI) => "i",
+        PhysicalKey::Code(KeyCode::KeyJ) => "j",
+        PhysicalKey::Code(KeyCode::KeyK) => "k",
+        PhysicalKey::Code(KeyCode::KeyL) => "l",
+        PhysicalKey::Code(KeyCode::KeyM) => "m",
+        PhysicalKey::Code(KeyCode::KeyN) => "n",
+        PhysicalKey::Code(KeyCode::KeyO) => "o",
+        PhysicalKey::Code(KeyCode::KeyP) => "p",
+        PhysicalKey::Code(KeyCode::KeyQ) => "q",
+        PhysicalKey::Code(KeyCode::KeyR) => "r",
+        PhysicalKey::Code(KeyCode::KeyS) => "s",
+        PhysicalKey::Code(KeyCode::KeyT) => "t",
+        PhysicalKey::Code(KeyCode::KeyU) => "u",
+        PhysicalKey::Code(KeyCode::KeyV) => "v",
+        PhysicalKey::Code(KeyCode::KeyW) => "w",
+        PhysicalKey::Code(KeyCode::KeyX) => "x",
+        PhysicalKey::Code(KeyCode::KeyY) => "y",
+        PhysicalKey::Code(KeyCode::KeyZ) => "z",
+        PhysicalKey::Code(KeyCode::Digit0 | KeyCode::Numpad0) => "0",
+        PhysicalKey::Code(KeyCode::Digit1 | KeyCode::Numpad1) => "1",
+        PhysicalKey::Code(KeyCode::Digit2 | KeyCode::Numpad2) => "2",
+        PhysicalKey::Code(KeyCode::Digit3 | KeyCode::Numpad3) => "3",
+        PhysicalKey::Code(KeyCode::Digit4 | KeyCode::Numpad4) => "4",
+        PhysicalKey::Code(KeyCode::Digit5 | KeyCode::Numpad5) => "5",
+        PhysicalKey::Code(KeyCode::Digit6 | KeyCode::Numpad6) => "6",
+        PhysicalKey::Code(KeyCode::Digit7 | KeyCode::Numpad7) => "7",
+        PhysicalKey::Code(KeyCode::Digit8 | KeyCode::Numpad8) => "8",
+        PhysicalKey::Code(KeyCode::Digit9 | KeyCode::Numpad9) => "9",
+        PhysicalKey::Code(KeyCode::BracketLeft) => "[",
+        PhysicalKey::Code(KeyCode::BracketRight) => "]",
+        PhysicalKey::Code(KeyCode::Comma) => ",",
+        PhysicalKey::Code(KeyCode::Period) => ".",
+        PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd) => "=",
+        PhysicalKey::Code(KeyCode::Minus | KeyCode::NumpadSubtract) => "-",
+        PhysicalKey::Code(KeyCode::Slash) => "/",
+        PhysicalKey::Code(KeyCode::Backslash) => "\\",
+        PhysicalKey::Code(KeyCode::Semicolon) => ";",
+        PhysicalKey::Code(KeyCode::Quote) => "'",
+        PhysicalKey::Code(KeyCode::Backquote) => "`",
+        _ => return None,
+    };
+    Some(code.to_string())
 }

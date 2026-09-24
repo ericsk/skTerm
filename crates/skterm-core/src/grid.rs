@@ -815,25 +815,72 @@ impl ScreenBuffer {
 
         for r_idx in start.0..=end.0 {
             if let Some(row) = self.get_visible_row(r_idx) {
-                let col_start = if r_idx == start.0 { start.1 } else { 0 };
-                let col_end = if r_idx == end.0 {
-                    end.1.min(row.cells.len().saturating_sub(1))
-                } else {
-                    row.cells.len().saturating_sub(1)
+                if row.cells.is_empty() {
+                    continue;
+                }
+                let last_cell_idx = row.cells.len().saturating_sub(1);
+                let (col_start, col_end) = match sel.mode {
+                    SelectionMode::Line => (0, last_cell_idx),
+                    SelectionMode::Block => (
+                        start.1.min(end.1).min(last_cell_idx),
+                        start.1.max(end.1).min(last_cell_idx),
+                    ),
+                    SelectionMode::Simple | SelectionMode::Word => {
+                        let cs = if r_idx == start.0 { start.1 } else { 0 };
+                        let ce = if r_idx == end.0 {
+                            end.1.min(last_cell_idx)
+                        } else {
+                            last_cell_idx
+                        };
+                        (cs, ce)
+                    }
                 };
 
+                if col_start > col_end {
+                    if r_idx < end.0 && (!row.is_wrapped || sel.mode == SelectionMode::Block) {
+                        result.push('\n');
+                    }
+                    continue;
+                }
+
                 let mut line_str = String::new();
+                // If selection starts on the trailing spacer cell of a wide CJK character,
+                // include the leading character cell so the first character isn't dropped.
+                if col_start > 0
+                    && col_start < row.cells.len()
+                    && row.cells[col_start]
+                        .flags
+                        .contains(CellFlags::WIDE_CHAR_SPACER)
+                {
+                    let prev = &row.cells[col_start - 1];
+                    if !prev
+                        .flags
+                        .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::WRAP_SPACER)
+                    {
+                        line_str.push(prev.c);
+                    }
+                }
+
                 for c_idx in col_start..=col_end {
                     if let Some(cell) = row.cells.get(c_idx) {
-                        if !cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                        if !cell
+                            .flags
+                            .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::WRAP_SPACER)
+                        {
                             line_str.push(cell.c);
                         }
                     }
                 }
 
-                result.push_str(line_str.trim_end());
-                if r_idx < end.0 && !row.is_wrapped {
-                    result.push('\n');
+                let continues_soft_wrap =
+                    r_idx < end.0 && row.is_wrapped && sel.mode != SelectionMode::Block;
+                if continues_soft_wrap {
+                    result.push_str(&line_str);
+                } else {
+                    result.push_str(line_str.trim_end());
+                    if r_idx < end.0 {
+                        result.push('\n');
+                    }
                 }
             }
         }
@@ -1211,7 +1258,9 @@ impl ScreenBuffer {
                 self.clear_split_wide_chars(cur_row, cur_col, self.cols);
                 let row = &mut self.grid[cur_row];
                 row.cells[cur_col..].fill(Cell::blank(bg));
+                row.is_wrapped = false;
                 row.is_dirty = true;
+                self.cursor.pending_wrap = false;
             }
             1 => {
                 let end = cur_col.min(self.cols.saturating_sub(1));
@@ -1222,6 +1271,7 @@ impl ScreenBuffer {
             }
             2 => {
                 self.grid[cur_row].clear(bg);
+                self.cursor.pending_wrap = false;
             }
             _ => {}
         }
@@ -1241,56 +1291,245 @@ impl ScreenBuffer {
         self.cursor.pending_wrap = false;
     }
 
-    /// Select the word at visible row and column (Double-click behavior).
-    pub fn select_word_at(&mut self, row: usize, col: usize) {
+    /// Compute the `(start, end)` cell coordinates of the word at `(row, col)`,
+    /// expanding across soft-wrapped rows (`is_wrapped == true`).
+    pub fn word_bounds_at(&self, row: usize, col: usize) -> ((usize, usize), (usize, usize)) {
         let is_word_char = |c: char| -> bool {
-            c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | '@' | ':' | '+')
+            c.is_alphanumeric()
+                || matches!(
+                    c,
+                    '_' | '-' | '.' | '/' | '~' | '@' | ':' | '+' | '?' | '=' | '&' | '%' | '#'
+                )
         };
 
-        let (start_col, end_col) = if let Some(r) = self.get_visible_row(row) {
-            if col >= r.cells.len() {
-                (col, col)
+        let Some(r) = self.get_visible_row(row) else {
+            return ((row, col), (row, col));
+        };
+        if r.cells.is_empty() {
+            return ((row, col), (row, col));
+        }
+
+        let mut base_col = col.min(r.cells.len().saturating_sub(1));
+        if base_col > 0
+            && r.cells[base_col]
+                .flags
+                .contains(CellFlags::WIDE_CHAR_SPACER)
+        {
+            base_col -= 1;
+        }
+
+        let target_cell = &r.cells[base_col];
+        if target_cell.c == ' ' || target_cell.flags.contains(CellFlags::WRAP_SPACER) {
+            return ((row, base_col), (row, base_col));
+        }
+        let target_is_word = is_word_char(target_cell.c);
+
+        let mut start_row = row;
+        let mut start_col = base_col;
+        loop {
+            if start_col > 0 {
+                let prev_col = start_col - 1;
+                let r_ref = self.get_visible_row(start_row).unwrap();
+                let check_col = if prev_col > 0
+                    && r_ref.cells[prev_col]
+                        .flags
+                        .contains(CellFlags::WIDE_CHAR_SPACER)
+                {
+                    prev_col - 1
+                } else {
+                    prev_col
+                };
+                let cell = &r_ref.cells[check_col];
+                if !cell.flags.contains(CellFlags::WRAP_SPACER)
+                    && cell.c != ' '
+                    && is_word_char(cell.c) == target_is_word
+                {
+                    start_col = check_col;
+                } else {
+                    break;
+                }
+            } else if start_row > 0 {
+                if let Some(prev_r) = self.get_visible_row(start_row - 1) {
+                    if prev_r.is_wrapped && !prev_r.cells.is_empty() {
+                        let mut prev_col = prev_r.cells.len() - 1;
+                        if prev_col > 0
+                            && prev_r.cells[prev_col]
+                                .flags
+                                .contains(CellFlags::WRAP_SPACER)
+                        {
+                            prev_col -= 1;
+                        }
+                        let check_col = if prev_col > 0
+                            && prev_r.cells[prev_col]
+                                .flags
+                                .contains(CellFlags::WIDE_CHAR_SPACER)
+                        {
+                            prev_col - 1
+                        } else {
+                            prev_col
+                        };
+                        let cell = &prev_r.cells[check_col];
+                        if !cell.flags.contains(CellFlags::WRAP_SPACER)
+                            && cell.c != ' '
+                            && is_word_char(cell.c) == target_is_word
+                        {
+                            start_row -= 1;
+                            start_col = check_col;
+                            continue;
+                        }
+                    }
+                }
+                break;
             } else {
-                let target_is_word = is_word_char(r.cells[col].c);
-                let mut s = col;
-                while s > 0 {
-                    let prev = r.cells[s - 1].c;
-                    if is_word_char(prev) == target_is_word && prev != ' ' {
-                        s -= 1;
-                    } else {
-                        break;
-                    }
-                }
-                let mut e = col;
-                while e + 1 < r.cells.len() {
-                    let next = r.cells[e + 1].c;
-                    if is_word_char(next) == target_is_word && next != ' ' {
-                        e += 1;
-                    } else {
-                        break;
-                    }
-                }
-                (s, e)
+                break;
             }
+        }
+
+        let mut end_row = row;
+        let mut end_col = if target_cell.flags.contains(CellFlags::WIDE_CHAR)
+            && base_col + 1 < r.cells.len()
+        {
+            base_col + 1
         } else {
-            (col, col)
+            base_col
         };
 
-        self.selection = Some(Selection::new(
-            (row, start_col),
-            (row, end_col),
-            SelectionMode::Word,
-        ));
+        loop {
+            let r_ref = self.get_visible_row(end_row).unwrap();
+            if end_col + 1 < r_ref.cells.len() {
+                let next_col = end_col + 1;
+                if r_ref.cells[next_col]
+                    .flags
+                    .contains(CellFlags::WRAP_SPACER)
+                {
+                    if r_ref.is_wrapped && end_row + 1 < self.rows {
+                        if let Some(next_r) = self.get_visible_row(end_row + 1) {
+                            if !next_r.cells.is_empty() {
+                                let cell = &next_r.cells[0];
+                                if !cell.flags.contains(CellFlags::WRAP_SPACER)
+                                    && cell.c != ' '
+                                    && is_word_char(cell.c) == target_is_word
+                                {
+                                    end_row += 1;
+                                    end_col = if cell.flags.contains(CellFlags::WIDE_CHAR)
+                                        && next_r.cells.len() > 1
+                                    {
+                                        1
+                                    } else {
+                                        0
+                                    };
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    break;
+                } else {
+                    let cell = &r_ref.cells[next_col];
+                    if cell.c != ' ' && is_word_char(cell.c) == target_is_word {
+                        end_col = if cell.flags.contains(CellFlags::WIDE_CHAR)
+                            && next_col + 1 < r_ref.cells.len()
+                        {
+                            next_col + 1
+                        } else {
+                            next_col
+                        };
+                    } else {
+                        break;
+                    }
+                }
+            } else if r_ref.is_wrapped && end_row + 1 < self.rows {
+                if let Some(next_r) = self.get_visible_row(end_row + 1) {
+                    if !next_r.cells.is_empty() {
+                        let cell = &next_r.cells[0];
+                        if !cell.flags.contains(CellFlags::WRAP_SPACER)
+                            && cell.c != ' '
+                            && is_word_char(cell.c) == target_is_word
+                        {
+                            end_row += 1;
+                            end_col = if cell.flags.contains(CellFlags::WIDE_CHAR)
+                                && next_r.cells.len() > 1
+                            {
+                                1
+                            } else {
+                                0
+                            };
+                            continue;
+                        }
+                    }
+                }
+                break;
+            } else {
+                break;
+            }
+        }
+
+        ((start_row, start_col), (end_row, end_col))
     }
 
-    /// Select the entire visible row (Triple-click behavior).
-    pub fn select_line_at(&mut self, row: usize) {
+    /// Compute the `(start, end)` cell coordinates of the full logical line at `row`,
+    /// expanding across soft-wrapped rows (`is_wrapped == true`).
+    pub fn line_bounds_at(&self, row: usize) -> ((usize, usize), (usize, usize)) {
+        let mut start_row = row.min(self.rows.saturating_sub(1));
+        while start_row > 0 {
+            if self
+                .get_visible_row(start_row - 1)
+                .is_some_and(|r| r.is_wrapped)
+            {
+                start_row -= 1;
+            } else {
+                break;
+            }
+        }
+
+        let mut end_row = row.min(self.rows.saturating_sub(1));
+        while end_row + 1 < self.rows {
+            if self
+                .get_visible_row(end_row)
+                .is_some_and(|r| r.is_wrapped)
+            {
+                end_row += 1;
+            } else {
+                break;
+            }
+        }
+
         let last_col = self.cols.saturating_sub(1);
-        self.selection = Some(Selection::new(
-            (row, 0),
-            (row, last_col),
-            SelectionMode::Line,
-        ));
+        ((start_row, 0), (end_row, last_col))
+    }
+
+    /// Select the word at visible row and column (Double-click behavior).
+    pub fn select_word_at(&mut self, row: usize, col: usize) {
+        let (start, end) = self.word_bounds_at(row, col);
+        self.selection = Some(Selection::new(start, end, SelectionMode::Word));
+    }
+
+    /// Select the entire logical line spanning `row` (Triple-click behavior).
+    pub fn select_line_at(&mut self, row: usize) {
+        let (start, end) = self.line_bounds_at(row);
+        self.selection = Some(Selection::new(start, end, SelectionMode::Line));
+    }
+
+    /// Update the active selection when dragging from `anchor` to `target`,
+    /// preserving word and logical-line boundaries for `Word` and `Line` modes.
+    pub fn extend_selection_to(&mut self, anchor: (usize, usize), target: (usize, usize)) {
+        let Some(mode) = self.selection.as_ref().map(|s| s.mode) else {
+            return;
+        };
+        let (start, end) = match mode {
+            SelectionMode::Simple | SelectionMode::Block => (anchor, target),
+            SelectionMode::Word => {
+                let (a_start, a_end) = self.word_bounds_at(anchor.0, anchor.1);
+                let (t_start, t_end) = self.word_bounds_at(target.0, target.1);
+                (a_start.min(t_start), a_end.max(t_end))
+            }
+            SelectionMode::Line => {
+                let (a_start, a_end) = self.line_bounds_at(anchor.0);
+                let (t_start, t_end) = self.line_bounds_at(target.0);
+                (a_start.min(t_start), a_end.max(t_end))
+            }
+        };
+        self.selection = Some(Selection::new(start, end, mode));
     }
 
     /// Case-insensitive search across scrollback history and active screen buffer.

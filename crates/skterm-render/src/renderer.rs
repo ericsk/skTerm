@@ -106,7 +106,7 @@ impl ScrollbarMetrics {
         let thumb_w = if is_active { 7.0 * scale } else { 5.0 * scale };
         let thumb_x = rect_x + rect_w - thumb_w - if is_active { 2.5 * scale } else { 3.5 * scale };
 
-        let hit_w = 16.0 * scale;
+        let hit_w = 10.0 * scale;
         let hit_x = rect_x + rect_w - hit_w;
         let hit_y = rect_y;
         let hit_h = rect_h;

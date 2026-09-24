@@ -170,6 +170,71 @@ mod tests {
     }
 
     #[test]
+    fn test_wrapped_line_selection_and_copy() {
+        // 10 columns wide: a 25-character line wraps across 3 rows (row 0, row 1, row 2).
+        let mut term = Terminal::new_headless(10, 10, 100);
+        term.feed_bytes(b"hello world wrapped line!");
+
+        let active = term.grid_mut().active_mut();
+        assert!(active.grid[0].is_wrapped);
+        assert!(active.grid[1].is_wrapped);
+        assert!(!active.grid[2].is_wrapped);
+
+        // 1. Selecting across wrapped rows joins them without inserting artificial '\n'
+        // and preserves intentional spaces at the end of soft-wrapped rows.
+        active.selection = Some(Selection::new((0, 0), (2, 4), SelectionMode::Simple));
+        assert_eq!(
+            active.extract_selected_text(),
+            "hello world wrapped line!"
+        );
+
+        // 2. Triple-click (select_line_at) on any part of the wrapped line selects all wrapped rows,
+        // and simulated winit mouseUp CursorMoved (`extend_selection_to` at click cell `(0, 0)`)
+        // must preserve the full multi-row Line selection instead of collapsing `end` to `(0, 0)`.
+        active.select_line_at(1);
+        active.extend_selection_to((1, 0), (1, 0));
+        assert_eq!(
+            active.extract_selected_text(),
+            "hello world wrapped line!"
+        );
+
+        // 3. Double-click (select_word_at) on a word that wraps across row 0 and row 1 ("world" at cols 6..10 + col 0)
+        active.select_word_at(0, 7);
+        active.extend_selection_to((0, 7), (0, 7));
+        assert_eq!(active.extract_selected_text(), "world");
+    }
+
+    #[test]
+    fn test_wrapped_cjk_selection_skips_wrap_spacer() {
+        // 10 columns wide: 9 ASCII chars + 2 CJK wide chars ("中文") wraps before '中'
+        // leaving a synthetic WRAP_SPACER at row 0 col 9.
+        let mut term = Terminal::new_headless(10, 10, 100);
+        term.feed_bytes("123456789中文".as_bytes());
+
+        let active = term.grid_mut().active_mut();
+        assert!(active.grid[0].cells[9].flags.contains(CellFlags::WRAP_SPACER));
+
+        active.selection = Some(Selection::new((0, 0), (1, 3), SelectionMode::Simple));
+        assert_eq!(
+            active.extract_selected_text(),
+            "123456789中文",
+            "WRAP_SPACER should not introduce an extra space when copying wrapped CJK text"
+        );
+    }
+
+    #[test]
+    fn test_osc52_clipboard_sequence() {
+        let mut term = Terminal::new_headless(24, 80, 100);
+        // "Copied from Vim" in base64 is "Q29waWVkIGZyb20gVmlt"
+        term.feed_bytes(b"\x1b]52;c;Q29waWVkIGZyb20gVmlt\x07");
+        assert_eq!(
+            term.take_pending_clipboard().as_deref(),
+            Some("Copied from Vim")
+        );
+        assert_eq!(term.take_pending_clipboard(), None);
+    }
+
+    #[test]
     fn test_sixel_decoder() {
         let mut decoder = SixelDecoder::new();
         // Sixel data: #1;2;100;0;0 (Red) !10~ (repeat 10 full 6-pixel rows)

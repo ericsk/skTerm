@@ -161,6 +161,8 @@ impl App {
             process_cache: crate::layout::ProcessTreeCache::new(),
             mouse_pos: (0.0, 0.0),
             is_mouse_down: false,
+            selection_anchor: None,
+            has_dragged_selection: false,
             last_click_time: Instant::now(),
             click_count: 0,
             dragging_splitter: None,

@@ -92,6 +92,9 @@ impl App {
                 }
             } else {
                 let outcome = session.workspace.poll_all_ptys();
+                if outcome.any_output {
+                    session.flush_osc52_clipboard(self.clipboard.as_ref());
+                }
                 if outcome.any_output && active_session != Some(*id) {
                     session.mark_unseen_output();
                 }

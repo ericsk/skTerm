@@ -1,7 +1,7 @@
 //! Pointer event handling: selection, splitters, scrollbars, tab bar, and hyperlinks.
 
 use super::agents::is_repeat_click;
-use super::events::{DOUBLE_CLICK_INTERVAL, RESIZE_REFLOW_DEBOUNCE};
+use super::events::{DOUBLE_CLICK_INTERVAL, RESIZE_REFLOW_DEBOUNCE, SCROLLBAR_FADE_AFTER};
 #[cfg(target_os = "macos")]
 use super::macos::get_nswindow;
 use super::session::ScrollbarDragState;
@@ -118,14 +118,17 @@ impl App {
 
             // 2. Handling Text Selection Dragging
             if session.is_mouse_down {
-                if let Some((_pane_id, row, col)) = session.get_pane_and_cell_at(mx, my, tab_bar_h)
-                {
+                if let Some((row, col)) = session.get_active_pane_cell_clamped(mx, my, tab_bar_h) {
+                    let anchor = session.selection_anchor.unwrap_or((row, col));
+                    if (row, col) != anchor {
+                        session.has_dragged_selection = true;
+                    }
                     if let Some(tab) = session.workspace.active_tab_mut() {
                         if let Some(term) = tab.active_terminal_mut() {
-                            if let Some(sel) = &mut term.grid_mut().active_mut().selection {
-                                sel.end = (row, col);
-                                session.window.request_redraw();
-                            }
+                            term.grid_mut()
+                                .active_mut()
+                                .extend_selection_to(anchor, (row, col));
+                            session.window.request_redraw();
                         }
                     }
                 }
@@ -665,7 +668,12 @@ impl App {
                                         buf.scroll_offset,
                                     )
                                 };
-                                if !is_alt && scrollback_len > 0 {
+                                let scrollbar_visible = session.hovered_scrollbar_pane == Some(*id)
+                                    || session
+                                        .last_scroll_time
+                                        .is_some_and(|t| t.elapsed() < SCROLLBAR_FADE_AFTER)
+                                    || scroll_offset > 0;
+                                if !is_alt && scrollback_len > 0 && scrollbar_visible {
                                     if let Some(metrics) = ScrollbarMetrics::compute(
                                         rect.x,
                                         rect.y,
@@ -731,11 +739,13 @@ impl App {
                     }
 
                     session.is_mouse_down = true;
+                    session.has_dragged_selection = false;
 
                     // Click inside Terminal Pane
                     if let Some((pane_id, row, col)) =
                         session.get_pane_and_cell_at(mx, my, tab_bar_h)
                     {
+                        session.selection_anchor = Some((row, col));
                         if let Some(tab) = session.workspace.active_tab_mut() {
                             tab.active_pane_id = pane_id;
 
@@ -768,7 +778,19 @@ impl App {
                         }
                     }
                 } else {
+                    if session.is_mouse_down
+                        && session.click_count == 1
+                        && !session.has_dragged_selection
+                    {
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            if let Some(terminal) = tab.active_terminal_mut() {
+                                terminal.grid_mut().active_mut().selection = None;
+                                session.window.request_redraw();
+                            }
+                        }
+                    }
                     session.is_mouse_down = false;
+                    session.selection_anchor = None;
                     if session.dragging_scrollbar.is_some() {
                         session.dragging_scrollbar = None;
                         session.window.request_redraw();

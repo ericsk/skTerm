@@ -45,6 +45,7 @@ pub struct TerminalState {
     pub kitty_parser: KittyGraphicsParser,
     pub insert_mode: bool,
     pub current_working_directory: Option<String>,
+    pub pending_clipboard: Option<String>,
 }
 
 impl TerminalState {
@@ -66,6 +67,7 @@ impl TerminalState {
             kitty_parser: KittyGraphicsParser::new(),
             insert_mode: false,
             current_working_directory: None,
+            pending_clipboard: None,
         }
     }
 
@@ -319,6 +321,23 @@ impl Perform for TerminalState {
                         } else {
                             self.current_hyperlink_id = None;
                             self.current_hyperlink = None;
+                        }
+                    }
+                }
+            }
+            b"52" => {
+                if params.len() >= 3 && params[2] != b"?" {
+                    use base64::Engine;
+                    let cleaned: Vec<u8> = params[2]
+                        .iter()
+                        .copied()
+                        .filter(|b| !b.is_ascii_whitespace())
+                        .collect();
+                    if let Ok(decoded) =
+                        base64::engine::general_purpose::STANDARD.decode(&cleaned)
+                    {
+                        if let Ok(text) = String::from_utf8(decoded) {
+                            self.pending_clipboard = Some(text);
                         }
                     }
                 }

@@ -239,4 +239,9 @@ impl Terminal {
         }
         None
     }
+
+    /// Take any pending OSC 52 clipboard text decoded by the VT state machine.
+    pub fn take_pending_clipboard(&mut self) -> Option<String> {
+        self.state.pending_clipboard.take()
+    }
 }
