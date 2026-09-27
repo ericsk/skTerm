@@ -927,9 +927,13 @@ impl ScreenBuffer {
     }
 
     pub fn linefeed(&mut self) {
+        self.linefeed_with_bg(Color::DefaultBg);
+    }
+
+    pub fn linefeed_with_bg(&mut self, bg: Color) {
         let (_, bottom) = self.scroll_region;
         if self.cursor.row == bottom {
-            self.scroll_up(1);
+            self.scroll_up_with_bg(1, bg);
         } else if self.cursor.row < self.rows.saturating_sub(1) {
             self.cursor.row += 1;
         }
@@ -937,12 +941,20 @@ impl ScreenBuffer {
     }
 
     pub fn newline(&mut self) {
-        self.linefeed();
+        self.newline_with_bg(Color::DefaultBg);
+    }
+
+    pub fn newline_with_bg(&mut self, bg: Color) {
+        self.linefeed_with_bg(bg);
         self.cursor.col = 0;
         self.cursor.pending_wrap = false;
     }
 
     pub fn scroll_up(&mut self, n: usize) {
+        self.scroll_up_with_bg(n, Color::DefaultBg);
+    }
+
+    pub fn scroll_up_with_bg(&mut self, n: usize, bg: Color) {
         let (top, bottom) = self.scroll_region;
         let full_screen = top == 0 && bottom == self.rows.saturating_sub(1);
         let cols = self.cols;
@@ -969,13 +981,13 @@ impl ScreenBuffer {
                 } else {
                     evicted
                 };
-                blank.reuse_as_blank(cols, Color::DefaultBg);
+                blank.reuse_as_blank(cols, bg);
                 self.grid.push_back(blank);
             } else {
                 let Some(mut row) = self.grid.remove(top) else {
                     break;
                 };
-                row.reuse_as_blank(cols, Color::DefaultBg);
+                row.reuse_as_blank(cols, bg);
                 self.grid.insert(bottom, row);
             }
         }
@@ -987,13 +999,17 @@ impl ScreenBuffer {
     }
 
     pub fn scroll_down(&mut self, n: usize) {
+        self.scroll_down_with_bg(n, Color::DefaultBg);
+    }
+
+    pub fn scroll_down_with_bg(&mut self, n: usize, bg: Color) {
         let (top, bottom) = self.scroll_region;
         let cols = self.cols;
         for _ in 0..n {
             let Some(mut row) = self.grid.remove(bottom) else {
                 break;
             };
-            row.reuse_as_blank(cols, Color::DefaultBg);
+            row.reuse_as_blank(cols, bg);
             self.grid.insert(top, row);
         }
 
@@ -1052,24 +1068,43 @@ impl ScreenBuffer {
         flags: CellFlags,
         hyperlink_id: Option<NonZeroU32>,
     ) {
+        self.write_char_with_wrap(c, fg, bg, flags, hyperlink_id, true);
+    }
+
+    pub fn write_char_with_wrap(
+        &mut self,
+        c: char,
+        fg: Color,
+        bg: Color,
+        flags: CellFlags,
+        hyperlink_id: Option<NonZeroU32>,
+        auto_wrap: bool,
+    ) {
         let char_width = UnicodeWidthChar::width(c).unwrap_or(1);
         if char_width == 0 {
             return;
         }
 
         if self.cursor.pending_wrap {
-            self.grid[self.cursor.row].is_wrapped = true;
-            self.newline();
+            if auto_wrap {
+                self.grid[self.cursor.row].is_wrapped = true;
+                self.newline_with_bg(bg);
+            } else {
+                self.cursor.pending_wrap = false;
+            }
         }
 
         if char_width == 2 && self.cursor.col + 1 >= self.cols {
+            if !auto_wrap {
+                return;
+            }
             self.clear_split_wide_chars(self.cursor.row, self.cursor.col, self.cols);
             self.grid[self.cursor.row].cells[self.cursor.col].reset();
             self.grid[self.cursor.row].cells[self.cursor.col]
                 .flags
                 .insert(CellFlags::WRAP_SPACER);
             self.grid[self.cursor.row].is_wrapped = true;
-            self.newline();
+            self.newline_with_bg(bg);
         }
 
         let cur_row = self.cursor.row;
@@ -1105,7 +1140,7 @@ impl ScreenBuffer {
         }
 
         if self.cursor.col + 1 >= self.cols {
-            self.cursor.pending_wrap = true;
+            self.cursor.pending_wrap = auto_wrap;
         } else {
             self.cursor.col += 1;
         }

@@ -13,7 +13,7 @@ pub use grid::{
 };
 pub use pty::{PtyEvent, PtyProcess, PtySpawnOptions};
 pub use terminal::Terminal;
-pub use vt::{MouseFormat, MouseProtocol, TerminalState};
+pub use vt::{Charset, MouseFormat, MouseProtocol, TerminalState};
 
 /// skterm-core library version and basic info
 pub fn core_info() -> &'static str {

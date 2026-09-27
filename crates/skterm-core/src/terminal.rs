@@ -117,6 +117,12 @@ impl Terminal {
         if had_data {
             self.last_output_time = std::time::Instant::now();
             self.parser.advance(&mut self.state, &buf);
+            if !self.state.pending_responses.is_empty() {
+                let responses = std::mem::take(&mut self.state.pending_responses);
+                if let Some(pty) = &self.pty {
+                    let _ = pty.write_all(&responses);
+                }
+            }
         }
 
         // Return the buffer so its capacity is reused next poll.
@@ -243,5 +249,10 @@ impl Terminal {
     /// Take any pending OSC 52 clipboard text decoded by the VT state machine.
     pub fn take_pending_clipboard(&mut self) -> Option<String> {
         self.state.pending_clipboard.take()
+    }
+
+    /// Take any pending VT device query responses (DA1, DA2, DSR, CPR, DECRQM, OSC 10/11/12, Kitty `a=q`).
+    pub fn take_pending_responses(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.state.pending_responses)
     }
 }

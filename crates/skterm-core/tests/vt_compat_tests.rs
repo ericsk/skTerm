@@ -454,3 +454,136 @@ fn test_vt_sgr_underline_color_and_subparams() {
         );
     }
 }
+
+#[test]
+fn test_vt_device_queries_and_responses() {
+    let mut term = Terminal::new_headless(24, 80, 100);
+
+    // DA1 (\x1b[c) and DA2 (\x1b[>c)
+    term.feed_bytes(b"\x1b[c\x1b[>c");
+    assert_eq!(
+        term.take_pending_responses(),
+        b"\x1b[?62;4;22c\x1b[>41;350;0c"
+    );
+
+    // DSR (\x1b[5n), CPR (\x1b[6n), and DECXCPR (\x1b[?6n)
+    term.feed_bytes(b"\x1b[4;12H\x1b[5n\x1b[6n\x1b[?6n");
+    assert_eq!(
+        term.take_pending_responses(),
+        b"\x1b[0n\x1b[4;12R\x1b[?4;12R"
+    );
+
+    // DECRQM for DEC Private Modes (?2026, ?25, ?7) and ANSI mode (4)
+    term.feed_bytes(b"\x1b[?2026$p\x1b[?2026h\x1b[?2026$p\x1b[?25$p\x1b[?7$p\x1b[4$p");
+    assert_eq!(
+        term.take_pending_responses(),
+        b"\x1b[?2026;2$y\x1b[?2026;1$y\x1b[?25;1$y\x1b[?7;1$y\x1b[4;2$y"
+    );
+
+    // OSC 10 (FG) and OSC 11 (BG) dynamic color queries with BEL and ST terminators
+    term.feed_bytes(b"\x1b]10;?\x07\x1b]11;?\x1b\\");
+    assert_eq!(
+        term.take_pending_responses(),
+        b"\x1b]10;rgb:f5f5/f5f5/f7f7\x07\x1b]11;rgb:1a1a/1b1b/1e1e\x1b\\"
+    );
+
+    // Kitty Graphics query (a=q) via APC/OSC must reply OK and not add a probe image to the grid
+    term.feed_bytes(b"\x1b]Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
+    assert_eq!(term.take_pending_responses(), b"\x1b_Gi=31;OK\x1b\\");
+    assert!(term.grid().active().images.is_empty());
+}
+
+#[test]
+fn test_vt_rep_cht_cbt_hpa_hpr_vpr_and_cnl_cpl() {
+    let mut term = Terminal::new_headless(10, 20, 100);
+
+    // CSI b (REP): Repeat preceding graphic character
+    term.feed_bytes(b"=\x1b[4b!");
+    let row0: String = term.grid().active().grid[0].cells[0..6]
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(row0, "=====!");
+
+    // CHT (\x1b[2I) forward 2 tab stops from col 0 -> col 16, then CBT (\x1b[1Z) back to col 8
+    term.feed_bytes(b"\r\n\x1b[2I\x1b[1Z");
+    assert_eq!(term.grid().active().cursor.row, 1);
+    assert_eq!(term.grid().active().cursor.col, 8);
+
+    // HPA (\x1b[5`), HPR (\x1b[3a), VPR (\x1b[2e)
+    term.feed_bytes(b"\x1b[5`\x1b[3a\x1b[2e");
+    assert_eq!(term.grid().active().cursor.col, 7);
+    assert_eq!(term.grid().active().cursor.row, 3);
+
+    // Fill row 3 to trigger pending_wrap at col 19, then verify CNL (\x1b[E) clears pending_wrap
+    term.feed_bytes(b"\x1b[4;1H01234567890123456789");
+    assert!(term.grid().active().cursor.pending_wrap);
+    term.feed_bytes(b"\x1b[1E");
+    assert_eq!(term.grid().active().cursor.row, 4);
+    assert_eq!(term.grid().active().cursor.col, 0);
+    assert!(!term.grid().active().cursor.pending_wrap);
+
+    // Verify Kitty Keyboard Protocol push/pop (\x1b[>1u / \x1b[<u) does not trigger ANSI restore_cursor ('u')
+    term.feed_bytes(b"\x1b[s\x1b[6;10H\x1b[>1u\x1b[<u");
+    assert_eq!(term.grid().active().cursor.row, 5);
+    assert_eq!(term.grid().active().cursor.col, 9);
+}
+
+#[test]
+fn test_vt_bce_scroll_and_linefeed_background() {
+    let mut term = Terminal::new_headless(4, 10, 100);
+
+    // Set blue background (\x1b[44m) and scroll up 1 line (\x1b[1S)
+    term.feed_bytes(b"\x1b[44m\x1b[1S");
+    for cell in &term.grid().active().grid[3].cells {
+        assert_eq!(cell.bg, Color::Named(NamedColor::Blue));
+    }
+
+    // Move to bottom row, set green background (\x1b[42m), and trigger linefeed (\n)
+    term.feed_bytes(b"\x1b[4;1H\x1b[42m\n");
+    for cell in &term.grid().active().grid[3].cells {
+        assert_eq!(cell.bg, Color::Named(NamedColor::Green));
+    }
+
+    // Move to top row, set red background (\x1b[41m), and trigger Reverse Index (\x1bM)
+    term.feed_bytes(b"\x1b[1;1H\x1b[41m\x1bM");
+    for cell in &term.grid().active().grid[0].cells {
+        assert_eq!(cell.bg, Color::Named(NamedColor::Red));
+    }
+}
+
+#[test]
+fn test_vt_decawm_autowrap_and_dec_special_graphics() {
+    let mut term = Terminal::new_headless(5, 10, 100);
+
+    // Disable auto-wrap (?7l) and write 12 characters on a 10-col line:
+    // the last cell (col 9) should be overwritten in place without wrapping to row 1.
+    term.feed_bytes(b"\x1b[?7l0123456789XY\x1b[?7h");
+    assert_eq!(term.grid().active().cursor.row, 0);
+    assert_eq!(term.grid().active().cursor.col, 9);
+    assert!(!term.grid().active().cursor.pending_wrap);
+    let row0: String = term.grid().active().grid[0]
+        .cells
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(row0, "012345678Y");
+
+    // DEC Special Graphics box drawing via ESC ( 0 and ESC ( B
+    term.feed_bytes(b"\r\n\x1b(0lqqqk\x1b(B text");
+    let row1: String = term.grid().active().grid[1]
+        .cells
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(row1.trim_end(), "┌───┐ text");
+
+    // G1 charset via ESC ) 0 + SO (0x0E) / SI (0x0F)
+    term.feed_bytes(b"\r\n\x1b)0\x0emqqqj\x0fdone");
+    let row2: String = term.grid().active().grid[2]
+        .cells
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(row2.trim_end(), "└───┘done");
+}

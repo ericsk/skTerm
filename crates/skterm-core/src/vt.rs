@@ -26,6 +26,14 @@ pub enum MouseFormat {
     Sgr,
 }
 
+/// Character set designation for G0 / G1 slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Charset {
+    #[default]
+    Ascii,
+    DecSpecialGraphics,
+}
+
 /// Terminal state engine combining ScreenGrid and VTE event handlers.
 #[derive(Debug, Clone)]
 pub struct TerminalState {
@@ -39,6 +47,8 @@ pub struct TerminalState {
     pub title: String,
     pub application_cursor_keys: bool,
     pub bracketed_paste: bool,
+    pub auto_wrap: bool,
+    pub synchronized_output: bool,
     pub mouse_protocol: MouseProtocol,
     pub mouse_format: MouseFormat,
     pub in_sixel: bool,
@@ -47,6 +57,11 @@ pub struct TerminalState {
     pub insert_mode: bool,
     pub current_working_directory: Option<String>,
     pub pending_clipboard: Option<String>,
+    pub pending_responses: Vec<u8>,
+    pub last_printed_char: Option<char>,
+    pub g0_charset: Charset,
+    pub g1_charset: Charset,
+    pub active_charset: u8,
 }
 
 impl TerminalState {
@@ -62,6 +77,8 @@ impl TerminalState {
             title: String::from("skTerm"),
             application_cursor_keys: false,
             bracketed_paste: false,
+            auto_wrap: true,
+            synchronized_output: false,
             mouse_protocol: MouseProtocol::None,
             mouse_format: MouseFormat::X10,
             in_sixel: false,
@@ -70,6 +87,11 @@ impl TerminalState {
             insert_mode: false,
             current_working_directory: None,
             pending_clipboard: None,
+            pending_responses: Vec::new(),
+            last_printed_char: None,
+            g0_charset: Charset::Ascii,
+            g1_charset: Charset::Ascii,
+            active_charset: 0,
         }
     }
 
@@ -78,6 +100,31 @@ impl TerminalState {
         self.bg = Color::DefaultBg;
         self.underline_color = None;
         self.flags = CellFlags::empty();
+    }
+
+    fn active_charset_mode(&self) -> Charset {
+        if self.active_charset == 1 {
+            self.g1_charset
+        } else {
+            self.g0_charset
+        }
+    }
+
+    fn write_graphic_char(&mut self, c: char) {
+        let fg = self.fg;
+        let bg = self.bg;
+        let flags = self.flags;
+        let hid = self.current_hyperlink_id;
+        let auto_wrap = self.auto_wrap;
+        if self.insert_mode {
+            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+            if w > 0 {
+                self.grid.active_mut().insert_chars(w, bg);
+            }
+        }
+        self.grid
+            .active_mut()
+            .write_char_with_wrap(c, fg, bg, flags, hid, auto_wrap);
     }
 
     fn save_cursor(&mut self) {
@@ -261,22 +308,18 @@ fn parse_extended_color<'a>(iter: &mut impl Iterator<Item = &'a [u16]>) -> Optio
 
 impl Perform for TerminalState {
     fn print(&mut self, c: char) {
-        let fg = self.fg;
-        let bg = self.bg;
-        let flags = self.flags;
-        let hid = self.current_hyperlink_id;
-        if self.insert_mode {
-            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
-            if w > 0 {
-                self.grid.active_mut().insert_chars(w, bg);
-            }
-        }
-        self.grid.active_mut().write_char(c, fg, bg, flags, hid);
+        let mapped = if self.active_charset_mode() == Charset::DecSpecialGraphics {
+            map_dec_special_graphics(c)
+        } else {
+            c
+        };
+        self.last_printed_char = Some(mapped);
+        self.write_graphic_char(mapped);
     }
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            b'\n' | 0x0B | 0x0C => self.grid.active_mut().linefeed(),
+            b'\n' | 0x0B | 0x0C => self.grid.active_mut().linefeed_with_bg(self.bg),
             b'\r' => {
                 let active = self.grid.active_mut();
                 active.cursor.col = 0;
@@ -289,7 +332,9 @@ impl Perform for TerminalState {
                 active.cursor.pending_wrap = false;
             }
             0x08 => self.grid.active_mut().move_backward(1),
-            0x07 => {} // Bell
+            0x0E => self.active_charset = 1, // SO (Shift Out -> G1)
+            0x0F => self.active_charset = 0, // SI (Shift In -> G0)
+            0x07 => {}                       // Bell
             _ => {}
         }
     }
@@ -349,7 +394,7 @@ impl Perform for TerminalState {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         if params.is_empty() {
             return;
         }
@@ -385,6 +430,19 @@ impl Perform for TerminalState {
                     }
                 }
             }
+            b"10" | b"11" | b"12" => {
+                // Dynamic color query (used by neovim, fish, zsh, lipgloss/termenv to detect theme)
+                if params.get(1) == Some(&&b"?"[..]) {
+                    let code = std::str::from_utf8(params[0]).unwrap_or("10");
+                    let rgb = match params[0] {
+                        b"11" => "rgb:1a1a/1b1b/1e1e", // Default dark background (#1a1b1e)
+                        _ => "rgb:f5f5/f5f5/f7f7",     // Default light foreground/cursor (#f5f5f7)
+                    };
+                    let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
+                    let resp = format!("\x1b]{code};{rgb}{terminator}");
+                    self.pending_responses.extend_from_slice(resp.as_bytes());
+                }
+            }
             b"52" => {
                 if params.len() >= 3 && params[2] != b"?" {
                     use base64::Engine;
@@ -405,7 +463,26 @@ impl Perform for TerminalState {
                 // Check Kitty Graphics via OSC or APC
                 if let Ok(cmd) = std::str::from_utf8(params[0]) {
                     if let Some(cmd_args) = cmd.strip_prefix('G') {
-                        if let Some((w, h, rgba, z)) = self.kitty_parser.parse_command(cmd_args) {
+                        let header = cmd_args.split(';').next().unwrap_or("");
+                        let is_query = header.split(',').any(|kv| kv == "a=q");
+                        if is_query {
+                            let quiet = header
+                                .split(',')
+                                .find_map(|kv| kv.strip_prefix("q="))
+                                .unwrap_or("0");
+                            if quiet != "2" {
+                                if let Some(id_val) =
+                                    header.split(',').find_map(|kv| kv.strip_prefix("i="))
+                                {
+                                    let resp = format!("\x1b_Gi={id_val};OK\x1b\\");
+                                    self.pending_responses.extend_from_slice(resp.as_bytes());
+                                } else {
+                                    self.pending_responses.extend_from_slice(b"\x1b_G;OK\x1b\\");
+                                }
+                            }
+                        } else if let Some((w, h, rgba, z)) =
+                            self.kitty_parser.parse_command(cmd_args)
+                        {
                             let id = self.grid.next_image_id;
                             self.grid.next_image_id += 1;
 
@@ -446,7 +523,7 @@ impl Perform for TerminalState {
 
         match action {
             'm' if intermediates.is_empty() => self.parse_sgr(params),
-            'H' | 'f' => {
+            'H' | 'f' if intermediates.is_empty() => {
                 let mut row = 1;
                 let mut col = 1;
                 let mut iter = params.iter();
@@ -468,82 +545,112 @@ impl Perform for TerminalState {
                     .active_mut()
                     .move_cursor((row as usize) - 1, (col as usize) - 1);
             }
-            'A' => self
+            'A' if intermediates.is_empty() => self
                 .grid
                 .active_mut()
                 .move_up((first_param as usize).max(1)),
-            'B' => self
+            'B' | 'e' if intermediates.is_empty() => self
                 .grid
                 .active_mut()
                 .move_down((first_param as usize).max(1)),
-            'C' => self
+            'C' | 'a' if intermediates.is_empty() => self
                 .grid
                 .active_mut()
                 .move_forward((first_param as usize).max(1)),
-            'D' => self
+            'D' if intermediates.is_empty() => self
                 .grid
                 .active_mut()
                 .move_backward((first_param as usize).max(1)),
-            'E' => {
+            'E' if intermediates.is_empty() => {
                 let active = self.grid.active_mut();
                 active.move_down((first_param as usize).max(1));
                 active.cursor.col = 0;
+                active.cursor.pending_wrap = false;
             }
-            'F' => {
+            'F' if intermediates.is_empty() => {
                 let active = self.grid.active_mut();
                 active.move_up((first_param as usize).max(1));
                 active.cursor.col = 0;
+                active.cursor.pending_wrap = false;
             }
-            'G' => {
+            'G' | '`' if intermediates.is_empty() => {
                 let col = (first_param as usize).max(1) - 1;
-                self.grid.active_mut().cursor.col =
-                    col.min(self.grid.active().cols.saturating_sub(1));
-                self.grid.active_mut().cursor.pending_wrap = false;
+                let active = self.grid.active_mut();
+                active.cursor.col = col.min(active.cols.saturating_sub(1));
+                active.cursor.pending_wrap = false;
             }
-            'd' => {
+            'd' if intermediates.is_empty() => {
                 let row = (first_param as usize).max(1) - 1;
-                self.grid.active_mut().cursor.row =
-                    row.min(self.grid.active().rows.saturating_sub(1));
-                self.grid.active_mut().cursor.pending_wrap = false;
+                let active = self.grid.active_mut();
+                active.cursor.row = row.min(active.rows.saturating_sub(1));
+                active.cursor.pending_wrap = false;
             }
-            '@' => self
+            'I' if intermediates.is_empty() => {
+                // CHT: Cursor Forward Tabulation Ps tab stops
+                let count = (first_param as usize).max(1);
+                let active = self.grid.active_mut();
+                let next_tab = (active.cursor.col / 8 + count) * 8;
+                active.cursor.col = next_tab.min(active.cols.saturating_sub(1));
+                active.cursor.pending_wrap = false;
+            }
+            'Z' if intermediates.is_empty() => {
+                // CBT: Cursor Backward Tabulation Ps tab stops
+                let count = (first_param as usize).max(1);
+                let active = self.grid.active_mut();
+                if active.cursor.col > 0 {
+                    let prev_stop = (active.cursor.col.saturating_sub(1)) / 8;
+                    active.cursor.col = prev_stop.saturating_sub(count - 1) * 8;
+                }
+                active.cursor.pending_wrap = false;
+            }
+            'b' if intermediates.is_empty() => {
+                // REP: Repeat preceding graphic character Ps times
+                if let Some(c) = self.last_printed_char {
+                    let max_repeat = self.grid.active().rows * self.grid.active().cols;
+                    let count = (first_param as usize).max(1).min(max_repeat);
+                    for _ in 0..count {
+                        self.write_graphic_char(c);
+                    }
+                }
+            }
+            '@' if intermediates.is_empty() => self
                 .grid
                 .active_mut()
                 .insert_chars((first_param as usize).max(1), self.bg),
-            'P' => self
+            'P' if intermediates.is_empty() => self
                 .grid
                 .active_mut()
                 .delete_chars((first_param as usize).max(1), self.bg),
-            'X' => self
+            'X' if intermediates.is_empty() => self
                 .grid
                 .active_mut()
                 .erase_chars((first_param as usize).max(1), self.bg),
-            'L' => self
+            'L' if intermediates.is_empty() => self
                 .grid
                 .active_mut()
                 .insert_lines((first_param as usize).max(1), self.bg),
-            'M' => self
+            'M' if intermediates.is_empty() => self
                 .grid
                 .active_mut()
                 .delete_lines((first_param as usize).max(1), self.bg),
-            'J' => self
+            'J' if intermediates.is_empty() || (is_private && intermediates.len() == 1) => self
                 .grid
                 .active_mut()
                 .erase_in_display(first_param as usize, self.bg),
-            'K' => self
+            'K' if intermediates.is_empty() || (is_private && intermediates.len() == 1) => self
                 .grid
                 .active_mut()
                 .erase_in_line(first_param as usize, self.bg),
-            'S' => self
+            'S' if intermediates.is_empty() => self
                 .grid
                 .active_mut()
-                .scroll_up((first_param as usize).max(1)),
-            'T' => self
+                .scroll_up_with_bg((first_param as usize).max(1), self.bg),
+            'T' if intermediates.is_empty() => self
                 .grid
                 .active_mut()
-                .scroll_down((first_param as usize).max(1)),
-            's' if !is_private && intermediates.is_empty() => self.save_cursor(),
-            'u' if !is_private && intermediates.is_empty() => self.restore_cursor(),
+                .scroll_down_with_bg((first_param as usize).max(1), self.bg),
+            's' if intermediates.is_empty() => self.save_cursor(),
+            'u' if intermediates.is_empty() => self.restore_cursor(),
             'r' if intermediates.is_empty() => {
                 let mut top = 1;
                 let mut bottom = self.grid.active().rows;
@@ -563,25 +670,157 @@ impl Perform for TerminalState {
                     }
                 }
                 if top < bottom && bottom <= self.grid.active().rows {
-                    self.grid.active_mut().scroll_region = (top - 1, bottom - 1);
-                    self.grid.active_mut().cursor.row = top - 1;
-                    self.grid.active_mut().cursor.col = 0;
+                    let active = self.grid.active_mut();
+                    active.scroll_region = (top - 1, bottom - 1);
+                    active.cursor.row = top - 1;
+                    active.cursor.col = 0;
+                    active.cursor.pending_wrap = false;
                 }
+            }
+            'c' if intermediates.is_empty() => {
+                // DA1: Primary Device Attributes (VT220 Level 2 + Sixel (4) + ANSI Color (22))
+                if first_param == 0 {
+                    self.pending_responses.extend_from_slice(b"\x1b[?62;4;22c");
+                }
+            }
+            'c' if intermediates == b">" => {
+                // DA2: Secondary Device Attributes (xterm version 350)
+                if first_param == 0 {
+                    self.pending_responses.extend_from_slice(b"\x1b[>41;350;0c");
+                }
+            }
+            'n' if intermediates.is_empty() => match first_param {
+                5 => {
+                    // DSR: Operating Status Report -> Terminal OK
+                    self.pending_responses.extend_from_slice(b"\x1b[0n");
+                }
+                6 => {
+                    // CPR: Cursor Position Report (1-indexed)
+                    let row = self.grid.active().cursor.row + 1;
+                    let col = self.grid.active().cursor.col + 1;
+                    let resp = format!("\x1b[{row};{col}R");
+                    self.pending_responses.extend_from_slice(resp.as_bytes());
+                }
+                _ => {}
+            },
+            'n' if is_private && intermediates.len() == 1 => {
+                if first_param == 6 {
+                    // DECXCPR: Extended Cursor Position Report (1-indexed)
+                    let row = self.grid.active().cursor.row + 1;
+                    let col = self.grid.active().cursor.col + 1;
+                    let resp = format!("\x1b[?{row};{col}R");
+                    self.pending_responses.extend_from_slice(resp.as_bytes());
+                }
+            }
+            'p' if intermediates == b"?$" => {
+                // DECRQM: Request DEC Private Mode
+                let pm = match first_param {
+                    1 => {
+                        if self.application_cursor_keys {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    7 => {
+                        if self.auto_wrap {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    25 => {
+                        if self.grid.active().cursor.visible {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    47 | 1047 | 1049 => {
+                        if self.grid.is_alternate {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    1000 => {
+                        if self.mouse_protocol == MouseProtocol::Normal {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    1002 => {
+                        if self.mouse_protocol == MouseProtocol::ButtonEvent {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    1003 => {
+                        if self.mouse_protocol == MouseProtocol::AnyEvent {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    1006 => {
+                        if self.mouse_format == MouseFormat::Sgr {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    2004 => {
+                        if self.bracketed_paste {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    2026 => {
+                        if self.synchronized_output {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    _ => 0,
+                };
+                let resp = format!("\x1b[?{first_param};{pm}$y");
+                self.pending_responses.extend_from_slice(resp.as_bytes());
+            }
+            'p' if intermediates == b"$" => {
+                // DECRQM: Request ANSI Mode
+                let pm = match first_param {
+                    4 => {
+                        if self.insert_mode {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    _ => 0,
+                };
+                let resp = format!("\x1b[{first_param};{pm}$y");
+                self.pending_responses.extend_from_slice(resp.as_bytes());
             }
             'h' => {
                 for param in params.iter() {
                     for &mode in param {
-                        if is_private {
+                        if is_private && intermediates.len() == 1 {
                             match mode {
                                 1 => self.application_cursor_keys = true,
+                                7 => self.auto_wrap = true,
                                 25 => self.grid.active_mut().cursor.visible = true,
-                                47 | 1049 => {
+                                47 | 1047 | 1049 => {
                                     if mode == 1049 {
                                         self.save_cursor();
                                     }
                                     self.grid.set_alternate(true);
                                 }
                                 2004 => self.bracketed_paste = true,
+                                2026 => self.synchronized_output = true,
                                 1000 => self.mouse_protocol = MouseProtocol::Normal,
                                 1002 => self.mouse_protocol = MouseProtocol::ButtonEvent,
                                 1003 => self.mouse_protocol = MouseProtocol::AnyEvent,
@@ -597,16 +836,21 @@ impl Perform for TerminalState {
             'l' => {
                 for param in params.iter() {
                     for &mode in param {
-                        if is_private {
+                        if is_private && intermediates.len() == 1 {
                             match mode {
                                 1 => self.application_cursor_keys = false,
+                                7 => {
+                                    self.auto_wrap = false;
+                                    self.grid.active_mut().cursor.pending_wrap = false;
+                                }
                                 25 => self.grid.active_mut().cursor.visible = false,
-                                47 => self.grid.set_alternate(false),
+                                47 | 1047 => self.grid.set_alternate(false),
                                 1049 => {
                                     self.grid.set_alternate(false);
                                     self.restore_cursor();
                                 }
                                 2004 => self.bracketed_paste = false,
+                                2026 => self.synchronized_output = false,
                                 1000 | 1002 | 1003 => self.mouse_protocol = MouseProtocol::None,
                                 1006 => self.mouse_format = MouseFormat::X10,
                                 _ => {}
@@ -617,8 +861,8 @@ impl Perform for TerminalState {
                     }
                 }
             }
-            'q' if intermediates.first() == Some(&b' ') => match first_param {
-                1 | 2 => self.grid.active_mut().cursor.shape = CursorShape::Block,
+            'q' if intermediates == b" " => match first_param {
+                0..=2 => self.grid.active_mut().cursor.shape = CursorShape::Block,
                 3 | 4 => self.grid.active_mut().cursor.shape = CursorShape::Underline,
                 5 | 6 => self.grid.active_mut().cursor.shape = CursorShape::Beam,
                 _ => {}
@@ -627,20 +871,41 @@ impl Perform for TerminalState {
         }
     }
 
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        if intermediates == b"(" {
+            match byte {
+                b'0' => self.g0_charset = Charset::DecSpecialGraphics,
+                b'B' => self.g0_charset = Charset::Ascii,
+                _ => {}
+            }
+            return;
+        }
+        if intermediates == b")" {
+            match byte {
+                b'0' => self.g1_charset = Charset::DecSpecialGraphics,
+                b'B' => self.g1_charset = Charset::Ascii,
+                _ => {}
+            }
+            return;
+        }
+        if !intermediates.is_empty() {
+            return;
+        }
+
         match byte {
             b'7' => self.save_cursor(),
             b'8' => self.restore_cursor(),
             b'M' => {
+                let bg = self.bg;
                 let active = self.grid.active_mut();
                 if active.cursor.row == active.scroll_region.0 {
-                    active.scroll_down(1);
+                    active.scroll_down_with_bg(1, bg);
                 } else {
                     active.move_up(1);
                 }
             }
-            b'D' => self.grid.active_mut().linefeed(),
-            b'E' => self.grid.active_mut().newline(),
+            b'D' => self.grid.active_mut().linefeed_with_bg(self.bg),
+            b'E' => self.grid.active_mut().newline_with_bg(self.bg),
             b'c' => {
                 let rows = self.grid.active().rows;
                 let cols = self.grid.active().cols;
@@ -649,6 +914,45 @@ impl Perform for TerminalState {
             }
             _ => {}
         }
+    }
+}
+
+/// Map VT100 DEC Special Graphics character set (`ESC ( 0`) bytes `0x60..=0x7E`
+/// to their corresponding Unicode box-drawing and symbol characters.
+fn map_dec_special_graphics(c: char) -> char {
+    match c {
+        '`' => '◆',
+        'a' => '▒',
+        'b' => '␉',
+        'c' => '␌',
+        'd' => '␍',
+        'e' => '␊',
+        'f' => '°',
+        'g' => '±',
+        'h' => '␤',
+        'i' => '␋',
+        'j' => '┘',
+        'k' => '┐',
+        'l' => '┌',
+        'm' => '└',
+        'n' => '┼',
+        'o' => '⎺',
+        'p' => '⎻',
+        'q' => '─',
+        'r' => '⎼',
+        's' => '⎽',
+        't' => '├',
+        'u' => '┤',
+        'v' => '┴',
+        'w' => '┬',
+        'x' => '│',
+        'y' => '≤',
+        'z' => '≥',
+        '{' => 'π',
+        '|' => '≠',
+        '}' => '£',
+        '~' => '·',
+        _ => c,
     }
 }
 
