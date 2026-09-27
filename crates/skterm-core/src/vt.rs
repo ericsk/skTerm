@@ -32,6 +32,7 @@ pub struct TerminalState {
     pub grid: ScreenGrid,
     pub fg: Color,
     pub bg: Color,
+    pub underline_color: Option<Color>,
     pub flags: CellFlags,
     pub current_hyperlink: Option<Arc<String>>,
     pub current_hyperlink_id: Option<NonZeroU32>,
@@ -54,6 +55,7 @@ impl TerminalState {
             grid: ScreenGrid::new(rows, cols, max_scrollback),
             fg: Color::DefaultFg,
             bg: Color::DefaultBg,
+            underline_color: None,
             flags: CellFlags::empty(),
             current_hyperlink: None,
             current_hyperlink_id: None,
@@ -74,9 +76,8 @@ impl TerminalState {
     pub fn reset_sgr(&mut self) {
         self.fg = Color::DefaultFg;
         self.bg = Color::DefaultBg;
+        self.underline_color = None;
         self.flags = CellFlags::empty();
-        self.current_hyperlink = None;
-        self.current_hyperlink_id = None;
     }
 
     fn save_cursor(&mut self) {
@@ -113,11 +114,41 @@ impl TerminalState {
             return;
         }
 
-        // Flatten subparameters lazily. Building a `Vec` here cost one malloc/free per
-        // `ESC[...m`, which for colored output (ls, cargo, rg, vim, tmux) is more
-        // frequent than one per printed character.
-        let mut iter = params.iter().flat_map(|p| p.iter().copied());
-        while let Some(code) = iter.next() {
+        // Walk `Params` directly without heap allocation while keeping colon-separated
+        // subparameters (`ESC[4:3m`, `ESC[38:2::r:g:bm`, `ESC[58:2::r:g:bm`) grouped
+        // with their owning SGR code instead of leaking them as standalone SGR commands.
+        let mut iter = params.iter();
+        while let Some(param) = iter.next() {
+            let code = param.first().copied().unwrap_or(0);
+            if param.len() > 1 {
+                match code {
+                    4 => {
+                        if param[1] == 0 {
+                            self.flags.remove(CellFlags::UNDERLINE);
+                        } else {
+                            self.flags.insert(CellFlags::UNDERLINE);
+                        }
+                    }
+                    38 => {
+                        if let Some(color) = parse_colon_color(&param[1..]) {
+                            self.fg = color;
+                        }
+                    }
+                    48 => {
+                        if let Some(color) = parse_colon_color(&param[1..]) {
+                            self.bg = color;
+                        }
+                    }
+                    58 => {
+                        if let Some(color) = parse_colon_color(&param[1..]) {
+                            self.underline_color = Some(color);
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             match code {
                 0 => self.reset_sgr(),
                 1 => self.flags.insert(CellFlags::BOLD),
@@ -128,6 +159,7 @@ impl TerminalState {
                 7 => self.flags.insert(CellFlags::INVERSE),
                 8 => self.flags.insert(CellFlags::HIDDEN),
                 9 => self.flags.insert(CellFlags::STRIKETHROUGH),
+                21 => self.flags.insert(CellFlags::UNDERLINE),
                 22 => self.flags.remove(CellFlags::BOLD | CellFlags::DIM),
                 23 => self.flags.remove(CellFlags::ITALIC),
                 24 => self.flags.remove(CellFlags::UNDERLINE),
@@ -151,6 +183,13 @@ impl TerminalState {
                     }
                 }
                 49 => self.bg = Color::DefaultBg,
+
+                58 => {
+                    if let Some(color) = parse_extended_color(&mut iter) {
+                        self.underline_color = Some(color);
+                    }
+                }
+                59 => self.underline_color = None,
 
                 90..=97 => self.fg = Color::Named(named_from_code(code - 90, true)),
                 100..=107 => self.bg = Color::Named(named_from_code(code - 100, true)),
@@ -183,16 +222,37 @@ fn named_from_code(offset: u16, bright: bool) -> NamedColor {
     }
 }
 
-fn parse_extended_color(iter: &mut impl Iterator<Item = u16>) -> Option<Color> {
-    match iter.next()? {
+fn parse_colon_color(sub: &[u16]) -> Option<Color> {
+    match sub.first().copied()? {
         2 => {
-            let r = iter.next()? as u8;
-            let g = iter.next()? as u8;
-            let b = iter.next()? as u8;
+            // ITU T.416 allows both `2:r:g:b` (4 items) and `2:colorspace:r:g:b` (5+ items)
+            if sub.len() >= 5 {
+                Some(Color::Rgb(sub[2] as u8, sub[3] as u8, sub[4] as u8))
+            } else if sub.len() == 4 {
+                Some(Color::Rgb(sub[1] as u8, sub[2] as u8, sub[3] as u8))
+            } else {
+                None
+            }
+        }
+        5 => sub.get(1).map(|&idx| Color::Indexed(idx as u8)),
+        _ => None,
+    }
+}
+
+fn parse_extended_color<'a>(iter: &mut impl Iterator<Item = &'a [u16]>) -> Option<Color> {
+    let mode_param = iter.next()?;
+    if mode_param.len() > 1 {
+        return parse_colon_color(mode_param);
+    }
+    match mode_param.first().copied()? {
+        2 => {
+            let r = iter.next()?.first().copied()? as u8;
+            let g = iter.next()?.first().copied()? as u8;
+            let b = iter.next()?.first().copied()? as u8;
             Some(Color::Rgb(r, g, b))
         }
         5 => {
-            let idx = iter.next()? as u8;
+            let idx = iter.next()?.first().copied()? as u8;
             Some(Color::Indexed(idx))
         }
         _ => None,

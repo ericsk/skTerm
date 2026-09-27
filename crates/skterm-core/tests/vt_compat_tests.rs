@@ -383,3 +383,58 @@ fn test_vt_cjk_wide_char_overwrite_and_backspace() {
     assert_eq!(cells[1].c, 'A');
     assert!(!cells[1].flags.contains(CellFlags::WIDE_CHAR_SPACER));
 }
+
+#[test]
+fn test_vt_sgr_underline_color_and_subparams() {
+    use skterm_core::CellFlags;
+    let mut term = Terminal::new_headless(10, 80, 100);
+
+    // Exact sequence pattern from Jetski CLI banner ("We're Hiring! (TPM, DevRel)"):
+    // RGB components in `58;2;R;G;B` that fall in 90..=97 or 100..=107 must be consumed as
+    // the underline color rather than leaking as bright fg/bg SGR codes or DIM (2).
+    term.feed_bytes(
+        b"\x1b[38;2;66;133;244;58;2;66;133;244;1;4m\x1b]8;id=jk;http://go/jetski-jobs\x07W\
+          \x1b[38;2;93;124;231;58;2;93;124;231me\
+          \x1b[38;2;100;122;228;58;2;100;122;228m \
+          \x1b[38;2;107;120;225;58;2;107;120;225mH\
+          \x1b[38;2;224;90;109;58;2;224;90;109m)\x1b[m\x1b]8;;\x07",
+    );
+
+    let cells = &term.grid().active().grid[0].cells;
+    let expected = [
+        ('W', Color::Rgb(66, 133, 244)),
+        ('e', Color::Rgb(93, 124, 231)),
+        (' ', Color::Rgb(100, 122, 228)),
+        ('H', Color::Rgb(107, 120, 225)),
+        (')', Color::Rgb(224, 90, 109)),
+    ];
+
+    for (idx, (ch, fg)) in expected.iter().enumerate() {
+        assert_eq!(cells[idx].c, *ch);
+        assert_eq!(cells[idx].fg, *fg, "cell {idx} ({ch:?}) fg mismatch");
+        assert_eq!(
+            cells[idx].bg,
+            Color::DefaultBg,
+            "cell {idx} ({ch:?}) bg must remain DefaultBg"
+        );
+        assert!(cells[idx].flags.contains(CellFlags::BOLD));
+        assert!(cells[idx].flags.contains(CellFlags::UNDERLINE));
+        assert!(
+            !cells[idx].flags.contains(CellFlags::DIM),
+            "58;2;... must not set DIM flag"
+        );
+    }
+
+    // Also test colon-separated ITU T.416 SGR subparameters (4:3, 38:2::R:G:B, 58:2::R:G:B, 4:0)
+    term.feed_bytes(b"\r\n\x1b[4:3;38:2::12:34:56;58:2::93:100:107mX\x1b[4:0mY\x1b[m");
+    let row1 = &term.grid().active().grid[1].cells;
+    assert_eq!(row1[0].c, 'X');
+    assert_eq!(row1[0].fg, Color::Rgb(12, 34, 56));
+    assert_eq!(row1[0].bg, Color::DefaultBg);
+    assert!(row1[0].flags.contains(CellFlags::UNDERLINE));
+    assert!(!row1[0].flags.contains(CellFlags::ITALIC));
+
+    assert_eq!(row1[1].c, 'Y');
+    assert_eq!(row1[1].fg, Color::Rgb(12, 34, 56));
+    assert!(!row1[1].flags.contains(CellFlags::UNDERLINE));
+}

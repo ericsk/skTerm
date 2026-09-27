@@ -399,11 +399,15 @@ impl TermRenderer {
             .await?;
 
         let surface_caps = surface.get_capabilities(&adapter);
+        // Terminal colors (TrueColor RGB, 256-color palette, theme hex values, and
+        // Sixel/Kitty Rgba8Unorm textures) are already in sRGB [0.0..1.0]. Selecting an
+        // `*Srgb` surface format would apply hardware linear-to-sRGB gamma encoding a
+        // second time and wash out midtones.
         let surface_format = surface_caps
             .formats
             .iter()
             .copied()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
         // Prioritize non-blocking, low-latency presentation modes for maximum typing smoothness
@@ -1360,7 +1364,11 @@ impl TermRenderer {
                         // search used to disable this fast path for the entire screen.
                         if cell.c == ' '
                             && cell.bg == Color::DefaultBg
-                            && !cell.flags.contains(CellFlags::INVERSE)
+                            && !cell.flags.intersects(
+                                CellFlags::INVERSE
+                                    | CellFlags::UNDERLINE
+                                    | CellFlags::STRIKETHROUGH,
+                            )
                             && !is_selected
                             && row_matches.is_empty()
                         {
@@ -1369,7 +1377,7 @@ impl TermRenderer {
 
                         let is_inverse = cell.flags.contains(CellFlags::INVERSE);
                         let is_bold_flag = cell.flags.contains(CellFlags::BOLD);
-                        let (fg_rgba, bg_rgba) = if is_inverse {
+                        let (mut fg_rgba, bg_rgba) = if is_inverse {
                             (
                                 color_to_rgba_themed(cell.bg, false, is_bold_flag, &self.theme),
                                 color_to_rgba_themed(cell.fg, true, false, &self.theme),
@@ -1380,6 +1388,12 @@ impl TermRenderer {
                                 color_to_rgba_themed(cell.bg, true, false, &self.theme),
                             )
                         };
+
+                        if cell.flags.contains(CellFlags::DIM) {
+                            fg_rgba[0] *= 0.66;
+                            fg_rgba[1] *= 0.66;
+                            fg_rgba[2] *= 0.66;
+                        }
 
                         if bg_rgba != self.theme.default_bg {
                             bg_instances.push(BgInstance {
@@ -1418,9 +1432,30 @@ impl TermRenderer {
                             });
                         }
 
+                        if !cell.flags.contains(CellFlags::HIDDEN) {
+                            let line_h = scale.round().max(1.0);
+                            if cell.flags.contains(CellFlags::UNDERLINE) {
+                                let ul_y =
+                                    (y + baseline + (2.0 * scale).round()).min(y + cell_h - line_h);
+                                bg_instances.push(BgInstance {
+                                    rect: [x, ul_y, cell_w, line_h],
+                                    color: fg_rgba,
+                                });
+                            }
+                            if cell.flags.contains(CellFlags::STRIKETHROUGH) {
+                                let st_y = (y + (cell_h * 0.5).round()).min(y + cell_h - line_h);
+                                bg_instances.push(BgInstance {
+                                    rect: [x, st_y, cell_w, line_h],
+                                    color: fg_rgba,
+                                });
+                            }
+                        }
+
                         if cell.c != ' '
                             && cell.c != '\0'
-                            && !cell.flags.contains(CellFlags::WIDE_CHAR_SPACER)
+                            && !cell
+                                .flags
+                                .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::HIDDEN)
                         {
                             // Procedural gap-free rendering for Unicode Block Elements and Box Drawing
                             if draw_custom_block_or_box_char(
