@@ -437,4 +437,20 @@ fn test_vt_sgr_underline_color_and_subparams() {
     assert_eq!(row1[1].c, 'Y');
     assert_eq!(row1[1].fg, Color::Rgb(12, 34, 56));
     assert!(!row1[1].flags.contains(CellFlags::UNDERLINE));
+
+    // Exiting a TUI (like Jetski CLI) emits xterm modifyOtherKeys teardown `\x1b[>4m`
+    // (and startup `\x1b[>4;2m`). Because these have intermediate `>`, they must NOT
+    // be interpreted as SGR 4 (UNDERLINE) or SGR 2 (DIM) on the shell prompt that follows.
+    term.feed_bytes(b"\r\n\x1b[>4;2m\x1b[>4mprompt% ");
+    let row2 = &term.grid().active().grid[2].cells;
+    for cell in &row2[0..8] {
+        assert!(
+            !cell.flags.contains(CellFlags::UNDERLINE),
+            "CSI > 4 m must not enable UNDERLINE on subsequent prompt text"
+        );
+        assert!(
+            !cell.flags.contains(CellFlags::DIM),
+            "CSI > 4 ; 2 m must not enable DIM on subsequent prompt text"
+        );
+    }
 }

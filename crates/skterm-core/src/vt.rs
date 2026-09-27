@@ -445,7 +445,7 @@ impl Perform for TerminalState {
         }
 
         match action {
-            'm' => self.parse_sgr(params),
+            'm' if intermediates.is_empty() => self.parse_sgr(params),
             'H' | 'f' => {
                 let mut row = 1;
                 let mut col = 1;
@@ -544,7 +544,7 @@ impl Perform for TerminalState {
                 .scroll_down((first_param as usize).max(1)),
             's' if !is_private && intermediates.is_empty() => self.save_cursor(),
             'u' if !is_private && intermediates.is_empty() => self.restore_cursor(),
-            'r' => {
+            'r' if intermediates.is_empty() => {
                 let mut top = 1;
                 let mut bottom = self.grid.active().rows;
                 let mut iter = params.iter();
@@ -588,7 +588,7 @@ impl Perform for TerminalState {
                                 1006 => self.mouse_format = MouseFormat::Sgr,
                                 _ => {}
                             }
-                        } else if mode == 4 {
+                        } else if intermediates.is_empty() && mode == 4 {
                             self.insert_mode = true;
                         }
                     }
@@ -611,7 +611,7 @@ impl Perform for TerminalState {
                                 1006 => self.mouse_format = MouseFormat::X10,
                                 _ => {}
                             }
-                        } else if mode == 4 {
+                        } else if intermediates.is_empty() && mode == 4 {
                             self.insert_mode = false;
                         }
                     }
