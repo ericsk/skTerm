@@ -1367,7 +1367,8 @@ impl TermRenderer {
                             && !cell.flags.intersects(
                                 CellFlags::INVERSE
                                     | CellFlags::UNDERLINE
-                                    | CellFlags::STRIKETHROUGH,
+                                    | CellFlags::STRIKETHROUGH
+                                    | CellFlags::OVERLINE,
                             )
                             && !is_selected
                             && row_matches.is_empty()
@@ -1435,10 +1436,64 @@ impl TermRenderer {
                         if !cell.flags.contains(CellFlags::HIDDEN) {
                             let line_h = scale.round().max(1.0);
                             if cell.flags.contains(CellFlags::UNDERLINE) {
+                                let ul_rgba = cell
+                                    .underline_color_id
+                                    .and_then(|id| pane.grid.get_underline_color(id))
+                                    .map(|col| color_to_rgba_themed(col, false, false, &self.theme))
+                                    .unwrap_or(fg_rgba);
                                 let ul_y =
                                     (y + baseline + (2.0 * scale).round()).min(y + cell_h - line_h);
+
+                                if cell.flags.contains(CellFlags::DOUBLE_UNDERLINE) {
+                                    let top_ul_y = (ul_y - 2.0 * line_h).max(y);
+                                    bg_instances.push(BgInstance {
+                                        rect: [x, top_ul_y, cell_w, line_h],
+                                        color: ul_rgba,
+                                    });
+                                    bg_instances.push(BgInstance {
+                                        rect: [x, ul_y, cell_w, line_h],
+                                        color: ul_rgba,
+                                    });
+                                } else if cell.flags.contains(CellFlags::CURLY_UNDERLINE) {
+                                    let seg_w = (cell_w / 4.0).max(1.0);
+                                    for step in 0..4 {
+                                        let sy = if step % 2 == 0 {
+                                            (ul_y - line_h).max(y)
+                                        } else {
+                                            ul_y
+                                        };
+                                        bg_instances.push(BgInstance {
+                                            rect: [x + step as f32 * seg_w, sy, seg_w, line_h],
+                                            color: ul_rgba,
+                                        });
+                                    }
+                                } else if cell.flags.contains(CellFlags::DOTTED_UNDERLINE) {
+                                    let dot_w = (cell_w / 4.0).max(1.0);
+                                    bg_instances.push(BgInstance {
+                                        rect: [x, ul_y, dot_w, line_h],
+                                        color: ul_rgba,
+                                    });
+                                    bg_instances.push(BgInstance {
+                                        rect: [x + 2.0 * dot_w, ul_y, dot_w, line_h],
+                                        color: ul_rgba,
+                                    });
+                                } else if cell.flags.contains(CellFlags::DASHED_UNDERLINE) {
+                                    let dash_w = (cell_w * 0.65).max(1.0);
+                                    let dash_x = x + (cell_w - dash_w) * 0.5;
+                                    bg_instances.push(BgInstance {
+                                        rect: [dash_x, ul_y, dash_w, line_h],
+                                        color: ul_rgba,
+                                    });
+                                } else {
+                                    bg_instances.push(BgInstance {
+                                        rect: [x, ul_y, cell_w, line_h],
+                                        color: ul_rgba,
+                                    });
+                                }
+                            }
+                            if cell.flags.contains(CellFlags::OVERLINE) {
                                 bg_instances.push(BgInstance {
-                                    rect: [x, ul_y, cell_w, line_h],
+                                    rect: [x, y, cell_w, line_h],
                                     color: fg_rgba,
                                 });
                             }

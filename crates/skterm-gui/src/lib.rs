@@ -18,7 +18,8 @@ pub use config::{default_config_template, parse_hex_color, Config, ConfigManager
 pub use icon::{apply_window_icon, configure_window_attributes, get_app_icon};
 pub use input::{
     check_tab_switch, check_tab_switch_for_os, encode_key, encode_key_event,
-    is_tab_switch_modifier, is_tab_switch_modifier_for_os, parse_tab_switch_digit,
+    encode_key_event_with_modes, encode_key_with_modes, is_tab_switch_modifier,
+    is_tab_switch_modifier_for_os, parse_tab_switch_digit,
 };
 pub use layout::{
     PaneId, PaneNode, PollOutcome, Rect, SplitDirection, SplitterBar, Tab, TabId, Workspace,
@@ -945,5 +946,73 @@ mod tests {
             assert!(reads > 0, "test did not actually read anything");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn test_encode_key_kitty_and_modify_other_keys() {
+        use winit::keyboard::{Key, NamedKey};
+
+        let mut shift = ModifiersState::empty();
+        shift.insert(ModifiersState::SHIFT);
+
+        let mut ctrl_shift = ModifiersState::empty();
+        ctrl_shift.insert(ModifiersState::CONTROL | ModifiersState::SHIFT);
+
+        // Shift+Enter with Kitty flags = 1 -> CSI 13;2u
+        let shift_enter_kitty = encode_key_with_modes(
+            &Key::Named(NamedKey::Enter),
+            None,
+            ElementState::Pressed,
+            shift,
+            false,
+            1,
+            0,
+        );
+        assert_eq!(shift_enter_kitty.as_deref(), Some(b"\x1b[13;2u".as_slice()));
+
+        // Shift+Enter with modifyOtherKeys = 2 -> CSI 27;2;13~
+        let shift_enter_mok = encode_key_with_modes(
+            &Key::Named(NamedKey::Enter),
+            None,
+            ElementState::Pressed,
+            shift,
+            false,
+            0,
+            2,
+        );
+        assert_eq!(
+            shift_enter_mok.as_deref(),
+            Some(b"\x1b[27;2;13~".as_slice())
+        );
+
+        // Ctrl+Shift+A with Kitty flags = 1 -> CSI 97;6u (base lowercase codepoint 97, mod 1+1+4=6)
+        let ctrl_shift_a_kitty = encode_key_with_modes(
+            &Key::Character("A".into()),
+            Some("A"),
+            ElementState::Pressed,
+            ctrl_shift,
+            false,
+            1,
+            0,
+        );
+        assert_eq!(
+            ctrl_shift_a_kitty.as_deref(),
+            Some(b"\x1b[97;6u".as_slice())
+        );
+
+        // Key release with Kitty flags = 3 (disambiguate + report event types) -> CSI 97;6:3u
+        let ctrl_shift_a_release = encode_key_with_modes(
+            &Key::Character("A".into()),
+            None,
+            ElementState::Released,
+            ctrl_shift,
+            false,
+            3,
+            0,
+        );
+        assert_eq!(
+            ctrl_shift_a_release.as_deref(),
+            Some(b"\x1b[97;6:3u".as_slice())
+        );
     }
 }

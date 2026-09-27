@@ -49,18 +49,18 @@
    - `?2026` (Synchronized Output)：追蹤批次畫面更新狀態並支援 DECRQM `?2026$p` 查詢。
 6. [x] **VT100 特殊繪圖字元集 (DEC Special Graphics `ESC ( 0` / `ESC ( B`)**
    - 支援 G0/G1 字元集切換與 `0x0E` (SO) / `0x0F` (SI)，將 DEC Special Graphics 模式的 `0x60..=0x7E` 映射為對應的 Unicode 框線與符號字元（解決傳統 `ncurses` / `dialog` / `tmux` ACS 框線顯示為 `qqqqxxxx` 的問題）。
-7. [ ] **獨立底線色彩儲存與進階底線樣式 (`4:2` 雙底線、`4:3` 波浪底線、SGR `53` Overline)**
-   - 在不顯著增加 `Cell` 記憶體開銷的前提下支援獨立底線色與 LSP 波浪底線渲染。
-8. [ ] **DEC Origin Mode (`?6` DECOM) 與 Focus Event (`?1004`)**
-   - 支援 `CSI H` 相對於 `scroll_region` 的定位模式，以及視窗焦點切換時發送 `\x1b[I` / `\x1b[O`。
+7. [x] **獨立底線色彩儲存與進階底線樣式 (`4:2` 雙底線、`4:3` 波浪底線、`4:4` 點狀底線、`4:5` 虛線底線、SGR `53`/`55` Overline)**
+   - 利用 `Cell` 內原有的 2 bytes 對齊空間儲存 `underline_color_id: Option<NonZeroU16>`（維持 `size_of::<Cell>() == 20` 零額外記憶體開銷），並於 `skterm-render` 實作雙底線、LSP 波浪底線、點狀／虛線底線、Overline 與獨立底線色彩渲染。
+8. [x] **DEC Origin Mode (`?6` DECOM) 與 Focus Event (`?1004`)**
+   - 支援 `?6h`/`?6l`（使 `CSI H`/`f`/`d` 與 `CPR` 相對於 `scroll_region` 定位並限制於捲動區內），以及 `?1004h`/`?1004l` 視窗焦點切換時發送 `\x1b[I` / `\x1b[O`。
 
 ---
 
 ## 🟢 第三階段：低優先級 (Low Priority — 進階擴充協定)
 
-9. [ ] **進階鍵盤協定 (Kitty Keyboard Protocol `CSI > Ps u` & xterm `modifyOtherKeys`)**
-   - 支援無歧義組合鍵編碼（如 `Shift+Enter`、`Ctrl+I` vs `Tab`、`Ctrl+;` 等）。
-10. [ ] **動態調色盤 OSC 控制碼 (`OSC 4`、`OSC 104`、`OSC 110`～`112`)**
-    - 支援執行期動態修改與重設 ANSI 256 色盤與游標色彩。
-11. [ ] **自訂 Tab 停駐點 (`ESC H` HTS、`CSI g` TBC)**
-    - 支援動態設定與清除水平 Tab 停駐點。
+9. [x] **進階鍵盤協定 (Kitty Keyboard Protocol `CSI > Ps u` / `CSI < u` / `CSI = u` / `CSI ? u` & xterm `modifyOtherKeys`)**
+   - 支援無歧義組合鍵編碼（如 `Shift+Enter`、`Ctrl+Shift+Letter`、`Ctrl+;`、Kitty `CSI u` 與 xterm `27;mod;code~`），並在離開 Alternate Screen 時自動清理堆疊狀態。
+10. [x] **動態調色盤 OSC 控制碼 (`OSC 4`、`OSC 104`、`OSC 10`～`12` 設定與 `OSC 110`～`112` 重設)**
+    - 支援執行期動態修改、查詢（`?`）與重設 ANSI 256 色盤及預設前景／背景／游標色彩（支援 `#RRGGBB` 與 `rgb:RRRR/GGGG/BBBB` 格式）。
+11. [x] **自訂 Tab 停駐點 (`ESC H` HTS、`CSI g` TBC)**
+    - 支援 `ESC H` 於當前欄設定水平 Tab 停駐點、`CSI 0 g` 清除當前欄停駐點、`CSI 3 g` 清除全部停駐點，並與 `\t`、`CSI I` (CHT)、`CSI Z` (CBT) 完整整合。

@@ -587,3 +587,155 @@ fn test_vt_decawm_autowrap_and_dec_special_graphics() {
         .collect();
     assert_eq!(row2.trim_end(), "└───┘done");
 }
+
+#[test]
+fn test_vt_underline_styles_independent_color_and_overline() {
+    use skterm_core::CellFlags;
+    let mut term = Terminal::new_headless(5, 20, 100);
+
+    // Write cell 0 with curly underline (4:3) + red underline color (58;2;255;10;20) + green fg (32)
+    // Write cell 1 with double underline (21) + blue underline color (58:5:21) + overline (53)
+    // Write cell 2 after resetting underline color (59), underline (24), and overline (55)
+    term.feed_bytes(b"\x1b[32;4:3;58;2;255;10;20mA\x1b[21;53;58:5:21mB\x1b[24;55;59mC");
+
+    let c0 = term.grid().active().grid[0].cells[0];
+    assert_eq!(c0.c, 'A');
+    assert_eq!(c0.fg, Color::Named(NamedColor::Green));
+    assert!(c0
+        .flags
+        .contains(CellFlags::UNDERLINE | CellFlags::CURLY_UNDERLINE));
+    assert!(!c0.flags.contains(CellFlags::DOUBLE_UNDERLINE));
+    let ul0 = c0
+        .underline_color_id
+        .and_then(|id| term.grid().get_underline_color(id));
+    assert_eq!(ul0, Some(Color::Rgb(255, 10, 20)));
+
+    let c1 = term.grid().active().grid[0].cells[1];
+    assert_eq!(c1.c, 'B');
+    assert_eq!(c1.fg, Color::Named(NamedColor::Green));
+    assert!(c1.flags.contains(CellFlags::DOUBLE_UNDERLINE));
+    assert!(c1.flags.contains(CellFlags::OVERLINE));
+    assert!(!c1.flags.contains(CellFlags::CURLY_UNDERLINE));
+    let ul1 = c1
+        .underline_color_id
+        .and_then(|id| term.grid().get_underline_color(id));
+    assert_eq!(ul1, Some(Color::Indexed(21)));
+
+    let c2 = term.grid().active().grid[0].cells[2];
+    assert_eq!(c2.c, 'C');
+    assert!(!c2.flags.intersects(CellFlags::ANY_UNDERLINE));
+    assert!(!c2.flags.contains(CellFlags::OVERLINE));
+    assert_eq!(c2.underline_color_id, None);
+}
+
+#[test]
+fn test_vt_decom_origin_mode_and_focus_events() {
+    let mut term = Terminal::new_headless(10, 20, 100);
+
+    // Set scroll region rows 3..7 (1-based) -> 0-based rows 2..6
+    // Enable Origin Mode (?6h): cursor should home to (row 2, col 0)
+    term.feed_bytes(b"\x1b[3;7r\x1b[?6h");
+    assert!(term.state.origin_mode);
+    assert_eq!(term.grid().active().cursor.row, 2);
+    assert_eq!(term.grid().active().cursor.col, 0);
+
+    // Move to relative (2, 4) -> absolute (row 3, col 3)
+    term.feed_bytes(b"\x1b[2;4H");
+    assert_eq!(term.grid().active().cursor.row, 3);
+    assert_eq!(term.grid().active().cursor.col, 3);
+
+    // Trying to move beyond the scroll region (row 99) clamps to region bottom (row 6)
+    term.feed_bytes(b"\x1b[99;1H");
+    assert_eq!(term.grid().active().cursor.row, 6);
+
+    // CPR (\x1b[6n) in Origin Mode reports relative row (5, since 6 - 2 + 1 = 5)
+    term.feed_bytes(b"\x1b[6n");
+    assert_eq!(term.take_pending_responses(), b"\x1b[5;1R");
+
+    // Disable Origin Mode (?6l): cursor homes to absolute (0, 0)
+    term.feed_bytes(b"\x1b[?6l");
+    assert!(!term.state.origin_mode);
+    assert_eq!(term.grid().active().cursor.row, 0);
+    assert_eq!(term.grid().active().cursor.col, 0);
+
+    // Focus events mode (?1004h / ?1004$p)
+    term.feed_bytes(b"\x1b[?1004h\x1b[?1004$p");
+    assert!(term.state.focus_events);
+    assert_eq!(term.take_pending_responses(), b"\x1b[?1004;1$y");
+}
+
+#[test]
+fn test_vt_kitty_keyboard_protocol_and_modify_other_keys() {
+    let mut term = Terminal::new_headless(5, 20, 100);
+
+    // Push flags 1 (\x1b[>1u), query (\x1b[?u)
+    term.feed_bytes(b"\x1b[>1u\x1b[?u");
+    assert_eq!(term.state.kitty_keyboard_flags(), 1);
+    assert_eq!(term.take_pending_responses(), b"\x1b[?1u");
+
+    // Push flags 3 (\x1b[>3u), then OR with 8 via mode 2 (\x1b[=8;2u) -> 11
+    term.feed_bytes(b"\x1b[>3u\x1b[=8;2u\x1b[?u");
+    assert_eq!(term.state.kitty_keyboard_flags(), 11);
+    assert_eq!(term.take_pending_responses(), b"\x1b[?11u");
+
+    // Pop 1 entry (\x1b[<1u) -> back to 1
+    term.feed_bytes(b"\x1b[<1u\x1b[?u");
+    assert_eq!(term.state.kitty_keyboard_flags(), 1);
+    assert_eq!(term.take_pending_responses(), b"\x1b[?1u");
+
+    // modifyOtherKeys level 2 (\x1b[>4;2m) and reset (\x1b[>4m)
+    term.feed_bytes(b"\x1b[>4;2m");
+    assert_eq!(term.state.modify_other_keys, 2);
+    term.feed_bytes(b"\x1b[>4m");
+    assert_eq!(term.state.modify_other_keys, 0);
+}
+
+#[test]
+fn test_vt_osc_dynamic_colors_and_palette() {
+    let mut term = Terminal::new_headless(5, 20, 100);
+
+    // Set palette index 1 via #RRGGBB and query it via OSC 4;1;?
+    term.feed_bytes(b"\x1b]4;1;#ff0080\x07\x1b]4;1;?\x07");
+    assert_eq!(
+        term.state.dynamic_palette.get(&1).copied(),
+        Some((0xff, 0x00, 0x80))
+    );
+    assert_eq!(
+        term.take_pending_responses(),
+        b"\x1b]4;1;rgb:ffff/0000/8080\x07"
+    );
+
+    // Reset palette index 1 via OSC 104;1
+    term.feed_bytes(b"\x1b]104;1\x07");
+    assert_eq!(term.state.dynamic_palette.get(&1), None);
+
+    // Set dynamic fg (OSC 10), bg (OSC 11), cursor (OSC 12) and query OSC 10;? with ST
+    term.feed_bytes(b"\x1b]10;rgb:1212/3434/5656\x07\x1b]10;?\x1b\\");
+    assert_eq!(term.state.dynamic_fg, Some((0x12, 0x34, 0x56)));
+    assert_eq!(
+        term.take_pending_responses(),
+        b"\x1b]10;rgb:1212/3434/5656\x1b\\"
+    );
+
+    // Reset dynamic fg via OSC 110
+    term.feed_bytes(b"\x1b]110\x07");
+    assert_eq!(term.state.dynamic_fg, None);
+}
+
+#[test]
+fn test_vt_custom_tab_stops_hts_and_tbc() {
+    let mut term = Terminal::new_headless(5, 20, 100);
+
+    // Clear all tab stops (\x1b[3g), move to col 4 (1-based col 5), set tab stop (\x1bH),
+    // move to col 11 (1-based col 12), set tab stop (\x1bH).
+    term.feed_bytes(b"\x1b[3g\x1b[1;5H\x1bH\x1b[1;12H\x1bH\x1b[1;1H");
+    term.feed_bytes(b"\t");
+    assert_eq!(term.grid().active().cursor.col, 4);
+    term.feed_bytes(b"\t");
+    assert_eq!(term.grid().active().cursor.col, 11);
+
+    // Clear current tab stop at col 11 (\x1b[0g), go to col 19, and backward tab (\x1b[Z)
+    // should land directly on col 4.
+    term.feed_bytes(b"\x1b[0g\x1b[1;20H\x1b[Z");
+    assert_eq!(term.grid().active().cursor.col, 4);
+}

@@ -350,18 +350,30 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
 
-        // 2. Track Focused Window
-        if let WindowEvent::Focused(true) = event {
-            self.active_session_id = Some(window_id);
-            // Selecting a tab is the user seeing it, so retire its activity dot.
+        // 2. Track Focused Window & Focus Events (?1004)
+        if let WindowEvent::Focused(focused) = event {
+            if focused {
+                self.active_session_id = Some(window_id);
+            }
             if let Some(session) = self.sessions.get_mut(&window_id) {
-                session.clear_unseen_output();
-                #[cfg(target_os = "macos")]
-                {
-                    let win_ptr = get_nswindow(&session.window);
-                    unsafe {
-                        center_macos_window_title(win_ptr);
-                        style_macos_tab_bar(win_ptr);
+                if focused {
+                    // Selecting a tab is the user seeing it, so retire its activity dot.
+                    session.clear_unseen_output();
+                    #[cfg(target_os = "macos")]
+                    {
+                        let win_ptr = get_nswindow(&session.window);
+                        unsafe {
+                            center_macos_window_title(win_ptr);
+                            style_macos_tab_bar(win_ptr);
+                        }
+                    }
+                }
+                if let Some(tab) = session.workspace.active_tab_mut() {
+                    if let Some(term) = tab.active_terminal_mut() {
+                        if term.state.focus_events {
+                            let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+                            let _ = term.write_to_pty(seq);
+                        }
                     }
                 }
             }

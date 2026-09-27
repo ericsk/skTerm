@@ -3,7 +3,7 @@
 use crate::graphics::GraphicImage;
 use bitflags::bitflags;
 use std::collections::{HashMap, VecDeque};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
 
@@ -22,11 +22,21 @@ bitflags! {
         const WIDE_CHAR         = 1 << 8;
         const WIDE_CHAR_SPACER  = 1 << 9;
         const WRAP_SPACER       = 1 << 10;
+        const DOUBLE_UNDERLINE  = 1 << 11;
+        const CURLY_UNDERLINE   = 1 << 12;
+        const DOTTED_UNDERLINE  = 1 << 13;
+        const DASHED_UNDERLINE  = 1 << 14;
+        const OVERLINE          = 1 << 15;
+        const ANY_UNDERLINE     = Self::UNDERLINE.bits()
+                                | Self::DOUBLE_UNDERLINE.bits()
+                                | Self::CURLY_UNDERLINE.bits()
+                                | Self::DOTTED_UNDERLINE.bits()
+                                | Self::DASHED_UNDERLINE.bits();
     }
 }
 
 /// Standard 16 ANSI colors
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NamedColor {
     Black,
     Red,
@@ -47,7 +57,7 @@ pub enum NamedColor {
 }
 
 /// Cell foreground / background color representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Color {
     #[default]
     DefaultFg,
@@ -64,19 +74,21 @@ pub enum Color {
 ///
 /// `hyperlink_id` uses `NonZeroU32` so that `Option` can exploit the null niche
 /// instead of spending 4 extra bytes on a discriminant (`Option<u32>` is 8 bytes,
-/// `Option<NonZeroU32>` is 4). Hyperlink ids are handed out starting from 1, so zero
-/// is never a valid id.
+/// `Option<NonZeroU32>` is 4). `underline_color_id` uses `Option<NonZeroU16>` (2 bytes)
+/// to occupy the 2 bytes of alignment padding next to `flags` (`u16`), keeping `Cell`
+/// at 20 bytes total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     pub c: char,
     pub fg: Color,
     pub bg: Color,
     pub flags: CellFlags,
+    pub underline_color_id: Option<NonZeroU16>,
     pub hyperlink_id: Option<NonZeroU32>,
 }
 
-// Lock in the layout: 4 (char) + 4 (fg) + 4 (bg) + 2 (flags) + 4 (link) = 18, padded
-// to 20 by the alignment-4 fields. If this ever fails, check what was added to `Cell`.
+// Lock in the layout: 4 (char) + 4 (fg) + 4 (bg) + 2 (flags) + 2 (underline_color_id) + 4 (link) = 20.
+// If this ever fails, check what was added to `Cell`.
 const _: () = assert!(std::mem::size_of::<Cell>() == 20);
 
 impl Default for Cell {
@@ -86,6 +98,7 @@ impl Default for Cell {
             fg: Color::DefaultFg,
             bg: Color::DefaultBg,
             flags: CellFlags::empty(),
+            underline_color_id: None,
             hyperlink_id: None,
         }
     }
@@ -98,6 +111,7 @@ impl Cell {
             fg,
             bg,
             flags,
+            underline_color_id: None,
             hyperlink_id: None,
         }
     }
@@ -115,6 +129,7 @@ impl Cell {
             fg: Color::DefaultFg,
             bg,
             flags: CellFlags::empty(),
+            underline_color_id: None,
             hyperlink_id: None,
         }
     }
@@ -154,6 +169,7 @@ impl Row {
                     c.c != ' '
                         || c.bg != Color::DefaultBg
                         || c.flags != CellFlags::empty()
+                        || c.underline_color_id.is_some()
                         || c.hyperlink_id.is_some()
                 })
                 .map(|idx| idx + 1)
@@ -221,10 +237,13 @@ pub struct SavedCursor {
     pub col: usize,
     pub fg: Color,
     pub bg: Color,
+    pub underline_color: Option<Color>,
+    pub underline_color_id: Option<NonZeroU16>,
     pub flags: CellFlags,
     pub shape: CursorShape,
     pub visible: bool,
     pub pending_wrap: bool,
+    pub origin_mode: bool,
 }
 
 /// Text Selection Mode
@@ -302,11 +321,13 @@ pub struct ScreenBuffer {
     pub selection: Option<Selection>,
     pub scroll_offset: usize,
     pub images: Vec<GraphicImage>,
+    pub tab_stops: Vec<bool>,
 }
 
 impl ScreenBuffer {
     pub fn new(rows: usize, cols: usize, max_scrollback: usize) -> Self {
         let grid = (0..rows).map(|_| Row::new(cols)).collect();
+        let tab_stops = (0..cols).map(|c| c > 0 && c % 8 == 0).collect();
         Self {
             rows,
             cols,
@@ -319,7 +340,63 @@ impl ScreenBuffer {
             selection: None,
             scroll_offset: 0,
             images: Vec::new(),
+            tab_stops,
         }
+    }
+
+    fn resize_tab_stops(&mut self, new_cols: usize) {
+        let old_len = self.tab_stops.len();
+        if new_cols > old_len {
+            self.tab_stops
+                .extend((old_len..new_cols).map(|c| c > 0 && c % 8 == 0));
+        } else {
+            self.tab_stops.truncate(new_cols);
+        }
+    }
+
+    pub fn set_tab_stop(&mut self) {
+        if self.cursor.col < self.tab_stops.len() {
+            self.tab_stops[self.cursor.col] = true;
+        }
+    }
+
+    pub fn clear_tab_stop(&mut self, mode: usize) {
+        match mode {
+            0 => {
+                if self.cursor.col < self.tab_stops.len() {
+                    self.tab_stops[self.cursor.col] = false;
+                }
+            }
+            3 => {
+                self.tab_stops.fill(false);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn advance_tab(&mut self, count: usize) {
+        let max_col = self.cols.saturating_sub(1);
+        for _ in 0..count.max(1) {
+            let next = ((self.cursor.col + 1)..self.cols)
+                .find(|&c| self.tab_stops.get(c).copied().unwrap_or(false))
+                .unwrap_or(max_col);
+            self.cursor.col = next.min(max_col);
+        }
+        self.cursor.pending_wrap = false;
+    }
+
+    pub fn backward_tab(&mut self, count: usize) {
+        for _ in 0..count.max(1) {
+            if self.cursor.col == 0 {
+                break;
+            }
+            let prev = (0..self.cursor.col)
+                .rev()
+                .find(|&c| self.tab_stops.get(c).copied().unwrap_or(false))
+                .unwrap_or(0);
+            self.cursor.col = prev;
+        }
+        self.cursor.pending_wrap = false;
     }
 
     pub fn add_image(&mut self, img: GraphicImage) {
@@ -407,6 +484,7 @@ impl ScreenBuffer {
             }
         }
 
+        self.resize_tab_stops(new_cols);
         self.rows = new_rows;
         self.cols = new_cols;
         self.scroll_region = (0, new_rows.saturating_sub(1));
@@ -767,6 +845,7 @@ impl ScreenBuffer {
             self.cursor.col = cursor_col_final.min(new_cols.saturating_sub(1));
         }
 
+        self.resize_tab_stops(new_cols);
         self.rows = new_rows;
         self.cols = new_cols;
         self.scroll_region = (0, new_rows.saturating_sub(1));
@@ -1080,6 +1159,20 @@ impl ScreenBuffer {
         hyperlink_id: Option<NonZeroU32>,
         auto_wrap: bool,
     ) {
+        self.write_char_with_style(c, fg, bg, flags, None, hyperlink_id, auto_wrap);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_char_with_style(
+        &mut self,
+        c: char,
+        fg: Color,
+        bg: Color,
+        flags: CellFlags,
+        underline_color_id: Option<NonZeroU16>,
+        hyperlink_id: Option<NonZeroU32>,
+        auto_wrap: bool,
+    ) {
         let char_width = UnicodeWidthChar::width(c).unwrap_or(1);
         if char_width == 0 {
             return;
@@ -1126,6 +1219,7 @@ impl ScreenBuffer {
         cell.fg = fg;
         cell.bg = bg;
         cell.flags = actual_flags;
+        cell.underline_color_id = underline_color_id;
         cell.hyperlink_id = hyperlink_id;
         row.is_dirty = true;
 
@@ -1135,6 +1229,7 @@ impl ScreenBuffer {
             spacer_cell.fg = fg;
             spacer_cell.bg = bg;
             spacer_cell.flags = flags | CellFlags::WIDE_CHAR_SPACER;
+            spacer_cell.underline_color_id = underline_color_id;
             spacer_cell.hyperlink_id = hyperlink_id;
             self.cursor.col += 1;
         }
@@ -1666,6 +1761,8 @@ pub struct ScreenGrid {
     pub is_alternate: bool,
     pub next_hyperlink_id: NonZeroU32,
     pub hyperlinks: HashMap<NonZeroU32, Arc<String>>,
+    pub underline_colors: Vec<Color>,
+    pub underline_color_map: HashMap<Color, NonZeroU16>,
     pub next_image_id: u32,
 }
 
@@ -1678,8 +1775,27 @@ impl ScreenGrid {
             // Starts at 1: zero is reserved as the `None` niche in `Cell::hyperlink_id`.
             next_hyperlink_id: NonZeroU32::new(1).unwrap(),
             hyperlinks: HashMap::new(),
+            underline_colors: Vec::new(),
+            underline_color_map: HashMap::new(),
             next_image_id: 1,
         }
+    }
+
+    pub fn register_underline_color(&mut self, color: Color) -> Option<NonZeroU16> {
+        if let Some(&id) = self.underline_color_map.get(&color) {
+            return Some(id);
+        }
+        let next_idx = self.underline_colors.len() + 1;
+        let id = NonZeroU16::new(next_idx.min(u16::MAX as usize) as u16)?;
+        if self.underline_colors.len() < u16::MAX as usize {
+            self.underline_colors.push(color);
+            self.underline_color_map.insert(color, id);
+        }
+        Some(id)
+    }
+
+    pub fn get_underline_color(&self, id: NonZeroU16) -> Option<Color> {
+        self.underline_colors.get((id.get() - 1) as usize).copied()
     }
 
     pub fn register_hyperlink(&mut self, uri: &str) -> NonZeroU32 {

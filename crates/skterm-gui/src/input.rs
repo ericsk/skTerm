@@ -30,29 +30,93 @@ pub fn encode_key(
     modifiers: ModifiersState,
     app_cursor_keys: bool,
 ) -> Option<Vec<u8>> {
-    if state != ElementState::Pressed || modifiers.super_key() {
+    encode_key_with_modes(logical_key, text, state, modifiers, app_cursor_keys, 0, 0)
+}
+
+/// Encode key parameters with optional Kitty Keyboard Protocol (`kitty_flags`) and
+/// xterm `modifyOtherKeys` (`modify_other_keys`) modes.
+pub fn encode_key_with_modes(
+    logical_key: &Key,
+    text: Option<&str>,
+    state: ElementState,
+    modifiers: ModifiersState,
+    app_cursor_keys: bool,
+    kitty_flags: u16,
+    modify_other_keys: u8,
+) -> Option<Vec<u8>> {
+    if modifiers.super_key() {
         return None;
     }
 
-    // 1. Check Ctrl + Letter combinations (ASCII 0x01 to 0x1A)
-    if modifiers.control_key() && !modifiers.alt_key() {
-        if let Key::Character(ref s) = logical_key {
-            if let Some(first_char) = s.chars().next() {
-                let lower = first_char.to_ascii_lowercase();
-                if lower.is_ascii_lowercase() {
-                    let code = (lower as u8) - b'a' + 1;
-                    return Some(vec![code]);
+    let mod_code = modifier_param(modifiers);
+    let kitty_disambiguate = (kitty_flags & 1) != 0;
+    let kitty_report_events = (kitty_flags & 2) != 0;
+
+    if state != ElementState::Pressed {
+        if !kitty_report_events {
+            return None;
+        }
+        let codepoint = match logical_key {
+            Key::Character(ref s) => s.chars().next().map(|c| c.to_ascii_lowercase() as u32),
+            Key::Named(NamedKey::Enter) => Some(13),
+            Key::Named(NamedKey::Tab) => Some(9),
+            Key::Named(NamedKey::Backspace) => Some(127),
+            Key::Named(NamedKey::Escape) => Some(27),
+            _ => None,
+        }?;
+        let m = mod_code.unwrap_or(1);
+        return Some(format!("\x1b[{codepoint};{m}:3u").into_bytes());
+    }
+
+    // 1. Check Character combinations with Ctrl / Alt
+    if let Key::Character(ref s) = logical_key {
+        if let Some(first_char) = s.chars().next() {
+            let lower = first_char.to_ascii_lowercase();
+            let cp = lower as u32;
+            if let Some(m) = mod_code {
+                if kitty_disambiguate && (modifiers.control_key() || modifiers.alt_key()) {
+                    return Some(format!("\x1b[{cp};{m}u").into_bytes());
                 }
+                if modify_other_keys == 2 && (modifiers.control_key() || modifiers.alt_key()) {
+                    return Some(format!("\x1b[27;{m};{cp}~").into_bytes());
+                }
+                if modify_other_keys == 1
+                    && modifiers.control_key()
+                    && (!lower.is_ascii_lowercase() || modifiers.shift_key() || modifiers.alt_key())
+                {
+                    return Some(format!("\x1b[27;{m};{cp}~").into_bytes());
+                }
+            }
+            if modifiers.control_key() && !modifiers.alt_key() && lower.is_ascii_lowercase() {
+                let code = (lower as u8) - b'a' + 1;
+                return Some(vec![code]);
+            }
+            if modifiers.alt_key() && !modifiers.control_key() && first_char.is_ascii() {
+                return Some(vec![0x1b, first_char as u8]);
             }
         }
     }
 
-    let mod_code = modifier_param(modifiers);
-
     // 2. Named special keys
     match logical_key {
-        Key::Named(NamedKey::Enter) => Some(vec![b'\r']),
+        Key::Named(NamedKey::Enter) => {
+            if let Some(m) = mod_code {
+                if kitty_disambiguate {
+                    return Some(format!("\x1b[13;{m}u").into_bytes());
+                } else if modify_other_keys > 0 {
+                    return Some(format!("\x1b[27;{m};13~").into_bytes());
+                }
+            }
+            Some(vec![b'\r'])
+        }
         Key::Named(NamedKey::Tab) => {
+            if let Some(m) = mod_code {
+                if kitty_disambiguate {
+                    return Some(format!("\x1b[9;{m}u").into_bytes());
+                } else if modify_other_keys == 2 && m != 2 {
+                    return Some(format!("\x1b[27;{m};9~").into_bytes());
+                }
+            }
             if modifiers.shift_key() {
                 // Standard DEC / xterm Cursor Backward Tabulation (Backtab / CBT)
                 Some(b"\x1b[Z".to_vec())
@@ -60,8 +124,29 @@ pub fn encode_key(
                 Some(vec![b'\t'])
             }
         }
-        Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
-        Key::Named(NamedKey::Escape) => Some(vec![0x1b]),
+        Key::Named(NamedKey::Backspace) => {
+            if let Some(m) = mod_code {
+                if kitty_disambiguate {
+                    return Some(format!("\x1b[127;{m}u").into_bytes());
+                } else if modify_other_keys > 0 {
+                    return Some(format!("\x1b[27;{m};127~").into_bytes());
+                }
+            }
+            Some(vec![0x7f])
+        }
+        Key::Named(NamedKey::Escape) => {
+            if kitty_disambiguate {
+                if let Some(m) = mod_code {
+                    return Some(format!("\x1b[27;{m}u").into_bytes());
+                }
+                return Some(b"\x1b[27u".to_vec());
+            } else if modify_other_keys > 0 {
+                if let Some(m) = mod_code {
+                    return Some(format!("\x1b[27;{m};27~").into_bytes());
+                }
+            }
+            Some(vec![0x1b])
+        }
         Key::Named(NamedKey::ArrowUp) => {
             if let Some(m) = mod_code {
                 Some(format!("\x1b[1;{}A", m).into_bytes())
@@ -171,28 +256,45 @@ pub fn encode_key_event(
     modifiers: ModifiersState,
     app_cursor_keys: bool,
 ) -> Option<Vec<u8>> {
+    encode_key_event_with_modes(event, modifiers, app_cursor_keys, 0, 0)
+}
+
+/// Encode a winit KeyEvent with optional Kitty Keyboard Protocol and xterm modifyOtherKeys modes.
+pub fn encode_key_event_with_modes(
+    event: &KeyEvent,
+    modifiers: ModifiersState,
+    app_cursor_keys: bool,
+    kitty_flags: u16,
+    modify_other_keys: u8,
+) -> Option<Vec<u8>> {
     if event.state != ElementState::Pressed || modifiers.super_key() {
         return None;
     }
 
     // Physical key fallback for Ctrl + Letter when a non-ASCII IME/layout is active
-    if modifiers.control_key() && !modifiers.alt_key() {
+    if modifiers.control_key()
+        && !modifiers.alt_key()
+        && (kitty_flags & 1) == 0
+        && modify_other_keys < 2
+    {
         if let Some(norm) = normalize_shortcut_char(&event.logical_key, event.physical_key) {
             if norm.len() == 1 {
                 let ch = norm.as_bytes()[0];
-                if ch.is_ascii_lowercase() {
+                if ch.is_ascii_lowercase() && !modifiers.shift_key() {
                     return Some(vec![ch - b'a' + 1]);
                 }
             }
         }
     }
 
-    encode_key(
+    encode_key_with_modes(
         &event.logical_key,
         event.text.as_deref(),
         event.state,
         modifiers,
         app_cursor_keys,
+        kitty_flags,
+        modify_other_keys,
     )
 }
 

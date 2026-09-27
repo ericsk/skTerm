@@ -2,10 +2,17 @@
 
 use crate::graphics::{GraphicImage, KittyGraphicsParser, SixelDecoder};
 use crate::grid::{CellFlags, Color, CursorShape, NamedColor, SavedCursor, ScreenGrid};
-use std::num::NonZeroU32;
+use std::collections::HashMap;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::Arc;
 use tracing::info;
 use vte::{Params, Perform};
+
+const ALL_UNDERLINE_FLAGS: CellFlags = CellFlags::UNDERLINE
+    .union(CellFlags::DOUBLE_UNDERLINE)
+    .union(CellFlags::CURLY_UNDERLINE)
+    .union(CellFlags::DOTTED_UNDERLINE)
+    .union(CellFlags::DASHED_UNDERLINE);
 
 /// Mouse reporting modes supported by xterm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -41,6 +48,7 @@ pub struct TerminalState {
     pub fg: Color,
     pub bg: Color,
     pub underline_color: Option<Color>,
+    pub current_underline_color_id: Option<NonZeroU16>,
     pub flags: CellFlags,
     pub current_hyperlink: Option<Arc<String>>,
     pub current_hyperlink_id: Option<NonZeroU32>,
@@ -48,7 +56,15 @@ pub struct TerminalState {
     pub application_cursor_keys: bool,
     pub bracketed_paste: bool,
     pub auto_wrap: bool,
+    pub origin_mode: bool,
+    pub focus_events: bool,
     pub synchronized_output: bool,
+    pub modify_other_keys: u8,
+    pub kitty_keyboard_stack: Vec<u16>,
+    pub dynamic_palette: HashMap<u8, (u8, u8, u8)>,
+    pub dynamic_fg: Option<(u8, u8, u8)>,
+    pub dynamic_bg: Option<(u8, u8, u8)>,
+    pub dynamic_cursor: Option<(u8, u8, u8)>,
     pub mouse_protocol: MouseProtocol,
     pub mouse_format: MouseFormat,
     pub in_sixel: bool,
@@ -71,6 +87,7 @@ impl TerminalState {
             fg: Color::DefaultFg,
             bg: Color::DefaultBg,
             underline_color: None,
+            current_underline_color_id: None,
             flags: CellFlags::empty(),
             current_hyperlink: None,
             current_hyperlink_id: None,
@@ -78,7 +95,15 @@ impl TerminalState {
             application_cursor_keys: false,
             bracketed_paste: false,
             auto_wrap: true,
+            origin_mode: false,
+            focus_events: false,
             synchronized_output: false,
+            modify_other_keys: 0,
+            kitty_keyboard_stack: Vec::new(),
+            dynamic_palette: HashMap::new(),
+            dynamic_fg: None,
+            dynamic_bg: None,
+            dynamic_cursor: None,
             mouse_protocol: MouseProtocol::None,
             mouse_format: MouseFormat::X10,
             in_sixel: false,
@@ -99,7 +124,17 @@ impl TerminalState {
         self.fg = Color::DefaultFg;
         self.bg = Color::DefaultBg;
         self.underline_color = None;
+        self.current_underline_color_id = None;
         self.flags = CellFlags::empty();
+    }
+
+    pub fn kitty_keyboard_flags(&self) -> u16 {
+        self.kitty_keyboard_stack.last().copied().unwrap_or(0)
+    }
+
+    fn set_underline_color(&mut self, color: Option<Color>) {
+        self.underline_color = color;
+        self.current_underline_color_id = color.and_then(|c| self.grid.register_underline_color(c));
     }
 
     fn active_charset_mode(&self) -> Charset {
@@ -114,6 +149,7 @@ impl TerminalState {
         let fg = self.fg;
         let bg = self.bg;
         let flags = self.flags;
+        let ul_id = self.current_underline_color_id;
         let hid = self.current_hyperlink_id;
         let auto_wrap = self.auto_wrap;
         if self.insert_mode {
@@ -124,20 +160,24 @@ impl TerminalState {
         }
         self.grid
             .active_mut()
-            .write_char_with_wrap(c, fg, bg, flags, hid, auto_wrap);
+            .write_char_with_style(c, fg, bg, flags, ul_id, hid, auto_wrap);
     }
 
     fn save_cursor(&mut self) {
+        let origin_mode = self.origin_mode;
         let active = self.grid.active_mut();
         active.saved_cursor = Some(SavedCursor {
             row: active.cursor.row,
             col: active.cursor.col,
             fg: self.fg,
             bg: self.bg,
+            underline_color: self.underline_color,
+            underline_color_id: self.current_underline_color_id,
             flags: self.flags,
             shape: active.cursor.shape,
             visible: active.cursor.visible,
             pending_wrap: active.cursor.pending_wrap,
+            origin_mode,
         });
     }
 
@@ -151,7 +191,10 @@ impl TerminalState {
             active.cursor.pending_wrap = saved.pending_wrap;
             self.fg = saved.fg;
             self.bg = saved.bg;
+            self.underline_color = saved.underline_color;
+            self.current_underline_color_id = saved.underline_color_id;
             self.flags = saved.flags;
+            self.origin_mode = saved.origin_mode;
         }
     }
 
@@ -170,10 +213,23 @@ impl TerminalState {
             if param.len() > 1 {
                 match code {
                     4 => {
-                        if param[1] == 0 {
-                            self.flags.remove(CellFlags::UNDERLINE);
-                        } else {
-                            self.flags.insert(CellFlags::UNDERLINE);
+                        self.flags.remove(ALL_UNDERLINE_FLAGS);
+                        match param[1] {
+                            0 => {}
+                            1 => self.flags.insert(CellFlags::UNDERLINE),
+                            2 => self
+                                .flags
+                                .insert(CellFlags::UNDERLINE | CellFlags::DOUBLE_UNDERLINE),
+                            3 => self
+                                .flags
+                                .insert(CellFlags::UNDERLINE | CellFlags::CURLY_UNDERLINE),
+                            4 => self
+                                .flags
+                                .insert(CellFlags::UNDERLINE | CellFlags::DOTTED_UNDERLINE),
+                            5 => self
+                                .flags
+                                .insert(CellFlags::UNDERLINE | CellFlags::DASHED_UNDERLINE),
+                            _ => self.flags.insert(CellFlags::UNDERLINE),
                         }
                     }
                     38 => {
@@ -188,7 +244,7 @@ impl TerminalState {
                     }
                     58 => {
                         if let Some(color) = parse_colon_color(&param[1..]) {
-                            self.underline_color = Some(color);
+                            self.set_underline_color(Some(color));
                         }
                     }
                     _ => {}
@@ -201,15 +257,22 @@ impl TerminalState {
                 1 => self.flags.insert(CellFlags::BOLD),
                 2 => self.flags.insert(CellFlags::DIM),
                 3 => self.flags.insert(CellFlags::ITALIC),
-                4 => self.flags.insert(CellFlags::UNDERLINE),
+                4 => {
+                    self.flags.remove(ALL_UNDERLINE_FLAGS);
+                    self.flags.insert(CellFlags::UNDERLINE);
+                }
                 5 => self.flags.insert(CellFlags::BLINK),
                 7 => self.flags.insert(CellFlags::INVERSE),
                 8 => self.flags.insert(CellFlags::HIDDEN),
                 9 => self.flags.insert(CellFlags::STRIKETHROUGH),
-                21 => self.flags.insert(CellFlags::UNDERLINE),
+                21 => {
+                    self.flags.remove(ALL_UNDERLINE_FLAGS);
+                    self.flags
+                        .insert(CellFlags::UNDERLINE | CellFlags::DOUBLE_UNDERLINE);
+                }
                 22 => self.flags.remove(CellFlags::BOLD | CellFlags::DIM),
                 23 => self.flags.remove(CellFlags::ITALIC),
-                24 => self.flags.remove(CellFlags::UNDERLINE),
+                24 => self.flags.remove(ALL_UNDERLINE_FLAGS),
                 25 => self.flags.remove(CellFlags::BLINK),
                 27 => self.flags.remove(CellFlags::INVERSE),
                 28 => self.flags.remove(CellFlags::HIDDEN),
@@ -231,12 +294,15 @@ impl TerminalState {
                 }
                 49 => self.bg = Color::DefaultBg,
 
+                53 => self.flags.insert(CellFlags::OVERLINE),
+                55 => self.flags.remove(CellFlags::OVERLINE),
+
                 58 => {
                     if let Some(color) = parse_extended_color(&mut iter) {
-                        self.underline_color = Some(color);
+                        self.set_underline_color(Some(color));
                     }
                 }
-                59 => self.underline_color = None,
+                59 => self.set_underline_color(None),
 
                 90..=97 => self.fg = Color::Named(named_from_code(code - 90, true)),
                 100..=107 => self.bg = Color::Named(named_from_code(code - 100, true)),
@@ -326,10 +392,7 @@ impl Perform for TerminalState {
                 active.cursor.pending_wrap = false;
             }
             b'\t' => {
-                let active = self.grid.active_mut();
-                let next_tab = (active.cursor.col / 8 + 1) * 8;
-                active.cursor.col = next_tab.min(active.cols.saturating_sub(1));
-                active.cursor.pending_wrap = false;
+                self.grid.active_mut().advance_tab(1);
             }
             0x08 => self.grid.active_mut().move_backward(1),
             0x0E => self.active_charset = 1, // SO (Shift Out -> G1)
@@ -399,11 +462,42 @@ impl Perform for TerminalState {
             return;
         }
 
+        let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
+
         match params[0] {
             b"0" | b"2" => {
                 if params.len() > 1 {
                     if let Ok(title) = std::str::from_utf8(params[1]) {
                         self.title = title.to_string();
+                    }
+                }
+            }
+            b"4" => {
+                // OSC 4 ; index ; spec [; index ; spec ...]
+                for pair in params[1..].chunks(2) {
+                    if pair.len() < 2 {
+                        break;
+                    }
+                    let Ok(idx_str) = std::str::from_utf8(pair[0]) else {
+                        continue;
+                    };
+                    let Ok(idx) = idx_str.trim().parse::<u8>() else {
+                        continue;
+                    };
+                    let Ok(spec) = std::str::from_utf8(pair[1]) else {
+                        continue;
+                    };
+                    if spec == "?" {
+                        let (r, g, b) = self
+                            .dynamic_palette
+                            .get(&idx)
+                            .copied()
+                            .unwrap_or_else(|| default_indexed_rgb(idx));
+                        let rgb_str = format_osc_rgb(r, g, b);
+                        let resp = format!("\x1b]4;{idx};{rgb_str}{terminator}");
+                        self.pending_responses.extend_from_slice(resp.as_bytes());
+                    } else if let Some(rgb) = parse_osc_color_spec(spec) {
+                        self.dynamic_palette.insert(idx, rgb);
                     }
                 }
             }
@@ -431,18 +525,46 @@ impl Perform for TerminalState {
                 }
             }
             b"10" | b"11" | b"12" => {
-                // Dynamic color query (used by neovim, fish, zsh, lipgloss/termenv to detect theme)
-                if params.get(1) == Some(&&b"?"[..]) {
+                // Dynamic color query or set (used by neovim, fish, zsh, lipgloss/termenv)
+                if let Some(&arg) = params.get(1) {
                     let code = std::str::from_utf8(params[0]).unwrap_or("10");
-                    let rgb = match params[0] {
-                        b"11" => "rgb:1a1a/1b1b/1e1e", // Default dark background (#1a1b1e)
-                        _ => "rgb:f5f5/f5f5/f7f7",     // Default light foreground/cursor (#f5f5f7)
-                    };
-                    let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
-                    let resp = format!("\x1b]{code};{rgb}{terminator}");
-                    self.pending_responses.extend_from_slice(resp.as_bytes());
+                    if arg == b"?" {
+                        let (r, g, b) = match params[0] {
+                            b"10" => self.dynamic_fg.unwrap_or((0xf5, 0xf5, 0xf7)),
+                            b"11" => self.dynamic_bg.unwrap_or((0x1a, 0x1b, 0x1e)),
+                            _ => self.dynamic_cursor.unwrap_or((0xf5, 0xf5, 0xf7)),
+                        };
+                        let rgb_str = format_osc_rgb(r, g, b);
+                        let resp = format!("\x1b]{code};{rgb_str}{terminator}");
+                        self.pending_responses.extend_from_slice(resp.as_bytes());
+                    } else if let Ok(spec) = std::str::from_utf8(arg) {
+                        if let Some(rgb) = parse_osc_color_spec(spec) {
+                            match params[0] {
+                                b"10" => self.dynamic_fg = Some(rgb),
+                                b"11" => self.dynamic_bg = Some(rgb),
+                                _ => self.dynamic_cursor = Some(rgb),
+                            }
+                        }
+                    }
                 }
             }
+            b"104" => {
+                // Reset dynamic palette colors (specific indices or all if none specified)
+                if params.len() <= 1 || (params.len() == 2 && params[1].is_empty()) {
+                    self.dynamic_palette.clear();
+                } else {
+                    for &p in &params[1..] {
+                        if let Ok(s) = std::str::from_utf8(p) {
+                            if let Ok(idx) = s.trim().parse::<u8>() {
+                                self.dynamic_palette.remove(&idx);
+                            }
+                        }
+                    }
+                }
+            }
+            b"110" => self.dynamic_fg = None,
+            b"111" => self.dynamic_bg = None,
+            b"112" => self.dynamic_cursor = None,
             b"52" => {
                 if params.len() >= 3 && params[2] != b"?" {
                     use base64::Engine;
@@ -523,6 +645,17 @@ impl Perform for TerminalState {
 
         match action {
             'm' if intermediates.is_empty() => self.parse_sgr(params),
+            'm' if intermediates == b">" => {
+                // xterm modifyOtherKeys: CSI > 4 ; Pv m (or CSI > 4 m to reset)
+                let mut iter = params.iter();
+                let res = iter.next().and_then(|p| p.first()).copied().unwrap_or(0);
+                let val = iter.next().and_then(|p| p.first()).copied().unwrap_or(0);
+                if res == 4 {
+                    self.modify_other_keys = (val as u8).min(2);
+                } else if res == 0 {
+                    self.modify_other_keys = 0;
+                }
+            }
             'H' | 'f' if intermediates.is_empty() => {
                 let mut row = 1;
                 let mut col = 1;
@@ -541,9 +674,15 @@ impl Perform for TerminalState {
                         }
                     }
                 }
+                let target_row = if self.origin_mode {
+                    let (top, bottom) = self.grid.active().scroll_region;
+                    (top + (row as usize - 1)).min(bottom)
+                } else {
+                    (row as usize) - 1
+                };
                 self.grid
                     .active_mut()
-                    .move_cursor((row as usize) - 1, (col as usize) - 1);
+                    .move_cursor(target_row, (col as usize) - 1);
             }
             'A' if intermediates.is_empty() => self
                 .grid
@@ -580,28 +719,29 @@ impl Perform for TerminalState {
                 active.cursor.pending_wrap = false;
             }
             'd' if intermediates.is_empty() => {
-                let row = (first_param as usize).max(1) - 1;
+                let rel_row = (first_param as usize).max(1) - 1;
+                let origin_mode = self.origin_mode;
                 let active = self.grid.active_mut();
-                active.cursor.row = row.min(active.rows.saturating_sub(1));
+                active.cursor.row = if origin_mode {
+                    (active.scroll_region.0 + rel_row).min(active.scroll_region.1)
+                } else {
+                    rel_row.min(active.rows.saturating_sub(1))
+                };
                 active.cursor.pending_wrap = false;
             }
             'I' if intermediates.is_empty() => {
                 // CHT: Cursor Forward Tabulation Ps tab stops
                 let count = (first_param as usize).max(1);
-                let active = self.grid.active_mut();
-                let next_tab = (active.cursor.col / 8 + count) * 8;
-                active.cursor.col = next_tab.min(active.cols.saturating_sub(1));
-                active.cursor.pending_wrap = false;
+                self.grid.active_mut().advance_tab(count);
             }
             'Z' if intermediates.is_empty() => {
                 // CBT: Cursor Backward Tabulation Ps tab stops
                 let count = (first_param as usize).max(1);
-                let active = self.grid.active_mut();
-                if active.cursor.col > 0 {
-                    let prev_stop = (active.cursor.col.saturating_sub(1)) / 8;
-                    active.cursor.col = prev_stop.saturating_sub(count - 1) * 8;
-                }
-                active.cursor.pending_wrap = false;
+                self.grid.active_mut().backward_tab(count);
+            }
+            'g' if intermediates.is_empty() => {
+                // TBC: Tabulation Clear (0 = current column, 3 = all tab stops)
+                self.grid.active_mut().clear_tab_stop(first_param as usize);
             }
             'b' if intermediates.is_empty() => {
                 // REP: Repeat preceding graphic character Ps times
@@ -651,6 +791,42 @@ impl Perform for TerminalState {
                 .scroll_down_with_bg((first_param as usize).max(1), self.bg),
             's' if intermediates.is_empty() => self.save_cursor(),
             'u' if intermediates.is_empty() => self.restore_cursor(),
+            'u' if intermediates == b">" => {
+                // Kitty Keyboard Protocol: push flags onto stack (CSI > flags u)
+                if self.kitty_keyboard_stack.len() >= 16 {
+                    self.kitty_keyboard_stack.remove(0);
+                }
+                self.kitty_keyboard_stack.push(first_param);
+            }
+            'u' if intermediates == b"<" => {
+                // Kitty Keyboard Protocol: pop count entries from stack (CSI < count u)
+                let count = (first_param as usize).max(1);
+                let new_len = self.kitty_keyboard_stack.len().saturating_sub(count);
+                self.kitty_keyboard_stack.truncate(new_len);
+            }
+            'u' if intermediates == b"=" => {
+                // Kitty Keyboard Protocol: set/modify current flags (CSI = flags ; mode u)
+                let mut iter = params.iter();
+                let flags = iter.next().and_then(|p| p.first()).copied().unwrap_or(0);
+                let mode = iter.next().and_then(|p| p.first()).copied().unwrap_or(1);
+                let cur = self.kitty_keyboard_flags();
+                let next = match mode {
+                    2 => cur | flags,
+                    3 => cur & !flags,
+                    _ => flags,
+                };
+                if let Some(last) = self.kitty_keyboard_stack.last_mut() {
+                    *last = next;
+                } else {
+                    self.kitty_keyboard_stack.push(next);
+                }
+            }
+            'u' if intermediates == b"?" => {
+                // Kitty Keyboard Protocol: query current flags (CSI ? u -> CSI ? flags u)
+                let flags = self.kitty_keyboard_flags();
+                let resp = format!("\x1b[?{flags}u");
+                self.pending_responses.extend_from_slice(resp.as_bytes());
+            }
             'r' if intermediates.is_empty() => {
                 let mut top = 1;
                 let mut bottom = self.grid.active().rows;
@@ -695,9 +871,14 @@ impl Perform for TerminalState {
                     self.pending_responses.extend_from_slice(b"\x1b[0n");
                 }
                 6 => {
-                    // CPR: Cursor Position Report (1-indexed)
-                    let row = self.grid.active().cursor.row + 1;
-                    let col = self.grid.active().cursor.col + 1;
+                    // CPR: Cursor Position Report (1-indexed, relative to scroll_region when DECOM is active)
+                    let active = self.grid.active();
+                    let row = if self.origin_mode {
+                        active.cursor.row.saturating_sub(active.scroll_region.0) + 1
+                    } else {
+                        active.cursor.row + 1
+                    };
+                    let col = active.cursor.col + 1;
                     let resp = format!("\x1b[{row};{col}R");
                     self.pending_responses.extend_from_slice(resp.as_bytes());
                 }
@@ -706,8 +887,13 @@ impl Perform for TerminalState {
             'n' if is_private && intermediates.len() == 1 => {
                 if first_param == 6 {
                     // DECXCPR: Extended Cursor Position Report (1-indexed)
-                    let row = self.grid.active().cursor.row + 1;
-                    let col = self.grid.active().cursor.col + 1;
+                    let active = self.grid.active();
+                    let row = if self.origin_mode {
+                        active.cursor.row.saturating_sub(active.scroll_region.0) + 1
+                    } else {
+                        active.cursor.row + 1
+                    };
+                    let col = active.cursor.col + 1;
                     let resp = format!("\x1b[?{row};{col}R");
                     self.pending_responses.extend_from_slice(resp.as_bytes());
                 }
@@ -717,6 +903,13 @@ impl Perform for TerminalState {
                 let pm = match first_param {
                     1 => {
                         if self.application_cursor_keys {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    6 => {
+                        if self.origin_mode {
                             1
                         } else {
                             2
@@ -759,6 +952,13 @@ impl Perform for TerminalState {
                     }
                     1003 => {
                         if self.mouse_protocol == MouseProtocol::AnyEvent {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    1004 => {
+                        if self.focus_events {
                             1
                         } else {
                             2
@@ -811,6 +1011,13 @@ impl Perform for TerminalState {
                         if is_private && intermediates.len() == 1 {
                             match mode {
                                 1 => self.application_cursor_keys = true,
+                                6 => {
+                                    self.origin_mode = true;
+                                    let active = self.grid.active_mut();
+                                    active.cursor.row = active.scroll_region.0;
+                                    active.cursor.col = 0;
+                                    active.cursor.pending_wrap = false;
+                                }
                                 7 => self.auto_wrap = true,
                                 25 => self.grid.active_mut().cursor.visible = true,
                                 47 | 1047 | 1049 => {
@@ -824,6 +1031,7 @@ impl Perform for TerminalState {
                                 1000 => self.mouse_protocol = MouseProtocol::Normal,
                                 1002 => self.mouse_protocol = MouseProtocol::ButtonEvent,
                                 1003 => self.mouse_protocol = MouseProtocol::AnyEvent,
+                                1004 => self.focus_events = true,
                                 1006 => self.mouse_format = MouseFormat::Sgr,
                                 _ => {}
                             }
@@ -839,19 +1047,33 @@ impl Perform for TerminalState {
                         if is_private && intermediates.len() == 1 {
                             match mode {
                                 1 => self.application_cursor_keys = false,
+                                6 => {
+                                    self.origin_mode = false;
+                                    let active = self.grid.active_mut();
+                                    active.cursor.row = 0;
+                                    active.cursor.col = 0;
+                                    active.cursor.pending_wrap = false;
+                                }
                                 7 => {
                                     self.auto_wrap = false;
                                     self.grid.active_mut().cursor.pending_wrap = false;
                                 }
                                 25 => self.grid.active_mut().cursor.visible = false,
-                                47 | 1047 => self.grid.set_alternate(false),
+                                47 | 1047 => {
+                                    self.grid.set_alternate(false);
+                                    self.kitty_keyboard_stack.clear();
+                                    self.modify_other_keys = 0;
+                                }
                                 1049 => {
                                     self.grid.set_alternate(false);
                                     self.restore_cursor();
+                                    self.kitty_keyboard_stack.clear();
+                                    self.modify_other_keys = 0;
                                 }
                                 2004 => self.bracketed_paste = false,
                                 2026 => self.synchronized_output = false,
                                 1000 | 1002 | 1003 => self.mouse_protocol = MouseProtocol::None,
+                                1004 => self.focus_events = false,
                                 1006 => self.mouse_format = MouseFormat::X10,
                                 _ => {}
                             }
@@ -895,6 +1117,7 @@ impl Perform for TerminalState {
         match byte {
             b'7' => self.save_cursor(),
             b'8' => self.restore_cursor(),
+            b'H' => self.grid.active_mut().set_tab_stop(),
             b'M' => {
                 let bg = self.bg;
                 let active = self.grid.active_mut();
@@ -913,6 +1136,83 @@ impl Perform for TerminalState {
                 *self = Self::new(rows, cols, max_scroll);
             }
             _ => {}
+        }
+    }
+}
+
+fn format_osc_rgb(r: u8, g: u8, b: u8) -> String {
+    format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
+}
+
+fn parse_osc_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
+    let s = spec.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        match hex.len() {
+            6 => {
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                Some((r, g, b))
+            }
+            12 => {
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                let b = u8::from_str_radix(&hex[8..10], 16).ok()?;
+                Some((r, g, b))
+            }
+            _ => None,
+        }
+    } else if let Some(rgb_part) = s.strip_prefix("rgb:") {
+        let mut parts = rgb_part.split('/');
+        let r = parse_xparsecolor_channel(parts.next()?)?;
+        let g = parse_xparsecolor_channel(parts.next()?)?;
+        let b = parse_xparsecolor_channel(parts.next()?)?;
+        Some((r, g, b))
+    } else {
+        None
+    }
+}
+
+fn parse_xparsecolor_channel(ch: &str) -> Option<u8> {
+    let val = u16::from_str_radix(ch, 16).ok()?;
+    match ch.len() {
+        1 => Some((val as u8) * 17),
+        2 => Some(val as u8),
+        3 => Some((val >> 4) as u8),
+        4 => Some((val >> 8) as u8),
+        _ => None,
+    }
+}
+
+fn default_indexed_rgb(idx: u8) -> (u8, u8, u8) {
+    match idx {
+        0 => (0x1a, 0x1b, 0x1e),
+        1 => (0xff, 0x55, 0x55),
+        2 => (0x50, 0xfa, 0x7b),
+        3 => (0xf1, 0xfa, 0x8c),
+        4 => (0xbd, 0x93, 0xf9),
+        5 => (0xff, 0x79, 0xc6),
+        6 => (0x8b, 0xe9, 0xfd),
+        7 => (0xbf, 0xbf, 0xbf),
+        8 => (0x4d, 0x4d, 0x4d),
+        9 => (0xff, 0x6e, 0x67),
+        10 => (0x5a, 0xf7, 0x8e),
+        11 => (0xf4, 0xf9, 0x9d),
+        12 => (0xca, 0xa9, 0xfa),
+        13 => (0xff, 0x92, 0xd0),
+        14 => (0x9a, 0xed, 0xfe),
+        15 => (0xe6, 0xe6, 0xe6),
+        16..=231 => {
+            let n = idx - 16;
+            let r_idx = n / 36;
+            let g_idx = (n % 36) / 6;
+            let b_idx = n % 6;
+            let to_u8 = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            (to_u8(r_idx), to_u8(g_idx), to_u8(b_idx))
+        }
+        232..=255 => {
+            let v = 8 + (idx - 232) * 10;
+            (v, v, v)
         }
     }
 }

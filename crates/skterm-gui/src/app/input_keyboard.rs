@@ -3,7 +3,7 @@
 #[cfg(target_os = "macos")]
 use super::macos::get_nswindow;
 use super::App;
-use crate::input::{check_tab_switch, encode_key_event, normalize_shortcut_char};
+use crate::input::{check_tab_switch, normalize_shortcut_char};
 use crate::layout::SplitDirection;
 use std::time::{Duration, Instant};
 use winit::event::{ElementState, Ime, KeyEvent};
@@ -85,6 +85,24 @@ impl App {
         event: &KeyEvent,
     ) {
         if event.state != ElementState::Pressed {
+            if let Some(session) = self.sessions.get_mut(&window_id) {
+                if let Some(tab) = session.workspace.active_tab_mut() {
+                    if let Some(term) = tab.active_terminal_mut() {
+                        let kitty_flags = term.state.kitty_keyboard_flags();
+                        if (kitty_flags & 2) != 0 {
+                            if let Some(bytes) = crate::input::encode_key_event_with_modes(
+                                event,
+                                self.modifiers,
+                                term.state.application_cursor_keys,
+                                kitty_flags,
+                                term.state.modify_other_keys,
+                            ) {
+                                let _ = term.write_to_pty(&bytes);
+                            }
+                        }
+                    }
+                }
+            }
             return;
         }
 
@@ -826,7 +844,15 @@ impl App {
             if let Some(tab) = session.workspace.active_tab_mut() {
                 if let Some(term) = tab.active_terminal_mut() {
                     let app_cursor = term.state.application_cursor_keys;
-                    if let Some(bytes) = encode_key_event(event, self.modifiers, app_cursor) {
+                    let kitty_flags = term.state.kitty_keyboard_flags();
+                    let modify_other_keys = term.state.modify_other_keys;
+                    if let Some(bytes) = crate::input::encode_key_event_with_modes(
+                        event,
+                        self.modifiers,
+                        app_cursor,
+                        kitty_flags,
+                        modify_other_keys,
+                    ) {
                         let was_scrolled = term.grid().active().scroll_offset != 0;
                         term.grid_mut().active_mut().scroll_offset = 0;
                         let _ = term.write_to_pty(&bytes);
