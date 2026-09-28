@@ -114,7 +114,27 @@ impl GlyphAtlas {
             .map(|m| (m.ascent - m.descent + m.line_gap).ceil())
             .unwrap_or(font_size * 1.3)
             .max(1.0);
-        let baseline_offset = line_metrics.map(|m| m.ascent.ceil()).unwrap_or(font_size);
+
+        // Vertically center glyphs within character cell height.
+        // Terminal text lines and cursors are visually judged by prompt characters (e.g. '>') and capital letters.
+        // Aligning the visual center of standard glyphs to cell_height / 2 ensures that the cursor quad
+        // (which spans the entire cell_height) frames text symmetrically with equal margins above and below,
+        // preventing the cursor from appearing noticeably lower or sagging beneath the text line.
+        let gt_metric = regular_font.metrics('>', font_size);
+        let baseline_offset = if gt_metric.height > 0 {
+            let gt_h = gt_metric.height as f32;
+            let gt_ymin = gt_metric.ymin as f32;
+            let top_margin = ((cell_height - gt_h) / 2.0).round();
+            (top_margin + gt_h + gt_ymin).clamp(1.0, cell_height - 1.0)
+        } else if regular_metrics.height > 0 {
+            let cap_h = regular_metrics.height as f32;
+            let cap_ymin = regular_metrics.ymin as f32;
+            let top_margin = ((cell_height - cap_h) / 2.0).round();
+            (top_margin + cap_h + cap_ymin).clamp(1.0, cell_height - 1.0)
+        } else {
+            let font_ascent = line_metrics.map(|m| m.ascent).unwrap_or(font_size);
+            font_ascent.round().clamp(1.0, cell_height - 1.0)
+        };
 
         info!(
             "Font Engine Loaded: family='{}', size={}, cell_w={}, cell_h={}, fallbacks_count={}",

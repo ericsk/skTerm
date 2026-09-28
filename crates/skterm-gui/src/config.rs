@@ -109,7 +109,14 @@ fn default_decorations() -> String {
     "full".to_string()
 }
 fn default_tab_bar_style() -> String {
-    "auto".to_string()
+    #[cfg(target_os = "macos")]
+    {
+        "auto".to_string()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "always".to_string()
+    }
 }
 
 impl Default for WindowConfig {
@@ -649,10 +656,7 @@ impl ConfigManager {
 
         #[cfg(target_os = "windows")]
         {
-            let _ = Command::new("cmd")
-                .args(["/c", "start", ""])
-                .arg(&self.path)
-                .spawn();
+            let _ = Command::new("explorer").arg(&self.path).spawn();
         }
     }
 }
@@ -769,7 +773,12 @@ tab_bar_style = "auto"
 term = "xterm-256color"
 
 # 自訂預設 Shell 與啟動參數 (選填，若未指定則自動偵測系統預設登入 Shell)
-# shell = { program = "/bin/zsh", args = ["--login"] }
+# Windows 常用設定範例：
+#   命令提示字元: shell = { program = "cmd.exe", args = [] }
+#   Windows PowerShell: shell = { program = "powershell.exe", args = ["-NoLogo"] }
+#   PowerShell 7+: shell = { program = "pwsh.exe", args = ["-NoLogo"] }
+# macOS / Linux 常用設定範例：
+#   shell = { program = "/bin/zsh", args = ["--login"] }
 
 # 初始工作目錄 (選填，例如: "~" 或 "/Users/username/Projects")
 # working_directory = "~"

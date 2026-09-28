@@ -5,6 +5,7 @@ use super::events::SCROLLBAR_FADE_AFTER;
 use super::macos::{
     center_macos_window_title, get_nswindow, set_macos_tab_label, style_macos_tab_bar,
 };
+use super::menu::build_top_dropdown_menu;
 use super::App;
 use skterm_render::{AgentPanelState, PaneRenderItem, TabItem};
 use std::time::Duration;
@@ -192,11 +193,23 @@ impl App {
                 tab_count: total_tab_count,
             };
 
+            let (top_menu, _actions) = if session.menu_open && tab_bar_h > 0.0 {
+                let scale = session.renderer.scale_factor;
+                let menu_w = 230.0 * scale;
+                let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
+                let (m, acts) =
+                    build_top_dropdown_menu(scale, menu_x, tab_bar_h, session.menu_hovered_idx);
+                (Some(m), acts)
+            } else {
+                (None, Vec::new())
+            };
+
             if let Err(e) = session.renderer.render_workspace_with_agent_panel(
                 &tabs,
                 &render_panes,
                 tab_bar_h,
                 panel_state,
+                top_menu.as_ref(),
                 None::<
                     fn(
                         &wgpu::Device,

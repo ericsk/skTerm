@@ -9,6 +9,7 @@ mod input_keyboard;
 mod input_mouse;
 #[cfg(target_os = "macos")]
 mod macos;
+mod menu;
 mod pacer;
 mod render;
 mod session;
@@ -21,6 +22,7 @@ pub use events::AppEvent;
 pub use input_mouse::open_url_in_browser;
 #[cfg(target_os = "macos")]
 pub use macos::{center_macos_window_title, set_macos_tab_label, style_macos_tab_bar};
+pub use menu::{build_top_dropdown_menu, hit_test_dropdown_menu, TopMenuAction};
 pub use session::{ScrollbarDragState, TerminalSession};
 
 use crate::config::ConfigManager;

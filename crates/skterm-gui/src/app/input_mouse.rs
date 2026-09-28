@@ -4,6 +4,7 @@ use super::agents::is_repeat_click;
 use super::events::{DOUBLE_CLICK_INTERVAL, RESIZE_REFLOW_DEBOUNCE, SCROLLBAR_FADE_AFTER};
 #[cfg(target_os = "macos")]
 use super::macos::get_nswindow;
+use super::menu::{build_top_dropdown_menu, hit_test_dropdown_menu, TopMenuAction};
 use super::session::ScrollbarDragState;
 use super::App;
 use crate::layout::SplitDirection;
@@ -48,6 +49,19 @@ impl App {
         if let Some(session) = self.sessions.get_mut(&window_id) {
             session.mouse_pos = (position.x as f32, position.y as f32);
             let (mx, my) = session.mouse_pos;
+
+            // Update top dropdown menu hovered item
+            if session.menu_open && tab_bar_h > 0.0 {
+                let scale = session.renderer.scale_factor;
+                let menu_w = 230.0 * scale;
+                let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
+                let (menu, _) = build_top_dropdown_menu(scale, menu_x, tab_bar_h, None);
+                let hovered = hit_test_dropdown_menu(&menu, scale, mx, my);
+                if session.menu_hovered_idx != hovered {
+                    session.menu_hovered_idx = hovered;
+                    session.window.request_redraw();
+                }
+            }
 
             // 0.4 Handling Scrollbar Dragging
             if let Some(drag) = session.dragging_scrollbar {
@@ -257,16 +271,66 @@ impl App {
         state: ElementState,
         button: MouseButton,
     ) {
+        // 0. Dropdown Menu Clicks
+        let mut menu_action_to_run: Option<TopMenuAction> = None;
+        if let Some(session) = self.sessions.get_mut(&window_id) {
+            if session.menu_open && state == ElementState::Pressed {
+                let (mx, my) = session.mouse_pos;
+                let scale = session.renderer.scale_factor;
+                let menu_w = 230.0 * scale;
+                let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
+                let (menu, actions) =
+                    build_top_dropdown_menu(scale, menu_x, tab_bar_h, session.menu_hovered_idx);
+
+                let (btn_x, btn_y, btn_w, btn_h) = session.get_menu_button_rect(tab_bar_h);
+                let is_on_btn = mx >= btn_x - 2.0 * scale
+                    && mx <= btn_x + btn_w + 2.0 * scale
+                    && my >= btn_y - 2.0 * scale
+                    && my <= btn_y + btn_h + 2.0 * scale;
+
+                if let Some(idx) = hit_test_dropdown_menu(&menu, scale, mx, my) {
+                    session.menu_open = false;
+                    session.menu_hovered_idx = None;
+                    session.window.request_redraw();
+                    if let Some(Some(act)) = actions.get(idx) {
+                        menu_action_to_run = Some(*act);
+                    }
+                } else if is_on_btn {
+                    session.menu_open = false;
+                    session.menu_hovered_idx = None;
+                    session.window.request_redraw();
+                    return;
+                } else {
+                    session.menu_open = false;
+                    session.menu_hovered_idx = None;
+                    session.window.request_redraw();
+                    if mx >= menu.x && mx <= menu.x + menu.width && my >= menu.y {
+                        return;
+                    }
+                }
+            }
+        }
+
+        if let Some(act) = menu_action_to_run {
+            self.execute_top_menu_action(event_loop, window_id, tab_bar_h, act);
+            return;
+        }
+
         // Inline Tab Bar handling (main window area only, excluding right sidebar)
-        if button == MouseButton::Left && state == ElementState::Pressed && tab_bar_h > 0.0 {
+        if (button == MouseButton::Left || button == MouseButton::Right)
+            && state == ElementState::Pressed
+            && tab_bar_h > 0.0
+        {
             #[allow(clippy::enum_variant_names)]
             enum TabAction {
+                ToggleTopMenu,
                 NewTab,
                 CloseTab(usize),
                 SelectTab(usize),
             }
 
             let mut action = None;
+            let mut consumed_tab_bar_click = false;
             if let Some(session) = self.sessions.get(&window_id) {
                 let (mx, my) = session.mouse_pos;
                 let scale = session.renderer.scale_factor;
@@ -278,6 +342,7 @@ impl App {
                 let main_w = (session.renderer.config.width as f32 - reserved_right).max(0.0);
 
                 if my <= tab_bar_h && mx < main_w {
+                    consumed_tab_bar_click = true;
                     let tabs_len = session.workspace.tabs.len();
                     let start_x = 8.0 * scale;
                     let plus_btn_w = 24.0 * scale;
@@ -291,13 +356,32 @@ impl App {
 
                     let last_tab_right = start_x + (tabs_len as f32 * (tab_w + tab_gap));
                     let plus_btn_x = last_tab_right + 2.0 * scale;
-                    if mx >= plus_btn_x - 4.0 * scale
-                        && mx <= plus_btn_x + plus_btn_w + 6.0 * scale
-                        && my >= tab_y
-                        && my <= tab_y + tab_h
+                    let plus_btn_y = tab_y + (tab_h - plus_btn_w) / 2.0;
+
+                    let (btn_x, btn_y, btn_w, btn_h) = session.get_menu_button_rect(tab_bar_h);
+
+                    // 1. Check Chevron Menu Button "v"
+                    if mx >= btn_x - 2.0 * scale
+                        && mx <= btn_x + btn_w + 4.0 * scale
+                        && my >= btn_y - 2.0 * scale
+                        && my <= btn_y + btn_h + 2.0 * scale
                     {
-                        action = Some(TabAction::NewTab);
-                    } else {
+                        action = Some(TabAction::ToggleTopMenu);
+                    }
+                    // 2. Check Plus Button "+"
+                    else if mx >= plus_btn_x - 2.0 * scale
+                        && mx <= plus_btn_x + plus_btn_w + 2.0 * scale
+                        && my >= plus_btn_y - 2.0 * scale
+                        && my <= plus_btn_y + plus_btn_w + 2.0 * scale
+                    {
+                        if button == MouseButton::Right {
+                            action = Some(TabAction::ToggleTopMenu);
+                        } else {
+                            action = Some(TabAction::NewTab);
+                        }
+                    }
+                    // 3. Check Tab Capsules
+                    else if button == MouseButton::Left {
                         for idx in 0..tabs_len {
                             let tab_x = start_x + (idx as f32 * (tab_w + tab_gap));
                             if mx >= tab_x
@@ -321,6 +405,13 @@ impl App {
 
             if let Some(act) = action {
                 match act {
+                    TabAction::ToggleTopMenu => {
+                        if let Some(session) = self.sessions.get_mut(&window_id) {
+                            session.menu_open = !session.menu_open;
+                            session.menu_hovered_idx = None;
+                            session.window.request_redraw();
+                        }
+                    }
                     TabAction::NewTab => {
                         let pty_opts = self.build_pty_options();
                         let scrollback =
@@ -365,6 +456,10 @@ impl App {
                         }
                     }
                 }
+                return;
+            }
+
+            if consumed_tab_bar_click {
                 return;
             }
         }

@@ -61,6 +61,10 @@ pub struct TerminalSession {
     pub has_unseen_output: bool,
     /// Keeps PTY-driven repaints down to what this window's monitor can show.
     pub pacer: FramePacer,
+    /// Whether the top dropdown menu is currently open.
+    pub menu_open: bool,
+    /// Currently hovered menu item index in the top dropdown menu.
+    pub menu_hovered_idx: Option<usize>,
 }
 
 /// Refresh period of the monitor `window` currently sits on.
@@ -549,5 +553,36 @@ impl TerminalSession {
             self.workspace.sidebar_width * scale,
             scale,
         ))
+    }
+
+    pub fn get_menu_button_rect(&self, tab_bar_h: f32) -> (f32, f32, f32, f32) {
+        let scale = self.renderer.scale_factor;
+        let tabs_len = self.workspace.tabs.len();
+        let base_x = 8.0 * scale;
+        let start_x = base_x;
+        let plus_btn_w = 24.0 * scale;
+        let tab_gap = 4.0 * scale;
+        let avail_w =
+            (self.renderer.config.width as f32 - start_x - plus_btn_w - 16.0 * scale).max(80.0);
+        let total_gaps = (tabs_len.saturating_sub(1) as f32) * tab_gap;
+        let tab_w = ((avail_w - total_gaps) / tabs_len as f32).clamp(75.0 * scale, 190.0 * scale);
+        let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);
+        let tab_y = (tab_bar_h - tab_h) / 2.0;
+
+        let last_tab_right = start_x + (tabs_len as f32 * (tab_w + tab_gap));
+        let plus_btn_x = last_tab_right + 2.0 * scale;
+        let plus_btn_y = tab_y + (tab_h - plus_btn_w) / 2.0;
+
+        let menu_btn_w = 20.0 * scale;
+        let menu_btn_x = plus_btn_x + plus_btn_w + 3.0 * scale;
+        let menu_btn_y = plus_btn_y;
+        (menu_btn_x, menu_btn_y, menu_btn_w, plus_btn_w)
+    }
+
+    pub fn get_dropdown_menu_x(&self, tab_bar_h: f32, menu_w: f32) -> f32 {
+        let scale = self.renderer.scale_factor;
+        let (btn_x, _, btn_w, _) = self.get_menu_button_rect(tab_bar_h);
+        let max_x = self.renderer.config.width as f32 - menu_w - 4.0 * scale;
+        (btn_x + btn_w / 2.0 - menu_w / 2.0).clamp(4.0 * scale, max_x.max(4.0 * scale))
     }
 }

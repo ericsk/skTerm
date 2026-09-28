@@ -11,7 +11,10 @@ pub use grid::{
     Cell, CellFlags, Color, Cursor, CursorShape, NamedColor, Row, ScreenBuffer, ScreenGrid,
     SearchMatch, Selection, SelectionMode,
 };
-pub use pty::{PtyEvent, PtyProcess, PtySpawnOptions};
+pub use pty::{
+    available_shell_presets, find_cmd, find_git_bash_path, find_pwsh_path, find_windows_powershell,
+    PtyEvent, PtyProcess, PtySpawnOptions, ShellPresetInfo,
+};
 pub use terminal::Terminal;
 pub use vt::{Charset, MouseFormat, MouseProtocol, TerminalState};
 
@@ -665,6 +668,22 @@ mod tests {
                 std::fs::canonicalize(&got).expect("canonicalize result"),
                 std::fs::canonicalize(&expected).expect("canonicalize expected"),
             );
+        }
+    }
+
+    #[test]
+    fn test_shell_presets() {
+        let presets = available_shell_presets();
+        assert!(
+            !presets.is_empty(),
+            "available_shell_presets should never be empty"
+        );
+        #[cfg(target_os = "windows")]
+        {
+            let has_cmd = presets.iter().any(|p| {
+                p.name.contains("命令提示字元") || p.program.to_lowercase().ends_with("cmd.exe")
+            });
+            assert!(has_cmd, "cmd.exe preset must be present on Windows");
         }
     }
 }

@@ -8,7 +8,7 @@ use crate::layout::SplitDirection;
 use std::time::{Duration, Instant};
 use winit::event::{ElementState, Ime, KeyEvent};
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::WindowId;
 
 impl App {
@@ -46,6 +46,7 @@ impl App {
                             let was_scrolled = term.grid().active().scroll_offset != 0;
                             term.grid_mut().active_mut().scroll_offset = 0;
                             let _ = term.write_to_pty(text.as_bytes());
+                            std::thread::yield_now();
                             if had_preedit || was_scrolled || term.poll_pty() {
                                 session.window.request_redraw();
                             }
@@ -250,6 +251,20 @@ impl App {
                     return;
                 }
             }
+        }
+
+        // Preferences Window Shortcut:
+        // Windows/Linux: Ctrl + , (or CJK comma ， or <)
+        // macOS: Cmd + ,
+        let is_ctrl = self.modifiers.control_key() && !self.modifiers.alt_key();
+        let is_super = self.modifiers.super_key();
+        let is_comma = match &event.logical_key {
+            Key::Character(s) => s == "," || s == "，" || s == "<",
+            _ => matches!(event.physical_key, PhysicalKey::Code(KeyCode::Comma)),
+        };
+        if (is_ctrl || is_super) && is_comma {
+            self.open_preferences_window(event_loop);
+            return;
         }
 
         #[cfg(target_os = "macos")]
@@ -856,6 +871,7 @@ impl App {
                         let was_scrolled = term.grid().active().scroll_offset != 0;
                         term.grid_mut().active_mut().scroll_offset = 0;
                         let _ = term.write_to_pty(&bytes);
+                        std::thread::yield_now();
                         if was_scrolled || term.poll_pty() {
                             session.window.request_redraw();
                         }
