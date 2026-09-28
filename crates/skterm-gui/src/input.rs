@@ -58,6 +58,7 @@ pub fn encode_key_with_modes(
         }
         let codepoint = match logical_key {
             Key::Character(ref s) => s.chars().next().map(|c| c.to_ascii_lowercase() as u32),
+            Key::Named(NamedKey::Space) => Some(32),
             Key::Named(NamedKey::Enter) => Some(13),
             Key::Named(NamedKey::Tab) => Some(9),
             Key::Named(NamedKey::Backspace) => Some(127),
@@ -87,9 +88,27 @@ pub fn encode_key_with_modes(
                     return Some(format!("\x1b[27;{m};{cp}~").into_bytes());
                 }
             }
-            if modifiers.control_key() && !modifiers.alt_key() && lower.is_ascii_lowercase() {
-                let code = (lower as u8) - b'a' + 1;
-                return Some(vec![code]);
+            if modifiers.control_key() {
+                let ctrl_byte = if lower.is_ascii_lowercase() {
+                    Some((lower as u8) - b'a' + 1)
+                } else {
+                    match first_char {
+                        ' ' | '@' | '2' => Some(0x00),
+                        '[' | '3' => Some(0x1b),
+                        '\\' | '4' => Some(0x1c),
+                        ']' | '5' => Some(0x1d),
+                        '^' | '6' | '~' => Some(0x1e),
+                        '/' | '_' | '7' => Some(0x1f),
+                        '?' | '8' => Some(0x7f),
+                        _ => None,
+                    }
+                };
+                if let Some(code) = ctrl_byte {
+                    if modifiers.alt_key() {
+                        return Some(vec![0x1b, code]);
+                    }
+                    return Some(vec![code]);
+                }
             }
             if modifiers.alt_key() && !modifiers.control_key() && first_char.is_ascii() {
                 return Some(vec![0x1b, first_char as u8]);
@@ -99,6 +118,31 @@ pub fn encode_key_with_modes(
 
     // 2. Named special keys
     match logical_key {
+        Key::Named(NamedKey::Space) => {
+            if let Some(m) = mod_code {
+                if kitty_disambiguate
+                    && (modifiers.control_key() || modifiers.alt_key() || modifiers.shift_key())
+                {
+                    return Some(format!("\x1b[32;{m}u").into_bytes());
+                }
+                if modify_other_keys > 0
+                    && (modifiers.control_key() || modifiers.alt_key() || modifiers.shift_key())
+                {
+                    return Some(format!("\x1b[27;{m};32~").into_bytes());
+                }
+            }
+            if modifiers.control_key() {
+                if modifiers.alt_key() {
+                    Some(vec![0x1b, 0x00])
+                } else {
+                    Some(vec![0x00])
+                }
+            } else if modifiers.alt_key() {
+                Some(vec![0x1b, b' '])
+            } else {
+                Some(vec![b' '])
+            }
+        }
         Key::Named(NamedKey::Enter) => {
             if let Some(m) = mod_code {
                 if kitty_disambiguate {
@@ -186,6 +230,8 @@ pub fn encode_key_with_modes(
         Key::Named(NamedKey::Home) => {
             if let Some(m) = mod_code {
                 Some(format!("\x1b[1;{}H", m).into_bytes())
+            } else if app_cursor_keys {
+                Some(b"\x1bOH".to_vec())
             } else {
                 Some(b"\x1b[H".to_vec())
             }
@@ -193,6 +239,8 @@ pub fn encode_key_with_modes(
         Key::Named(NamedKey::End) => {
             if let Some(m) = mod_code {
                 Some(format!("\x1b[1;{}F", m).into_bytes())
+            } else if app_cursor_keys {
+                Some(b"\x1bOF".to_vec())
             } else {
                 Some(b"\x1b[F".to_vec())
             }
@@ -225,18 +273,42 @@ pub fn encode_key_with_modes(
                 Some(b"\x1b[2~".to_vec())
             }
         }
-        Key::Named(NamedKey::F1) => Some(b"\x1bOP".to_vec()),
-        Key::Named(NamedKey::F2) => Some(b"\x1bOQ".to_vec()),
-        Key::Named(NamedKey::F3) => Some(b"\x1bOR".to_vec()),
-        Key::Named(NamedKey::F4) => Some(b"\x1bOS".to_vec()),
-        Key::Named(NamedKey::F5) => Some(b"\x1b[15~".to_vec()),
-        Key::Named(NamedKey::F6) => Some(b"\x1b[17~".to_vec()),
-        Key::Named(NamedKey::F7) => Some(b"\x1b[18~".to_vec()),
-        Key::Named(NamedKey::F8) => Some(b"\x1b[19~".to_vec()),
-        Key::Named(NamedKey::F9) => Some(b"\x1b[20~".to_vec()),
-        Key::Named(NamedKey::F10) => Some(b"\x1b[21~".to_vec()),
-        Key::Named(NamedKey::F11) => Some(b"\x1b[23~".to_vec()),
-        Key::Named(NamedKey::F12) => Some(b"\x1b[24~".to_vec()),
+        Key::Named(NamedKey::F1) => {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[1;{m}P").into_bytes())
+            } else {
+                Some(b"\x1bOP".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F2) => {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[1;{m}Q").into_bytes())
+            } else {
+                Some(b"\x1bOQ".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F3) => {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[1;{m}R").into_bytes())
+            } else {
+                Some(b"\x1bOR".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F4) => {
+            if let Some(m) = mod_code {
+                Some(format!("\x1b[1;{m}S").into_bytes())
+            } else {
+                Some(b"\x1bOS".to_vec())
+            }
+        }
+        Key::Named(NamedKey::F5) => encode_tilde_fn_key(15, mod_code),
+        Key::Named(NamedKey::F6) => encode_tilde_fn_key(17, mod_code),
+        Key::Named(NamedKey::F7) => encode_tilde_fn_key(18, mod_code),
+        Key::Named(NamedKey::F8) => encode_tilde_fn_key(19, mod_code),
+        Key::Named(NamedKey::F9) => encode_tilde_fn_key(20, mod_code),
+        Key::Named(NamedKey::F10) => encode_tilde_fn_key(21, mod_code),
+        Key::Named(NamedKey::F11) => encode_tilde_fn_key(23, mod_code),
+        Key::Named(NamedKey::F12) => encode_tilde_fn_key(24, mod_code),
         _ => {
             // 3. Printable characters / IME output text
             if let Some(text_str) = text {
@@ -247,6 +319,14 @@ pub fn encode_key_with_modes(
                 None
             }
         }
+    }
+}
+
+fn encode_tilde_fn_key(code: u8, mod_code: Option<u8>) -> Option<Vec<u8>> {
+    if let Some(m) = mod_code {
+        Some(format!("\x1b[{code};{m}~").into_bytes())
+    } else {
+        Some(format!("\x1b[{code}~").into_bytes())
     }
 }
 
@@ -267,12 +347,16 @@ pub fn encode_key_event_with_modes(
     kitty_flags: u16,
     modify_other_keys: u8,
 ) -> Option<Vec<u8>> {
-    if event.state != ElementState::Pressed || modifiers.super_key() {
+    if modifiers.super_key() {
+        return None;
+    }
+    if event.state != ElementState::Pressed && (kitty_flags & 2) == 0 {
         return None;
     }
 
     // Physical key fallback for Ctrl + Letter when a non-ASCII IME/layout is active
-    if modifiers.control_key()
+    if event.state == ElementState::Pressed
+        && modifiers.control_key()
         && !modifiers.alt_key()
         && (kitty_flags & 1) == 0
         && modify_other_keys < 2

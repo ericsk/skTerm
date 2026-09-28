@@ -143,6 +143,10 @@ pub struct PaneRenderItem<'a> {
     pub is_scrollbar_hovered: bool,
     pub is_scrollbar_dragging: bool,
     pub is_recently_scrolled: bool,
+    pub dynamic_palette: Option<&'a HashMap<u8, (u8, u8, u8)>>,
+    pub dynamic_fg: Option<(u8, u8, u8)>,
+    pub dynamic_bg: Option<(u8, u8, u8)>,
+    pub dynamic_cursor: Option<(u8, u8, u8)>,
 }
 
 /// Render descriptor for a tab item in the tab bar
@@ -1213,9 +1217,30 @@ impl TermRenderer {
             let pw = pane.rect_w;
             let ph = pane.rect_h;
 
+            let mut pane_theme = self.theme;
+            if let Some((r, g, b)) = pane.dynamic_fg {
+                pane_theme.default_fg = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0];
+            }
+            if let Some((r, g, b)) = pane.dynamic_bg {
+                pane_theme.default_bg = [
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    self.theme.default_bg[3],
+                ];
+            }
+            if let Some((r, g, b)) = pane.dynamic_cursor {
+                pane_theme.cursor_color = [
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    self.theme.cursor_color[3],
+                ];
+            }
+
             bg_instances.push(BgInstance {
                 rect: [px, py, pw, ph],
-                color: self.theme.default_bg,
+                color: pane_theme.default_bg,
             });
 
             let border_col = if pane.is_focused && panes.len() > 1 {
@@ -1380,13 +1405,37 @@ impl TermRenderer {
                         let is_bold_flag = cell.flags.contains(CellFlags::BOLD);
                         let (mut fg_rgba, bg_rgba) = if is_inverse {
                             (
-                                color_to_rgba_themed(cell.bg, false, is_bold_flag, &self.theme),
-                                color_to_rgba_themed(cell.fg, true, false, &self.theme),
+                                color_to_rgba_with_dynamic_palette(
+                                    cell.bg,
+                                    false,
+                                    is_bold_flag,
+                                    &pane_theme,
+                                    pane.dynamic_palette,
+                                ),
+                                color_to_rgba_with_dynamic_palette(
+                                    cell.fg,
+                                    true,
+                                    false,
+                                    &pane_theme,
+                                    pane.dynamic_palette,
+                                ),
                             )
                         } else {
                             (
-                                color_to_rgba_themed(cell.fg, false, is_bold_flag, &self.theme),
-                                color_to_rgba_themed(cell.bg, true, false, &self.theme),
+                                color_to_rgba_with_dynamic_palette(
+                                    cell.fg,
+                                    false,
+                                    is_bold_flag,
+                                    &pane_theme,
+                                    pane.dynamic_palette,
+                                ),
+                                color_to_rgba_with_dynamic_palette(
+                                    cell.bg,
+                                    true,
+                                    false,
+                                    &pane_theme,
+                                    pane.dynamic_palette,
+                                ),
                             )
                         };
 
@@ -1396,7 +1445,7 @@ impl TermRenderer {
                             fg_rgba[2] *= 0.66;
                         }
 
-                        if bg_rgba != self.theme.default_bg {
+                        if bg_rgba != pane_theme.default_bg {
                             bg_instances.push(BgInstance {
                                 rect: [x, y, cell_w, cell_h],
                                 color: bg_rgba,
@@ -1429,7 +1478,7 @@ impl TermRenderer {
                         if is_selected {
                             bg_instances.push(BgInstance {
                                 rect: [x, y, cell_w, cell_h],
-                                color: self.theme.selection_color,
+                                color: pane_theme.selection_color,
                             });
                         }
 
@@ -1439,7 +1488,15 @@ impl TermRenderer {
                                 let ul_rgba = cell
                                     .underline_color_id
                                     .and_then(|id| pane.grid.get_underline_color(id))
-                                    .map(|col| color_to_rgba_themed(col, false, false, &self.theme))
+                                    .map(|col| {
+                                        color_to_rgba_with_dynamic_palette(
+                                            col,
+                                            false,
+                                            false,
+                                            &pane_theme,
+                                            pane.dynamic_palette,
+                                        )
+                                    })
                                     .unwrap_or(fg_rgba);
                                 let ul_y =
                                     (y + baseline + (2.0 * scale).round()).min(y + cell_h - line_h);
@@ -1580,7 +1637,7 @@ impl TermRenderer {
 
                     bg_instances.push(BgInstance {
                         rect: [cx, cy, cw, ch],
-                        color: self.theme.cursor_color,
+                        color: pane_theme.cursor_color,
                     });
                 }
             }
@@ -1898,4 +1955,43 @@ pub fn color_to_rgba_themed(
         }
         _ => color_to_rgba(color, is_bg),
     }
+}
+
+/// Convert skterm Color to RGBA considering per-pane dynamic OSC 4 palette overrides,
+/// active theme, custom palette, and bold_is_bright.
+pub fn color_to_rgba_with_dynamic_palette(
+    color: Color,
+    is_bg: bool,
+    is_bold: bool,
+    theme: &RenderTheme,
+    dynamic_palette: Option<&HashMap<u8, (u8, u8, u8)>>,
+) -> [f32; 4] {
+    if let Some(dyn_pal) = dynamic_palette {
+        if !dyn_pal.is_empty() {
+            let target_idx = match color {
+                Color::DefaultFg if is_bold && !is_bg => Some(15u8),
+                Color::Named(named) => {
+                    let mut idx = named as u8;
+                    if is_bold && !is_bg && idx < 8 {
+                        idx += 8;
+                    }
+                    Some(idx)
+                }
+                Color::Indexed(mut idx) => {
+                    if is_bold && !is_bg && idx < 8 {
+                        idx += 8;
+                    }
+                    Some(idx)
+                }
+                _ => None,
+            };
+            if let Some(idx) = target_idx {
+                if let Some(&(r, g, b)) = dyn_pal.get(&idx) {
+                    let alpha = if is_bg { theme.default_bg[3] } else { 1.0 };
+                    return [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, alpha];
+                }
+            }
+        }
+    }
+    color_to_rgba_themed(color, is_bg, is_bold, theme)
 }

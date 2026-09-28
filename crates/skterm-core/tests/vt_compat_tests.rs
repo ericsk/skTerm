@@ -739,3 +739,85 @@ fn test_vt_custom_tab_stops_hts_and_tbc() {
     term.feed_bytes(b"\x1b[0g\x1b[1;20H\x1b[Z");
     assert_eq!(term.grid().active().cursor.col, 4);
 }
+
+#[test]
+fn test_vt_synchronized_output_mode_2026() {
+    let mut term = Terminal::new_headless(5, 20, 100);
+    assert!(!term.state.is_synchronized_output_active());
+
+    // Enable synchronized output (?2026h)
+    term.feed_bytes(b"\x1b[?2026h");
+    assert!(term.state.synchronized_output);
+    assert!(term.state.is_synchronized_output_active());
+
+    // Disable synchronized output (?2026l)
+    term.feed_bytes(b"\x1b[?2026l");
+    assert!(!term.state.synchronized_output);
+    assert!(!term.state.is_synchronized_output_active());
+}
+
+#[test]
+fn test_vt_dcs_xtgettcap_and_decrqss() {
+    let mut term = Terminal::new_headless(10, 40, 100);
+
+    // 1. XTGETTCAP: query TN (544e), RGB (524742), and unknown "xx" (7878)
+    term.feed_bytes(b"\x1bP+q544e;524742;7878\x1b\\");
+    let resp = String::from_utf8(term.take_pending_responses()).unwrap();
+    // TN = "xterm-256color" -> 787465726d2d323536636f6c6f72
+    assert!(resp.contains("\x1bP1+r544e=787465726d2d323536636f6c6f72\x1b\\"));
+    // RGB = "8/8/8" -> 382f382f38
+    assert!(resp.contains("\x1bP1+r524742=382f382f38\x1b\\"));
+    // Unknown capability "xx" -> 0+r7878
+    assert!(resp.contains("\x1bP0+r7878\x1b\\"));
+
+    // 2. DECRQSS for SGR (`m`), DECSTBM (`r`), and DECSCUSR (` q`)
+    term.feed_bytes(b"\x1b[1;4:3;38;2;10;20;30m\x1b[2;8r\x1b[5 q");
+    term.feed_bytes(b"\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\");
+    let rqss_resp = String::from_utf8(term.take_pending_responses()).unwrap();
+    assert!(
+        rqss_resp.contains("\x1bP1$r0;1;4:3;38;2;10;20;30m\x1b\\"),
+        "unexpected SGR DECRQSS response: {:?}",
+        rqss_resp
+    );
+    assert!(
+        rqss_resp.contains("\x1bP1$r2;8r\x1b\\"),
+        "unexpected DECSTBM DECRQSS response: {:?}",
+        rqss_resp
+    );
+    assert!(
+        rqss_resp.contains("\x1bP1$r5 q\x1b\\"),
+        "unexpected DECSCUSR DECRQSS response: {:?}",
+        rqss_resp
+    );
+}
+
+#[test]
+fn test_vt_decstr_xtversion_and_xtwinops() {
+    let mut term = Terminal::new_headless(24, 80, 100);
+
+    // XTVERSION (CSI > q)
+    term.feed_bytes(b"\x1b[>q");
+    assert_eq!(term.take_pending_responses(), b"\x1bP>|skTerm(0.1.0)\x1b\\");
+
+    // XTWINOPS: report text area size in chars (CSI 18 t) and cell size (CSI 16 t)
+    term.feed_bytes(b"\x1b[18t\x1b[16t");
+    assert_eq!(term.take_pending_responses(), b"\x1b[8;24;80t\x1b[6;18;9t");
+
+    // XTWINOPS title stack push (CSI 22;0 t) and pop (CSI 23;0 t)
+    term.feed_bytes(b"\x1b]2;Initial Title\x07\x1b[22;0t\x1b]2;Temp Title\x07");
+    assert_eq!(term.state.title, "Temp Title");
+    term.feed_bytes(b"\x1b[23;0t");
+    assert_eq!(term.state.title, "Initial Title");
+
+    // DECSTR soft reset (CSI ! p): resets SGR, origin mode, scroll region, app cursor keys, insert mode
+    term.feed_bytes(b"\x1b[1;31m\x1b[5;15r\x1b[?6h\x1b[?1h\x1b[4h");
+    assert!(term.state.origin_mode);
+    assert!(term.state.application_cursor_keys);
+    assert!(term.state.insert_mode);
+    term.feed_bytes(b"\x1b[!p");
+    assert!(!term.state.origin_mode);
+    assert!(!term.state.application_cursor_keys);
+    assert!(!term.state.insert_mode);
+    assert_eq!(term.grid().active().scroll_region, (0, 23));
+    assert!(!term.state.flags.contains(skterm_core::CellFlags::BOLD));
+}

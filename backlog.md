@@ -64,3 +64,25 @@
     - 支援執行期動態修改、查詢（`?`）與重設 ANSI 256 色盤及預設前景／背景／游標色彩（支援 `#RRGGBB` 與 `rgb:RRRR/GGGG/BBBB` 格式）。
 11. [x] **自訂 Tab 停駐點 (`ESC H` HTS、`CSI g` TBC)**
     - 支援 `ESC H` 於當前欄設定水平 Tab 停駐點、`CSI 0 g` 清除當前欄停駐點、`CSI 3 g` 清除全部停駐點，並與 `\t`、`CSI I` (CHT)、`CSI Z` (CBT) 完整整合。
+
+---
+
+## 🟣 第四階段：端到端渲染整合與 `xterm-256color` 深度相容 (Phase 4 — End-to-End Integration & Extended xterm-256color)
+
+12. [x] **動態調色盤與主題色 (`OSC 4/104/10..12/110..112`) GPU 渲染端到端串接 (`skterm-render` & `skterm-gui`)**
+    - 將 `TerminalState` 的 `dynamic_palette`、`dynamic_fg`、`dynamic_bg`、`dynamic_cursor` 傳遞至 `PaneRenderItem` 與 `TermRenderer`，使執行期透過 OSC 動態修改的色盤、背景色、前景色與游標色彩即時反映於 GPU 畫面渲染。
+13. [x] **Synchronized Output (`?2026h` / `?2026l`) 事件迴圈批次繪圖延遲與安全逾時 (`skterm-core` & `skterm-gui`)**
+    - 記錄 `synchronized_output_since` 時間戳記並設定 100ms 安全逾時上限；當活動窗格處於 `?2026h` 批次更新期間時暫緩中間幀重繪，待收到 `?2026l` 或逾時到達後立即觸發完整幀渲染，消除大型 TUI 畫面撕裂。
+14. [x] **DCS 進階狀態與 Terminfo 能力查詢 (`XTGETTCAP` `DCS + q`、`DECRQSS` `DCS $ q`) 及 Sixel DCS 隔離**
+    - 修正 `hook` 僅在 `intermediates.is_empty()` 時進入 Sixel 模式，避免 `DCS + q` 與 `DCS $ q` 誤觸 Sixel 解碼。
+    - 實作 `XTGETTCAP` (`\x1bP+q<hex>\x1b\\`) 回報 `TN`/`name` (`xterm-256color`)、`Tc`/`RGB`、`colors`/`Co` (`256`)、`Smulx`、`Setulc`、`sync` 等能力，未知能力回傳 `0+r`。
+    - 實作 `DECRQSS` (`\x1bP$q...\x1b\\`) 支援 `m` (SGR)、`r` (DECSTBM)、` q` (DECSCUSR) 狀態回報。
+15. [x] **`DECSTR` 軟重設 (`CSI ! p`)、`XTVERSION` (`CSI > q`) 與 `XTWINOPS` 視窗操作 (`CSI Ps t`)**
+    - 實作 `xterm-256color` `is2`/`rs2` 必備的 `CSI ! p` (DECSTR 軟重設)。
+    - 實作 `CSI > q` (`XTVERSION`) 回報 `\x1b>|skTerm(0.1.0)\x1b\\`。
+    - 實作 `CSI 18 t`（字元行列數回報）、`CSI 14 t` / `CSI 16 t`（像素尺寸回報）及 `CSI 22 t` / `CSI 23 t`（視窗標題堆疊 Push/Pop）。
+16. [x] **`xterm-256color` 完整按鍵編碼補齊 (`skterm-gui/src/input.rs`)**
+    - 在 `?1h` (`DECCKM` Application Cursor Keys) 模式下，`Home` / `End` 發送 `\x1bOH` / `\x1bOF`（符合 `xterm-256color` 的 `khome=\EOH`、`kend=\EOF`）。
+    - 支援 `F1..F12` 搭配 `Shift` / `Alt` / `Ctrl` 修飾鍵編碼（`\x1b[1;{m}P..S` 與 `\x1b[15..24;{m}~`，對應 `kf13..kf63`）。
+    - 支援 `Ctrl+Space` / `Ctrl+@` (`0x00`)、`Ctrl+/` / `Ctrl+_` (`0x1f`)、`Ctrl+[` (`0x1b`)、`Ctrl+\` (`0x1c`)、`Ctrl+]` (`0x1d`)、`Ctrl+^` (`0x1e`)、`Ctrl+?` (`0x7f`) 等常用控制字元組合。
+

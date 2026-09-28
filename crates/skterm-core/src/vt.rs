@@ -41,6 +41,16 @@ pub enum Charset {
     DecSpecialGraphics,
 }
 
+/// Active Device Control String (DCS) sub-protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DcsMode {
+    #[default]
+    None,
+    Sixel,
+    XtGetTcap,
+    DecRqss,
+}
+
 /// Terminal state engine combining ScreenGrid and VTE event handlers.
 #[derive(Debug, Clone)]
 pub struct TerminalState {
@@ -53,12 +63,14 @@ pub struct TerminalState {
     pub current_hyperlink: Option<Arc<String>>,
     pub current_hyperlink_id: Option<NonZeroU32>,
     pub title: String,
+    pub title_stack: Vec<String>,
     pub application_cursor_keys: bool,
     pub bracketed_paste: bool,
     pub auto_wrap: bool,
     pub origin_mode: bool,
     pub focus_events: bool,
     pub synchronized_output: bool,
+    pub synchronized_output_since: Option<std::time::Instant>,
     pub modify_other_keys: u8,
     pub kitty_keyboard_stack: Vec<u16>,
     pub dynamic_palette: HashMap<u8, (u8, u8, u8)>,
@@ -69,6 +81,8 @@ pub struct TerminalState {
     pub mouse_format: MouseFormat,
     pub in_sixel: bool,
     pub sixel_buffer: Vec<u8>,
+    pub dcs_mode: DcsMode,
+    pub dcs_buffer: Vec<u8>,
     pub kitty_parser: KittyGraphicsParser,
     pub insert_mode: bool,
     pub current_working_directory: Option<String>,
@@ -92,12 +106,14 @@ impl TerminalState {
             current_hyperlink: None,
             current_hyperlink_id: None,
             title: String::from("skTerm"),
+            title_stack: Vec::new(),
             application_cursor_keys: false,
             bracketed_paste: false,
             auto_wrap: true,
             origin_mode: false,
             focus_events: false,
             synchronized_output: false,
+            synchronized_output_since: None,
             modify_other_keys: 0,
             kitty_keyboard_stack: Vec::new(),
             dynamic_palette: HashMap::new(),
@@ -108,6 +124,8 @@ impl TerminalState {
             mouse_format: MouseFormat::X10,
             in_sixel: false,
             sixel_buffer: Vec::new(),
+            dcs_mode: DcsMode::None,
+            dcs_buffer: Vec::new(),
             kitty_parser: KittyGraphicsParser::new(),
             insert_mode: false,
             current_working_directory: None,
@@ -128,8 +146,95 @@ impl TerminalState {
         self.flags = CellFlags::empty();
     }
 
+    /// Perform DECSTR (`CSI ! p`) Soft Terminal Reset without clearing the screen.
+    pub fn soft_reset(&mut self) {
+        self.reset_sgr();
+        self.application_cursor_keys = false;
+        self.origin_mode = false;
+        self.auto_wrap = true;
+        self.insert_mode = false;
+        self.synchronized_output = false;
+        self.synchronized_output_since = None;
+        self.g0_charset = Charset::Ascii;
+        self.g1_charset = Charset::Ascii;
+        self.active_charset = 0;
+        let active = self.grid.active_mut();
+        active.cursor.visible = true;
+        active.cursor.pending_wrap = false;
+        active.scroll_region = (0, active.rows.saturating_sub(1));
+        active.saved_cursor = None;
+    }
+
+    /// Returns true if DEC Private Mode `?2026` (Synchronized Output) is currently active
+    /// and within its 100ms safety timeout window.
+    pub fn is_synchronized_output_active(&self) -> bool {
+        self.synchronized_output
+            && self
+                .synchronized_output_since
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(100))
+    }
+
     pub fn kitty_keyboard_flags(&self) -> u16 {
         self.kitty_keyboard_stack.last().copied().unwrap_or(0)
+    }
+
+    fn format_decrqss_sgr(&self) -> String {
+        let mut parts: Vec<String> = vec!["0".to_string()];
+        if self.flags.contains(CellFlags::BOLD) {
+            parts.push("1".to_string());
+        }
+        if self.flags.contains(CellFlags::DIM) {
+            parts.push("2".to_string());
+        }
+        if self.flags.contains(CellFlags::ITALIC) {
+            parts.push("3".to_string());
+        }
+        if self.flags.contains(CellFlags::CURLY_UNDERLINE) {
+            parts.push("4:3".to_string());
+        } else if self.flags.contains(CellFlags::DOUBLE_UNDERLINE) {
+            parts.push("4:2".to_string());
+        } else if self.flags.contains(CellFlags::DOTTED_UNDERLINE) {
+            parts.push("4:4".to_string());
+        } else if self.flags.contains(CellFlags::DASHED_UNDERLINE) {
+            parts.push("4:5".to_string());
+        } else if self.flags.contains(CellFlags::UNDERLINE) {
+            parts.push("4".to_string());
+        }
+        if self.flags.contains(CellFlags::BLINK) {
+            parts.push("5".to_string());
+        }
+        if self.flags.contains(CellFlags::INVERSE) {
+            parts.push("7".to_string());
+        }
+        if self.flags.contains(CellFlags::HIDDEN) {
+            parts.push("8".to_string());
+        }
+        if self.flags.contains(CellFlags::STRIKETHROUGH) {
+            parts.push("9".to_string());
+        }
+        if self.flags.contains(CellFlags::OVERLINE) {
+            parts.push("53".to_string());
+        }
+        match self.fg {
+            Color::DefaultFg | Color::DefaultBg => {}
+            Color::Named(n) => parts.push(named_color_to_sgr(n, false).to_string()),
+            Color::Indexed(idx) => parts.push(format!("38;5;{idx}")),
+            Color::Rgb(r, g, b) => parts.push(format!("38;2;{r};{g};{b}")),
+        }
+        match self.bg {
+            Color::DefaultFg | Color::DefaultBg => {}
+            Color::Named(n) => parts.push(named_color_to_sgr(n, true).to_string()),
+            Color::Indexed(idx) => parts.push(format!("48;5;{idx}")),
+            Color::Rgb(r, g, b) => parts.push(format!("48;2;{r};{g};{b}")),
+        }
+        if let Some(ul) = self.underline_color {
+            match ul {
+                Color::Indexed(idx) => parts.push(format!("58;5;{idx}")),
+                Color::Rgb(r, g, b) => parts.push(format!("58;2;{r};{g};{b}")),
+                _ => {}
+            }
+        }
+        parts.join(";")
     }
 
     fn set_underline_color(&mut self, color: Option<Color>) {
@@ -335,6 +440,32 @@ fn named_from_code(offset: u16, bright: bool) -> NamedColor {
     }
 }
 
+fn named_color_to_sgr(color: NamedColor, is_bg: bool) -> u16 {
+    let base = match color {
+        NamedColor::Black => 30,
+        NamedColor::Red => 31,
+        NamedColor::Green => 32,
+        NamedColor::Yellow => 33,
+        NamedColor::Blue => 34,
+        NamedColor::Magenta => 35,
+        NamedColor::Cyan => 36,
+        NamedColor::White => 37,
+        NamedColor::BrightBlack => 90,
+        NamedColor::BrightRed => 91,
+        NamedColor::BrightGreen => 92,
+        NamedColor::BrightYellow => 93,
+        NamedColor::BrightBlue => 94,
+        NamedColor::BrightMagenta => 95,
+        NamedColor::BrightCyan => 96,
+        NamedColor::BrightWhite => 97,
+    };
+    if is_bg {
+        base + 10
+    } else {
+        base
+    }
+}
+
 fn parse_colon_color(sub: &[u16]) -> Option<Color> {
     match sub.first().copied()? {
         2 => {
@@ -402,58 +533,129 @@ impl Perform for TerminalState {
         }
     }
 
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
+    fn hook(&mut self, _params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        self.in_sixel = false;
+        self.dcs_mode = DcsMode::None;
+        self.dcs_buffer.clear();
         if action == 'q' {
-            // Sixel Graphics DCS entry
-            self.in_sixel = true;
-            self.sixel_buffer.clear();
+            if intermediates.is_empty() {
+                // Sixel Graphics DCS entry
+                self.in_sixel = true;
+                self.dcs_mode = DcsMode::Sixel;
+                self.sixel_buffer.clear();
+            } else if intermediates == b"+" {
+                self.dcs_mode = DcsMode::XtGetTcap;
+            } else if intermediates == b"$" {
+                self.dcs_mode = DcsMode::DecRqss;
+            }
         }
     }
 
     fn put(&mut self, byte: u8) {
-        if self.in_sixel {
-            self.sixel_buffer.push(byte);
+        match self.dcs_mode {
+            DcsMode::Sixel => self.sixel_buffer.push(byte),
+            DcsMode::XtGetTcap | DcsMode::DecRqss => {
+                if self.dcs_buffer.len() < 4096 {
+                    self.dcs_buffer.push(byte);
+                }
+            }
+            DcsMode::None => {}
         }
     }
 
     fn unhook(&mut self) {
-        if self.in_sixel {
-            self.in_sixel = false;
-            let mut decoder = SixelDecoder::new();
-            if let Some((w_px, h_px, rgba)) = decoder.decode(&self.sixel_buffer) {
-                let cell_w = 9.0;
-                let cell_h = 18.0;
-                let w_cells = ((w_px as f32 / cell_w).ceil() as usize).max(1);
-                let h_cells = ((h_px as f32 / cell_h).ceil() as usize).max(1);
+        let mode = self.dcs_mode;
+        self.dcs_mode = DcsMode::None;
+        self.in_sixel = false;
 
-                let id = self.grid.next_image_id;
-                self.grid.next_image_id += 1;
+        match mode {
+            DcsMode::Sixel => {
+                let mut decoder = SixelDecoder::new();
+                if let Some((w_px, h_px, rgba)) = decoder.decode(&self.sixel_buffer) {
+                    let cell_w = 9.0;
+                    let cell_h = 18.0;
+                    let w_cells = ((w_px as f32 / cell_w).ceil() as usize).max(1);
+                    let h_cells = ((h_px as f32 / cell_h).ceil() as usize).max(1);
 
-                let cur_row = self.grid.active().cursor.row;
-                let cur_col = self.grid.active().cursor.col;
+                    let id = self.grid.next_image_id;
+                    self.grid.next_image_id += 1;
 
-                let img = GraphicImage {
-                    id,
-                    row: cur_row,
-                    col: cur_col,
-                    width_px: w_px,
-                    height_px: h_px,
-                    width_cells: w_cells,
-                    height_cells: h_cells,
-                    rgba_data: rgba,
-                    z_index: 0,
-                };
+                    let cur_row = self.grid.active().cursor.row;
+                    let cur_col = self.grid.active().cursor.col;
 
-                info!(
-                    "Decoded Sixel image: {}x{} px (cells: {}x{})",
-                    w_px, h_px, w_cells, h_cells
-                );
-                self.grid.active_mut().add_image(img);
+                    let img = GraphicImage {
+                        id,
+                        row: cur_row,
+                        col: cur_col,
+                        width_px: w_px,
+                        height_px: h_px,
+                        width_cells: w_cells,
+                        height_cells: h_cells,
+                        rgba_data: rgba,
+                        z_index: 0,
+                    };
 
-                // Advance cursor down below the image
-                self.grid.active_mut().move_down(h_cells);
+                    info!(
+                        "Decoded Sixel image: {}x{} px (cells: {}x{})",
+                        w_px, h_px, w_cells, h_cells
+                    );
+                    self.grid.active_mut().add_image(img);
+
+                    // Advance cursor down below the image
+                    self.grid.active_mut().move_down(h_cells);
+                }
+                self.sixel_buffer.clear();
             }
-            self.sixel_buffer.clear();
+            DcsMode::XtGetTcap => {
+                if let Ok(payload) = std::str::from_utf8(&self.dcs_buffer) {
+                    for hex_key in payload.split(';') {
+                        let hex_key = hex_key.trim();
+                        if hex_key.is_empty() {
+                            continue;
+                        }
+                        if let Some(cap_bytes) = decode_hex_bytes(hex_key) {
+                            if let Ok(cap_name) = std::str::from_utf8(&cap_bytes) {
+                                if let Some(val_bytes) = lookup_xtgettcap(cap_name) {
+                                    let resp = if val_bytes.is_empty() {
+                                        format!("\x1bP1+r{hex_key}\x1b\\")
+                                    } else {
+                                        let hex_val = encode_hex_bytes(val_bytes);
+                                        format!("\x1bP1+r{hex_key}={hex_val}\x1b\\")
+                                    };
+                                    self.pending_responses.extend_from_slice(resp.as_bytes());
+                                    continue;
+                                }
+                            }
+                        }
+                        let resp = format!("\x1bP0+r{hex_key}\x1b\\");
+                        self.pending_responses.extend_from_slice(resp.as_bytes());
+                    }
+                }
+                self.dcs_buffer.clear();
+            }
+            DcsMode::DecRqss => {
+                if let Ok(req) = std::str::from_utf8(&self.dcs_buffer) {
+                    let resp = match req {
+                        "m" => format!("\x1bP1$r{}m\x1b\\", self.format_decrqss_sgr()),
+                        "r" => {
+                            let (top, bottom) = self.grid.active().scroll_region;
+                            format!("\x1bP1$r{};{}r\x1b\\", top + 1, bottom + 1)
+                        }
+                        " q" => {
+                            let code = match self.grid.active().cursor.shape {
+                                CursorShape::Block => 1,
+                                CursorShape::Underline => 3,
+                                CursorShape::Beam => 5,
+                            };
+                            format!("\x1bP1$r{code} q\x1b\\")
+                        }
+                        _ => String::from("\x1bP0$r\x1b\\"),
+                    };
+                    self.pending_responses.extend_from_slice(resp.as_bytes());
+                }
+                self.dcs_buffer.clear();
+            }
+            DcsMode::None => {}
         }
     }
 
@@ -1027,7 +1229,11 @@ impl Perform for TerminalState {
                                     self.grid.set_alternate(true);
                                 }
                                 2004 => self.bracketed_paste = true,
-                                2026 => self.synchronized_output = true,
+                                2026 => {
+                                    self.synchronized_output = true;
+                                    self.synchronized_output_since =
+                                        Some(std::time::Instant::now());
+                                }
                                 1000 => self.mouse_protocol = MouseProtocol::Normal,
                                 1002 => self.mouse_protocol = MouseProtocol::ButtonEvent,
                                 1003 => self.mouse_protocol = MouseProtocol::AnyEvent,
@@ -1071,7 +1277,10 @@ impl Perform for TerminalState {
                                     self.modify_other_keys = 0;
                                 }
                                 2004 => self.bracketed_paste = false,
-                                2026 => self.synchronized_output = false,
+                                2026 => {
+                                    self.synchronized_output = false;
+                                    self.synchronized_output_since = None;
+                                }
                                 1000 | 1002 | 1003 => self.mouse_protocol = MouseProtocol::None,
                                 1004 => self.focus_events = false,
                                 1006 => self.mouse_format = MouseFormat::X10,
@@ -1083,12 +1292,71 @@ impl Perform for TerminalState {
                     }
                 }
             }
+            'p' if intermediates == b"!" => {
+                // DECSTR (Soft Terminal Reset)
+                self.soft_reset();
+            }
             'q' if intermediates == b" " => match first_param {
                 0..=2 => self.grid.active_mut().cursor.shape = CursorShape::Block,
                 3 | 4 => self.grid.active_mut().cursor.shape = CursorShape::Underline,
                 5 | 6 => self.grid.active_mut().cursor.shape = CursorShape::Beam,
                 _ => {}
             },
+            'q' if intermediates == b">" => {
+                // XTVERSION: CSI > q / CSI > 0 q -> DCS > | skTerm(0.1.0) ST
+                if first_param == 0 {
+                    self.pending_responses
+                        .extend_from_slice(b"\x1bP>|skTerm(0.1.0)\x1b\\");
+                }
+            }
+            't' if intermediates.is_empty() => {
+                // XTWINOPS: Window manipulation queries and title stack
+                match first_param {
+                    14 => {
+                        let rows = self.grid.active().rows;
+                        let cols = self.grid.active().cols;
+                        let resp = format!("\x1b[4;{};{}t", rows * 18, cols * 9);
+                        self.pending_responses.extend_from_slice(resp.as_bytes());
+                    }
+                    16 => {
+                        self.pending_responses.extend_from_slice(b"\x1b[6;18;9t");
+                    }
+                    18 => {
+                        let rows = self.grid.active().rows;
+                        let cols = self.grid.active().cols;
+                        let resp = format!("\x1b[8;{rows};{cols}t");
+                        self.pending_responses.extend_from_slice(resp.as_bytes());
+                    }
+                    22 => {
+                        let sub = params
+                            .iter()
+                            .nth(1)
+                            .and_then(|p| p.first())
+                            .copied()
+                            .unwrap_or(0);
+                        if sub == 0 || sub == 2 {
+                            if self.title_stack.len() >= 16 {
+                                self.title_stack.remove(0);
+                            }
+                            self.title_stack.push(self.title.clone());
+                        }
+                    }
+                    23 => {
+                        let sub = params
+                            .iter()
+                            .nth(1)
+                            .and_then(|p| p.first())
+                            .copied()
+                            .unwrap_or(0);
+                        if sub == 0 || sub == 2 {
+                            if let Some(prev) = self.title_stack.pop() {
+                                self.title = prev;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
@@ -1291,4 +1559,45 @@ fn parse_osc7_uri(uri: &str) -> Option<String> {
     }
 
     String::from_utf8(bytes).ok()
+}
+
+fn decode_hex_bytes(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    for chunk in bytes.as_chunks::<2>().0 {
+        let s = std::str::from_utf8(chunk).ok()?;
+        let val = u8::from_str_radix(s, 16).ok()?;
+        out.push(val);
+    }
+    Some(out)
+}
+
+fn encode_hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+fn lookup_xtgettcap(cap_name: &str) -> Option<&'static [u8]> {
+    match cap_name {
+        "TN" | "name" => Some(b"xterm-256color"),
+        "Co" | "colors" => Some(b"256"),
+        "RGB" => Some(b"8/8/8"),
+        "Tc" | "bce" | "am" | "xenl" | "msgr" | "Su" => Some(b""),
+        "Smulx" => Some(b"\x1b[4:%p1%dm"),
+        "Setulc" => Some(b"\x1b[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%dm"),
+        "sync" => Some(b"\x1b[?2026%?%p1%{1}%-%tl%eh%;"),
+        "Cs" => Some(b"\x1b]12;%p1%s\x07"),
+        "Cr" => Some(b"\x1b]112\x07"),
+        "Se" => Some(b"\x1b[2 q"),
+        "Ss" => Some(b"\x1b[%p1%d q"),
+        "Ms" => Some(b"\x1b]52;%p1%s;%p2%s\x07"),
+        _ => None,
+    }
 }

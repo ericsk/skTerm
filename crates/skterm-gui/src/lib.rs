@@ -1015,4 +1015,119 @@ mod tests {
             Some(b"\x1b[97;6:3u".as_slice())
         );
     }
+
+    #[test]
+    fn test_xterm_key_encoding_app_home_end_modified_fkeys_and_ctrl_symbols() {
+        use winit::keyboard::{Key, NamedKey};
+
+        let mut shift = ModifiersState::empty();
+        shift.insert(ModifiersState::SHIFT);
+
+        let mut ctrl = ModifiersState::empty();
+        ctrl.insert(ModifiersState::CONTROL);
+
+        // Home / End in normal vs app_cursor_keys (?1h) mode
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::Home),
+                None,
+                ElementState::Pressed,
+                ModifiersState::empty(),
+                false
+            )
+            .as_deref(),
+            Some(b"\x1b[H".as_slice())
+        );
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::Home),
+                None,
+                ElementState::Pressed,
+                ModifiersState::empty(),
+                true
+            )
+            .as_deref(),
+            Some(b"\x1bOH".as_slice())
+        );
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::End),
+                None,
+                ElementState::Pressed,
+                ModifiersState::empty(),
+                true
+            )
+            .as_deref(),
+            Some(b"\x1bOF".as_slice())
+        );
+
+        // Modified F1..F12: Shift+F1 -> \x1b[1;2P, Ctrl+F5 -> \x1b[15;5~, Shift+F12 -> \x1b[24;2~
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::F1),
+                None,
+                ElementState::Pressed,
+                shift,
+                false
+            )
+            .as_deref(),
+            Some(b"\x1b[1;2P".as_slice())
+        );
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::F5),
+                None,
+                ElementState::Pressed,
+                ctrl,
+                false
+            )
+            .as_deref(),
+            Some(b"\x1b[15;5~".as_slice())
+        );
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::F12),
+                None,
+                ElementState::Pressed,
+                shift,
+                false
+            )
+            .as_deref(),
+            Some(b"\x1b[24;2~".as_slice())
+        );
+
+        // Ctrl+Space (NamedKey::Space or Character(" ")) -> 0x00 (NUL)
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::Space),
+                Some(" "),
+                ElementState::Pressed,
+                ctrl,
+                false
+            ),
+            Some(vec![0x00])
+        );
+        // Ctrl+/ -> 0x1f (US / Undo in emacs/zsh/bash)
+        assert_eq!(
+            encode_key(
+                &Key::Character("/".into()),
+                None,
+                ElementState::Pressed,
+                ctrl,
+                false
+            ),
+            Some(vec![0x1f])
+        );
+        // Ctrl+\ -> 0x1c (SIGQUIT)
+        assert_eq!(
+            encode_key(
+                &Key::Character("\\".into()),
+                None,
+                ElementState::Pressed,
+                ctrl,
+                false
+            ),
+            Some(vec![0x1c])
+        );
+    }
 }

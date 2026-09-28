@@ -76,16 +76,47 @@ impl TerminalSession {
     /// Repaint because PTY output changed something visible, at most once per
     /// refresh period. See [`FramePacer`] for why this is a leading-edge
     /// throttle and what that has to do with typing latency.
+    ///
+    /// If the active terminal is mid-batch in DEC Mode `?2026` (Synchronized Output),
+    /// hold the repaint until `?2026l` arrives or the 100ms safety timeout expires.
     pub fn request_output_redraw(&mut self) {
+        if self
+            .workspace
+            .active_tab()
+            .and_then(|t| t.active_terminal())
+            .is_some_and(|term| term.state.is_synchronized_output_active())
+        {
+            return;
+        }
         if self.pacer.on_output(Instant::now()) {
             self.window.request_redraw();
         }
     }
 
     /// Release a frame the pacer deferred, or report when it comes due so the
-    /// caller can arm the event loop's timer.
+    /// caller can arm the event loop's timer. Also enforces the 100ms safety
+    /// timeout for DEC Mode `?2026` (Synchronized Output).
     pub fn flush_paced_redraw(&mut self) -> Option<Instant> {
-        match self.pacer.poll(Instant::now()) {
+        let now = Instant::now();
+        if let Some(term) = self
+            .workspace
+            .active_tab_mut()
+            .and_then(|t| t.active_terminal_mut())
+        {
+            if term.state.synchronized_output {
+                if let Some(since) = term.state.synchronized_output_since {
+                    let timeout_at = since + Duration::from_millis(100);
+                    if now < timeout_at {
+                        return Some(timeout_at);
+                    }
+                }
+                term.state.synchronized_output = false;
+                term.state.synchronized_output_since = None;
+                self.window.request_redraw();
+                return None;
+            }
+        }
+        match self.pacer.poll(now) {
             PacerPoll::Idle => None,
             PacerPoll::RedrawNow => {
                 self.window.request_redraw();

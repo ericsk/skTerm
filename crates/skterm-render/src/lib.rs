@@ -11,8 +11,8 @@ pub use agent_panel::{AgentPanelHit, AgentPanelLayout, PanelRect};
 pub use atlas::{GlyphAtlas, GlyphInfo, GlyphKey};
 pub use pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
 pub use renderer::{
-    color_to_rgba_themed, AgentPanelState, AgentSidebarItem, PaneRenderItem, RenderTheme,
-    ScrollbarMetrics, TabItem, TermRenderer,
+    color_to_rgba_themed, color_to_rgba_with_dynamic_palette, AgentPanelState, AgentSidebarItem,
+    PaneRenderItem, RenderTheme, ScrollbarMetrics, TabItem, TermRenderer,
 };
 
 /// skterm-render version and basic info
@@ -42,7 +42,8 @@ mod tests {
 
     #[test]
     fn test_theme_color_overrides() {
-        use skterm_core::Color;
+        use skterm_core::{Color, NamedColor};
+        use std::collections::HashMap;
         let theme = RenderTheme::default();
         assert_eq!(
             color_to_rgba_themed(Color::DefaultFg, false, false, &theme),
@@ -60,6 +61,31 @@ mod tests {
         assert_eq!(
             color_to_rgba_themed(Color::Indexed(1), false, true, &themed),
             palette[9]
+        );
+
+        // Verify per-pane dynamic OSC 4 palette overrides take precedence over static theme
+        let mut dyn_pal = HashMap::new();
+        dyn_pal.insert(2u8, (0, 255, 128));
+        dyn_pal.insert(10u8, (128, 255, 0));
+        assert_eq!(
+            color_to_rgba_with_dynamic_palette(
+                Color::Named(NamedColor::Green),
+                false,
+                false,
+                &themed,
+                Some(&dyn_pal),
+            ),
+            [0.0, 1.0, 128.0 / 255.0, 1.0]
+        );
+        assert_eq!(
+            color_to_rgba_with_dynamic_palette(
+                Color::Named(NamedColor::Green),
+                false,
+                true,
+                &themed,
+                Some(&dyn_pal),
+            ),
+            [128.0 / 255.0, 1.0, 0.0, 1.0]
         );
     }
 

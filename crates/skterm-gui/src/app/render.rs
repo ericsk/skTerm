@@ -172,6 +172,10 @@ impl App {
                             is_scrollbar_hovered,
                             is_scrollbar_dragging,
                             is_recently_scrolled,
+                            dynamic_palette: Some(&t.state.dynamic_palette),
+                            dynamic_fg: t.state.dynamic_fg,
+                            dynamic_bg: t.state.dynamic_bg,
+                            dynamic_cursor: t.state.dynamic_cursor,
                         });
                     }
                 }
