@@ -355,6 +355,45 @@ fn clean_name(s: &str) -> String {
 
 static FONT_FILE_INDEX: std::sync::OnceLock<Vec<(PathBuf, String)>> = std::sync::OnceLock::new();
 
+const MAX_FONT_SCAN_DEPTH: usize = 6;
+
+fn collect_font_files_recursive(
+    dir: &std::path::Path,
+    depth: usize,
+    seen_paths: &mut std::collections::HashSet<PathBuf>,
+    files: &mut Vec<(PathBuf, String)>,
+) {
+    if depth > MAX_FONT_SCAN_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+
+    for path in paths {
+        if path.is_dir() {
+            collect_font_files_recursive(&path, depth + 1, seen_paths, files);
+        } else if path.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                let ext_lower = ext.to_lowercase();
+                if ext_lower == "ttf" || ext_lower == "ttc" || ext_lower == "otf" {
+                    // Index the stem, not the file name: the extension
+                    // would otherwise count as "extra" characters when
+                    // ranking candidates below.
+                    if let Some(stem) = path.file_stem().and_then(|n| n.to_str()) {
+                        let clean = clean_name(stem);
+                        if !clean.is_empty() && seen_paths.insert(path.clone()) {
+                            files.push((path, clean));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn get_cached_font_index() -> &'static [(PathBuf, String)] {
     FONT_FILE_INDEX.get_or_init(|| {
         let mut search_dirs = Vec::new();
@@ -364,6 +403,12 @@ fn get_cached_font_index() -> &'static [(PathBuf, String)] {
             search_dirs.push(home_path.join(".local/share/fonts"));
             search_dirs.push(home_path.join(".fonts"));
         }
+        if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
+            let xdg_fonts = PathBuf::from(xdg_data_home).join("fonts");
+            if !search_dirs.contains(&xdg_fonts) {
+                search_dirs.push(xdg_fonts);
+            }
+        }
         if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
             search_dirs.push(PathBuf::from(appdata).join("Microsoft\\Windows\\Fonts"));
         }
@@ -372,30 +417,28 @@ fn get_cached_font_index() -> &'static [(PathBuf, String)] {
         search_dirs.push(PathBuf::from("/System/Library/Fonts/Supplemental"));
         search_dirs.push(PathBuf::from("/usr/share/fonts"));
         search_dirs.push(PathBuf::from("/usr/local/share/fonts"));
-        search_dirs.push(PathBuf::from("C:\\Windows\\Fonts"));
-
-        let mut files = Vec::new();
-        for dir in search_dirs {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                            let ext_lower = ext.to_lowercase();
-                            if ext_lower == "ttf" || ext_lower == "ttc" || ext_lower == "otf" {
-                                // Index the stem, not the file name: the extension
-                                // would otherwise count as "extra" characters when
-                                // ranking candidates below.
-                                if let Some(stem) = path.file_stem().and_then(|n| n.to_str()) {
-                                    let clean = clean_name(stem);
-                                    files.push((path, clean));
-                                }
-                            }
-                        }
-                    }
+        if let Ok(xdg_data_dirs) = std::env::var("XDG_DATA_DIRS") {
+            for dir in xdg_data_dirs.split(':').filter(|s| !s.is_empty()) {
+                let fonts_dir = PathBuf::from(dir).join("fonts");
+                if !search_dirs.contains(&fonts_dir) {
+                    search_dirs.push(fonts_dir);
                 }
             }
         }
+        search_dirs.push(PathBuf::from("C:\\Windows\\Fonts"));
+
+        let mut files = Vec::new();
+        let mut seen_paths = std::collections::HashSet::new();
+        for dir in search_dirs {
+            collect_font_files_recursive(&dir, 0, &mut seen_paths, &mut files);
+        }
+        // Sort by file stem first so TitleCase names (e.g. "Georgia") precede
+        // lowercase duplicates (e.g. "georgia") when building the family picker.
+        files.sort_by(|a, b| {
+            let stem_a = a.0.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let stem_b = b.0.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            stem_a.cmp(stem_b).then_with(|| a.0.cmp(&b.0))
+        });
         files
     })
 }
@@ -479,6 +522,14 @@ fn direct_candidate(clean_q: &str) -> Option<PathBuf> {
         (
             "dejavusansmono",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ),
+        (
+            "notosansmono",
+            "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+        ),
+        (
+            "liberationmono",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
         ),
         ("consolas", "C:\\Windows\\Fonts\\consola.ttf"),
     ];
@@ -602,18 +653,36 @@ pub fn installed_font_families() -> Vec<String> {
 /// "NotoSansTC-VariableFont_wght"             -> "NotoSansTC"
 /// "Andale Mono"                              -> "Andale Mono"
 fn family_of(stem: &str) -> String {
-    let Some((head, tail)) = stem.rsplit_once('-') else {
+    if let Some((head, tail)) = stem.rsplit_once('-') {
+        let clean_tail = clean_name(tail);
+        let is_style = clean_tail.starts_with("regular")
+            || clean_tail.starts_with("variablefont")
+            || clean_tail == "vf"
+            || clean_tail == "roman"
+            || clean_tail == "book"
+            || clean_tail == "bdita"
+            || clean_tail.contains("demi")
+            || clean_tail.contains("hairline")
+            || STYLE_TOKENS.iter().any(|t| clean_tail.contains(t));
+        if is_style && !head.is_empty() {
+            return head.to_string();
+        }
         return stem.to_string();
-    };
-    let clean_tail = clean_name(tail);
-    let is_style = clean_tail.starts_with("regular")
-        || clean_tail.starts_with("variablefont")
-        || STYLE_TOKENS.iter().any(|t| clean_tail.contains(t));
-    if is_style && !head.is_empty() {
-        head.to_string()
-    } else {
-        stem.to_string()
     }
+
+    // Handle underscore-separated style suffixes common in Linux msttcorefonts / TeX fonts
+    // (e.g. "Courier_New_Bold_Italic" -> "Courier_New", "Aegean_hint" -> "Aegean").
+    let mut current = stem;
+    while let Some((head, tail)) = current.rsplit_once('_') {
+        let clean_tail = clean_name(tail);
+        let is_style = clean_tail == "hint" || STYLE_TOKENS.iter().any(|t| clean_tail == *t);
+        if is_style && !head.is_empty() {
+            current = head;
+        } else {
+            break;
+        }
+    }
+    current.to_string()
 }
 
 /// Load full configured font chain (Primary Monospace + Fallbacks)
@@ -658,6 +727,11 @@ pub fn load_configured_font_chain(
                     let italic_query = format!("{}Italic", q);
                     if let Some((i_font, _)) = find_font_file(&italic_query) {
                         italic_font = Some(i_font);
+                    } else {
+                        let oblique_query = format!("{}Oblique", q);
+                        if let Some((o_font, _)) = find_font_file(&oblique_query) {
+                            italic_font = Some(o_font);
+                        }
                     }
                 }
             } else {
@@ -675,6 +749,8 @@ pub fn load_configured_font_chain(
             "/System/Library/Fonts/SFMono-Regular.otf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
             "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
             "C:\\Windows\\Fonts\\consola.ttf",
         ];
         for d in defaults {
@@ -830,6 +906,12 @@ mod tests {
             family_of("NotoSansMNerdFontMono-Italic"),
             "NotoSansMNerdFontMono"
         );
+        // Linux-common suffixes (-VF, -Roman, -Book, underscore styles)
+        assert_eq!(family_of("Cantarell-VF"), "Cantarell");
+        assert_eq!(family_of("URWGothic-BookOblique"), "URWGothic");
+        assert_eq!(family_of("Courier_New_Bold_Italic"), "Courier_New");
+        assert_eq!(family_of("Times_New_Roman_Bold"), "Times_New_Roman");
+        assert_eq!(family_of("Andale_Mono"), "Andale_Mono");
         // ...but a dash that is part of the name itself must survive, otherwise
         // the family would be truncated to something that resolves elsewhere.
         assert_eq!(family_of("Andale Mono"), "Andale Mono");
@@ -841,7 +923,15 @@ mod tests {
     fn family_names_round_trip_to_a_real_file() {
         // A name offered by the picker must resolve, or the UI would suggest
         // entries that silently do nothing.
-        for family in installed_font_families().iter().take(40) {
+        let families = installed_font_families();
+        #[cfg(target_os = "linux")]
+        if std::path::Path::new("/usr/share/fonts").exists() {
+            assert!(
+                !families.is_empty(),
+                "expected to discover fonts under /usr/share/fonts subdirectories"
+            );
+        }
+        for family in &families {
             assert!(
                 resolve_font_path(family).is_some(),
                 "picker offers {:?} but it resolves to nothing",

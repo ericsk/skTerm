@@ -46,7 +46,18 @@ pub struct FontConfig {
 }
 
 fn default_font_family() -> String {
-    "Menlo".to_string()
+    #[cfg(target_os = "macos")]
+    {
+        "Menlo".to_string()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "Consolas".to_string()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        "DejaVu Sans Mono".to_string()
+    }
 }
 fn default_font_size() -> f32 {
     16.0
@@ -729,8 +740,8 @@ pub fn default_config_template() -> &'static str {
 # 快捷鍵：在終端機內按下 Cmd+, (macOS) 或 Ctrl+, (Linux/Windows) 可快速開啟此檔案。
 
 [font]
-# 主要等寬字型家族名稱 (例如: "Menlo", "JetBrains Mono", "Fira Code", "SF Mono")
-family = "Menlo"
+# 主要等寬字型家族名稱 (未指定時自動使用系統預設: macOS "Menlo", Linux "DejaVu Sans Mono", Windows "Consolas")
+# family = "Menlo"
 
 # 字型大小 (pt 單位，Retina 螢幕將自動以 physical pixels 進行高解析度光柵化)
 size = 16.0
