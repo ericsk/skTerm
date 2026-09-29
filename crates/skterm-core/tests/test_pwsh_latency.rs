@@ -1,4 +1,6 @@
+#[cfg(target_os = "windows")]
 use skterm_core::Terminal;
+#[cfg(target_os = "windows")]
 use std::time::{Duration, Instant};
 
 #[test]

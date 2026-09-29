@@ -177,6 +177,7 @@ impl App {
                 }
             }
             TopMenuAction::NewTabCmd => {
+                #[allow(unused_mut)]
                 let mut pty_opts = self.build_pty_options();
                 #[cfg(target_os = "windows")]
                 {
@@ -194,6 +195,7 @@ impl App {
                 }
             }
             TopMenuAction::NewTabWinPowerShell => {
+                #[allow(unused_mut)]
                 let mut pty_opts = self.build_pty_options();
                 #[cfg(target_os = "windows")]
                 {
@@ -213,6 +215,7 @@ impl App {
                 }
             }
             TopMenuAction::NewTabPwsh => {
+                #[allow(unused_mut)]
                 let mut pty_opts = self.build_pty_options();
                 #[cfg(target_os = "windows")]
                 {
@@ -232,6 +235,7 @@ impl App {
                 }
             }
             TopMenuAction::NewTabGitBash => {
+                #[allow(unused_mut)]
                 let mut pty_opts = self.build_pty_options();
                 #[cfg(target_os = "windows")]
                 {
