@@ -1361,13 +1361,13 @@ impl ProcessTreeCache {
         }
         let is_first_refresh = self.last_refresh.is_none();
         self.last_refresh = Some(std::time::Instant::now());
+        self.cwd_cache.clear();
 
         // On Linux, `find_agent_descendant` walks `/proc/<pid>/task/*/children` directly
         // in microseconds without spawning `ps` or touching unrelated system processes.
         #[cfg(target_os = "linux")]
         {
             let _ = is_first_refresh;
-            self.cwd_cache.clear();
         }
 
         #[cfg(all(unix, not(target_os = "linux")))]
@@ -1626,7 +1626,7 @@ impl ProcessTreeCache {
         }
         #[cfg(target_os = "macos")]
         {
-            if let Some(path_str) = skterm_core::process_cwd(pid as libc::pid_t) {
+            if let Some(path_str) = skterm_core::process_cwd(pid as i32) {
                 let name = std::path::Path::new(&path_str)
                     .file_name()
                     .and_then(|s| s.to_str())

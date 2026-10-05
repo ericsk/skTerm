@@ -15,6 +15,8 @@ pub use pty::{
     available_shell_presets, find_cmd, find_git_bash_path, find_pwsh_path, find_windows_powershell,
     PtyEvent, PtyProcess, PtySpawnOptions, ShellPresetInfo,
 };
+#[cfg(target_os = "macos")]
+pub use pty::process_cwd;
 pub use terminal::Terminal;
 pub use vt::{Charset, MouseFormat, MouseProtocol, TerminalState};
 
