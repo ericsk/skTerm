@@ -143,9 +143,9 @@ impl PtyProcess {
             cmd.env("LC_ALL", "en_US.UTF-8");
         }
 
-        // On macOS, if PATH only has minimal system paths (typical when launched via Finder/LaunchServices),
-        // enrich PATH with common tool locations (/usr/local/bin, /opt/homebrew/bin, $HOME/homebrew/bin, $HOME/.cargo/bin)
-        #[cfg(target_os = "macos")]
+        // On Unix, if PATH only has minimal system paths (typical when launched via Finder/LaunchServices or .desktop launcher),
+        // enrich PATH with common tool locations (/usr/local/bin, /opt/homebrew/bin, $HOME/homebrew/bin, $HOME/.cargo/bin, $HOME/.local/bin)
+        #[cfg(unix)]
         {
             let current_path = std::env::var("PATH").unwrap_or_default();
             let mut paths: Vec<std::path::PathBuf> = std::env::split_paths(&current_path).collect();
@@ -157,6 +157,7 @@ impl PtyProcess {
                 home.as_ref().map(|h| h.join("homebrew/bin")),
                 home.as_ref().map(|h| h.join(".cargo/bin")),
                 home.as_ref().map(|h| h.join(".local/bin")),
+                home.as_ref().map(|h| h.join("bin")),
             ];
 
             let mut modified = false;
@@ -347,6 +348,22 @@ impl PtyProcess {
     /// Return the OS process ID of the spawned shell/child process.
     pub fn process_id(&self) -> Option<u32> {
         self.pid
+    }
+
+    /// Return the OS process group leader ID currently in the foreground of this pty.
+    #[cfg(unix)]
+    pub fn foreground_process_group_id(&self) -> Option<u32> {
+        let pgid = self.master.process_group_leader()?;
+        if pgid > 0 {
+            Some(pgid as u32)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn foreground_process_group_id(&self) -> Option<u32> {
+        None
     }
 
     /// Name of the process currently in the foreground of this pty.

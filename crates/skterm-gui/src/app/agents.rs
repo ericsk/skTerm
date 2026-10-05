@@ -34,7 +34,20 @@ pub struct AgentList {
 
 impl AgentList {
     /// Replace the list wholesale. The only way to populate it.
-    pub fn set(&mut self, scanned: Vec<(WindowId, AgentSidebarItem)>) {
+    /// Returns `true` if the new list differs from the previous one.
+    pub fn set(&mut self, scanned: Vec<(WindowId, AgentSidebarItem)>) -> bool {
+        let unchanged = self.items.len() == scanned.len()
+            && self
+                .owners
+                .iter()
+                .zip(self.items.iter())
+                .zip(scanned.iter())
+                .all(|((&owner, item), (wid, new_item))| {
+                    owner == (*wid, new_item.tab_id, new_item.pane_id) && item == new_item
+                });
+        if unchanged {
+            return false;
+        }
         self.items.clear();
         self.owners.clear();
         self.items.reserve(scanned.len());
@@ -43,6 +56,7 @@ impl AgentList {
             self.owners.push((wid, item.tab_id, item.pane_id));
             self.items.push(item);
         }
+        true
     }
 
     /// The cards, in draw order.
@@ -229,7 +243,11 @@ impl App {
     pub fn refresh_agent_cache(&mut self) {
         self.last_ai_agent_scan = Some(Instant::now());
         let scanned = self.scan_all_ai_agents();
-        self.cached_ai_agents.set(scanned);
+        if self.cached_ai_agents.set(scanned) {
+            for s in self.sessions.values() {
+                s.window.request_redraw();
+            }
+        }
     }
 
     /// Overlay the in-progress rename onto the card being edited.
@@ -419,4 +437,154 @@ mod tests {
     fn the_first_click_of_all_is_not_a_double_click() {
         assert!(!is_repeat_click(None, (win(), 1, 10), Instant::now()));
     }
+
+    #[test]
+    fn set_reports_whether_the_agent_list_changed() {
+        let mut list = AgentList::default();
+        assert!(!list.set(vec![]), "empty -> empty is unchanged");
+
+        assert!(
+            list.set(vec![(win(), item(1, 10, "Jetski"))]),
+            "empty -> non-empty is a change"
+        );
+        assert!(
+            !list.set(vec![(win(), item(1, 10, "Jetski"))]),
+            "identical scan is unchanged"
+        );
+
+        let mut updated = item(1, 10, "Jetski");
+        updated.is_active_output = true;
+        assert!(
+            list.set(vec![(win(), updated.clone())]),
+            "activity status change is detected"
+        );
+        assert!(
+            !list.set(vec![(win(), updated)]),
+            "same activity status is unchanged"
+        );
+    }
+
+    #[test]
+    fn match_agent_command_detects_linux_and_glinux_invocations() {
+        use crate::layout::ProcessTreeCache;
+
+        // Direct binaries
+        assert_eq!(ProcessTreeCache::match_agent_command("jetski"), Some("Jetski"));
+        assert_eq!(
+            ProcessTreeCache::match_agent_command("agy"),
+            Some("Antigravity CLI")
+        );
+        assert_eq!(
+            ProcessTreeCache::match_agent_command("claude"),
+            Some("Claude Code")
+        );
+        assert_eq!(
+            ProcessTreeCache::match_agent_command("gemini"),
+            Some("Gemini CLI")
+        );
+        assert_eq!(ProcessTreeCache::match_agent_command("aider"), Some("Aider"));
+        assert_eq!(
+            ProcessTreeCache::match_agent_command("codex"),
+            Some("Codex CLI")
+        );
+
+        // Google Linux (gLinux) SAR extracted binaries and release wrappers
+        assert_eq!(
+            ProcessTreeCache::match_agent_command(
+                "/tmp/sar.cli_internal.9mu5541l/cli_internal_impl.runfiles/google3/third_party/jetski/cmd/cli/cli --app_data_dir=jetski"
+            ),
+            Some("Jetski")
+        );
+        assert_eq!(
+            ProcessTreeCache::match_agent_command("/google/bin/releases/jetski-devs/tools/cli"),
+            Some("Jetski")
+        );
+        assert_eq!(
+            ProcessTreeCache::match_agent_command(
+                "/bin/bash /tmp/sar.gemini.ab12cd34/gemini_impl"
+            ),
+            Some("Gemini CLI")
+        );
+        assert_eq!(
+            ProcessTreeCache::match_agent_command(
+                "/google/bin/releases/gemini-cli/tools/gemini"
+            ),
+            Some("Gemini CLI")
+        );
+
+        // Node / npm / Python wrappers on Linux
+        assert_eq!(
+            ProcessTreeCache::match_agent_command(
+                "node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+            ),
+            Some("Claude Code")
+        );
+        assert_eq!(
+            ProcessTreeCache::match_agent_command(
+                "env NODE_NO_WARNINGS=1 node /home/user/.nvm/versions/node/v22.0.0/bin/gemini"
+            ),
+            Some("Gemini CLI")
+        );
+        assert_eq!(
+            ProcessTreeCache::match_agent_command("/usr/bin/python3 -m aider --model sonnet"),
+            Some("Aider")
+        );
+        assert_eq!(
+            ProcessTreeCache::match_agent_command(
+                "node /usr/lib/node_modules/@openai/codex/bin/codex.js"
+            ),
+            Some("Codex CLI")
+        );
+
+        // Non-agents and background daemons must not false-positive
+        assert_eq!(ProcessTreeCache::match_agent_command("/bin/bash"), None);
+        assert_eq!(
+            ProcessTreeCache::match_agent_command("grep jetski Cargo.toml"),
+            None
+        );
+        assert_eq!(
+            ProcessTreeCache::match_agent_command("vim claude.md"),
+            None
+        );
+        assert_eq!(
+            ProcessTreeCache::match_agent_command("git checkout gemini"),
+            None
+        );
+        assert_eq!(
+            ProcessTreeCache::match_agent_command(
+                "/tmp/sar.123/google3/third_party/jetski/cmd/hub/server/jetski-hub-server"
+            ),
+            None
+        );
+        assert_eq!(
+            ProcessTreeCache::match_agent_command("jetski-sidecar --port 9000"),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proc_tree_finds_spawned_agent_descendant() {
+        use crate::layout::ProcessTreeCache;
+        use std::os::unix::process::CommandExt;
+
+        // Spawn a short-lived child process whose argv[0] mimics the Jetski SAR CLI binary.
+        let mut child = std::process::Command::new("sleep")
+            .arg0("/tmp/sar.cli_internal.test/cli_internal_impl.runfiles/google3/third_party/jetski/cmd/cli/cli")
+            .arg("5")
+            .spawn()
+            .expect("spawn test child");
+
+        let my_pid = std::process::id();
+        let mut cache = ProcessTreeCache::new();
+        let detected = cache.find_agent_descendant(my_pid);
+        let project = cache.get_project_name(child.id());
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(detected, Some((child.id(), "Jetski")));
+        assert!(!project.is_empty() && project != "workspace");
+    }
 }
+

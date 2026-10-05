@@ -1093,38 +1093,81 @@ impl Workspace {
 
             for (pane_id, terminal) in leaves {
                 let mut found_agent: Option<(u32, String)> = None;
+                let shell_pid = terminal.process_id();
 
-                if let Some(shell_pid) = terminal.process_id() {
-                    if let Some((agent_pid, name)) = cache.find_agent_descendant(shell_pid) {
+                if let Some(spid) = shell_pid {
+                    if let Some((agent_pid, name)) = cache.find_agent_descendant(spid) {
                         found_agent = Some((agent_pid, name.to_string()));
+                    }
+                }
+
+                // Also check the PTY's foreground process group leader in case a wrapper
+                // script re-parented the agent process while keeping it in the foreground.
+                if found_agent.is_none() {
+                    if let Some(fg_pid) = terminal.foreground_process_group_id() {
+                        if Some(fg_pid) != shell_pid {
+                            if let Some((agent_pid, name)) = cache.find_agent_descendant(fg_pid) {
+                                found_agent = Some((agent_pid, name.to_string()));
+                            }
+                        }
+                    }
+                }
+
+                if found_agent.is_none() {
+                    if let Some(fg_name) = terminal.foreground_process_name() {
+                        if let Some(name) = ProcessTreeCache::match_agent_command(&fg_name) {
+                            let pid = terminal
+                                .foreground_process_group_id()
+                                .or(shell_pid)
+                                .unwrap_or(0);
+                            found_agent = Some((pid, name.to_string()));
+                        }
                     }
                 }
 
                 if found_agent.is_none() {
                     let title_lower = terminal.state.title.to_lowercase();
                     if title_lower.contains("jetski") {
-                        let pid = terminal.process_id().unwrap_or(0);
+                        let pid = shell_pid.unwrap_or(0);
                         found_agent = Some((pid, "Jetski".to_string()));
                     } else if title_lower.contains("antigravity") || title_lower.contains("agy") {
-                        let pid = terminal.process_id().unwrap_or(0);
+                        let pid = shell_pid.unwrap_or(0);
                         found_agent = Some((pid, "Antigravity CLI".to_string()));
                     } else if title_lower.contains("claude") {
-                        let pid = terminal.process_id().unwrap_or(0);
+                        let pid = shell_pid.unwrap_or(0);
                         found_agent = Some((pid, "Claude Code".to_string()));
                     } else if title_lower.contains("gemini") {
-                        let pid = terminal.process_id().unwrap_or(0);
+                        let pid = shell_pid.unwrap_or(0);
                         found_agent = Some((pid, "Gemini CLI".to_string()));
+                    } else if title_lower.contains("aider") {
+                        let pid = shell_pid.unwrap_or(0);
+                        found_agent = Some((pid, "Aider".to_string()));
+                    } else if title_lower.contains("codex") {
+                        let pid = shell_pid.unwrap_or(0);
+                        found_agent = Some((pid, "Codex CLI".to_string()));
                     }
                 }
 
                 if let Some((agent_pid, agent_name)) = found_agent {
-                    let project_name = if agent_pid > 0 {
+                    let mut project_name = if agent_pid > 0 {
                         cache.get_project_name(agent_pid)
-                    } else if let Some(spid) = terminal.process_id() {
+                    } else if let Some(spid) = shell_pid {
                         cache.get_project_name(spid)
                     } else {
                         "workspace".to_string()
                     };
+                    if project_name == "workspace" {
+                        if let Some(cwd) = terminal.current_working_directory() {
+                            if let Some(name) = std::path::Path::new(&cwd)
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                            {
+                                if !name.is_empty() {
+                                    project_name = name.to_string();
+                                }
+                            }
+                        }
+                    }
 
                     let location_label = format!("Tab {} · #{}", tab_idx + 1, pane_id);
                     let title_summary = if let Some(ref custom) = terminal.custom_label {
@@ -1164,6 +1207,40 @@ impl Workspace {
     }
 }
 
+/// Choose the default CLI command sent when clicking `+ New` in the AI Agents sidebar.
+pub fn default_new_agent_command() -> &'static [u8] {
+    fn in_path(bin: &str) -> bool {
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                if dir.join(bin).is_file() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    if in_path("agy") {
+        b"agy\r"
+    } else if in_path("jetski")
+        || std::path::Path::new("/google/bin/releases/jetski-devs/tools/cli").exists()
+    {
+        b"jetski\r"
+    } else if in_path("claude") {
+        b"claude\r"
+    } else if in_path("gemini")
+        || std::path::Path::new("/google/bin/releases/gemini-cli/tools/gemini").exists()
+    {
+        b"gemini\r"
+    } else if in_path("codex") {
+        b"codex\r"
+    } else if in_path("aider") {
+        b"aider\r"
+    } else {
+        b"agy\r"
+    }
+}
+
 /// Parent PID -> its child `(pid, process name)` pairs, shared with the
 /// background refresh thread that repopulates the tree off the UI thread.
 type ChildrenMap =
@@ -1173,6 +1250,7 @@ type ChildrenMap =
 pub struct ProcessTreeCache {
     last_refresh: Option<std::time::Instant>,
     children_map: ChildrenMap,
+    #[allow(dead_code)]
     is_refreshing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     cwd_cache: std::collections::HashMap<u32, String>,
 }
@@ -1183,11 +1261,65 @@ impl Default for ProcessTreeCache {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn linux_child_pids(pid: u32) -> Option<Vec<u32>> {
+    let task_dir = std::fs::read_dir(format!("/proc/{}/task", pid)).ok()?;
+    let mut children = Vec::new();
+    let mut any_children_file = false;
+    for entry in task_dir.flatten() {
+        let children_path = entry.path().join("children");
+        if let Ok(content) = std::fs::read_to_string(&children_path) {
+            any_children_file = true;
+            for tok in content.split_whitespace() {
+                if let Ok(cpid) = tok.parse::<u32>() {
+                    if !children.contains(&cpid) {
+                        children.push(cpid);
+                    }
+                }
+            }
+        }
+    }
+    if any_children_file {
+        Some(children)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_match_process(pid: u32) -> Option<&'static str> {
+    if let Ok(bytes) = std::fs::read(format!("/proc/{}/cmdline", pid)) {
+        if !bytes.is_empty() {
+            let s = String::from_utf8_lossy(&bytes);
+            let cmd = s
+                .split('\0')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Some(agent) = ProcessTreeCache::match_agent_command(&cmd) {
+                return Some(agent);
+            }
+        }
+    }
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", pid)) {
+        let exe_str = exe.to_string_lossy();
+        let clean_exe = exe_str.strip_suffix(" (deleted)").unwrap_or(&exe_str);
+        if let Some(agent) = ProcessTreeCache::match_agent_command(clean_exe) {
+            return Some(agent);
+        }
+    }
+    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
+        if let Some(agent) = ProcessTreeCache::match_agent_command(comm.trim()) {
+            return Some(agent);
+        }
+    }
+    None
+}
+
 impl ProcessTreeCache {
     pub fn new() -> Self {
         Self {
-            // Defer first process tree scan so cold startup frame renders immediately with zero subprocess delay
-            last_refresh: Some(std::time::Instant::now()),
+            last_refresh: None,
             children_map: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -1196,89 +1328,264 @@ impl ProcessTreeCache {
         }
     }
 
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn collect_ps_children_map() -> std::collections::HashMap<u32, Vec<(u32, String)>> {
+        let mut new_map: std::collections::HashMap<u32, Vec<(u32, String)>> =
+            std::collections::HashMap::new();
+        if let Ok(output) = std::process::Command::new("ps")
+            .args(["-ax", "-o", "pid=,ppid=,args="])
+            .output()
+        {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                for line in text.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 3 {
+                        if let (Ok(pid), Ok(ppid)) =
+                            (parts[0].parse::<u32>(), parts[1].parse::<u32>())
+                        {
+                            let cmd_line = parts[2..].join(" ").to_lowercase();
+                            new_map.entry(ppid).or_default().push((pid, cmd_line));
+                        }
+                    }
+                }
+            }
+        }
+        new_map
+    }
+
     pub fn refresh_if_needed(&mut self) {
         if let Some(last) = self.last_refresh {
             if last.elapsed() < std::time::Duration::from_millis(1200) {
                 return;
             }
         }
-        if self
-            .is_refreshing
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_err()
+        let is_first_refresh = self.last_refresh.is_none();
+        self.last_refresh = Some(std::time::Instant::now());
+
+        // On Linux, `find_agent_descendant` walks `/proc/<pid>/task/*/children` directly
+        // in microseconds without spawning `ps` or touching unrelated system processes.
+        #[cfg(target_os = "linux")]
         {
-            return;
+            let _ = is_first_refresh;
+            self.cwd_cache.clear();
         }
 
-        self.last_refresh = Some(std::time::Instant::now());
-        let map_arc = self.children_map.clone();
-        let flag_arc = self.is_refreshing.clone();
-
-        std::thread::spawn(move || {
-            #[allow(unused_mut)]
-            let mut new_map: std::collections::HashMap<u32, Vec<(u32, String)>> =
-                std::collections::HashMap::new();
-
-            #[cfg(unix)]
-            {
-                if let Ok(output) = std::process::Command::new("ps")
-                    .args(["-ax", "-o", "pid=,ppid=,args="])
-                    .output()
-                {
-                    if let Ok(text) = String::from_utf8(output.stdout) {
-                        for line in text.lines() {
-                            let parts: Vec<&str> = line.split_whitespace().collect();
-                            if parts.len() >= 3 {
-                                if let (Ok(pid), Ok(ppid)) =
-                                    (parts[0].parse::<u32>(), parts[1].parse::<u32>())
-                                {
-                                    let cmd_line = parts[2..].join(" ").to_lowercase();
-                                    new_map.entry(ppid).or_default().push((pid, cmd_line));
-                                }
-                            }
-                        }
-                    }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            // Populate synchronously on the very first refresh when opening the sidebar
+            // so the initial frame immediately shows running agents.
+            if is_first_refresh {
+                let new_map = Self::collect_ps_children_map();
+                if let Ok(mut guard) = self.children_map.lock() {
+                    *guard = new_map;
                 }
+                return;
             }
 
-            if let Ok(mut guard) = map_arc.lock() {
-                *guard = new_map;
+            if self
+                .is_refreshing
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                return;
             }
-            flag_arc.store(false, std::sync::atomic::Ordering::SeqCst);
-        });
+
+            let map_arc = self.children_map.clone();
+            let flag_arc = self.is_refreshing.clone();
+
+            std::thread::spawn(move || {
+                let new_map = Self::collect_ps_children_map();
+                if let Ok(mut guard) = map_arc.lock() {
+                    *guard = new_map;
+                }
+                flag_arc.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
     }
 
-    fn match_agent_command(cmd_line: &str) -> Option<&'static str> {
-        for token in cmd_line.split_whitespace() {
+    pub fn match_agent_command(cmd_line: &str) -> Option<&'static str> {
+        let lower = cmd_line.trim().to_lowercase();
+        if lower.is_empty() {
+            return None;
+        }
+
+        // Exclude background daemons, sidecars, MCP helper servers, and telemetry/install scripts.
+        if lower.contains("jetski-hub-server")
+            || lower.contains("/cmd/hub/server/")
+            || lower.contains("jetski-sidecar")
+            || lower.contains("install_jetski")
+            || lower.contains("install-jetski")
+            || lower.contains("gemini_api_proxy")
+            || lower.contains("launch_mcp_server")
+            || lower.contains("mcp_server")
+            || lower.contains("/crudd/log_usage")
+        {
+            return None;
+        }
+
+        for raw_token in lower.split_whitespace() {
+            let token = raw_token.trim_matches(|c: char| c == '"' || c == '\'');
+            if token.is_empty() {
+                continue;
+            }
+
+            // Skip leading KEY=VALUE environment assignments (e.g. `NODE_OPTIONS=... claude`).
+            if !token.starts_with('-') && token.contains('=') && !token.starts_with('/') {
+                continue;
+            }
+
+            // Check explicit agent flags (e.g. `--app_data_dir=jetski` passed by Jetski SAR wrapper).
+            if token == "--app_data_dir=jetski" || token.starts_with("--app_data_dir=jetski/") {
+                return Some("Jetski");
+            }
+            if token == "--app_data_dir=antigravity"
+                || token == "--app_data_dir=agy"
+                || token.starts_with("--app_data_dir=antigravity/")
+                || token.starts_with("--app_data_dir=agy/")
+            {
+                return Some("Antigravity CLI");
+            }
+
+            // Check known path patterns for SAR / runfiles / npm / node_modules / release wrappers.
+            if token.contains("/jetski/cmd/cli/")
+                || token.contains("/jetski/cli/")
+                || token.contains("/jetski-devs/tools/")
+            {
+                return Some("Jetski");
+            }
+            if token.contains("/antigravity/cmd/cli/")
+                || token.contains("/antigravity/cli/")
+                || token.contains("/antigravity-devs/tools/")
+                || token.contains("@google/antigravity")
+            {
+                return Some("Antigravity CLI");
+            }
+            if token.contains("@anthropic-ai/claude-code")
+                || token.contains("/claude-code/")
+                || token.contains("/.claude/local/")
+            {
+                return Some("Claude Code");
+            }
+            if token.contains("@google/gemini-cli")
+                || token.contains("/google_gemini_cli/")
+                || token.contains("/gemini-cli/tools/gemini")
+                || token.contains("/sar.gemini.")
+            {
+                return Some("Gemini CLI");
+            }
+            if token.contains("@openai/codex") {
+                return Some("Codex CLI");
+            }
+
             let base = std::path::Path::new(token)
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or(token);
-            if base == "jetski" {
+            let base = base
+                .strip_suffix(".exe")
+                .or_else(|| base.strip_suffix(".cmd"))
+                .or_else(|| base.strip_suffix(".js"))
+                .or_else(|| base.strip_suffix(".mjs"))
+                .or_else(|| base.strip_suffix(".py"))
+                .unwrap_or(base);
+
+            if base == "jetski" || base == "jetski-cli" {
                 return Some("Jetski");
-            } else if base == "agy" || base == "antigravity" {
+            } else if base == "agy" || base == "antigravity" || base == "antigravity-cli" {
                 return Some("Antigravity CLI");
-            } else if base == "claude" {
+            } else if base == "claude" || base == "claude-code" {
                 return Some("Claude Code");
-            } else if base == "gemini" {
+            } else if base == "gemini" || base == "gemini-cli" || base == "gemini_impl" {
                 return Some("Gemini CLI");
-            } else if base == "aider" {
+            } else if base == "aider" || base == "aider-chat" {
                 return Some("Aider");
-            } else if base == "codex" {
+            } else if base == "codex" || base == "codex-cli" {
                 return Some("Codex CLI");
+            }
+
+            // Skip flags (e.g. `-e`, `--no-warnings`, `-m`, `-l`, `-c`).
+            if token.starts_with('-') {
+                continue;
+            }
+
+            // Allow transparent wrappers, shells, and language runtimes to continue
+            // scanning the next token (the script or module being executed).
+            let is_wrapper_or_runtime = matches!(
+                base,
+                "sh" | "bash"
+                    | "zsh"
+                    | "fish"
+                    | "dash"
+                    | "ksh"
+                    | "env"
+                    | "sudo"
+                    | "nohup"
+                    | "nice"
+                    | "time"
+                    | "caffeinate"
+                    | "setsid"
+                    | "node"
+                    | "nodejs"
+                    | "bun"
+                    | "deno"
+                    | "tsx"
+                    | "npx"
+                    | "pnpx"
+                    | "bunx"
+                    | "python"
+                    | "python2"
+                    | "python3"
+                    | "uv"
+                    | "uvx"
+                    | "pipx"
+                    | "cli"
+                    | "cli_internal"
+            ) || base.starts_with("python3.");
+
+            if !is_wrapper_or_runtime {
+                // First non-wrapper executable was not an agent (e.g. `grep jetski`, `vim claude.md`,
+                // `git checkout gemini`); stop so positional arguments do not false-positive.
+                return None;
             }
         }
         None
     }
 
-    /// Search descendant processes of `root_pid` for a known AI Agent CLI.
+    /// Search `root_pid` and its descendant processes for a known AI Agent CLI.
     pub fn find_agent_descendant(&self, root_pid: u32) -> Option<(u32, &'static str)> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(root_pid);
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(root_pid);
+
+            while let Some(curr_pid) = queue.pop_front() {
+                if visited.len() > 128 {
+                    break;
+                }
+                if let Some(agent_name) = linux_match_process(curr_pid) {
+                    return Some((curr_pid, agent_name));
+                }
+                if let Some(children) = linux_child_pids(curr_pid) {
+                    for child_pid in children {
+                        if visited.insert(child_pid) {
+                            queue.push_back(child_pid);
+                        }
+                    }
+                }
+            }
+        }
+
         let guard = self.children_map.lock().ok()?;
+        if guard.is_empty() {
+            return None;
+        }
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(root_pid);
         let mut visited = std::collections::HashSet::new();
@@ -1319,6 +1626,17 @@ impl ProcessTreeCache {
         }
         #[cfg(target_os = "macos")]
         {
+            if let Some(path_str) = skterm_core::process_cwd(pid as libc::pid_t) {
+                let name = std::path::Path::new(&path_str)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&path_str)
+                    .to_string();
+                if !name.is_empty() {
+                    self.cwd_cache.insert(pid, name.clone());
+                    return name;
+                }
+            }
             if let Ok(output) = std::process::Command::new("lsof")
                 .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
                 .output()
@@ -1343,3 +1661,4 @@ impl ProcessTreeCache {
         "workspace".to_string()
     }
 }
+

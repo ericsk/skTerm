@@ -217,6 +217,11 @@ impl Terminal {
         self.pty.as_ref()?.foreground_process_name()
     }
 
+    /// OS process group leader ID currently in the foreground of this terminal's pty.
+    pub fn foreground_process_group_id(&self) -> Option<u32> {
+        self.pty.as_ref()?.foreground_process_group_id()
+    }
+
     /// Return the current working directory of this terminal (from OSC 7 or child OS process CWD).
     pub fn current_working_directory(&self) -> Option<String> {
         if let Some(ref cwd) = self.state.current_working_directory {

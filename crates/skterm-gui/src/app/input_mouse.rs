@@ -651,6 +651,7 @@ impl App {
             // mouse press and release was pure waste.
             let pty_opts = self.build_pty_options();
             let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
+            let agent_cmd = crate::layout::default_new_agent_command();
 
             if let Some(session) = self.sessions.get_mut(&window_id) {
                 let _ = session.workspace.split_active_pane(
@@ -663,7 +664,7 @@ impl App {
                 session.sync_all_pane_sizes(tab_bar_h);
                 if let Some(tab) = session.workspace.active_tab_mut() {
                     if let Some(term) = tab.active_terminal_mut() {
-                        let _ = term.write_to_pty(b"agy\r");
+                        let _ = term.write_to_pty(agent_cmd);
                     }
                 }
                 session.window.request_redraw();
@@ -809,6 +810,9 @@ impl App {
                 if let Some(target_session) = self.sessions.get_mut(&target_wid) {
                     target_session.sync_all_pane_sizes(new_tab_bar_h);
                     target_session.window.request_redraw();
+                }
+                if self.sidebar_open {
+                    self.refresh_agent_cache();
                 }
             }
             return;

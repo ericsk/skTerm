@@ -156,7 +156,7 @@ pub struct TabItem {
 }
 
 /// Render descriptor for an AI Agent item in the global agents panel
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSidebarItem {
     pub tab_id: u32,
     pub pane_id: u32,
