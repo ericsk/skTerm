@@ -43,6 +43,7 @@ pub struct GlyphAtlas {
     fallback_fonts: Vec<Font>,
     fallback_initialized: bool,
     pub font_size: f32,
+    pub base_cell_height: f32,
     pub cell_width: f32,
     pub cell_height: f32,
     pub baseline_offset: f32,
@@ -110,10 +111,11 @@ impl GlyphAtlas {
         let line_metrics = regular_font.horizontal_line_metrics(font_size);
 
         let cell_width = regular_metrics.advance_width.ceil().max(1.0);
-        let cell_height = line_metrics
+        let base_cell_height = line_metrics
             .map(|m| (m.ascent - m.descent + m.line_gap).ceil())
             .unwrap_or(font_size * 1.3)
             .max(1.0);
+        let cell_height = base_cell_height;
 
         // Vertically center glyphs within character cell height.
         // Terminal text lines and cursors are visually judged by prompt characters (e.g. '>') and capital letters.
@@ -161,6 +163,7 @@ impl GlyphAtlas {
             fallback_fonts,
             fallback_initialized: false,
             font_size,
+            base_cell_height,
             cell_width,
             cell_height,
             baseline_offset,
@@ -174,6 +177,30 @@ impl GlyphAtlas {
         }
 
         Ok(atlas)
+    }
+
+    /// Update vertical cell height and baseline offset based on the user's `line_height` multiplier
+    /// (where `1.2` is the standard baseline 1.0x cell height).
+    pub fn set_line_height(&mut self, line_height: f32) {
+        let ratio = (line_height.clamp(0.8, 2.5)) / 1.2;
+        self.cell_height = (self.base_cell_height * ratio).round().max(1.0);
+        let regular_metrics = self.regular_font.metrics('M', self.font_size);
+        let line_metrics = self.regular_font.horizontal_line_metrics(self.font_size);
+        let gt_metric = self.regular_font.metrics('>', self.font_size);
+        self.baseline_offset = if gt_metric.height > 0 {
+            let gt_h = gt_metric.height as f32;
+            let gt_ymin = gt_metric.ymin as f32;
+            let top_margin = ((self.cell_height - gt_h) / 2.0).round();
+            (top_margin + gt_h + gt_ymin).clamp(1.0, self.cell_height - 1.0)
+        } else if regular_metrics.height > 0 {
+            let cap_h = regular_metrics.height as f32;
+            let cap_ymin = regular_metrics.ymin as f32;
+            let top_margin = ((self.cell_height - cap_h) / 2.0).round();
+            (top_margin + cap_h + cap_ymin).clamp(1.0, self.cell_height - 1.0)
+        } else {
+            let font_ascent = line_metrics.map(|m| m.ascent).unwrap_or(self.font_size);
+            font_ascent.round().clamp(1.0, self.cell_height - 1.0)
+        };
     }
 
     /// Lazy-load standard system CJK / Emoji fallback fonts on first demand if not already in chain
@@ -645,6 +672,48 @@ pub fn installed_font_families() -> Vec<String> {
 
     families.sort_by_key(|f| f.to_lowercase());
     families
+}
+
+/// Returns `true` if a font family name looks like a monospace, coding, Nerd Font, or CJK font
+/// suitable for terminal primary or fallback use.
+pub fn is_terminal_friendly_font(family: &str) -> bool {
+    let lower = clean_name(family);
+    const KEYWORDS: &[&str] = &[
+        "mono",
+        "nerd",
+        "code",
+        "term",
+        "console",
+        "consolas",
+        "courier",
+        "menlo",
+        "monaco",
+        "cascadia",
+        "jetbrains",
+        "firacode",
+        "iosevka",
+        "inconsolata",
+        "hack",
+        "ubuntu",
+        "dejavusansmono",
+        "liberationmono",
+        "notosansm",
+        "notomono",
+        "cjk",
+        "sanstc",
+        "sanssc",
+        "sansjp",
+        "sanskr",
+        "pingfang",
+        "hiragino",
+        "wqy",
+        "wenquanyi",
+        "jhenghei",
+        "yahei",
+        "msyh",
+        "simsun",
+    ];
+    KEYWORDS.iter().any(|k| lower.contains(k))
 }
 
 /// Strip a trailing style segment from a font file stem.

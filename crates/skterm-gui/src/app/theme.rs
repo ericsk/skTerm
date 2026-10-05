@@ -159,9 +159,11 @@ impl App {
     pub fn apply_config_live(&mut self, new_cfg: &Config, persist: bool) {
         info!("Applying live configuration update to all terminal sessions...");
         let old_font = self.config_manager.current_config.font.clone();
+        let old_decorations = self.config_manager.current_config.window.decorations.clone();
         let font_changed = old_font.family != new_cfg.font.family
             || (old_font.size - new_cfg.font.size).abs() > 0.01
             || old_font.fallback_families != new_cfg.font.fallback_families;
+        let decorations_changed = old_decorations != new_cfg.window.decorations;
 
         self.config_manager.current_config = new_cfg.clone();
         let render_theme = self.build_render_theme();
@@ -183,9 +185,17 @@ impl App {
             }
             session
                 .renderer
+                .update_line_height(new_cfg.font.line_height);
+            session
+                .renderer
                 .update_padding(new_cfg.window.padding_x, new_cfg.window.padding_y);
             session.renderer.update_opacity(new_cfg.window.opacity);
             session.renderer.set_theme(render_theme);
+            if decorations_changed {
+                session
+                    .window
+                    .set_decorations(new_cfg.window.decorations != "none");
+            }
             session.workspace.update_cursor_shape(cursor_shape);
             session.sync_all_pane_sizes(tab_bar_h);
             session.window.request_redraw();

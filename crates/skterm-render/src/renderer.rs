@@ -182,6 +182,12 @@ pub struct AgentPanelState<'a> {
     pub agents: &'a [AgentSidebarItem],
     /// Total number of tabs the listing covers, across every window.
     pub tab_count: usize,
+    /// Whether to draw the floating top-right `[AI] [⚙]` pill when the tab bar is hidden.
+    pub show_floating_top_right: bool,
+    /// Whether the pointer is hovering over the `[AI]` toggle button.
+    pub ai_btn_hovered: bool,
+    /// Whether the pointer is hovering over the `[⚙]` preferences button.
+    pub prefs_btn_hovered: bool,
 }
 
 impl AgentPanelState<'_> {
@@ -192,7 +198,85 @@ impl AgentPanelState<'_> {
             width_px: 0.0,
             agents: &[],
             tab_count: 0,
+            show_floating_top_right: false,
+            ai_btn_hovered: false,
+            prefs_btn_hovered: false,
         }
+    }
+}
+
+/// Geometry and hit-test helper for the right-aligned `[AI]` and `[⚙]` buttons
+/// shown on the right end of the tab bar (when `tab_bar_h > 0`) or as a floating
+/// hover pill in the top-right corner of the terminal (when `tab_bar_h == 0`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TopRightButtons {
+    /// Pill container rect `[x, y, w, h]`
+    pub pill_rect: [f32; 4],
+    /// `[x, y, w, h]` of the `[AI]` sidebar toggle button
+    pub ai_btn: [f32; 4],
+    /// `[x, y, w, h]` of the `[⚙]` preferences button
+    pub prefs_btn: [f32; 4],
+}
+
+impl TopRightButtons {
+    /// Width reserved on the right end of the tab bar so tab capsules and `[+][v]`
+    /// never overlap the `[AI]` and `[⚙]` buttons.
+    pub fn reserved_width(scale: f32) -> f32 {
+        76.0 * scale
+    }
+
+    pub fn compute(main_w: f32, tab_bar_h: f32, scale: f32) -> Self {
+        let btn_h = 24.0 * scale;
+        let prefs_w = 26.0 * scale;
+        let ai_w = 32.0 * scale;
+        let gap = 4.0 * scale;
+        let right_margin = 8.0 * scale;
+
+        let prefs_x = (main_w - right_margin - prefs_w).max(4.0 * scale);
+        let ai_x = (prefs_x - gap - ai_w).max(4.0 * scale);
+        let btn_y = if tab_bar_h > 0.0 {
+            (tab_bar_h - btn_h) / 2.0
+        } else {
+            6.0 * scale
+        };
+
+        let pad = 4.0 * scale;
+        let pill_rect = [
+            (ai_x - pad).max(0.0),
+            (btn_y - pad * 0.75).max(0.0),
+            ai_w + gap + prefs_w + pad * 2.0,
+            btn_h + pad * 1.5,
+        ];
+
+        Self {
+            pill_rect,
+            ai_btn: [ai_x, btn_y, ai_w, btn_h],
+            prefs_btn: [prefs_x, btn_y, prefs_w, btn_h],
+        }
+    }
+
+    /// Returns `true` when `(mx, my)` is inside the top-right hover zone that reveals
+    /// the floating `[AI] [⚙]` pill when the tab bar is hidden (`tab_bar_h == 0`).
+    pub fn in_hover_zone(&self, mx: f32, my: f32, scale: f32) -> bool {
+        let [px, py, pw, ph] = self.pill_rect;
+        let margin_x = 28.0 * scale;
+        let margin_y = 16.0 * scale;
+        mx >= (px - margin_x).max(0.0)
+            && mx <= px + pw + 8.0 * scale
+            && my >= 0.0
+            && my <= py + ph + margin_y
+    }
+
+    pub fn hit_ai(&self, mx: f32, my: f32, scale: f32) -> bool {
+        let [x, y, w, h] = self.ai_btn;
+        let pad = 2.0 * scale;
+        mx >= x - pad && mx <= x + w + pad && my >= y - pad && my <= y + h + pad
+    }
+
+    pub fn hit_prefs(&self, mx: f32, my: f32, scale: f32) -> bool {
+        let [x, y, w, h] = self.prefs_btn;
+        let pad = 2.0 * scale;
+        mx >= x - pad && mx <= x + w + pad && my >= y - pad && my <= y + h + pad
     }
 }
 
@@ -204,7 +288,7 @@ pub struct TopDropdownMenuItem {
     pub is_separator: bool,
 }
 
-/// Descriptor for the floating top dropdown menu.
+/// Descriptor for the floating top dropdown / context menu.
 #[derive(Debug, Clone)]
 pub struct TopDropdownMenu {
     pub x: f32,
@@ -212,6 +296,31 @@ pub struct TopDropdownMenu {
     pub width: f32,
     pub items: Vec<TopDropdownMenuItem>,
     pub hovered_idx: Option<usize>,
+}
+
+impl TopDropdownMenu {
+    pub fn total_height(&self, scale: f32) -> f32 {
+        let row_h = 24.0 * scale;
+        let sep_h = 6.0 * scale;
+        let mut total_h = 6.0 * scale;
+        for item in &self.items {
+            if item.is_separator {
+                total_h += sep_h;
+            } else {
+                total_h += row_h;
+            }
+        }
+        total_h
+    }
+
+    pub fn clamp_to_screen(&mut self, screen_w: f32, screen_h: f32, scale: f32) {
+        let total_h = self.total_height(scale);
+        let margin = 4.0 * scale;
+        let max_x = (screen_w - self.width - margin).max(margin);
+        let max_y = (screen_h - total_h - margin).max(margin);
+        self.x = self.x.clamp(margin, max_x);
+        self.y = self.y.clamp(margin, max_y);
+    }
 }
 
 pub struct TermRenderer {
@@ -227,6 +336,7 @@ pub struct TermRenderer {
     pub theme: RenderTheme,
     pub scale_factor: f32,
     pub font_size_pt: f32,
+    pub line_height: f32,
     pub font_family: String,
     pub fallback_families: Vec<String>,
     pub opacity: f32,
@@ -502,6 +612,7 @@ impl TermRenderer {
             theme: RenderTheme::default(),
             scale_factor,
             font_size_pt,
+            line_height: 1.2,
             font_family: font_family.to_string(),
             fallback_families: fallback_families.to_vec(),
             opacity: 1.0,
@@ -524,6 +635,11 @@ impl TermRenderer {
 
     pub fn update_opacity(&mut self, opacity: f32) {
         self.opacity = opacity.clamp(0.05, 1.0);
+    }
+
+    pub fn update_line_height(&mut self, line_height: f32) {
+        self.line_height = line_height.clamp(0.8, 2.5);
+        self.atlas.set_line_height(self.line_height);
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -550,6 +666,7 @@ impl TermRenderer {
                 &self.fallback_families,
                 None,
             )?;
+            self.atlas.set_line_height(self.line_height);
             self.pipeline = TerminalPipeline::new(&self.device, &self.config, &self.atlas)?;
         }
         Ok(())
@@ -574,6 +691,7 @@ impl TermRenderer {
             &self.fallback_families,
             None,
         )?;
+        self.atlas.set_line_height(self.line_height);
         self.pipeline = TerminalPipeline::new(&self.device, &self.config, &self.atlas)?;
         Ok(())
     }
@@ -638,6 +756,179 @@ impl TermRenderer {
                 }
             }
             cur_x += cw;
+        }
+    }
+
+    /// Draws the right-aligned `[AI]` and `[⚙]` action buttons (either embedded in
+    /// the tab bar or inside a floating top-right pill when the tab bar is hidden).
+    fn draw_top_right_buttons(
+        &mut self,
+        bg: &mut Vec<BgInstance>,
+        glyphs: &mut Vec<GlyphInstance>,
+        btns: &TopRightButtons,
+        state: &AgentPanelState<'_>,
+        floating_pill: bool,
+        scale: f32,
+    ) {
+        if floating_pill {
+            let [px, py, pw, ph] = btns.pill_rect;
+            // Subtle shadow under floating pill
+            bg.push(BgInstance {
+                rect: [
+                    px - 2.0 * scale,
+                    py - 1.0 * scale,
+                    pw + 4.0 * scale,
+                    ph + 3.0 * scale,
+                ],
+                color: [0.0, 0.0, 0.0, 0.40],
+            });
+            // Pill container background + 1px border
+            bg.push(BgInstance {
+                rect: [px - 1.0, py - 1.0, pw + 2.0, ph + 2.0],
+                color: [0.26, 0.30, 0.40, 0.95],
+            });
+            bg.push(BgInstance {
+                rect: btns.pill_rect,
+                color: [0.08, 0.09, 0.13, 0.96],
+            });
+        }
+
+        // 1. [AI] Sidebar Toggle Button
+        let [ax, ay_btn, aw, ah] = btns.ai_btn;
+        let ai_bg = if state.open {
+            [0.12, 0.34, 0.68, 0.95]
+        } else if state.ai_btn_hovered {
+            [0.20, 0.24, 0.34, 0.95]
+        } else {
+            [0.12, 0.14, 0.18, 0.78]
+        };
+        let ai_border = if state.open {
+            [0.24, 0.60, 1.0, 0.95]
+        } else if state.ai_btn_hovered {
+            [0.32, 0.38, 0.52, 0.85]
+        } else {
+            [0.22, 0.25, 0.33, 0.6]
+        };
+        bg.push(BgInstance {
+            rect: btns.ai_btn,
+            color: ai_bg,
+        });
+        bg.push(BgInstance {
+            rect: [ax, ay_btn, aw, 1.0],
+            color: ai_border,
+        });
+
+        let ai_fg = if state.open || state.ai_btn_hovered {
+            [0.98, 0.99, 1.0, 1.0]
+        } else {
+            [0.80, 0.84, 0.94, 0.92]
+        };
+
+        let glyph_a = self.atlas.get_or_insert_glyph(&self.queue, 'A', true, false);
+        let glyph_i = self.atlas.get_or_insert_glyph(&self.queue, 'I', true, false);
+        if let (Some(ga), Some(gi)) = (glyph_a, glyph_i) {
+            if ga.size[0] > 0.0 && gi.size[0] > 0.0 {
+                let gap = 1.5 * scale;
+                let total_w = ga.size[0] + gap + gi.size[0];
+                let start_x = ax + (aw - total_w) / 2.0;
+                let ay = ay_btn + (ah - ga.size[1]) / 2.0;
+                let iy = ay_btn + (ah - gi.size[1]) / 2.0;
+                glyphs.push(GlyphInstance {
+                    rect: [start_x, ay, ga.size[0], ga.size[1]],
+                    uv: [ga.uv_min[0], ga.uv_min[1], ga.uv_max[0], ga.uv_max[1]],
+                    color: ai_fg,
+                });
+                glyphs.push(GlyphInstance {
+                    rect: [start_x + ga.size[0] + gap, iy, gi.size[0], gi.size[1]],
+                    uv: [gi.uv_min[0], gi.uv_min[1], gi.uv_max[0], gi.uv_max[1]],
+                    color: ai_fg,
+                });
+            }
+        }
+        // Small active-agent indicator dot in top-right corner of [AI] button
+        if !state.agents.is_empty() {
+            let dot = (4.5 * scale).round().max(3.0);
+            let any_running = state.agents.iter().any(|a| a.is_active_output);
+            bg.push(BgInstance {
+                rect: [ax + aw - dot - 2.0 * scale, ay_btn + 2.0 * scale, dot, dot],
+                color: if any_running {
+                    [0.18, 0.88, 0.46, 1.0]
+                } else {
+                    [0.96, 0.76, 0.22, 1.0]
+                },
+            });
+        }
+
+        // 2. [⚙] Preferences Button
+        let [prx, pry, prw, prh] = btns.prefs_btn;
+        let prefs_bg = if state.prefs_btn_hovered {
+            [0.20, 0.24, 0.34, 0.95]
+        } else {
+            [0.12, 0.14, 0.18, 0.78]
+        };
+        let prefs_border = if state.prefs_btn_hovered {
+            [0.32, 0.38, 0.52, 0.85]
+        } else {
+            [0.22, 0.25, 0.33, 0.6]
+        };
+        bg.push(BgInstance {
+            rect: btns.prefs_btn,
+            color: prefs_bg,
+        });
+        bg.push(BgInstance {
+            rect: [prx, pry, prw, 1.0],
+            color: prefs_border,
+        });
+
+        let prefs_fg = if state.prefs_btn_hovered {
+            [0.98, 0.99, 1.0, 1.0]
+        } else {
+            [0.80, 0.84, 0.94, 0.92]
+        };
+
+        let mut drew_gear = false;
+        if let Some(g) = self.atlas.get_or_insert_glyph(&self.queue, '⚙', false, false) {
+            if g.size[0] > 0.0 && g.size[1] > 0.0 {
+                let max_icon = prw - 6.0 * scale;
+                let scale_down = if g.size[0] > max_icon || g.size[1] > max_icon {
+                    (max_icon / g.size[0].max(g.size[1])).clamp(0.4, 1.0)
+                } else {
+                    1.0
+                };
+                let gw = g.size[0] * scale_down;
+                let gh = g.size[1] * scale_down;
+                let gx = prx + (prw - gw) / 2.0;
+                let gy = pry + (prh - gh) / 2.0;
+                glyphs.push(GlyphInstance {
+                    rect: [gx, gy, gw, gh],
+                    uv: [g.uv_min[0], g.uv_min[1], g.uv_max[0], g.uv_max[1]],
+                    color: prefs_fg,
+                });
+                drew_gear = true;
+            }
+        }
+        if !drew_gear {
+            // Procedural 3-slider settings icon fallback if no system font has U+2699
+            let bar_w = 12.0 * scale;
+            let bar_h = (1.5 * scale).round().max(1.0);
+            let bx = prx + (prw - bar_w) / 2.0;
+            for (i, knob_frac) in [0.25_f32, 0.65, 0.35].iter().enumerate() {
+                let by = pry + 6.5 * scale + (i as f32 * 5.0 * scale);
+                bg.push(BgInstance {
+                    rect: [bx, by, bar_w, bar_h],
+                    color: prefs_fg,
+                });
+                let knob_s = (3.0 * scale).round().max(2.0);
+                bg.push(BgInstance {
+                    rect: [
+                        bx + bar_w * knob_frac - knob_s * 0.5,
+                        by - (knob_s - bar_h) * 0.5,
+                        knob_s,
+                        knob_s,
+                    ],
+                    color: prefs_fg,
+                });
+            }
         }
     }
 
@@ -1069,8 +1360,17 @@ impl TermRenderer {
             // 2.2 Calculate Tab Capsule Geometry
             let start_x = base_x;
             let plus_btn_w = 24.0 * scale;
+            let chevron_w = 20.0 * scale;
+            let right_btns = TopRightButtons::compute(main_w, tab_bar_h, scale);
+            let right_btns_w = TopRightButtons::reserved_width(scale);
             let tab_gap = 4.0 * scale;
-            let avail_w = (main_w - start_x - plus_btn_w - 16.0 * scale).max(80.0);
+            let avail_w = (main_w
+                - start_x
+                - plus_btn_w
+                - chevron_w
+                - right_btns_w
+                - 16.0 * scale)
+                .max(80.0);
             let total_gaps = (tabs.len().saturating_sub(1) as f32) * tab_gap;
             let tab_w =
                 ((avail_w - total_gaps) / tabs.len() as f32).clamp(75.0 * scale, 190.0 * scale);
@@ -1219,7 +1519,6 @@ impl TermRenderer {
             }
 
             // Dropdown Menu chevron "v" Button
-            let chevron_w = 20.0 * scale;
             let chevron_x = plus_btn_x + plus_btn_w + 2.0 * scale;
             bg_instances.push(BgInstance {
                 rect: [chevron_x, plus_btn_y, chevron_w, plus_btn_w],
@@ -1237,6 +1536,16 @@ impl TermRenderer {
                 chevron_w,
                 [0.7, 0.75, 0.85, 1.0],
                 false,
+            );
+
+            // 2.4 Right-aligned [AI] and [⚙] Action Buttons
+            self.draw_top_right_buttons(
+                &mut bg_instances,
+                &mut glyph_instances,
+                &right_btns,
+                &panel_state,
+                false,
+                scale,
             );
         }
 
@@ -1821,7 +2130,25 @@ impl TermRenderer {
         let normal_bg_len = bg_instances.len();
         let normal_glyph_len = glyph_instances.len();
 
-        // Floating Top Dropdown Menu Overlay
+        // Floating Top-Right [AI] [⚙] Pill Overlay when Tab Bar is hidden (auto 1-tab or never)
+        if tab_bar_h <= 0.0 && panel_state.show_floating_top_right {
+            let main_w = if sidebar_open {
+                (screen_w - panel_state.width_px).max(0.0)
+            } else {
+                screen_w
+            };
+            let right_btns = TopRightButtons::compute(main_w, 0.0, scale);
+            self.draw_top_right_buttons(
+                &mut bg_instances,
+                &mut glyph_instances,
+                &right_btns,
+                &panel_state,
+                true,
+                scale,
+            );
+        }
+
+        // Floating Top Dropdown / Context Menu Overlay
         if let Some(menu) = top_menu {
             let row_h = 24.0 * scale;
             let sep_h = 6.0 * scale;

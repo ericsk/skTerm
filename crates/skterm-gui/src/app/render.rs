@@ -5,7 +5,7 @@ use super::events::SCROLLBAR_FADE_AFTER;
 use super::macos::{
     center_macos_window_title, get_nswindow, set_macos_tab_label, style_macos_tab_bar,
 };
-use super::menu::build_top_dropdown_menu;
+use super::menu::{build_context_menu, build_top_dropdown_menu};
 use super::App;
 use skterm_render::{AgentPanelState, PaneRenderItem, TabItem};
 use std::time::Duration;
@@ -42,7 +42,8 @@ impl App {
             &edited_agents
         } else {
             self.cached_ai_agents.items()
-        };
+        }
+        ;
 
         // The panel header states how many tabs the listing spans, which
         // is what stops it reading as a feature of the selected tab. On
@@ -191,15 +192,38 @@ impl App {
                 },
                 agents,
                 tab_count: total_tab_count,
+                show_floating_top_right: session.top_right_hover
+                    || (session.menu_open && !session.menu_is_context),
+                ai_btn_hovered: session.ai_btn_hovered,
+                prefs_btn_hovered: session.prefs_btn_hovered,
             };
 
-            let (top_menu, _actions) = if session.menu_open && tab_bar_h > 0.0 {
+            let (top_menu, _actions) = if session.menu_open {
                 let scale = session.renderer.scale_factor;
-                let menu_w = 230.0 * scale;
-                let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
-                let (m, acts) =
-                    build_top_dropdown_menu(scale, menu_x, tab_bar_h, session.menu_hovered_idx);
-                (Some(m), acts)
+                let screen_w = session.renderer.config.width as f32;
+                let screen_h = session.renderer.config.height as f32;
+                if session.menu_is_context {
+                    let (m, acts) = build_context_menu(
+                        scale,
+                        session.menu_anchor.0,
+                        session.menu_anchor.1,
+                        screen_w,
+                        screen_h,
+                        session.menu_hovered_idx,
+                    );
+                    (Some(m), acts)
+                } else {
+                    let menu_w = 240.0 * scale;
+                    let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
+                    let (mut m, acts) = build_top_dropdown_menu(
+                        scale,
+                        menu_x,
+                        tab_bar_h,
+                        session.menu_hovered_idx,
+                    );
+                    m.clamp_to_screen(screen_w, screen_h, scale);
+                    (Some(m), acts)
+                }
             } else {
                 (None, Vec::new())
             };

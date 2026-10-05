@@ -22,7 +22,9 @@ pub use events::AppEvent;
 pub use input_mouse::open_url_in_browser;
 #[cfg(target_os = "macos")]
 pub use macos::{center_macos_window_title, set_macos_tab_label, style_macos_tab_bar};
-pub use menu::{build_top_dropdown_menu, hit_test_dropdown_menu, TopMenuAction};
+pub use menu::{
+    build_context_menu, build_top_dropdown_menu, hit_test_dropdown_menu, TopMenuAction,
+};
 pub use session::{ScrollbarDragState, TerminalSession};
 
 use crate::config::ConfigManager;
@@ -327,9 +329,14 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     WindowEvent::RedrawRequested => {
                         let maybe_new_cfg = pref.render_frame(&self.config_manager);
+                        let should_close = pref.should_close;
                         if let Some(new_cfg) = maybe_new_cfg {
                             // Originates from the user editing the prefs UI -> persist.
                             self.apply_config_live(&new_cfg, true);
+                        }
+                        if should_close {
+                            info!("Preferences Window closed via keyboard shortcut or close button.");
+                            self.preferences_window = None;
                         }
                         return;
                     }

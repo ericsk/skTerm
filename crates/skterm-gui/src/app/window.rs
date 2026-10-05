@@ -112,6 +112,9 @@ impl App {
             &font_cfg.family,
             &font_cfg.fallback_families,
         ))?;
+        renderer.update_line_height(font_cfg.line_height);
+        renderer.update_padding(pad_x, pad_y);
+        renderer.update_opacity(self.config_manager.current_config.window.opacity);
 
         if existing_geometry.is_none() {
             let scale = renderer.scale_factor;
@@ -184,7 +187,12 @@ impl App {
             has_unseen_output: false,
             pacer: FramePacer::new(monitor_frame_interval(&window), Instant::now()),
             menu_open: false,
+            menu_is_context: false,
+            menu_anchor: (0.0, 0.0),
             menu_hovered_idx: None,
+            top_right_hover: false,
+            ai_btn_hovered: false,
+            prefs_btn_hovered: false,
         };
 
         self.sessions.insert(window_id, session);

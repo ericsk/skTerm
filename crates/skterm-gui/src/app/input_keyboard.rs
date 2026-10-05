@@ -107,6 +107,18 @@ impl App {
             return;
         }
 
+        // 0. If top dropdown or right-click context menu is open, Escape dismisses it
+        if event.logical_key == Key::Named(NamedKey::Escape) {
+            if let Some(session) = self.sessions.get_mut(&window_id) {
+                if session.menu_open {
+                    session.menu_open = false;
+                    session.menu_hovered_idx = None;
+                    session.window.request_redraw();
+                    return;
+                }
+            }
+        }
+
         // 1. Tab Switching by Number (Ctrl+1~9 on Windows/Linux, Cmd+1~9 on macOS)
         if let Some(digit) = check_tab_switch(event, self.modifiers) {
             let target_idx = digit - 1;

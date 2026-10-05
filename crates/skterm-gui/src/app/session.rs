@@ -4,7 +4,7 @@ use super::events::TAB_LABEL_REFRESH_INTERVAL;
 use super::pacer::{frame_interval_from_millihertz, FramePacer, PacerPoll};
 use crate::layout::{PaneId, Rect, SplitDirection, Workspace};
 use arboard::Clipboard;
-use skterm_render::{AgentPanelLayout, TermRenderer};
+use skterm_render::{AgentPanelLayout, TermRenderer, TopRightButtons};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -61,10 +61,20 @@ pub struct TerminalSession {
     pub has_unseen_output: bool,
     /// Keeps PTY-driven repaints down to what this window's monitor can show.
     pub pacer: FramePacer,
-    /// Whether the top dropdown menu is currently open.
+    /// Whether the top dropdown or right-click context menu is currently open.
     pub menu_open: bool,
-    /// Currently hovered menu item index in the top dropdown menu.
+    /// True when `menu_open` is a right-click context menu rather than the top bar dropdown.
+    pub menu_is_context: bool,
+    /// Anchor position `(x, y)` in physical pixels when `menu_is_context` is true (or custom anchored).
+    pub menu_anchor: (f32, f32),
+    /// Currently hovered menu item index in the open menu.
     pub menu_hovered_idx: Option<usize>,
+    /// Whether the pointer is in the top-right hover zone (reveals floating `[AI] [⚙]` pill when tab bar is hidden).
+    pub top_right_hover: bool,
+    /// Whether the pointer is hovering over the `[AI]` button.
+    pub ai_btn_hovered: bool,
+    /// Whether the pointer is hovering over the `[⚙]` Preferences button.
+    pub prefs_btn_hovered: bool,
 }
 
 /// Refresh period of the monitor `window` currently sits on.
@@ -555,15 +565,39 @@ impl TerminalSession {
         ))
     }
 
+    pub fn top_right_buttons(&self, tab_bar_h: f32) -> TopRightButtons {
+        let scale = self.renderer.scale_factor;
+        let reserved_right = if self.workspace.sidebar_open {
+            AgentPanelLayout::reserved_width(self.workspace.sidebar_width * scale, scale)
+        } else {
+            0.0
+        };
+        let main_w = (self.renderer.config.width as f32 - reserved_right).max(0.0);
+        TopRightButtons::compute(main_w, tab_bar_h, scale)
+    }
+
     pub fn get_menu_button_rect(&self, tab_bar_h: f32) -> (f32, f32, f32, f32) {
         let scale = self.renderer.scale_factor;
         let tabs_len = self.workspace.tabs.len();
+        let reserved_right = if self.workspace.sidebar_open {
+            AgentPanelLayout::reserved_width(self.workspace.sidebar_width * scale, scale)
+        } else {
+            0.0
+        };
+        let main_w = (self.renderer.config.width as f32 - reserved_right).max(0.0);
         let base_x = 8.0 * scale;
         let start_x = base_x;
         let plus_btn_w = 24.0 * scale;
+        let menu_btn_w = 20.0 * scale;
+        let right_btns_w = TopRightButtons::reserved_width(scale);
         let tab_gap = 4.0 * scale;
-        let avail_w =
-            (self.renderer.config.width as f32 - start_x - plus_btn_w - 16.0 * scale).max(80.0);
+        let avail_w = (main_w
+            - start_x
+            - plus_btn_w
+            - menu_btn_w
+            - right_btns_w
+            - 16.0 * scale)
+            .max(80.0);
         let total_gaps = (tabs_len.saturating_sub(1) as f32) * tab_gap;
         let tab_w = ((avail_w - total_gaps) / tabs_len as f32).clamp(75.0 * scale, 190.0 * scale);
         let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);
@@ -573,14 +607,19 @@ impl TerminalSession {
         let plus_btn_x = last_tab_right + 2.0 * scale;
         let plus_btn_y = tab_y + (tab_h - plus_btn_w) / 2.0;
 
-        let menu_btn_w = 20.0 * scale;
-        let menu_btn_x = plus_btn_x + plus_btn_w + 3.0 * scale;
+        let menu_btn_x = plus_btn_x + plus_btn_w + 2.0 * scale;
         let menu_btn_y = plus_btn_y;
         (menu_btn_x, menu_btn_y, menu_btn_w, plus_btn_w)
     }
 
     pub fn get_dropdown_menu_x(&self, tab_bar_h: f32, menu_w: f32) -> f32 {
         let scale = self.renderer.scale_factor;
+        if tab_bar_h <= 0.0 {
+            let btns = self.top_right_buttons(0.0);
+            let max_x = self.renderer.config.width as f32 - menu_w - 4.0 * scale;
+            let prefs_right = btns.prefs_btn[0] + btns.prefs_btn[2];
+            return (prefs_right - menu_w).clamp(4.0 * scale, max_x.max(4.0 * scale));
+        }
         let (btn_x, _, btn_w, _) = self.get_menu_button_rect(tab_bar_h);
         let max_x = self.renderer.config.width as f32 - menu_w - 4.0 * scale;
         (btn_x + btn_w / 2.0 - menu_w / 2.0).clamp(4.0 * scale, max_x.max(4.0 * scale))

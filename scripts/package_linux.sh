@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 echo "=== Building skTerm for Linux (Release) ==="
 cargo build --release -p skterm-app
@@ -7,6 +8,7 @@ cargo build --release -p skterm-app
 PKG_DIR="dist/linux/skterm-0.1.0"
 rm -rf dist/linux
 mkdir -p "${PKG_DIR}/usr/bin" "${PKG_DIR}/usr/share/applications" "${PKG_DIR}/usr/share/pixmaps" "${PKG_DIR}/DEBIAN"
+chmod 755 "${PKG_DIR}" "${PKG_DIR}/DEBIAN" "${PKG_DIR}/usr" "${PKG_DIR}/usr/bin" "${PKG_DIR}/usr/share" "${PKG_DIR}/usr/share/applications" "${PKG_DIR}/usr/share/pixmaps"
 
 cp target/release/skterm "${PKG_DIR}/usr/bin/skterm"
 chmod 755 "${PKG_DIR}/usr/bin/skterm"

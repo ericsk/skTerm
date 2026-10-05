@@ -762,24 +762,34 @@ pub fn available_shell_presets() -> Vec<ShellPresetInfo> {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let mut presets = Vec::new();
-        for candidate in [
-            "/bin/bash",
-            "/usr/bin/bash",
-            "/bin/zsh",
-            "/usr/bin/zsh",
-            "/usr/bin/fish",
-            "/bin/sh",
-        ] {
-            if std::path::Path::new(candidate).exists() {
-                let name = candidate.rsplit('/').next().unwrap_or("shell");
-                presets.push(ShellPresetInfo {
-                    id: name.to_string(),
-                    name: format!("{} ({})", name, candidate),
-                    program: candidate.to_string(),
-                    args: vec!["-l".to_string()],
-                    is_available: true,
-                    description: "Linux 系統 Shell".to_string(),
-                });
+        let mut seen_canonical = std::collections::HashSet::new();
+        let candidates: &[(&str, &str, &str, &[&str], &str)] = &[
+            ("bash", "GNU Bash", "/bin/bash", &["-l"], "Linux 標準 Bash Shell"),
+            ("bash", "GNU Bash", "/usr/bin/bash", &["-l"], "Linux 標準 Bash Shell"),
+            ("zsh", "Zsh", "/bin/zsh", &["-l"], "Z Shell 互動式終端"),
+            ("zsh", "Zsh", "/usr/bin/zsh", &["-l"], "Z Shell 互動式終端"),
+            ("fish", "Fish Shell", "/usr/bin/fish", &["-l"], "Friendly Interactive Shell"),
+            ("fish", "Fish Shell", "/bin/fish", &["-l"], "Friendly Interactive Shell"),
+            ("nu", "Nushell", "/usr/bin/nu", &["-l"], "現代結構化資料 Shell"),
+            ("sh", "POSIX sh", "/bin/sh", &[], "系統輕量 POSIX Shell"),
+        ];
+        for &(id, title, candidate, default_args, desc) in candidates {
+            let p = std::path::Path::new(candidate);
+            if p.exists() {
+                let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                // Deduplicate /bin/bash and /usr/bin/bash when /bin is a symlink to /usr/bin,
+                // unless it's a distinct shell binary (like /bin/sh pointing to dash/bash).
+                let dedup_key = (id.to_string(), canon);
+                if seen_canonical.insert(dedup_key) {
+                    presets.push(ShellPresetInfo {
+                        id: id.to_string(),
+                        name: format!("{} ({})", title, candidate),
+                        program: candidate.to_string(),
+                        args: default_args.iter().map(|s| (*s).to_string()).collect(),
+                        is_available: true,
+                        description: desc.to_string(),
+                    });
+                }
             }
         }
         presets

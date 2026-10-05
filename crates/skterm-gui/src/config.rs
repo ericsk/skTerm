@@ -160,6 +160,8 @@ pub struct TerminalConfig {
     pub option_as_alt: String,
     #[serde(default = "default_bell")]
     pub bell: String,
+    #[serde(default = "default_right_click_action")]
+    pub right_click_action: String,
 }
 
 fn default_term() -> String {
@@ -174,6 +176,9 @@ fn default_option_as_alt() -> String {
 fn default_bell() -> String {
     "visual".to_string()
 }
+fn default_right_click_action() -> String {
+    "menu".to_string()
+}
 
 impl Default for TerminalConfig {
     fn default() -> Self {
@@ -185,6 +190,7 @@ impl Default for TerminalConfig {
             env: HashMap::new(),
             option_as_alt: default_option_as_alt(),
             bell: default_bell(),
+            right_click_action: default_right_click_action(),
         }
     }
 }
@@ -245,6 +251,56 @@ pub struct PaletteConfig {
     pub bright_magenta: Option<String>,
     pub bright_cyan: Option<String>,
     pub bright_white: Option<String>,
+}
+
+impl PaletteConfig {
+    pub fn get_index(&self, idx: usize) -> Option<&str> {
+        match idx {
+            0 => self.black.as_deref(),
+            1 => self.red.as_deref(),
+            2 => self.green.as_deref(),
+            3 => self.yellow.as_deref(),
+            4 => self.blue.as_deref(),
+            5 => self.magenta.as_deref(),
+            6 => self.cyan.as_deref(),
+            7 => self.white.as_deref(),
+            8 => self.bright_black.as_deref(),
+            9 => self.bright_red.as_deref(),
+            10 => self.bright_green.as_deref(),
+            11 => self.bright_yellow.as_deref(),
+            12 => self.bright_blue.as_deref(),
+            13 => self.bright_magenta.as_deref(),
+            14 => self.bright_cyan.as_deref(),
+            15 => self.bright_white.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn set_index(&mut self, idx: usize, val: Option<String>) {
+        match idx {
+            0 => self.black = val,
+            1 => self.red = val,
+            2 => self.green = val,
+            3 => self.yellow = val,
+            4 => self.blue = val,
+            5 => self.magenta = val,
+            6 => self.cyan = val,
+            7 => self.white = val,
+            8 => self.bright_black = val,
+            9 => self.bright_red = val,
+            10 => self.bright_green = val,
+            11 => self.bright_yellow = val,
+            12 => self.bright_blue = val,
+            13 => self.bright_magenta = val,
+            14 => self.bright_cyan = val,
+            15 => self.bright_white = val,
+            _ => {}
+        }
+    }
+
+    pub fn is_all_none(&self) -> bool {
+        (0..16).all(|i| self.get_index(i).is_none())
+    }
 }
 
 /// Cursor visual settings
@@ -733,11 +789,13 @@ pub fn default_config_path() -> PathBuf {
 
 /// Generate default TOML configuration template with rich comments.
 pub fn default_config_template() -> &'static str {
-    r##"# ==============================================================================
+    #[cfg(target_os = "macos")]
+    {
+        r##"# ==============================================================================
 # skTerm 偏好設定檔 (Preferences & Configuration)
 # ==============================================================================
 # 本設定檔支援即時熱重載（Hot-Reload），存檔後無需重啟程式即可即時套用！
-# 快捷鍵：在終端機內按下 Cmd+, (macOS) 或 Ctrl+, (Linux/Windows) 可快速開啟此檔案。
+# 快捷鍵：在終端機內按下 Cmd+, (macOS) 或 Ctrl+, (Linux/Windows) 可快速開啟偏好設定。
 
 [font]
 # 主要等寬字型家族名稱 (未指定時自動使用系統預設: macOS "Menlo", Linux "DejaVu Sans Mono", Windows "Consolas")
@@ -784,10 +842,6 @@ tab_bar_style = "auto"
 term = "xterm-256color"
 
 # 自訂預設 Shell 與啟動參數 (選填，若未指定則自動偵測系統預設登入 Shell)
-# Windows 常用設定範例：
-#   命令提示字元: shell = { program = "cmd.exe", args = [] }
-#   Windows PowerShell: shell = { program = "powershell.exe", args = ["-NoLogo"] }
-#   PowerShell 7+: shell = { program = "pwsh.exe", args = ["-NoLogo"] }
 # macOS / Linux 常用設定範例：
 #   shell = { program = "/bin/zsh", args = ["--login"] }
 
@@ -803,11 +857,13 @@ scrollback_lines = 10000
 # EDITOR = "vim"
 
 # macOS Option 鍵行為 ("both", "only_left", "only_right", "none")
-# 設為 "both" 或 "only_left" 時，按下 Option 鍵會發送 Esc+ 序列 (Meta 鍵)
 option_as_alt = "both"
 
 # 終端鈴聲模式 ("visual", "sound", "none")
 bell = "visual"
+
+# 滑鼠右鍵行為 ("menu": 開啟快捷選單 [Shift+右鍵貼上], "paste": 直接貼上 [Shift+右鍵開選單])
+right_click_action = "menu"
 
 
 [colors]
@@ -851,4 +907,127 @@ blink_interval_ms = 500
 # "cmd+d" = "split_vertical"
 # "cmd+shift+d" = "split_horizontal"
 "##
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        r##"# ==============================================================================
+# skTerm 偏好設定檔 (Preferences & Configuration)
+# ==============================================================================
+# 本設定檔支援即時熱重載（Hot-Reload），存檔後無需重啟程式即可即時套用！
+# 快捷鍵：在終端機內按下 Ctrl+, (Linux/Windows) 或 Cmd+, (macOS) 可快速開啟偏好設定。
+
+[font]
+# 主要等寬字型家族名稱 (未指定時自動使用系統預設: Linux "DejaVu Sans Mono", Windows "Consolas", macOS "Menlo")
+# family = "DejaVu Sans Mono"
+
+# 字型大小 (pt 單位)
+size = 16.0
+
+# 行高倍率 (預設 1.2)
+line_height = 1.2
+
+# 自訂粗體與斜體字型檔或字型名稱 (選填)
+# bold_family = "DejaVu Sans Mono Bold"
+# italic_family = "DejaVu Sans Mono Oblique"
+
+# 自訂 CJK 多重回退字型搜尋清單 (選填)
+# fallback_families = ["Noto Sans Mono CJK TC", "Noto Sans CJK TC"]
+
+
+[window]
+# 初始終端幾何大小 (欄數與行數)
+columns = 80
+rows = 24
+
+# 視窗邊距 (單位: pt)
+padding_x = 8.0
+padding_y = 8.0
+
+# 視窗背景不透明度 (0.1 ~ 1.0)
+opacity = 1.0
+
+# 啟動視窗模式 ("normal", "maximized", "fullscreen")
+startup_mode = "normal"
+
+# 標題列與視窗外觀 ("full", "transparent", "none")
+decorations = "full"
+
+# 分頁標籤列顯示策略 ("always": 恆顯示, "auto": 多於1個分頁時自動顯示, "never": 恆隱藏)
+tab_bar_style = "always"
+
+
+[terminal]
+# 終端模擬器 TERM 環境變數 (預設: "xterm-256color")
+term = "xterm-256color"
+
+# 自訂預設 Shell 與啟動參數 (選填，若未指定則自動偵測系統預設登入 Shell)
+# Linux 常用設定範例：
+#   shell = { program = "/bin/bash", args = ["--login"] }
+#   shell = { program = "/bin/zsh", args = ["--login"] }
+# Windows 常用設定範例：
+#   shell = { program = "pwsh.exe", args = ["-NoLogo"] }
+
+# 初始工作目錄 (選填，例如: "~" 或 "/home/username/Projects")
+# working_directory = "~"
+
+# 歷史滾動緩衝區行數 (預設: 10000 行)
+scrollback_lines = 10000
+
+# 自訂環境變數表 (選填)
+# [terminal.env]
+# COLORTERM = "truecolor"
+# EDITOR = "vim"
+
+# Option / Alt 鍵行為 ("both", "only_left", "only_right", "none")
+option_as_alt = "both"
+
+# 終端鈴聲模式 ("visual", "sound", "none")
+bell = "visual"
+
+# 滑鼠右鍵行為 ("menu": 開啟快捷選單 [Shift+右鍵貼上], "paste": 直接貼上 [Shift+右鍵開選單])
+right_click_action = "menu"
+
+
+[colors]
+# 內建色彩主題名稱
+# 支援: "pure-black", "catppuccin-mocha", "tokyo-night", "dracula", "solarized-dark", "nord", "default-dark"
+theme = "pure-black"
+
+# 自訂色彩覆蓋 (選填 Hex 碼，若指定將覆蓋上述主題之預設值)
+# foreground = "#cdd6f4"
+# background = "#1e1e2e"
+# cursor     = "#f5e0dc"
+# selection  = "#585b70"
+
+# 自訂 16 色 ANSI 調色盤覆蓋 (選填)
+# [colors.palette]
+# black   = "#45475a"
+# red     = "#f38ba8"
+# green   = "#a6e3a1"
+# yellow  = "#f9e2af"
+# blue    = "#89b4fa"
+# magenta = "#f5c2e7"
+# cyan    = "#94e2d5"
+# white   = "#bac2de"
+
+
+[cursor]
+# 游標形狀 ("block", "beam", "underline")
+shape = "block"
+
+# 游標是否閃爍 (true / false)
+blink = true
+
+# 游標閃爍間隔毫秒數
+blink_interval_ms = 500
+
+
+[keybindings]
+# 自訂按鍵綁定 (選填)
+# "ctrl+shift+t" = "new_tab"
+# "ctrl+shift+w" = "close_pane"
+# "ctrl+shift+d" = "split_vertical"
+# "ctrl+shift+e" = "split_horizontal"
+"##
+    }
 }

@@ -1194,4 +1194,23 @@ mod tests {
         let outside_hit = hit_test_dropdown_menu(&menu, 1.0, 50.0, 45.0);
         assert_eq!(outside_hit, None);
     }
+
+    #[test]
+    fn test_build_context_menu_and_top_right_buttons() {
+        let (ctx_menu, actions) =
+            crate::app::build_context_menu(1.0, 780.0, 550.0, 800.0, 600.0, None);
+        assert_eq!(ctx_menu.items.len(), actions.len());
+        assert_eq!(actions[0], Some(TopMenuAction::Copy));
+        assert_eq!(actions[1], Some(TopMenuAction::Paste));
+        assert!(actions.contains(&Some(TopMenuAction::OpenPreferences)));
+        // Clamped so menu stays inside the 800x600 screen
+        assert!(ctx_menu.x + ctx_menu.width <= 800.0);
+
+        let btns = skterm_render::TopRightButtons::compute(800.0, 36.0, 1.0);
+        let [ax, ay, aw, ah] = btns.ai_btn;
+        let [px, py, pw, ph] = btns.prefs_btn;
+        assert!(btns.hit_ai(ax + aw * 0.5, ay + ah * 0.5, 1.0));
+        assert!(btns.hit_prefs(px + pw * 0.5, py + ph * 0.5, 1.0));
+        assert!(!btns.hit_ai(10.0, 10.0, 1.0));
+    }
 }

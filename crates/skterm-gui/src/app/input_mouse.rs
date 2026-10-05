@@ -4,12 +4,14 @@ use super::agents::is_repeat_click;
 use super::events::{DOUBLE_CLICK_INTERVAL, RESIZE_REFLOW_DEBOUNCE, SCROLLBAR_FADE_AFTER};
 #[cfg(target_os = "macos")]
 use super::macos::get_nswindow;
-use super::menu::{build_top_dropdown_menu, hit_test_dropdown_menu, TopMenuAction};
+use super::menu::{
+    build_context_menu, build_top_dropdown_menu, hit_test_dropdown_menu, TopMenuAction,
+};
 use super::session::ScrollbarDragState;
 use super::App;
 use crate::layout::SplitDirection;
 use skterm_core::{Selection, SelectionMode};
-use skterm_render::{AgentPanelHit, AgentPanelLayout, ScrollbarMetrics};
+use skterm_render::{AgentPanelHit, AgentPanelLayout, ScrollbarMetrics, TopRightButtons};
 use std::time::Instant;
 use tracing::{error, info};
 use winit::dpi::PhysicalPosition;
@@ -49,18 +51,50 @@ impl App {
         if let Some(session) = self.sessions.get_mut(&window_id) {
             session.mouse_pos = (position.x as f32, position.y as f32);
             let (mx, my) = session.mouse_pos;
+            let scale = session.renderer.scale_factor;
+            let screen_w = session.renderer.config.width as f32;
+            let screen_h = session.renderer.config.height as f32;
 
-            // Update top dropdown menu hovered item
-            if session.menu_open && tab_bar_h > 0.0 {
-                let scale = session.renderer.scale_factor;
-                let menu_w = 230.0 * scale;
-                let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
-                let (menu, _) = build_top_dropdown_menu(scale, menu_x, tab_bar_h, None);
+            // Update open dropdown / context menu hovered item
+            if session.menu_open {
+                let menu = if session.menu_is_context {
+                    build_context_menu(
+                        scale,
+                        session.menu_anchor.0,
+                        session.menu_anchor.1,
+                        screen_w,
+                        screen_h,
+                        None,
+                    )
+                    .0
+                } else {
+                    let menu_w = 240.0 * scale;
+                    let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
+                    let (mut m, _) = build_top_dropdown_menu(scale, menu_x, tab_bar_h, None);
+                    m.clamp_to_screen(screen_w, screen_h, scale);
+                    m
+                };
                 let hovered = hit_test_dropdown_menu(&menu, scale, mx, my);
                 if session.menu_hovered_idx != hovered {
                     session.menu_hovered_idx = hovered;
                     session.window.request_redraw();
                 }
+            }
+
+            // Update top-right [AI] and [⚙] button hover state (and floating pill visibility when tab_bar_h == 0)
+            let top_btns = session.top_right_buttons(tab_bar_h);
+            let in_zone = top_btns.in_hover_zone(mx, my, scale);
+            let btns_visible = tab_bar_h > 0.0 || in_zone || (session.menu_open && !session.menu_is_context);
+            let over_ai = btns_visible && top_btns.hit_ai(mx, my, scale);
+            let over_prefs = btns_visible && top_btns.hit_prefs(mx, my, scale);
+            if in_zone != session.top_right_hover
+                || over_ai != session.ai_btn_hovered
+                || over_prefs != session.prefs_btn_hovered
+            {
+                session.top_right_hover = in_zone;
+                session.ai_btn_hovered = over_ai;
+                session.prefs_btn_hovered = over_prefs;
+                session.window.request_redraw();
             }
 
             // 0.4 Handling Scrollbar Dragging
@@ -88,7 +122,6 @@ impl App {
 
             // 0.5 Handling Agents Panel Resizing Dragging
             if session.dragging_sidebar {
-                let scale = session.renderer.scale_factor;
                 // The panel is docked right, so its width grows as the
                 // pointer moves *away* from the right edge.
                 session.workspace.sidebar_width = AgentPanelLayout::width_for_pointer(
@@ -147,6 +180,11 @@ impl App {
                     }
                 }
             } else {
+                if over_ai || over_prefs {
+                    session.window.set_cursor(CursorIcon::Pointer);
+                    return;
+                }
+
                 // 3. Hover testing for Scrollbar, Splitters, and Hyperlinks to update cursor icon
                 let width = session.renderer.config.width as f32;
                 let height = session.renderer.config.height as f32;
@@ -161,7 +199,6 @@ impl App {
                 );
 
                 // 3.0 Check Scrollbar Hover
-                let scale = session.renderer.scale_factor;
                 let pane_rects = session
                     .workspace
                     .compute_active_pane_rects_with_scale(width, height, tab_bar_h, scale);
@@ -271,40 +308,74 @@ impl App {
         state: ElementState,
         button: MouseButton,
     ) {
-        // 0. Dropdown Menu Clicks
+        // 0. Dropdown / Context Menu Clicks
         let mut menu_action_to_run: Option<TopMenuAction> = None;
         if let Some(session) = self.sessions.get_mut(&window_id) {
             if session.menu_open && state == ElementState::Pressed {
                 let (mx, my) = session.mouse_pos;
                 let scale = session.renderer.scale_factor;
-                let menu_w = 230.0 * scale;
-                let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
-                let (menu, actions) =
-                    build_top_dropdown_menu(scale, menu_x, tab_bar_h, session.menu_hovered_idx);
-
-                let (btn_x, btn_y, btn_w, btn_h) = session.get_menu_button_rect(tab_bar_h);
-                let is_on_btn = mx >= btn_x - 2.0 * scale
-                    && mx <= btn_x + btn_w + 2.0 * scale
-                    && my >= btn_y - 2.0 * scale
-                    && my <= btn_y + btn_h + 2.0 * scale;
-
-                if let Some(idx) = hit_test_dropdown_menu(&menu, scale, mx, my) {
-                    session.menu_open = false;
-                    session.menu_hovered_idx = None;
-                    session.window.request_redraw();
-                    if let Some(Some(act)) = actions.get(idx) {
-                        menu_action_to_run = Some(*act);
-                    }
-                } else if is_on_btn {
-                    session.menu_open = false;
-                    session.menu_hovered_idx = None;
-                    session.window.request_redraw();
-                    return;
+                let screen_w = session.renderer.config.width as f32;
+                let screen_h = session.renderer.config.height as f32;
+                let (menu, actions) = if session.menu_is_context {
+                    build_context_menu(
+                        scale,
+                        session.menu_anchor.0,
+                        session.menu_anchor.1,
+                        screen_w,
+                        screen_h,
+                        session.menu_hovered_idx,
+                    )
                 } else {
+                    let menu_w = 240.0 * scale;
+                    let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
+                    let (mut m, acts) = build_top_dropdown_menu(
+                        scale,
+                        menu_x,
+                        tab_bar_h,
+                        session.menu_hovered_idx,
+                    );
+                    m.clamp_to_screen(screen_w, screen_h, scale);
+                    (m, acts)
+                };
+
+                let is_on_btn = if !session.menu_is_context && tab_bar_h > 0.0 {
+                    let (btn_x, btn_y, btn_w, btn_h) = session.get_menu_button_rect(tab_bar_h);
+                    mx >= btn_x - 2.0 * scale
+                        && mx <= btn_x + btn_w + 2.0 * scale
+                        && my >= btn_y - 2.0 * scale
+                        && my <= btn_y + btn_h + 2.0 * scale
+                } else {
+                    false
+                };
+
+                if button == MouseButton::Left {
+                    if let Some(idx) = hit_test_dropdown_menu(&menu, scale, mx, my) {
+                        session.menu_open = false;
+                        session.menu_hovered_idx = None;
+                        session.window.request_redraw();
+                        if let Some(Some(act)) = actions.get(idx) {
+                            menu_action_to_run = Some(*act);
+                        }
+                    } else if is_on_btn {
+                        session.menu_open = false;
+                        session.menu_hovered_idx = None;
+                        session.window.request_redraw();
+                        return;
+                    } else {
+                        session.menu_open = false;
+                        session.menu_hovered_idx = None;
+                        session.window.request_redraw();
+                        if mx >= menu.x && mx <= menu.x + menu.width && my >= menu.y {
+                            return;
+                        }
+                    }
+                } else {
+                    // Right-click while menu is open closes current menu; if in terminal pane,
+                    // it will fall through to open the context menu at the new click position.
                     session.menu_open = false;
                     session.menu_hovered_idx = None;
                     session.window.request_redraw();
-                    if mx >= menu.x && mx <= menu.x + menu.width && my >= menu.y {
+                    if is_on_btn {
                         return;
                     }
                 }
@@ -314,6 +385,55 @@ impl App {
         if let Some(act) = menu_action_to_run {
             self.execute_top_menu_action(event_loop, window_id, tab_bar_h, act);
             return;
+        }
+
+        // 0.1 Top-Right [AI] and [⚙] Action Buttons (active in Tab Bar OR Floating Top-Right Pill when hovered)
+        if (button == MouseButton::Left || button == MouseButton::Right)
+            && state == ElementState::Pressed
+        {
+            enum TopRightAction {
+                ToggleAiSidebar,
+                OpenPreferences,
+                OpenTopMenu,
+            }
+            let mut tr_action = None;
+            if let Some(session) = self.sessions.get(&window_id) {
+                let scale = session.renderer.scale_factor;
+                let (mx, my) = session.mouse_pos;
+                let top_btns = session.top_right_buttons(tab_bar_h);
+                let btns_active =
+                    tab_bar_h > 0.0 || session.top_right_hover || top_btns.in_hover_zone(mx, my, scale);
+                if btns_active {
+                    if top_btns.hit_ai(mx, my, scale) && button == MouseButton::Left {
+                        tr_action = Some(TopRightAction::ToggleAiSidebar);
+                    } else if top_btns.hit_prefs(mx, my, scale) {
+                        if button == MouseButton::Right {
+                            tr_action = Some(TopRightAction::OpenTopMenu);
+                        } else {
+                            tr_action = Some(TopRightAction::OpenPreferences);
+                        }
+                    }
+                }
+            }
+            if let Some(act) = tr_action {
+                match act {
+                    TopRightAction::ToggleAiSidebar => {
+                        self.toggle_sidebar();
+                    }
+                    TopRightAction::OpenPreferences => {
+                        self.open_preferences_window(event_loop);
+                    }
+                    TopRightAction::OpenTopMenu => {
+                        if let Some(session) = self.sessions.get_mut(&window_id) {
+                            session.menu_open = true;
+                            session.menu_is_context = false;
+                            session.menu_hovered_idx = None;
+                            session.window.request_redraw();
+                        }
+                    }
+                }
+                return;
+            }
         }
 
         // Inline Tab Bar handling (main window area only, excluding right sidebar)
@@ -346,8 +466,16 @@ impl App {
                     let tabs_len = session.workspace.tabs.len();
                     let start_x = 8.0 * scale;
                     let plus_btn_w = 24.0 * scale;
+                    let chevron_w = 20.0 * scale;
+                    let right_btns_w = TopRightButtons::reserved_width(scale);
                     let tab_gap = 4.0 * scale;
-                    let avail_w = (main_w - start_x - plus_btn_w - 16.0 * scale).max(80.0);
+                    let avail_w = (main_w
+                        - start_x
+                        - plus_btn_w
+                        - chevron_w
+                        - right_btns_w
+                        - 16.0 * scale)
+                        .max(80.0);
                     let total_gaps = (tabs_len.saturating_sub(1) as f32) * tab_gap;
                     let tab_w = ((avail_w - total_gaps) / tabs_len as f32)
                         .clamp(75.0 * scale, 190.0 * scale);
@@ -408,6 +536,7 @@ impl App {
                     TabAction::ToggleTopMenu => {
                         if let Some(session) = self.sessions.get_mut(&window_id) {
                             session.menu_open = !session.menu_open;
+                            session.menu_is_context = false;
                             session.menu_hovered_idx = None;
                             session.window.request_redraw();
                         }
@@ -906,7 +1035,35 @@ impl App {
                     }
                 }
             } else if button == MouseButton::Right && state == ElementState::Pressed {
-                session.paste_from_clipboard(self.clipboard.as_ref());
+                // Focus the pane under the right-click first
+                if let Some((pane_id, _, _)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
+                    if let Some(tab) = session.workspace.active_tab_mut() {
+                        tab.active_pane_id = pane_id;
+                    }
+                }
+
+                let default_is_paste = self
+                    .config_manager
+                    .current_config
+                    .terminal
+                    .right_click_action
+                    .eq_ignore_ascii_case("paste");
+                let shift_held = self.modifiers.shift_key();
+                let do_paste = if shift_held {
+                    !default_is_paste
+                } else {
+                    default_is_paste
+                };
+
+                if do_paste {
+                    session.paste_from_clipboard(self.clipboard.as_ref());
+                } else {
+                    session.menu_open = true;
+                    session.menu_is_context = true;
+                    session.menu_anchor = (mx, my);
+                    session.menu_hovered_idx = None;
+                    session.window.request_redraw();
+                }
             }
         }
     }

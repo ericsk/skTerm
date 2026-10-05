@@ -8,12 +8,12 @@ pub mod renderer;
 pub mod shader;
 
 pub use agent_panel::{AgentPanelHit, AgentPanelLayout, PanelRect};
-pub use atlas::{GlyphAtlas, GlyphInfo, GlyphKey};
+pub use atlas::{is_terminal_friendly_font, GlyphAtlas, GlyphInfo, GlyphKey};
 pub use pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
 pub use renderer::{
     color_to_rgba_themed, color_to_rgba_with_dynamic_palette, AgentPanelState, AgentSidebarItem,
     PaneRenderItem, RenderTheme, ScrollbarMetrics, TabItem, TermRenderer, TopDropdownMenu,
-    TopDropdownMenuItem,
+    TopDropdownMenuItem, TopRightButtons,
 };
 
 /// skterm-render version and basic info
