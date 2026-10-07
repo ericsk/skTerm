@@ -111,13 +111,7 @@ impl App {
                 arm(due);
             }
 
-            if let Some((label, tooltip)) = session.refresh_tab_label(configured_shell) {
-                let clean = label.strip_prefix("• ").unwrap_or(&label);
-                let win_title = if clean.is_empty() || clean == "skTerm" {
-                    "skTerm".to_string()
-                } else {
-                    format!("skTerm — {}", clean)
-                };
+            if let Some((label, win_title, tooltip)) = session.refresh_tab_label(configured_shell) {
                 if session.window.title() != win_title {
                     session.window.set_title(&win_title);
                 }
@@ -136,7 +130,7 @@ impl App {
                     }
                 }
                 #[cfg(not(target_os = "macos"))]
-                let _ = tooltip;
+                let _ = (label, tooltip);
             }
 
             // The scrollbar is shown for SCROLLBAR_FADE_AFTER after the last scroll and

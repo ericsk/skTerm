@@ -400,6 +400,21 @@ impl PtyProcess {
     pub fn foreground_process_name(&self) -> Option<String> {
         None
     }
+
+    /// Command-line arguments of the process currently in the foreground of this pty.
+    #[cfg(unix)]
+    pub fn foreground_process_cmdline(&self) -> Option<String> {
+        let pgid = self.master.process_group_leader()?;
+        if pgid <= 0 {
+            return None;
+        }
+        process_cmdline(pgid)
+    }
+
+    #[cfg(not(unix))]
+    pub fn foreground_process_cmdline(&self) -> Option<String> {
+        None
+    }
 }
 
 /// This process's own name, resolved once.
@@ -484,6 +499,101 @@ fn process_name(pid: libc::pid_t) -> Option<String> {
         None
     } else {
         Some(name)
+    }
+}
+
+/// Read the command-line arguments of `pid` via a single `sysctl` (`KERN_PROCARGS2`).
+#[cfg(target_os = "macos")]
+pub fn process_cmdline(pid: libc::pid_t) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || size < std::mem::size_of::<libc::c_int>()
+    {
+        return None;
+    }
+    let size = size.min(65536);
+    let mut buf = vec![0u8; size];
+    let mut actual_size = size;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut actual_size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || actual_size < std::mem::size_of::<libc::c_int>()
+    {
+        return None;
+    }
+    buf.truncate(actual_size);
+    let argc = i32::from_ne_bytes(buf[0..4].try_into().ok()?) as usize;
+    if argc == 0 {
+        return None;
+    }
+    let rest = &buf[4..];
+    let exec_end = rest.iter().position(|&b| b == 0)?;
+    let mut pos = exec_end;
+    while pos < rest.len() && rest[pos] == 0 {
+        pos += 1;
+    }
+    let mut args = Vec::with_capacity(argc.min(32));
+    for _ in 0..argc {
+        if pos >= rest.len() {
+            break;
+        }
+        let end = rest[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|rel| pos + rel)
+            .unwrap_or(rest.len());
+        let arg = String::from_utf8_lossy(&rest[pos..end]);
+        if !arg.is_empty() {
+            args.push(arg.into_owned());
+        }
+        pos = end + 1;
+    }
+    if args.is_empty() {
+        None
+    } else {
+        Some(args.join(" "))
+    }
+}
+
+/// Read the command-line arguments of `pid` from `/proc/<pid>/cmdline`.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn process_cmdline(pid: libc::pid_t) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    let bytes = std::fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let args: Vec<String> = bytes
+        .split(|&b| b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect();
+    if args.is_empty() {
+        None
+    } else {
+        Some(args.join(" "))
     }
 }
 
@@ -781,13 +891,43 @@ pub fn available_shell_presets() -> Vec<ShellPresetInfo> {
         let mut presets = Vec::new();
         let mut seen_canonical = std::collections::HashSet::new();
         let candidates: &[(&str, &str, &str, &[&str], &str)] = &[
-            ("bash", "GNU Bash", "/bin/bash", &["-l"], "Linux 標準 Bash Shell"),
-            ("bash", "GNU Bash", "/usr/bin/bash", &["-l"], "Linux 標準 Bash Shell"),
+            (
+                "bash",
+                "GNU Bash",
+                "/bin/bash",
+                &["-l"],
+                "Linux 標準 Bash Shell",
+            ),
+            (
+                "bash",
+                "GNU Bash",
+                "/usr/bin/bash",
+                &["-l"],
+                "Linux 標準 Bash Shell",
+            ),
             ("zsh", "Zsh", "/bin/zsh", &["-l"], "Z Shell 互動式終端"),
             ("zsh", "Zsh", "/usr/bin/zsh", &["-l"], "Z Shell 互動式終端"),
-            ("fish", "Fish Shell", "/usr/bin/fish", &["-l"], "Friendly Interactive Shell"),
-            ("fish", "Fish Shell", "/bin/fish", &["-l"], "Friendly Interactive Shell"),
-            ("nu", "Nushell", "/usr/bin/nu", &["-l"], "現代結構化資料 Shell"),
+            (
+                "fish",
+                "Fish Shell",
+                "/usr/bin/fish",
+                &["-l"],
+                "Friendly Interactive Shell",
+            ),
+            (
+                "fish",
+                "Fish Shell",
+                "/bin/fish",
+                &["-l"],
+                "Friendly Interactive Shell",
+            ),
+            (
+                "nu",
+                "Nushell",
+                "/usr/bin/nu",
+                &["-l"],
+                "現代結構化資料 Shell",
+            ),
             ("sh", "POSIX sh", "/bin/sh", &[], "系統輕量 POSIX Shell"),
         ];
         for &(id, title, candidate, default_args, desc) in candidates {

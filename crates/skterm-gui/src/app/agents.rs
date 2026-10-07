@@ -118,6 +118,7 @@ impl App {
                                     if label.is_empty() { None } else { Some(label) };
                             }
                         }
+                        target_s.last_tab_label_refresh = None;
                         target_s.window.request_redraw();
                     }
                     self.editing_agent_pane = None;
@@ -194,6 +195,7 @@ impl App {
                         term.custom_label = if label.is_empty() { None } else { Some(label) };
                     }
                 }
+                target_s.last_tab_label_refresh = None;
                 target_s.window.request_redraw();
             }
             self.ime_preedit.clear();
@@ -469,7 +471,10 @@ mod tests {
         use crate::layout::ProcessTreeCache;
 
         // Direct binaries
-        assert_eq!(ProcessTreeCache::match_agent_command("jetski"), Some("Jetski"));
+        assert_eq!(
+            ProcessTreeCache::match_agent_command("jetski"),
+            Some("Jetski")
+        );
         assert_eq!(
             ProcessTreeCache::match_agent_command("agy"),
             Some("Antigravity CLI")
@@ -482,7 +487,10 @@ mod tests {
             ProcessTreeCache::match_agent_command("gemini"),
             Some("Gemini CLI")
         );
-        assert_eq!(ProcessTreeCache::match_agent_command("aider"), Some("Aider"));
+        assert_eq!(
+            ProcessTreeCache::match_agent_command("aider"),
+            Some("Aider")
+        );
         assert_eq!(
             ProcessTreeCache::match_agent_command("codex"),
             Some("Codex CLI")
@@ -500,15 +508,11 @@ mod tests {
             Some("Jetski")
         );
         assert_eq!(
-            ProcessTreeCache::match_agent_command(
-                "/bin/bash /tmp/sar.gemini.ab12cd34/gemini_impl"
-            ),
+            ProcessTreeCache::match_agent_command("/bin/bash /tmp/sar.gemini.ab12cd34/gemini_impl"),
             Some("Gemini CLI")
         );
         assert_eq!(
-            ProcessTreeCache::match_agent_command(
-                "/google/bin/releases/gemini-cli/tools/gemini"
-            ),
+            ProcessTreeCache::match_agent_command("/google/bin/releases/gemini-cli/tools/gemini"),
             Some("Gemini CLI")
         );
 
@@ -542,10 +546,7 @@ mod tests {
             ProcessTreeCache::match_agent_command("grep jetski Cargo.toml"),
             None
         );
-        assert_eq!(
-            ProcessTreeCache::match_agent_command("vim claude.md"),
-            None
-        );
+        assert_eq!(ProcessTreeCache::match_agent_command("vim claude.md"), None);
         assert_eq!(
             ProcessTreeCache::match_agent_command("git checkout gemini"),
             None
@@ -587,4 +588,3 @@ mod tests {
         assert!(!project.is_empty() && project != "workspace");
     }
 }
-

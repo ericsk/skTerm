@@ -55,7 +55,9 @@ pub struct TerminalSession {
     /// per session. Cheap individually, but not worth paying every frame for a
     /// string that changes only when the user runs something or cds.
     pub last_tab_label_refresh: Option<Instant>,
+    pub last_active_tab_pane: Option<(u32, u32)>,
     pub cached_tab_label: String,
+    pub cached_window_title: String,
     pub cached_tab_tooltip: String,
     /// PTY output arrived while this window was not the focused one.
     pub has_unseen_output: bool,
@@ -174,44 +176,106 @@ impl TerminalSession {
         }
     }
 
-    /// Recompute this window's native tab label, at most once per
-    /// [`TAB_LABEL_REFRESH_INTERVAL`].
+    /// Recompute this window's tab labels and window title, at most once per
+    /// [`TAB_LABEL_REFRESH_INTERVAL`] (or immediately when the active tab/pane changes).
     ///
-    /// Returns `Some((label, tooltip))` **only when the text actually changed**.
-    /// In the steady state a terminal sits in one directory running one program,
-    /// so this returns `None` and the caller skips the AppKit round-trip
-    /// entirely.
+    /// Returns `Some((tab_label, window_title, tooltip))` **only when any of the
+    /// strings actually changed**.
     pub fn refresh_tab_label(
         &mut self,
         configured_shell: Option<&str>,
-    ) -> Option<(String, String)> {
-        let due = match self.last_tab_label_refresh {
-            Some(t) => t.elapsed() >= TAB_LABEL_REFRESH_INTERVAL,
-            None => true,
-        };
+    ) -> Option<(String, String, String)> {
+        let current_active_tab_pane = self
+            .workspace
+            .active_tab()
+            .map(|t| (t.id, t.active_pane_id));
+        let focus_changed = current_active_tab_pane != self.last_active_tab_pane;
+
+        let due = focus_changed
+            || match self.last_tab_label_refresh {
+                Some(t) => t.elapsed() >= TAB_LABEL_REFRESH_INTERVAL,
+                None => true,
+            };
         if !due {
             return None;
         }
         self.last_tab_label_refresh = Some(Instant::now());
+        self.last_active_tab_pane = current_active_tab_pane;
 
         let home = std::env::var("HOME").ok();
         let active_idx = self.workspace.active_tab_idx;
         let mut active_label = None;
+        let mut active_win_title = None;
         let mut active_tooltip = None;
         let mut any_tab_changed = false;
 
+        let process_cache = &self.process_cache;
+
         for (idx, tab) in self.workspace.tabs.iter_mut().enumerate() {
-            if let Some(terminal) = tab.active_terminal() {
+            let computed = if let Some(terminal) = tab.active_terminal_mut() {
                 let process = terminal.foreground_process_name();
+                let cmdline = terminal.foreground_process_cmdline();
                 let cwd = terminal.current_working_directory();
-                let fallback = format!("Tab {}", idx + 1);
-                let mut label = crate::tab_title::build_tab_label(
+                let descendant_agent = terminal
+                    .foreground_process_group_id()
+                    .and_then(|pid| {
+                        process_cache
+                            .find_agent_descendant(pid)
+                            .map(|(_, name)| name)
+                    })
+                    .or_else(|| {
+                        terminal.process_id().and_then(|pid| {
+                            process_cache
+                                .find_agent_descendant(pid)
+                                .map(|(_, name)| name)
+                        })
+                    });
+
+                // Clear stale OSC titles left behind by an exited foreground program
+                // once the terminal returns to an idle shell prompt with a known CWD.
+                let running_prog = crate::tab_title::resolve_program_name(
                     process.as_deref(),
+                    cmdline.as_deref(),
+                    descendant_agent,
+                    &terminal.state.title,
+                    configured_shell,
+                );
+                if running_prog.is_none() && cwd.is_some() && terminal.state.title != "skTerm" {
+                    terminal.state.title = "skTerm".to_string();
+                }
+
+                let fallback = format!("Tab {}", idx + 1);
+                let label = crate::tab_title::build_tab_label(
+                    terminal.custom_label.as_deref(),
+                    process.as_deref(),
+                    cmdline.as_deref(),
+                    descendant_agent,
                     cwd.as_deref(),
                     home.as_deref(),
                     configured_shell,
+                    &terminal.state.title,
                     &fallback,
                 );
+                let win_title = if idx == active_idx {
+                    Some(crate::tab_title::build_window_title(
+                        terminal.custom_label.as_deref(),
+                        process.as_deref(),
+                        cmdline.as_deref(),
+                        descendant_agent,
+                        cwd.as_deref(),
+                        home.as_deref(),
+                        configured_shell,
+                        &terminal.state.title,
+                    ))
+                } else {
+                    None
+                };
+                Some((label, win_title, cwd))
+            } else {
+                None
+            };
+
+            if let Some((mut label, win_title, cwd)) = computed {
                 if tab.has_unseen_output {
                     label.insert_str(0, "• ");
                 }
@@ -219,13 +283,14 @@ impl TerminalSession {
                     tab.title = label.clone();
                     any_tab_changed = true;
                 }
-                if idx == active_idx {
+                if let Some(win_title) = win_title {
                     let mut win_label = label;
                     if self.has_unseen_output && !win_label.starts_with("• ") {
                         win_label.insert_str(0, "• ");
                     }
-                    let tooltip = cwd.unwrap_or_else(|| win_label.clone());
+                    let tooltip = cwd.unwrap_or_else(|| win_title.clone());
                     active_label = Some(win_label);
+                    active_win_title = Some(win_title);
                     active_tooltip = Some(tooltip);
                 }
             }
@@ -236,14 +301,19 @@ impl TerminalSession {
         }
 
         let label = active_label?;
+        let win_title = active_win_title?;
         let tooltip = active_tooltip?;
 
-        if label == self.cached_tab_label && tooltip == self.cached_tab_tooltip {
+        if label == self.cached_tab_label
+            && win_title == self.cached_window_title
+            && tooltip == self.cached_tab_tooltip
+        {
             return None;
         }
         self.cached_tab_label = label.clone();
+        self.cached_window_title = win_title.clone();
         self.cached_tab_tooltip = tooltip.clone();
-        Some((label, tooltip))
+        Some((label, win_title, tooltip))
     }
 
     pub fn update_search_matches(&mut self) {
@@ -591,13 +661,8 @@ impl TerminalSession {
         let menu_btn_w = 20.0 * scale;
         let right_btns_w = TopRightButtons::reserved_width(scale);
         let tab_gap = 4.0 * scale;
-        let avail_w = (main_w
-            - start_x
-            - plus_btn_w
-            - menu_btn_w
-            - right_btns_w
-            - 16.0 * scale)
-            .max(80.0);
+        let avail_w =
+            (main_w - start_x - plus_btn_w - menu_btn_w - right_btns_w - 16.0 * scale).max(80.0);
         let total_gaps = (tabs_len.saturating_sub(1) as f32) * tab_gap;
         let tab_w = ((avail_w - total_gaps) / tabs_len as f32).clamp(75.0 * scale, 190.0 * scale);
         let tab_h = (tab_bar_h - 8.0 * scale).max(18.0);

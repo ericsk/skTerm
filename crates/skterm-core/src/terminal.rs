@@ -217,6 +217,11 @@ impl Terminal {
         self.pty.as_ref()?.foreground_process_name()
     }
 
+    /// Command-line arguments of the process currently in the foreground of this terminal's pty.
+    pub fn foreground_process_cmdline(&self) -> Option<String> {
+        self.pty.as_ref()?.foreground_process_cmdline()
+    }
+
     /// OS process group leader ID currently in the foreground of this terminal's pty.
     pub fn foreground_process_group_id(&self) -> Option<u32> {
         self.pty.as_ref()?.foreground_process_group_id()
@@ -230,7 +235,8 @@ impl Terminal {
             }
         }
 
-        if let Some(pid) = self.process_id() {
+        let candidates = [self.foreground_process_group_id(), self.process_id()];
+        for pid in candidates.into_iter().flatten() {
             #[cfg(target_os = "macos")]
             {
                 if let Some(path) = crate::pty::process_cwd(pid as libc::pid_t) {

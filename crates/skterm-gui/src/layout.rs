@@ -942,7 +942,15 @@ impl Workspace {
 
     pub fn rename_active_tab(&mut self, new_title: String) {
         if let Some(tab) = self.active_tab_mut() {
-            tab.title = new_title;
+            tab.title = new_title.clone();
+            if let Some(term) = tab.active_terminal_mut() {
+                let trimmed = new_title.trim();
+                term.custom_label = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
         }
     }
 
@@ -1661,4 +1669,3 @@ impl ProcessTreeCache {
         "workspace".to_string()
     }
 }
-

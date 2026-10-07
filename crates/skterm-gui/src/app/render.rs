@@ -42,8 +42,7 @@ impl App {
             &edited_agents
         } else {
             self.cached_ai_agents.items()
-        }
-        ;
+        };
 
         // The panel header states how many tabs the listing spans, which
         // is what stops it reading as a feature of the selected tab. On
@@ -62,31 +61,20 @@ impl App {
                 session.update_ime_position(tab_bar_h);
             }
 
-            if let Some(active_tab) = session.workspace.active_tab() {
-                let raw_title = {
-                    #[cfg(target_os = "macos")]
-                    {
-                        let clean = session
-                            .cached_tab_label
-                            .strip_prefix("• ")
-                            .unwrap_or(&session.cached_tab_label);
-                        if !clean.is_empty() {
-                            clean.to_string()
-                        } else if active_tab.title == "Tab 1" {
-                            "skTerm".to_string()
-                        } else {
-                            active_tab.title.clone()
-                        }
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        active_tab.title.clone()
-                    }
-                };
-                let win_title = if raw_title.is_empty() || raw_title == "skTerm" {
+            let configured_shell = self
+                .config_manager
+                .current_config
+                .terminal
+                .shell
+                .as_ref()
+                .map(|s| s.program.as_str());
+            let _ = session.refresh_tab_label(configured_shell);
+
+            if session.workspace.active_tab().is_some() {
+                let win_title = if session.cached_window_title.is_empty() {
                     "skTerm".to_string()
                 } else {
-                    format!("skTerm — {}", raw_title)
+                    session.cached_window_title.clone()
                 };
                 if session.window.title() != win_title {
                     session.window.set_title(&win_title);
@@ -215,12 +203,8 @@ impl App {
                 } else {
                     let menu_w = 240.0 * scale;
                     let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
-                    let (mut m, acts) = build_top_dropdown_menu(
-                        scale,
-                        menu_x,
-                        tab_bar_h,
-                        session.menu_hovered_idx,
-                    );
+                    let (mut m, acts) =
+                        build_top_dropdown_menu(scale, menu_x, tab_bar_h, session.menu_hovered_idx);
                     m.clamp_to_screen(screen_w, screen_h, scale);
                     (Some(m), acts)
                 }
