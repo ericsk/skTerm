@@ -383,7 +383,7 @@ impl TerminalSession {
             }
         }
     }
-    pub fn update_ime_position(&mut self, tab_bar_h: f32) {
+    pub fn update_ime_position(&mut self, tab_bar_h: f32, ime_preedit: &str) {
         if let Some(active_tab) = self.workspace.active_tab() {
             if let Some(terminal) = active_tab.active_terminal() {
                 let pane_rects = self.workspace.compute_active_pane_rects_with_scale(
@@ -395,22 +395,67 @@ impl TerminalSession {
 
                 for (id, rect) in &pane_rects {
                     if *id == active_tab.active_pane_id {
-                        let cursor = &terminal.grid().active().cursor;
                         let cell_w = self.renderer.cell_width();
                         let cell_h = self.renderer.cell_height();
+                        let scale_f32 = self.renderer.scale_factor;
 
-                        let cursor_px =
-                            rect.x + self.renderer.padding_x + (cursor.col as f32 * cell_w);
-                        let cursor_py =
-                            rect.y + self.renderer.padding_y + (cursor.row as f32 * cell_h);
+                        let (area_px, area_py, area_pw, area_ph) = if self.search_open {
+                            let count_str = if self.search_matches.is_empty() {
+                                "0/0".to_string()
+                            } else {
+                                format!(
+                                    "{}/{}",
+                                    self.active_search_idx.unwrap_or(0) + 1,
+                                    self.search_matches.len()
+                                )
+                            };
+                            let label = if ime_preedit.is_empty() {
+                                format!("Find: {}▏  ({})", self.search_query, count_str)
+                            } else {
+                                format!(
+                                    "Find: {}[{}]▏  ({})",
+                                    self.search_query, ime_preedit, count_str
+                                )
+                            };
+                            let bar_w = ((skterm_render::text_display_cells(&label) as f32
+                                * cell_w)
+                                + 24.0 * scale_f32)
+                                .clamp(
+                                    220.0 * scale_f32,
+                                    (rect.width - 24.0 * scale_f32).max(120.0),
+                                );
+                            let bar_h = cell_h + 12.0 * scale_f32;
+                            let bar_x =
+                                (rect.x + rect.width - bar_w - 12.0 * scale_f32).max(rect.x + 4.0);
+                            let bar_y = rect.y + 8.0 * scale_f32;
+                            (bar_x, bar_y, bar_w, bar_h)
+                        } else {
+                            let cursor = &terminal.grid().active().cursor;
+                            let cursor_px =
+                                rect.x + self.renderer.padding_x + (cursor.col as f32 * cell_w);
+                            let cursor_py =
+                                rect.y + self.renderer.padding_y + (cursor.row as f32 * cell_h);
 
-                        let scale = self.renderer.scale_factor as f64;
-                        let logical_pos = LogicalPosition::new(
-                            cursor_px as f64 / scale,
-                            cursor_py as f64 / scale,
-                        );
+                            if let Some(layout) = skterm_render::PreeditOverlayLayout::compute(
+                                ime_preedit,
+                                None,
+                                cursor_px,
+                                rect.x,
+                                rect.width,
+                                self.renderer.padding_x,
+                                cell_w,
+                            ) {
+                                (layout.start_x, cursor_py, layout.box_w.max(cell_w), cell_h)
+                            } else {
+                                (cursor_px, cursor_py, cell_w, cell_h)
+                            }
+                        };
+
+                        let scale = scale_f32 as f64;
+                        let logical_pos =
+                            LogicalPosition::new(area_px as f64 / scale, area_py as f64 / scale);
                         let logical_size =
-                            LogicalSize::new(cell_w as f64 / scale, cell_h as f64 / scale);
+                            LogicalSize::new(area_pw as f64 / scale, area_ph as f64 / scale);
 
                         let area_key = (
                             logical_pos.x.round() as i32,

@@ -41,13 +41,35 @@ pub struct GlyphAtlas {
     bold_font: Option<Font>,
     italic_font: Option<Font>,
     fallback_fonts: Vec<Font>,
-    fallback_initialized: bool,
+    system_fallback_cursor: usize,
     pub font_size: f32,
     pub base_cell_height: f32,
     pub cell_width: f32,
     pub cell_height: f32,
     pub baseline_offset: f32,
 }
+
+const SYSTEM_CJK_CANDIDATES: &[&str] = &[
+    // macOS
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Songti.ttc",
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    "/System/Library/Fonts/Apple Symbols.ttf",
+    // Linux
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    // Windows
+    "C:\\Windows\\Fonts\\msyh.ttc",
+    "C:\\Windows\\Fonts\\simsun.ttc",
+    "C:\\Windows\\Fonts\\msgothic.ttc",
+    "C:\\Windows\\Fonts\\malgun.ttf",
+];
 
 impl GlyphAtlas {
     pub const ATLAS_SIZE: u32 = 2048;
@@ -161,7 +183,7 @@ impl GlyphAtlas {
             bold_font,
             italic_font,
             fallback_fonts,
-            fallback_initialized: false,
+            system_fallback_cursor: 0,
             font_size,
             base_cell_height,
             cell_width,
@@ -203,37 +225,21 @@ impl GlyphAtlas {
         };
     }
 
-    /// Lazy-load standard system CJK / Emoji fallback fonts on first demand if not already in chain
-    fn ensure_fallback_loaded(&mut self) {
-        if !self.fallback_initialized {
-            self.fallback_initialized = true;
-            let cjk_candidates = [
-                // macOS
-                "/System/Library/Fonts/Hiragino Sans GB.ttc",
-                "/System/Library/Fonts/STHeiti Light.ttc",
-                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-                "/System/Library/Fonts/Supplemental/Songti.ttc",
-                "/System/Library/Fonts/PingFang.ttc",
-                // Linux
-                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-                "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-                "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-                "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-                // Windows
-                "C:\\Windows\\Fonts\\msyh.ttc",
-                "C:\\Windows\\Fonts\\simsun.ttc",
-            ];
-
-            for path in &cjk_candidates {
-                if let Ok(bytes) = std::fs::read(path) {
-                    if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
-                        info!("Loaded system CJK fallback font: {}", path);
-                        self.fallback_fonts.push(font);
-                        break;
-                    }
+    /// Lazily load the next available system CJK / Unicode fallback font on demand.
+    fn load_next_system_fallback(&mut self) -> Option<usize> {
+        while self.system_fallback_cursor < SYSTEM_CJK_CANDIDATES.len() {
+            let path = SYSTEM_CJK_CANDIDATES[self.system_fallback_cursor];
+            self.system_fallback_cursor += 1;
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                    info!("Loaded system CJK fallback font: {}", path);
+                    let idx = self.fallback_fonts.len();
+                    self.fallback_fonts.push(font);
+                    return Some(idx);
                 }
             }
         }
+        None
     }
 
     /// Retrieve glyph from cache or rasterize (checking primary font, configured fallbacks, then system fallbacks) and upload to GPU texture.
@@ -266,7 +272,7 @@ impl GlyphAtlas {
         let (metrics, bitmap) = if primary.lookup_glyph_index(c) != 0 {
             primary.rasterize(c, self.font_size)
         } else {
-            // 2. Check configured fallback chain
+            // 2. Check already-loaded fallback chain
             let mut found = None;
             for fallback in &self.fallback_fonts {
                 if fallback.lookup_glyph_index(c) != 0 {
@@ -275,14 +281,14 @@ impl GlyphAtlas {
                 }
             }
 
-            // 3. Check system fallback fonts
-            if found.is_none() {
-                self.ensure_fallback_loaded();
-                for fallback in &self.fallback_fonts {
-                    if fallback.lookup_glyph_index(c) != 0 {
-                        found = Some(fallback.rasterize(c, self.font_size));
-                        break;
-                    }
+            // 3. Progressively load system fallback fonts until one covers `c`
+            while found.is_none() {
+                let Some(idx) = self.load_next_system_fallback() else {
+                    break;
+                };
+                let fallback = &self.fallback_fonts[idx];
+                if fallback.lookup_glyph_index(c) != 0 {
+                    found = Some(fallback.rasterize(c, self.font_size));
                 }
             }
 

@@ -199,6 +199,7 @@ impl App {
                 target_s.window.request_redraw();
             }
             self.ime_preedit.clear();
+            self.ime_preedit_cursor = None;
             // See the native-editor path above: the card reads its label from
             // the cache, so it has to be rebuilt for the rename to show.
             if self.sidebar_open {

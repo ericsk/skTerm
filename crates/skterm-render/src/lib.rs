@@ -11,9 +11,9 @@ pub use agent_panel::{AgentPanelHit, AgentPanelLayout, PanelRect};
 pub use atlas::{is_terminal_friendly_font, GlyphAtlas, GlyphInfo, GlyphKey};
 pub use pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
 pub use renderer::{
-    color_to_rgba_themed, color_to_rgba_with_dynamic_palette, AgentPanelState, AgentSidebarItem,
-    PaneRenderItem, RenderTheme, ScrollbarMetrics, TabItem, TermRenderer, TopDropdownMenu,
-    TopDropdownMenuItem, TopRightButtons,
+    color_to_rgba_themed, color_to_rgba_with_dynamic_palette, text_display_cells, AgentPanelState,
+    AgentSidebarItem, PaneRenderItem, PreeditOverlayLayout, RenderTheme, ScrollbarMetrics, TabItem,
+    TermRenderer, TopDropdownMenu, TopDropdownMenuItem, TopRightButtons,
 };
 
 /// skterm-render version and basic info
@@ -115,5 +115,48 @@ mod tests {
             ScrollbarMetrics::compute(0.0, 0.0, 800.0, 600.0, 1.0, 100, 25, 100, false, false)
                 .expect("Should compute scrollbar metrics");
         assert_eq!(m_top.thumb_y, m_top.track_y);
+    }
+
+    #[test]
+    fn test_preedit_overlay_layout_zhuyin_and_kana() {
+        // Empty preedit returns None
+        assert!(PreeditOverlayLayout::compute("", None, 20.0, 0.0, 800.0, 10.0, 10.0).is_none());
+
+        // Zhuyin radicals "ㄐㄧˇ" -> 'ㄐ' (2 cells) + 'ㄧ' (2 cells) + 'ˇ' (1 cell) = 5 cells
+        let zhuyin = "ㄐㄧˇ";
+        assert_eq!(text_display_cells(zhuyin), 5);
+        let layout = PreeditOverlayLayout::compute(
+            zhuyin,
+            Some((zhuyin.len(), zhuyin.len())),
+            50.0,
+            0.0,
+            800.0,
+            10.0,
+            10.0,
+        )
+        .expect("zhuyin preedit layout");
+        assert_eq!(layout.start_x, 50.0);
+        assert_eq!(layout.box_w, 50.0);
+        assert_eq!(layout.selected_clause, None);
+        assert_eq!(layout.caret_x, 100.0);
+
+        // Japanese Kana multi-clause conversion: "きょうは" (4 full-width kana = 8 cells)
+        // with first 2 kana ("きょ" = 6 UTF-8 bytes = 4 cells) selected as active clause
+        let kana = "きょうは";
+        assert_eq!(text_display_cells(kana), 8);
+        let layout_kana =
+            PreeditOverlayLayout::compute(kana, Some((0, 6)), 100.0, 0.0, 800.0, 10.0, 10.0)
+                .expect("kana preedit layout");
+        assert_eq!(layout_kana.start_x, 100.0);
+        assert_eq!(layout_kana.box_w, 80.0);
+        assert_eq!(layout_kana.selected_clause, Some((100.0, 40.0)));
+        assert_eq!(layout_kana.caret_x, 140.0);
+
+        // Right-edge clamping when cursor is near the right border of the pane
+        let clamped = PreeditOverlayLayout::compute(kana, None, 760.0, 0.0, 800.0, 10.0, 10.0)
+            .expect("clamped preedit layout");
+        // max_right = 800 - 10 = 790, box_w = 80 -> start_x shifts left to 710
+        assert_eq!(clamped.start_x, 710.0);
+        assert_eq!(clamped.box_w, 80.0);
     }
 }

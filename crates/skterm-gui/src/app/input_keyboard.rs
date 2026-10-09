@@ -13,12 +13,13 @@ use winit::window::WindowId;
 
 impl App {
     /// Handles `WindowEvent::Ime` for a terminal window.
-    pub(crate) fn handle_ime(&mut self, window_id: WindowId, ime_event: Ime) {
+    pub(crate) fn handle_ime(&mut self, window_id: WindowId, tab_bar_h: f32, ime_event: Ime) {
         match ime_event {
             Ime::Commit(text) => {
                 let had_preedit = !self.ime_preedit.is_empty();
                 self.last_ime_commit_time = Some(Instant::now());
                 self.ime_preedit.clear();
+                self.ime_preedit_cursor = None;
                 if self.modifiers.super_key() {
                     if text.eq_ignore_ascii_case("c") {
                         if let Some(session) = self.sessions.get(&window_id) {
@@ -40,6 +41,7 @@ impl App {
                     if session.search_open {
                         session.search_query.push_str(&text);
                         session.update_search_matches();
+                        session.update_ime_position(tab_bar_h, &self.ime_preedit);
                         session.window.request_redraw();
                     } else if let Some(tab) = session.workspace.active_tab_mut() {
                         if let Some(term) = tab.active_terminal_mut() {
@@ -47,18 +49,21 @@ impl App {
                             term.grid_mut().active_mut().scroll_offset = 0;
                             let _ = term.write_to_pty(text.as_bytes());
                             std::thread::yield_now();
-                            if had_preedit || was_scrolled || term.poll_pty() {
+                            let pty_updated = term.poll_pty();
+                            session.update_ime_position(tab_bar_h, &self.ime_preedit);
+                            if had_preedit || was_scrolled || pty_updated {
                                 session.window.request_redraw();
                             }
                         }
                     }
                 }
             }
-            Ime::Preedit(text, _cursor) => {
+            Ime::Preedit(text, cursor) => {
                 self.ime_preedit = text;
+                self.ime_preedit_cursor = cursor;
                 if self.editing_agent_pane.is_none() {
                     if let Some(session) = self.sessions.get_mut(&window_id) {
-                        if !session.search_open {
+                        if !session.search_open && !self.ime_preedit.is_empty() {
                             if let Some(tab) = session.workspace.active_tab_mut() {
                                 if let Some(term) = tab.active_terminal_mut() {
                                     if term.grid().active().scroll_offset != 0 {
@@ -67,13 +72,30 @@ impl App {
                                 }
                             }
                         }
+                        session.update_ime_position(tab_bar_h, &self.ime_preedit);
                         session.window.request_redraw();
                     }
                 } else if let Some(session) = self.sessions.get(&window_id) {
                     session.window.request_redraw();
                 }
             }
-            _ => {}
+            Ime::Enabled => {
+                if self.editing_agent_pane.is_none() {
+                    if let Some(session) = self.sessions.get_mut(&window_id) {
+                        session.update_ime_position(tab_bar_h, &self.ime_preedit);
+                    }
+                }
+            }
+            Ime::Disabled => {
+                let had_preedit = !self.ime_preedit.is_empty();
+                self.ime_preedit.clear();
+                self.ime_preedit_cursor = None;
+                if had_preedit {
+                    if let Some(session) = self.sessions.get(&window_id) {
+                        session.window.request_redraw();
+                    }
+                }
+            }
         }
     }
 
@@ -300,6 +322,7 @@ impl App {
 
         if is_cmd {
             self.ime_preedit.clear();
+            self.ime_preedit_cursor = None;
             // Check NamedKey first (Enter, Arrow keys)
             match event.logical_key {
                 Key::Named(NamedKey::Enter) if is_shift => {
@@ -652,6 +675,7 @@ impl App {
                     Key::Named(NamedKey::Escape) => {
                         self.editing_agent_pane = None;
                         self.ime_preedit.clear();
+                        self.ime_preedit_cursor = None;
                         if let Some(s) = self.sessions.get(&window_id) {
                             s.window.request_redraw();
                         }

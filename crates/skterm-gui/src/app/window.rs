@@ -157,7 +157,7 @@ impl App {
         );
 
         let window_id = window.id();
-        let session = TerminalSession {
+        let mut session = TerminalSession {
             window: window.clone(),
             renderer,
             workspace,
@@ -196,6 +196,7 @@ impl App {
             ai_btn_hovered: false,
             prefs_btn_hovered: false,
         };
+        session.update_ime_position(tab_bar_h, "");
 
         self.sessions.insert(window_id, session);
         self.session_order.push(window_id);

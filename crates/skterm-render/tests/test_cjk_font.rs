@@ -187,3 +187,45 @@ fn test_font_baseline_centering() {
         println!("Note: No candidate font found on this environment, skipped gracefully.");
     }
 }
+
+#[test]
+fn test_zhuyin_and_kana_fallback_rasterize() {
+    let loaded_fonts: Vec<(&str, Font)> = CANDIDATE_PATHS
+        .iter()
+        .filter_map(|&path| {
+            let bytes = std::fs::read(path).ok()?;
+            let font = Font::from_bytes(bytes.as_slice(), FontSettings::default()).ok()?;
+            Some((path, font))
+        })
+        .collect();
+
+    assert!(
+        !loaded_fonts.is_empty(),
+        "no system candidate fonts could be loaded"
+    );
+
+    // Zhuyin (Bopomofo phonetic symbols + tone marks) and Japanese Hiragana/Katakana
+    // used during inline IME preedit composition.
+    let ime_preedit_chars = [
+        'ㄅ', 'ㄆ', 'ㄐ', 'ㄧ', 'ˇ', 'ˊ', 'ˋ', '˙', 'あ', 'か', 'き', 'ょ', 'う', 'ア', 'カ',
+    ];
+
+    for ch in ime_preedit_chars {
+        let found = loaded_fonts.iter().find_map(|(path, font)| {
+            if font.lookup_glyph_index(ch) == 0 {
+                return None;
+            }
+            let (metrics, bitmap) = font.rasterize(ch, 16.0);
+            if metrics.width > 0 && metrics.height > 0 && has_visible_coverage(&bitmap) {
+                Some(*path)
+            } else {
+                None
+            }
+        });
+        assert!(
+            found.is_some(),
+            "IME preedit glyph '{ch}' (U+{:04X}) was not covered by any system fallback font",
+            ch as u32
+        );
+    }
+}

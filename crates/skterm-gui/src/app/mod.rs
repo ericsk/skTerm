@@ -69,6 +69,7 @@ pub struct App {
     pub editing_agent_text: String,
     pub editing_agent_cursor: usize,
     pub ime_preedit: String,
+    pub ime_preedit_cursor: Option<(usize, usize)>,
     pub last_ime_commit_time: Option<Instant>,
     pub event_proxy: Option<winit::event_loop::EventLoopProxy<AppEvent>>,
     /// Set by PTY reader threads when they have queued output, cleared by the event
@@ -125,6 +126,7 @@ impl App {
             editing_agent_text: String::new(),
             editing_agent_cursor: 0,
             ime_preedit: String::new(),
+            ime_preedit_cursor: None,
             last_ime_commit_time: None,
             event_proxy: None,
             pty_wakeup_pending: Arc::new(AtomicBool::new(false)),
@@ -335,7 +337,9 @@ impl ApplicationHandler<AppEvent> for App {
                             self.apply_config_live(&new_cfg, true);
                         }
                         if should_close {
-                            info!("Preferences Window closed via keyboard shortcut or close button.");
+                            info!(
+                                "Preferences Window closed via keyboard shortcut or close button."
+                            );
                             self.preferences_window = None;
                         }
                         return;
@@ -363,6 +367,12 @@ impl ApplicationHandler<AppEvent> for App {
         if let WindowEvent::Focused(focused) = event {
             if focused {
                 self.active_session_id = Some(window_id);
+            } else if !self.ime_preedit.is_empty() {
+                self.ime_preedit.clear();
+                self.ime_preedit_cursor = None;
+                if let Some(session) = self.sessions.get(&window_id) {
+                    session.window.request_redraw();
+                }
             }
             if let Some(session) = self.sessions.get_mut(&window_id) {
                 if focused {
@@ -406,7 +416,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.handle_modifiers_changed(window_id, new_modifiers)
             }
 
-            WindowEvent::Ime(ime_event) => self.handle_ime(window_id, ime_event),
+            WindowEvent::Ime(ime_event) => self.handle_ime(window_id, tab_bar_h, ime_event),
 
             WindowEvent::KeyboardInput { ref event, .. } => {
                 self.handle_keyboard_input(event_loop, window_id, tab_bar_h, event)

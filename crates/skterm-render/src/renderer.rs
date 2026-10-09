@@ -129,6 +129,90 @@ impl ScrollbarMetrics {
     }
 }
 
+/// Number of terminal grid cells occupied by `text` when rendered inline.
+pub fn text_display_cells(text: &str) -> usize {
+    text.chars()
+        .map(|c| {
+            unicode_width::UnicodeWidthChar::width(c)
+                .unwrap_or(1)
+                .max(1)
+        })
+        .sum()
+}
+
+/// Computed horizontal geometry for an inline IME preedit overlay inside a pane.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreeditOverlayLayout {
+    pub start_x: f32,
+    pub box_w: f32,
+    pub avail_w: f32,
+    pub selected_clause: Option<(f32, f32)>,
+    pub caret_x: f32,
+}
+
+impl PreeditOverlayLayout {
+    pub fn compute(
+        preedit: &str,
+        cursor_range: Option<(usize, usize)>,
+        cur_x: f32,
+        pane_x: f32,
+        pane_w: f32,
+        padding_x: f32,
+        cell_w: f32,
+    ) -> Option<Self> {
+        if preedit.is_empty() || cell_w <= 0.0 || pane_w <= 0.0 {
+            return None;
+        }
+        let total_cells = text_display_cells(preedit).max(1);
+        let preedit_w = total_cells as f32 * cell_w;
+
+        let min_left = pane_x + padding_x;
+        let max_right = (pane_x + pane_w - padding_x).max(min_left + cell_w);
+        let start_x = if cur_x + preedit_w > max_right {
+            (max_right - preedit_w).max(min_left)
+        } else {
+            cur_x.max(min_left)
+        };
+        let avail_w = (pane_x + pane_w - start_x).max(0.0);
+        let box_w = preedit_w.min(avail_w);
+        if box_w <= 0.0 {
+            return None;
+        }
+
+        let byte_offset_to_px = |byte_idx: usize| -> f32 {
+            let clamped = byte_idx.min(preedit.len());
+            let cells: usize = preedit
+                .char_indices()
+                .take_while(|&(idx, _)| idx < clamped)
+                .map(|(_, c)| {
+                    unicode_width::UnicodeWidthChar::width(c)
+                        .unwrap_or(1)
+                        .max(1)
+                })
+                .sum();
+            (start_x + cells as f32 * cell_w).min(start_x + box_w)
+        };
+
+        let (selected_clause, caret_x) = match cursor_range {
+            Some((start_b, end_b)) => {
+                let sx = byte_offset_to_px(start_b);
+                let ex = byte_offset_to_px(end_b);
+                let clause = if ex > sx { Some((sx, ex - sx)) } else { None };
+                (clause, ex)
+            }
+            None => (None, start_x + box_w),
+        };
+
+        Some(Self {
+            start_x,
+            box_w,
+            avail_w,
+            selected_clause,
+            caret_x,
+        })
+    }
+}
+
 /// Render descriptor for an individual pane on screen
 pub struct PaneRenderItem<'a> {
     pub grid: &'a ScreenGrid,
@@ -140,6 +224,8 @@ pub struct PaneRenderItem<'a> {
     pub search_matches: &'a [skterm_core::SearchMatch],
     pub active_search_idx: Option<usize>,
     pub search_query: Option<&'a str>,
+    pub ime_preedit: Option<&'a str>,
+    pub ime_preedit_cursor: Option<(usize, usize)>,
     pub is_scrollbar_hovered: bool,
     pub is_scrollbar_dragging: bool,
     pub is_recently_scrolled: bool,
@@ -729,7 +815,10 @@ impl TermRenderer {
         let baseline = self.atlas.baseline_offset;
         let mut cur_x = x;
         for c in text.chars() {
-            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as f32 * cell_w;
+            let cw = unicode_width::UnicodeWidthChar::width(c)
+                .unwrap_or(1)
+                .max(1) as f32
+                * cell_w;
             if cur_x + cw > x + max_w {
                 break;
             }
@@ -824,8 +913,12 @@ impl TermRenderer {
             [0.80, 0.84, 0.94, 0.92]
         };
 
-        let glyph_a = self.atlas.get_or_insert_glyph(&self.queue, 'A', true, false);
-        let glyph_i = self.atlas.get_or_insert_glyph(&self.queue, 'I', true, false);
+        let glyph_a = self
+            .atlas
+            .get_or_insert_glyph(&self.queue, 'A', true, false);
+        let glyph_i = self
+            .atlas
+            .get_or_insert_glyph(&self.queue, 'I', true, false);
         if let (Some(ga), Some(gi)) = (glyph_a, glyph_i) {
             if ga.size[0] > 0.0 && gi.size[0] > 0.0 {
                 let gap = 1.5 * scale;
@@ -887,7 +980,10 @@ impl TermRenderer {
         };
 
         let mut drew_gear = false;
-        if let Some(g) = self.atlas.get_or_insert_glyph(&self.queue, '⚙', false, false) {
+        if let Some(g) = self
+            .atlas
+            .get_or_insert_glyph(&self.queue, '⚙', false, false)
+        {
             if g.size[0] > 0.0 && g.size[1] > 0.0 {
                 let max_icon = prw - 6.0 * scale;
                 let scale_down = if g.size[0] > max_icon || g.size[1] > max_icon {
@@ -1364,13 +1460,8 @@ impl TermRenderer {
             let right_btns = TopRightButtons::compute(main_w, tab_bar_h, scale);
             let right_btns_w = TopRightButtons::reserved_width(scale);
             let tab_gap = 4.0 * scale;
-            let avail_w = (main_w
-                - start_x
-                - plus_btn_w
-                - chevron_w
-                - right_btns_w
-                - 16.0 * scale)
-                .max(80.0);
+            let avail_w =
+                (main_w - start_x - plus_btn_w - chevron_w - right_btns_w - 16.0 * scale).max(80.0);
             let total_gaps = (tabs.len().saturating_sub(1) as f32) * tab_gap;
             let tab_w =
                 ((avail_w - total_gaps) / tabs.len() as f32).clamp(75.0 * scale, 190.0 * scale);
@@ -1969,8 +2060,15 @@ impl TermRenderer {
                 }
             }
 
-            // Cursor
-            if pane.is_focused && active_buf.cursor.visible && active_buf.scroll_offset == 0 {
+            // Cursor (suppressed while inline IME preedit composition is drawn over the cursor)
+            let has_terminal_preedit = pane.is_focused
+                && pane.search_query.is_none()
+                && pane.ime_preedit.is_some_and(|s| !s.is_empty());
+            if pane.is_focused
+                && active_buf.cursor.visible
+                && active_buf.scroll_offset == 0
+                && !has_terminal_preedit
+            {
                 let cur_x = px + self.padding_x + (active_buf.cursor.col as f32 * cell_w);
                 let cur_y = py + self.padding_y + (active_buf.cursor.row as f32 * cell_h);
 
@@ -1991,46 +2089,6 @@ impl TermRenderer {
                         color: pane_theme.cursor_color,
                     });
                 }
-            }
-
-            // Floating Find Bar overlay (Cmd+F)
-            if let Some(query) = pane.search_query {
-                let count_str = if pane.search_matches.is_empty() {
-                    "0/0".to_string()
-                } else {
-                    format!(
-                        "{}/{}",
-                        pane.active_search_idx.unwrap_or(0) + 1,
-                        pane.search_matches.len()
-                    )
-                };
-                let label = format!("Find: {}▏  ({})", query, count_str);
-                let bar_w = ((label.chars().count() as f32 * cell_w) + 24.0 * scale)
-                    .clamp(220.0 * scale, (pw - 24.0 * scale).max(120.0));
-                let bar_h = cell_h + 12.0 * scale;
-                let bar_x = (px + pw - bar_w - 12.0 * scale).max(px + 4.0);
-                let bar_y = py + 8.0 * scale;
-
-                // Capsule background
-                bg_instances.push(BgInstance {
-                    rect: [bar_x, bar_y, bar_w, bar_h],
-                    color: [0.10, 0.12, 0.17, 0.96],
-                });
-                // Top accent line
-                bg_instances.push(BgInstance {
-                    rect: [bar_x, bar_y, bar_w, 2.0 * scale],
-                    color: [0.039, 0.518, 1.00, 0.95],
-                });
-
-                self.draw_text_line(
-                    &mut glyph_instances,
-                    &label,
-                    bar_x + 12.0 * scale,
-                    bar_y + 6.0 * scale,
-                    bar_w - 16.0 * scale,
-                    [0.96, 0.97, 1.0, 1.0],
-                    false,
-                );
             }
 
             // Vertical Scrollbar (Overlay on right side of pane)
@@ -2129,6 +2187,200 @@ impl TermRenderer {
 
         let normal_bg_len = bg_instances.len();
         let normal_glyph_len = glyph_instances.len();
+
+        // Foreground Pane Overlays (Inline IME Preedit & Floating Cmd+F Find Bar)
+        // Drawn in the overlay pass so their opaque backgrounds cleanly cover any
+        // underlying terminal glyphs on the same cells.
+        for pane in panes {
+            let px = pane.rect_x;
+            let py = pane.rect_y;
+            let pw = pane.rect_w;
+            let ph = pane.rect_h;
+
+            let mut pane_theme = self.theme;
+            if let Some((r, g, b)) = pane.dynamic_fg {
+                pane_theme.default_fg = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0];
+            }
+            if let Some((r, g, b)) = pane.dynamic_bg {
+                pane_theme.default_bg = [
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    self.theme.default_bg[3],
+                ];
+            }
+            if let Some((r, g, b)) = pane.dynamic_cursor {
+                pane_theme.cursor_color = [
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    self.theme.cursor_color[3],
+                ];
+            }
+
+            // 1. Inline IME Preedit Composition Overlay at Terminal Cursor
+            if pane.is_focused && pane.search_query.is_none() {
+                if let Some(preedit) = pane.ime_preedit.filter(|s| !s.is_empty()) {
+                    let active_buf = pane.grid.active();
+                    if active_buf.scroll_offset == 0 {
+                        let cur_x = px + self.padding_x + (active_buf.cursor.col as f32 * cell_w);
+                        let cur_y = py + self.padding_y + (active_buf.cursor.row as f32 * cell_h);
+
+                        if cur_y + cell_h <= py + ph {
+                            if let Some(layout) = PreeditOverlayLayout::compute(
+                                preedit,
+                                pane.ime_preedit_cursor,
+                                cur_x,
+                                px,
+                                pw,
+                                self.padding_x,
+                                cell_w,
+                            ) {
+                                // Subtle 1px border outline around preedit composition box
+                                let border_col = [
+                                    pane_theme.cursor_color[0],
+                                    pane_theme.cursor_color[1],
+                                    pane_theme.cursor_color[2],
+                                    0.55,
+                                ];
+                                bg_instances.push(BgInstance {
+                                    rect: [
+                                        layout.start_x - 1.0,
+                                        cur_y - 1.0,
+                                        layout.box_w + 2.0,
+                                        cell_h + 2.0,
+                                    ],
+                                    color: border_col,
+                                });
+
+                                // Opaque elevated background so underlying terminal text never bleeds through
+                                let preedit_bg = [
+                                    (pane_theme.default_bg[0] * 0.82
+                                        + pane_theme.default_fg[0] * 0.18)
+                                        .clamp(0.0, 1.0),
+                                    (pane_theme.default_bg[1] * 0.82
+                                        + pane_theme.default_fg[1] * 0.18)
+                                        .clamp(0.0, 1.0),
+                                    (pane_theme.default_bg[2] * 0.82
+                                        + pane_theme.default_fg[2] * 0.18)
+                                        .clamp(0.0, 1.0),
+                                    1.0,
+                                ];
+                                bg_instances.push(BgInstance {
+                                    rect: [layout.start_x, cur_y, layout.box_w, cell_h],
+                                    color: preedit_bg,
+                                });
+
+                                // Marked-text underline across the entire composition string
+                                let line_h = scale.round().max(1.0);
+                                let ul_y = (cur_y + baseline + (2.0 * scale).round())
+                                    .min(cur_y + cell_h - line_h);
+                                let ul_color = [
+                                    pane_theme.default_fg[0],
+                                    pane_theme.default_fg[1],
+                                    pane_theme.default_fg[2],
+                                    0.75,
+                                ];
+                                bg_instances.push(BgInstance {
+                                    rect: [layout.start_x, ul_y, layout.box_w, line_h],
+                                    color: ul_color,
+                                });
+
+                                // Thicker accent underline for the currently selected conversion clause
+                                if let Some((clause_x, clause_w)) = layout.selected_clause {
+                                    let thick_h = (line_h * 2.0).min(cell_h);
+                                    let thick_y = (cur_y + cell_h - thick_h).max(cur_y);
+                                    bg_instances.push(BgInstance {
+                                        rect: [clause_x, thick_y, clause_w, thick_h],
+                                        color: [
+                                            pane_theme.cursor_color[0],
+                                            pane_theme.cursor_color[1],
+                                            pane_theme.cursor_color[2],
+                                            0.95,
+                                        ],
+                                    });
+                                }
+
+                                // Insertion caret beam inside the preedit string
+                                let beam_w = (2.0 * scale).max(1.0);
+                                let beam_x = layout.caret_x.min(
+                                    (layout.start_x + layout.box_w - beam_w).max(layout.start_x),
+                                );
+                                bg_instances.push(BgInstance {
+                                    rect: [beam_x, cur_y, beam_w, cell_h],
+                                    color: [
+                                        pane_theme.cursor_color[0],
+                                        pane_theme.cursor_color[1],
+                                        pane_theme.cursor_color[2],
+                                        0.95,
+                                    ],
+                                });
+
+                                // Preedit composition glyphs (Zhuyin / Kana / Cangjie radicals / uncommitted text)
+                                let preedit_fg = [
+                                    pane_theme.default_fg[0],
+                                    pane_theme.default_fg[1],
+                                    pane_theme.default_fg[2],
+                                    1.0,
+                                ];
+                                self.draw_text_line(
+                                    &mut glyph_instances,
+                                    preedit,
+                                    layout.start_x,
+                                    cur_y,
+                                    layout.avail_w,
+                                    preedit_fg,
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Floating Find Bar overlay (Cmd+F)
+            if let Some(query) = pane.search_query {
+                let count_str = if pane.search_matches.is_empty() {
+                    "0/0".to_string()
+                } else {
+                    format!(
+                        "{}/{}",
+                        pane.active_search_idx.unwrap_or(0) + 1,
+                        pane.search_matches.len()
+                    )
+                };
+                let label = match pane.ime_preedit.filter(|s| !s.is_empty()) {
+                    Some(preedit) => format!("Find: {}[{}]▏  ({})", query, preedit, count_str),
+                    None => format!("Find: {}▏  ({})", query, count_str),
+                };
+                let bar_w = ((text_display_cells(&label) as f32 * cell_w) + 24.0 * scale)
+                    .clamp(220.0 * scale, (pw - 24.0 * scale).max(120.0));
+                let bar_h = cell_h + 12.0 * scale;
+                let bar_x = (px + pw - bar_w - 12.0 * scale).max(px + 4.0);
+                let bar_y = py + 8.0 * scale;
+
+                // Capsule background
+                bg_instances.push(BgInstance {
+                    rect: [bar_x, bar_y, bar_w, bar_h],
+                    color: [0.10, 0.12, 0.17, 0.96],
+                });
+                // Top accent line
+                bg_instances.push(BgInstance {
+                    rect: [bar_x, bar_y, bar_w, 2.0 * scale],
+                    color: [0.039, 0.518, 1.00, 0.95],
+                });
+
+                self.draw_text_line(
+                    &mut glyph_instances,
+                    &label,
+                    bar_x + 12.0 * scale,
+                    bar_y + 6.0 * scale,
+                    bar_w - 16.0 * scale,
+                    [0.96, 0.97, 1.0, 1.0],
+                    false,
+                );
+            }
+        }
 
         // Floating Top-Right [AI] [⚙] Pill Overlay when Tab Bar is hidden (auto 1-tab or never)
         if tab_bar_h <= 0.0 && panel_state.show_floating_top_right {

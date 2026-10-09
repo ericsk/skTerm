@@ -8,7 +8,6 @@ use super::macos::{
 use super::menu::{build_context_menu, build_top_dropdown_menu};
 use super::App;
 use skterm_render::{AgentPanelState, PaneRenderItem, TabItem};
-use std::time::Duration;
 use tracing::warn;
 use winit::window::WindowId;
 
@@ -52,13 +51,8 @@ impl App {
         if let Some(session) = self.sessions.get_mut(&window_id) {
             session.mark_frame_start();
 
-            if self.editing_agent_pane.is_none()
-                && (!self.ime_preedit.is_empty()
-                    || self
-                        .last_ime_commit_time
-                        .is_some_and(|t| t.elapsed() < Duration::from_millis(200)))
-            {
-                session.update_ime_position(tab_bar_h);
+            if self.editing_agent_pane.is_none() {
+                session.update_ime_position(tab_bar_h, &self.ime_preedit);
             }
 
             let configured_shell = self
@@ -136,6 +130,9 @@ impl App {
                         let is_recently_scrolled = session
                             .last_scroll_time
                             .is_some_and(|t| t.elapsed() < SCROLLBAR_FADE_AFTER);
+                        let show_pane_ime = is_focused
+                            && self.editing_agent_pane.is_none()
+                            && !self.ime_preedit.is_empty();
 
                         render_panes.push(PaneRenderItem {
                             grid: t.grid(),
@@ -156,6 +153,16 @@ impl App {
                             },
                             search_query: if is_focused && session.search_open {
                                 Some(&session.search_query)
+                            } else {
+                                None
+                            },
+                            ime_preedit: if show_pane_ime {
+                                Some(&self.ime_preedit)
+                            } else {
+                                None
+                            },
+                            ime_preedit_cursor: if show_pane_ime {
+                                self.ime_preedit_cursor
                             } else {
                                 None
                             },
