@@ -158,5 +158,28 @@ mod tests {
         // max_right = 800 - 10 = 790, box_w = 80 -> start_x shifts left to 710
         assert_eq!(clamped.start_x, 710.0);
         assert_eq!(clamped.box_w, 80.0);
+
+        // Ghostty/cmux grid-column span calculation (`compute_grid_cols`)
+        assert!(PreeditOverlayLayout::compute_grid_cols("", 5, 80).is_none());
+        // Cangjie radical "日月" -> 4 cells at col 10 -> 10..14
+        assert_eq!(
+            PreeditOverlayLayout::compute_grid_cols("日月", 10, 80),
+            Some((10, 14))
+        );
+        // Zhuyin "ㄐㄧˇ" -> 5 cells at col 5 -> 5..10
+        assert_eq!(
+            PreeditOverlayLayout::compute_grid_cols(zhuyin, 5, 80),
+            Some((5, 10))
+        );
+        // Right-edge shift when cursor_col + width > cols (78 + 8 > 80 -> shifts to 72..80)
+        assert_eq!(
+            PreeditOverlayLayout::compute_grid_cols(kana, 78, 80),
+            Some((72, 80))
+        );
+        // Truncates cleanly if wider than the entire row (cols = 5, kana = 8 cells -> 2 chars = 4 cells)
+        assert_eq!(
+            PreeditOverlayLayout::compute_grid_cols(kana, 2, 5),
+            Some((0, 4))
+        );
     }
 }

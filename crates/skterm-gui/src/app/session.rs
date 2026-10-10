@@ -430,22 +430,24 @@ impl TerminalSession {
                             let bar_y = rect.y + 8.0 * scale_f32;
                             (bar_x, bar_y, bar_w, bar_h)
                         } else {
-                            let cursor = &terminal.grid().active().cursor;
+                            let buf = terminal.grid().active();
+                            let cursor = &buf.cursor;
                             let cursor_px =
                                 rect.x + self.renderer.padding_x + (cursor.col as f32 * cell_w);
                             let cursor_py =
                                 rect.y + self.renderer.padding_y + (cursor.row as f32 * cell_h);
 
-                            if let Some(layout) = skterm_render::PreeditOverlayLayout::compute(
-                                ime_preedit,
-                                None,
-                                cursor_px,
-                                rect.x,
-                                rect.width,
-                                self.renderer.padding_x,
-                                cell_w,
-                            ) {
-                                (layout.start_x, cursor_py, layout.box_w.max(cell_w), cell_h)
+                            if let Some((start_col, end_col)) =
+                                skterm_render::PreeditOverlayLayout::compute_grid_cols(
+                                    ime_preedit,
+                                    cursor.col,
+                                    buf.cols,
+                                )
+                            {
+                                let start_x =
+                                    rect.x + self.renderer.padding_x + (start_col as f32 * cell_w);
+                                let box_w = ((end_col - start_col) as f32 * cell_w).max(cell_w);
+                                (start_x, cursor_py, box_w, cell_h)
                             } else {
                                 (cursor_px, cursor_py, cell_w, cell_h)
                             }
