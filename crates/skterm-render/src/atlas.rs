@@ -1,5 +1,6 @@
 //! Dynamic Glyph Texture Atlas, Font Resolution Engine, Multi-Font Fallback, and Fontdue-based text rasterization.
 
+use ab_glyph::{ScaleFont as _, VariableFont as _};
 use fontdue::{Font, FontSettings};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,6 +9,219 @@ use wgpu::{
     Extent3d, Origin3d, Queue, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
     TextureDimension, TextureFormat, TextureUsages,
 };
+
+/// Standard OpenType `wght` coordinate for Regular (400) weight.
+pub const REGULAR_WEIGHT: f32 = 400.0;
+/// Standard OpenType `wght` coordinate for Bold (700) weight.
+pub const BOLD_WEIGHT: f32 = 700.0;
+
+fn px_to_ab_scale(font: &ab_glyph::FontVec, px: f32) -> ab_glyph::PxScale {
+    let upem = ab_glyph::Font::units_per_em(font).unwrap_or(1000.0).max(1.0);
+    let height = ab_glyph::Font::height_unscaled(font);
+    ab_glyph::PxScale::from(px * height / upem)
+}
+
+/// Unified font face supporting both static fonts (via `fontdue`) and OpenType
+/// Variable Fonts with a `wght` variation axis (via `ab_glyph`), so variable fonts
+/// such as `NotoSansTC-VariableFont_wght.ttf` render at Regular (400) and Bold (700)
+/// rather than defaulting to their Thin (100) base master.
+pub enum FontFace {
+    Static(Font),
+    Variable {
+        font: ab_glyph::FontVec,
+        collection_index: u32,
+        weight: f32,
+    },
+}
+
+impl FontFace {
+    pub fn from_bytes(bytes: Vec<u8>, settings: FontSettings) -> Result<Self, &'static str> {
+        Self::from_bytes_with_weight(bytes, REGULAR_WEIGHT, settings)
+    }
+
+    pub fn from_bytes_with_weight(
+        bytes: Vec<u8>,
+        weight: f32,
+        settings: FontSettings,
+    ) -> Result<Self, &'static str> {
+        let collection_index = settings.collection_index;
+        if let Ok(mut var_font) = ab_glyph::FontVec::try_from_vec_and_index(bytes, collection_index)
+        {
+            let has_wght = var_font.variations().iter().any(|axis| &axis.tag == b"wght");
+            if has_wght {
+                var_font.set_variation(b"wght", weight);
+                return Ok(Self::Variable {
+                    font: var_font,
+                    collection_index,
+                    weight,
+                });
+            }
+            let raw_bytes = var_font.into_vec();
+            return Font::from_bytes(raw_bytes, settings).map(Self::Static);
+        }
+        Err("Failed to parse font data")
+    }
+
+    /// Derive a new instance of this face at a different `wght` coordinate if it is a Variable Font.
+    pub fn with_weight(&self, weight: f32) -> Option<Self> {
+        match self {
+            Self::Static(_) => None,
+            Self::Variable {
+                font,
+                collection_index,
+                ..
+            } => {
+                let mut cloned = ab_glyph::FontVec::try_from_vec_and_index(
+                    font.as_slice().to_vec(),
+                    *collection_index,
+                )
+                .ok()?;
+                if cloned.set_variation(b"wght", weight) {
+                    Some(Self::Variable {
+                        font: cloned,
+                        collection_index: *collection_index,
+                        weight,
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Returns the configured OpenType `wght` coordinate if this is a Variable Font.
+    pub fn variable_weight(&self) -> Option<f32> {
+        match self {
+            Self::Static(_) => None,
+            Self::Variable { weight, .. } => Some(*weight),
+        }
+    }
+
+    pub fn lookup_glyph_index(&self, c: char) -> u16 {
+        match self {
+            Self::Static(font) => font.lookup_glyph_index(c),
+            Self::Variable { font, .. } => ab_glyph::Font::glyph_id(font, c).0,
+        }
+    }
+
+    pub fn horizontal_line_metrics(&self, px: f32) -> Option<fontdue::LineMetrics> {
+        match self {
+            Self::Static(font) => font.horizontal_line_metrics(px),
+            Self::Variable { font, .. } => {
+                let scale = px_to_ab_scale(font, px);
+                let sf = ab_glyph::Font::as_scaled(font, scale);
+                let ascent = sf.ascent();
+                let descent = sf.descent();
+                let line_gap = sf.line_gap();
+                Some(fontdue::LineMetrics {
+                    ascent,
+                    descent,
+                    line_gap,
+                    new_line_size: ascent - descent + line_gap,
+                })
+            }
+        }
+    }
+
+    pub fn metrics(&self, c: char, px: f32) -> fontdue::Metrics {
+        match self {
+            Self::Static(font) => font.metrics(c, px),
+            Self::Variable { font, .. } => {
+                let scale = px_to_ab_scale(font, px);
+                let sf = ab_glyph::Font::as_scaled(font, scale);
+                let glyph_id = sf.glyph_id(c);
+                let advance_width = sf.h_advance(glyph_id);
+                let advance_height = sf.v_advance(glyph_id);
+                let glyph = glyph_id.with_scale_and_position(scale, ab_glyph::point(0.0, 0.0));
+                if let Some(outlined) = sf.outline_glyph(glyph) {
+                    let px_bounds = outlined.px_bounds();
+                    let width = px_bounds.width().max(0.0) as usize;
+                    let height = px_bounds.height().max(0.0) as usize;
+                    let xmin = px_bounds.min.x as i32;
+                    let ymin = (-px_bounds.max.y) as i32;
+                    fontdue::Metrics {
+                        xmin,
+                        ymin,
+                        width,
+                        height,
+                        advance_width,
+                        advance_height,
+                        bounds: fontdue::OutlineBounds {
+                            xmin: px_bounds.min.x,
+                            ymin: -px_bounds.max.y,
+                            width: px_bounds.width().max(0.0),
+                            height: px_bounds.height().max(0.0),
+                        },
+                    }
+                } else {
+                    fontdue::Metrics {
+                        advance_width,
+                        advance_height,
+                        ..Default::default()
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn rasterize(&self, c: char, px: f32) -> (fontdue::Metrics, Vec<u8>) {
+        match self {
+            Self::Static(font) => font.rasterize(c, px),
+            Self::Variable { font, .. } => {
+                let scale = px_to_ab_scale(font, px);
+                let sf = ab_glyph::Font::as_scaled(font, scale);
+                let glyph_id = sf.glyph_id(c);
+                let advance_width = sf.h_advance(glyph_id);
+                let advance_height = sf.v_advance(glyph_id);
+                let glyph = glyph_id.with_scale_and_position(scale, ab_glyph::point(0.0, 0.0));
+                if let Some(outlined) = sf.outline_glyph(glyph) {
+                    let px_bounds = outlined.px_bounds();
+                    let width = px_bounds.width().max(0.0) as usize;
+                    let height = px_bounds.height().max(0.0) as usize;
+                    let xmin = px_bounds.min.x as i32;
+                    let ymin = (-px_bounds.max.y) as i32;
+                    let mut bitmap = vec![0u8; width * height];
+                    outlined.draw(|x, y, cov| {
+                        let idx = (y as usize) * width + (x as usize);
+                        if idx < bitmap.len() {
+                            bitmap[idx] = (cov.clamp(0.0, 1.0) * 255.0).round() as u8;
+                        }
+                    });
+                    let metrics = fontdue::Metrics {
+                        xmin,
+                        ymin,
+                        width,
+                        height,
+                        advance_width,
+                        advance_height,
+                        bounds: fontdue::OutlineBounds {
+                            xmin: px_bounds.min.x,
+                            ymin: -px_bounds.max.y,
+                            width: px_bounds.width().max(0.0),
+                            height: px_bounds.height().max(0.0),
+                        },
+                    };
+                    (metrics, bitmap)
+                } else {
+                    (
+                        fontdue::Metrics {
+                            advance_width,
+                            advance_height,
+                            ..Default::default()
+                        },
+                        Vec::new(),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// A fallback font entry holding both its Regular (400) face and an optional Bold (700) face.
+pub struct FallbackFont {
+    pub regular: FontFace,
+    pub bold: Option<FontFace>,
+}
 
 /// Key identifying a cached glyph in the texture atlas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,10 +251,10 @@ pub struct GlyphAtlas {
     cursor_y: u32,
     row_height: u32,
     cache: HashMap<GlyphKey, GlyphInfo>,
-    regular_font: Font,
-    bold_font: Option<Font>,
-    italic_font: Option<Font>,
-    fallback_fonts: Vec<Font>,
+    regular_font: FontFace,
+    bold_font: Option<FontFace>,
+    italic_font: Option<FontFace>,
+    fallback_fonts: Vec<FallbackFont>,
     system_fallback_cursor: usize,
     pub font_size: f32,
     pub base_cell_height: f32,
@@ -52,8 +266,8 @@ pub struct GlyphAtlas {
 const SYSTEM_CJK_CANDIDATES: &[&str] = &[
     // macOS
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
-    "/System/Library/Fonts/STHeiti Light.ttc",
     "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     "/System/Library/Fonts/Supplemental/Songti.ttc",
     "/System/Library/Fonts/PingFang.ttc",
@@ -121,9 +335,10 @@ impl GlyphAtlas {
         // Load configured font chain
         let (regular_font, bold_font, italic_font, fallback_fonts) =
             if let Some(data) = custom_font_data {
-                let font = Font::from_bytes(data, FontSettings::default())
+                let font = FontFace::from_bytes(data.to_vec(), FontSettings::default())
                     .map_err(|e| anyhow::anyhow!("Failed to parse custom font: {}", e))?;
-                (font, None, None, Vec::new())
+                let bold = font.with_weight(BOLD_WEIGHT);
+                (font, bold, None, Vec::new())
             } else {
                 load_configured_font_chain(font_family, fallback_families)
             };
@@ -231,10 +446,23 @@ impl GlyphAtlas {
             let path = SYSTEM_CJK_CANDIDATES[self.system_fallback_cursor];
             self.system_fallback_cursor += 1;
             if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+                let companion_bold = if path.ends_with("Hiragino Sans GB.ttc") {
+                    FontFace::from_bytes(
+                        bytes.clone(),
+                        FontSettings {
+                            collection_index: 1,
+                            ..Default::default()
+                        },
+                    )
+                    .ok()
+                } else {
+                    None
+                };
+                if let Ok(regular) = FontFace::from_bytes(bytes, FontSettings::default()) {
                     info!("Loaded system CJK fallback font: {}", path);
+                    let bold = companion_bold.or_else(|| regular.with_weight(BOLD_WEIGHT));
                     let idx = self.fallback_fonts.len();
-                    self.fallback_fonts.push(font);
+                    self.fallback_fonts.push(FallbackFont { regular, bold });
                     return Some(idx);
                 }
             }
@@ -272,11 +500,16 @@ impl GlyphAtlas {
         let (metrics, bitmap) = if primary.lookup_glyph_index(c) != 0 {
             primary.rasterize(c, self.font_size)
         } else {
-            // 2. Check already-loaded fallback chain
+            // 2. Check already-loaded fallback chain (selecting Bold face when `is_bold` is true)
             let mut found = None;
             for fallback in &self.fallback_fonts {
-                if fallback.lookup_glyph_index(c) != 0 {
-                    found = Some(fallback.rasterize(c, self.font_size));
+                let face = if is_bold {
+                    fallback.bold.as_ref().unwrap_or(&fallback.regular)
+                } else {
+                    &fallback.regular
+                };
+                if face.lookup_glyph_index(c) != 0 {
+                    found = Some(face.rasterize(c, self.font_size));
                     break;
                 }
             }
@@ -287,8 +520,13 @@ impl GlyphAtlas {
                     break;
                 };
                 let fallback = &self.fallback_fonts[idx];
-                if fallback.lookup_glyph_index(c) != 0 {
-                    found = Some(fallback.rasterize(c, self.font_size));
+                let face = if is_bold {
+                    fallback.bold.as_ref().unwrap_or(&fallback.regular)
+                } else {
+                    &fallback.regular
+                };
+                if face.lookup_glyph_index(c) != 0 {
+                    found = Some(face.rasterize(c, self.font_size));
                 }
             }
 
@@ -642,15 +880,84 @@ pub fn resolve_font_path(query: &str) -> Option<PathBuf> {
     ranked_candidates(query).into_iter().next()
 }
 
-/// Search user and system font directories for a font family name, returning the parsed Font.
-pub fn find_font_file(query: &str) -> Option<(Font, PathBuf)> {
+/// Infer the desired OpenType `wght` coordinate from a font query string.
+///
+/// Unstyled family names (e.g. `"NotoSansTC"`) default to [`REGULAR_WEIGHT`] (`400.0`),
+/// while explicit weight suffixes (e.g. `"NotoSansTCBold"`) select their corresponding weight.
+fn infer_weight_from_query(query: &str) -> f32 {
+    let q = clean_name(query);
+    if q.contains("thin") || q.contains("hairline") {
+        100.0
+    } else if q.contains("extralight") || q.contains("ultralight") {
+        200.0
+    } else if q.contains("semilight") {
+        350.0
+    } else if q.contains("light") {
+        300.0
+    } else if q.contains("medium") {
+        500.0
+    } else if q.contains("semibold") || q.contains("demibold") {
+        600.0
+    } else if q.contains("extrabold") || q.contains("ultrabold") {
+        800.0
+    } else if q.contains("black") || q.contains("heavy") {
+        900.0
+    } else if q.contains("bold") {
+        BOLD_WEIGHT
+    } else {
+        REGULAR_WEIGHT
+    }
+}
+
+/// Search user and system font directories for a font family name, returning the parsed [`FontFace`].
+pub fn find_font_file(query: &str) -> Option<(FontFace, PathBuf)> {
+    let target_weight = infer_weight_from_query(query);
     for path in ranked_candidates(query) {
         if let Ok(bytes) = std::fs::read(&path) {
-            if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
+            if let Ok(font) =
+                FontFace::from_bytes_with_weight(bytes, target_weight, FontSettings::default())
+            {
                 return Some((font, path));
             }
         }
     }
+    None
+}
+
+/// Locate or derive a Bold (`700`) companion face for `query` given its loaded `regular_face`.
+///
+/// 1. Prefers a dedicated static `*Bold` font file if one is installed.
+/// 2. Otherwise, if `regular_face` is a Variable Font with a `wght` axis (such as
+///    `NotoSansTC-VariableFont_wght.ttf`), derives a `wght = 700` instance directly from it.
+/// 3. Finally, if `regular_face` came from a static file without a matching static `*Bold`
+///    file, checks if a Variable Font candidate for `query` exists and loads it at `wght = 700`.
+fn load_bold_companion(query: &str, regular_face: &FontFace) -> Option<FontFace> {
+    let clean_q = clean_name(query);
+    if clean_q == "menlo" || clean_q == "monaco" {
+        return None;
+    }
+
+    let bold_query = format!("{}Bold", query);
+    if let Some((b_font, _)) = find_font_file(&bold_query) {
+        return Some(b_font);
+    }
+
+    if let Some(var_bold) = regular_face.with_weight(BOLD_WEIGHT) {
+        return Some(var_bold);
+    }
+
+    for path in ranked_candidates(query) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(face) =
+                FontFace::from_bytes_with_weight(bytes, BOLD_WEIGHT, FontSettings::default())
+            {
+                if matches!(face, FontFace::Variable { .. }) {
+                    return Some(face);
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -764,7 +1071,12 @@ fn family_of(stem: &str) -> String {
 pub fn load_configured_font_chain(
     family_str: &str,
     fallback_families: &[String],
-) -> (Font, Option<Font>, Option<Font>, Vec<Font>) {
+) -> (
+    FontFace,
+    Option<FontFace>,
+    Option<FontFace>,
+    Vec<FallbackFont>,
+) {
     let mut queries = Vec::new();
 
     for token in family_str.split(',') {
@@ -781,24 +1093,20 @@ pub fn load_configured_font_chain(
         }
     }
 
-    let mut primary_font: Option<Font> = None;
-    let mut bold_font: Option<Font> = None;
-    let mut italic_font: Option<Font> = None;
-    let mut fallback_fonts: Vec<Font> = Vec::new();
+    let mut primary_font: Option<FontFace> = None;
+    let mut bold_font: Option<FontFace> = None;
+    let mut italic_font: Option<FontFace> = None;
+    let mut fallback_fonts: Vec<FallbackFont> = Vec::new();
 
     for q in &queries {
         if let Some((font, path)) = find_font_file(q) {
             if primary_font.is_none() {
                 info!("Found primary font match for '{}': {:?}", q, path);
-                primary_font = Some(font);
+                bold_font = load_bold_companion(q, &font);
 
-                // Only query bold/italic variants if not a single-file TTC like Menlo
+                // Query italic/oblique variants if not a single-file TTC like Menlo
                 let clean_q = clean_name(q);
                 if clean_q != "menlo" && clean_q != "monaco" {
-                    let bold_query = format!("{}Bold", q);
-                    if let Some((b_font, _)) = find_font_file(&bold_query) {
-                        bold_font = Some(b_font);
-                    }
                     let italic_query = format!("{}Italic", q);
                     if let Some((i_font, _)) = find_font_file(&italic_query) {
                         italic_font = Some(i_font);
@@ -809,9 +1117,14 @@ pub fn load_configured_font_chain(
                         }
                     }
                 }
+                primary_font = Some(font);
             } else {
                 info!("Found fallback font match for '{}': {:?}", q, path);
-                fallback_fonts.push(font);
+                let bold = load_bold_companion(q, &font);
+                fallback_fonts.push(FallbackFont {
+                    regular: font,
+                    bold,
+                });
             }
         }
     }
@@ -830,7 +1143,7 @@ pub fn load_configured_font_chain(
         ];
         for d in defaults {
             if let Ok(b) = std::fs::read(d) {
-                if let Ok(f) = Font::from_bytes(b, FontSettings::default()) {
+                if let Ok(f) = FontFace::from_bytes(b, FontSettings::default()) {
                     info!("Loaded default fallback primary monospace font: {}", d);
                     return f;
                 }
@@ -1011,6 +1324,82 @@ mod tests {
                 resolve_font_path(family).is_some(),
                 "picker offers {:?} but it resolves to nothing",
                 family
+            );
+        }
+    }
+
+    #[test]
+    fn infer_weight_defaults_to_regular_and_recognizes_styles() {
+        assert_eq!(infer_weight_from_query("NotoSansTC"), REGULAR_WEIGHT);
+        assert_eq!(
+            infer_weight_from_query("NotoSansTC-Regular"),
+            REGULAR_WEIGHT
+        );
+        assert_eq!(infer_weight_from_query("NotoSansTCBold"), BOLD_WEIGHT);
+        assert_eq!(infer_weight_from_query("NotoSansTC-Bold"), BOLD_WEIGHT);
+        assert_eq!(infer_weight_from_query("NotoSansTC-Thin"), 100.0);
+        assert_eq!(infer_weight_from_query("NotoSansTC-ExtraLight"), 200.0);
+        assert_eq!(infer_weight_from_query("NotoSansTC-Light"), 300.0);
+        assert_eq!(infer_weight_from_query("NotoSansTC-Medium"), 500.0);
+        assert_eq!(infer_weight_from_query("NotoSansTC-SemiBold"), 600.0);
+        assert_eq!(infer_weight_from_query("NotoSansTC-ExtraBold"), 800.0);
+        assert_eq!(infer_weight_from_query("NotoSansTC-Black"), 900.0);
+    }
+
+    #[test]
+    fn fallback_font_chain_loads_regular_and_bold_for_cjk() {
+        if let Some((regular, path)) = find_font_file("NotoSansTC") {
+            let bold = load_bold_companion("NotoSansTC", &regular)
+                .expect("NotoSansTC should resolve a Bold companion face");
+
+            if let Some(w) = regular.variable_weight() {
+                assert_eq!(
+                    w, REGULAR_WEIGHT,
+                    "Variable font {:?} should use Regular (400) weight by default",
+                    path
+                );
+            }
+            if let Some(bw) = bold.variable_weight() {
+                assert_eq!(
+                    bw, BOLD_WEIGHT,
+                    "Variable font {:?} bold companion should use Bold (700) weight",
+                    path
+                );
+            }
+
+            let (_, reg_bmp) = regular.rasterize('中', 32.0);
+            let (_, bold_bmp) = bold.rasterize('中', 32.0);
+            let reg_ink: u64 = reg_bmp.iter().map(|&a| a as u64).sum();
+            let bold_ink: u64 = bold_bmp.iter().map(|&a| a as u64).sum();
+            assert!(reg_ink > 0, "Regular '中' should have non-zero coverage");
+            assert!(
+                bold_ink > reg_ink,
+                "Bold '中' coverage ({bold_ink}) should exceed Regular ({reg_ink})"
+            );
+
+            if let Some(thin) = regular.with_weight(100.0) {
+                let (_, thin_bmp) = thin.rasterize('中', 32.0);
+                let thin_ink: u64 = thin_bmp.iter().map(|&a| a as u64).sum();
+                println!(
+                    "NotoSansTC ({:?}): thin_ink(100)={}, reg_ink(400)={}, bold_ink(700)={}",
+                    path, thin_ink, reg_ink, bold_ink
+                );
+                assert!(
+                    reg_ink > thin_ink,
+                    "Regular (400) '中' coverage ({reg_ink}) should exceed Thin (100) ({thin_ink})"
+                );
+            } else {
+                println!(
+                    "NotoSansTC ({:?}): reg_ink={}, bold_ink={}",
+                    path, reg_ink, bold_ink
+                );
+            }
+
+            let (_, _, _, fallbacks) =
+                load_configured_font_chain("Menlo, NotoSansTC", &[]);
+            assert!(
+                !fallbacks.is_empty() && fallbacks[0].bold.is_some(),
+                "Fallback chain entry for NotoSansTC must include a Bold companion"
             );
         }
     }

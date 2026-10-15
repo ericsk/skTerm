@@ -57,6 +57,7 @@ winit = { version = "0.30", features = ["rwh_06"] }
 wgpu = "24.0"
 bytemuck = { version = "1.21", features = ["derive"] }
 fontdue = "0.9"
+ab_glyph = "0.2"
 
 # GUI & Preferences UI
 egui = "0.31"

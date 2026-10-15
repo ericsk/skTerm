@@ -11,6 +11,7 @@ pub fn setup_egui_cjk_fonts(ctx: &Context) {
     let cjk_candidates = [
         // macOS
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
         "/System/Library/Fonts/Supplemental/Songti.ttc",

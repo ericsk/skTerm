@@ -12,6 +12,7 @@ winit = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
 fontdue = { workspace = true }
+ab_glyph = { workspace = true }
 unicode-width = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
