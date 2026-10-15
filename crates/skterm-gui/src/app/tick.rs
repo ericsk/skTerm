@@ -148,6 +148,7 @@ impl App {
         }
 
         for id in dead_sessions {
+            self.record_session_window_position(id);
             self.sessions.remove(&id);
             self.session_order.retain(|&wid| wid != id);
         }
@@ -204,6 +205,9 @@ impl App {
 
     /// Body of [`winit::application::ApplicationHandler::exiting`].
     pub(crate) fn on_exiting(&mut self) {
+        if let Some(active_id) = self.active_session_id {
+            self.record_session_window_position(active_id);
+        }
         // Saves are debounced, so a change made in the last few hundred
         // milliseconds before quitting would otherwise never reach disk. Write it
         // synchronously here rather than on a thread we are about to outlive.

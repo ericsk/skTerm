@@ -87,6 +87,10 @@ pub struct WindowConfig {
     pub columns: u16,
     #[serde(default = "default_rows")]
     pub rows: u16,
+    #[serde(default)]
+    pub position_x: Option<i32>,
+    #[serde(default)]
+    pub position_y: Option<i32>,
     #[serde(default = "default_opacity")]
     pub opacity: f32,
     #[serde(default = "default_padding")]
@@ -135,6 +139,8 @@ impl Default for WindowConfig {
         Self {
             columns: default_columns(),
             rows: default_rows(),
+            position_x: None,
+            position_y: None,
             opacity: default_opacity(),
             padding_x: default_padding(),
             padding_y: default_padding(),
@@ -820,6 +826,10 @@ line_height = 1.2
 columns = 80
 rows = 24
 
+# 視窗位置 (選填，單位: 邏輯像素 pt；移動或關閉視窗時將自動記錄上次位置)
+# position_x = 100
+# position_y = 100
+
 # 視窗邊距 (單位: pt)
 padding_x = 8.0
 padding_y = 8.0
@@ -938,6 +948,10 @@ line_height = 1.2
 # 初始終端幾何大小 (欄數與行數)
 columns = 80
 rows = 24
+
+# 視窗位置 (選填，單位: 邏輯像素 pt；移動或關閉視窗時將自動記錄上次位置)
+# position_x = 100
+# position_y = 100
 
 # 視窗邊距 (單位: pt)
 padding_x = 8.0

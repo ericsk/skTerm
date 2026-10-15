@@ -13,7 +13,10 @@ pub mod macos_titlebar;
 pub mod preferences_window;
 pub mod tab_title;
 
-pub use app::{build_top_dropdown_menu, hit_test_dropdown_menu, App, TopMenuAction};
+pub use app::{
+    build_top_dropdown_menu, hit_test_dropdown_menu, is_rect_visible_on_monitors, App,
+    TopMenuAction,
+};
 pub use config::{default_config_template, parse_hex_color, Config, ConfigManager, Theme};
 pub use icon::{apply_window_icon, configure_window_attributes, get_app_icon};
 pub use input::{
@@ -1212,5 +1215,35 @@ mod tests {
         assert!(btns.hit_ai(ax + aw * 0.5, ay + ah * 0.5, 1.0));
         assert!(btns.hit_prefs(px + pw * 0.5, py + ph * 0.5, 1.0));
         assert!(!btns.hit_ai(10.0, 10.0, 1.0));
+    }
+
+    #[test]
+    fn test_window_position_config_roundtrip_and_monitor_visibility() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.window.position_x, None);
+        assert_eq!(cfg.window.position_y, None);
+
+        cfg.window.position_x = Some(140);
+        cfg.window.position_y = Some(85);
+        let serialized = toml::to_string_pretty(&cfg).expect("serialize config");
+        let parsed: Config = toml::from_str(&serialized).expect("deserialize config");
+        assert_eq!(parsed.window.position_x, Some(140));
+        assert_eq!(parsed.window.position_y, Some(85));
+
+        let monitors = [(0.0, 0.0, 1728.0, 1117.0), (1728.0, 0.0, 2560.0, 1440.0)];
+        // Normal position on primary monitor
+        assert!(is_rect_visible_on_monitors(140.0, 85.0, 900.0, 600.0, &monitors));
+        // Normal position on secondary monitor
+        assert!(is_rect_visible_on_monitors(2000.0, 120.0, 900.0, 600.0, &monitors));
+        // Off-screen after unplugging secondary monitor
+        assert!(!is_rect_visible_on_monitors(
+            2000.0,
+            120.0,
+            900.0,
+            600.0,
+            &monitors[..1]
+        ));
+        // Empty monitor list falls back to allowing the position
+        assert!(is_rect_visible_on_monitors(2000.0, 120.0, 900.0, 600.0, &[]));
     }
 }

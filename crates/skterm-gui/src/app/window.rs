@@ -10,10 +10,82 @@ use skterm_render::TermRenderer;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::Modifiers;
 use winit::event_loop::ActiveEventLoop;
-use winit::window::{CursorIcon, Fullscreen, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, Fullscreen, Window, WindowAttributes, WindowId};
+
+/// Checks whether a window at `(pos_x, pos_y)` with outer logical size `(win_w, win_h)`
+/// has its top/titlebar region visible on at least one monitor `(mx, my, mw, mh)`.
+///
+/// Returns `true` when `monitors` is empty (e.g. backends that do not enumerate displays).
+pub fn is_rect_visible_on_monitors(
+    pos_x: f64,
+    pos_y: f64,
+    win_w: f64,
+    win_h: f64,
+    monitors: &[(f64, f64, f64, f64)],
+) -> bool {
+    let mut any_valid_monitor = false;
+    let min_visible_w = 60.0_f64.min(win_w.max(1.0));
+    let min_visible_h = 40.0_f64.min(win_h.max(1.0));
+    for &(mx, my, mw, mh) in monitors {
+        if mw <= 0.0 || mh <= 0.0 {
+            continue;
+        }
+        any_valid_monitor = true;
+        let horiz_ok =
+            pos_x + win_w >= mx + min_visible_w && pos_x <= mx + mw - min_visible_w;
+        let vert_ok = pos_y >= my - 10.0 && pos_y <= my + mh - min_visible_h;
+        if horiz_ok && vert_ok {
+            return true;
+        }
+    }
+    !any_valid_monitor
+}
+
+fn is_position_visible_on_monitors(
+    event_loop: &ActiveEventLoop,
+    pos_x: f64,
+    pos_y: f64,
+    win_w: f64,
+    win_h: f64,
+) -> bool {
+    let monitors: Vec<(f64, f64, f64, f64)> = event_loop
+        .available_monitors()
+        .map(|m| {
+            let scale = m.scale_factor();
+            let pos = m.position().to_logical::<f64>(scale);
+            let size = m.size().to_logical::<f64>(scale);
+            (pos.x, pos.y, size.width, size.height)
+        })
+        .collect();
+    is_rect_visible_on_monitors(pos_x, pos_y, win_w, win_h, &monitors)
+}
+
+fn center_window_on_screen(window: &Window, event_loop: &ActiveEventLoop) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc::{msg_send, sel, sel_impl};
+        let win_ptr = get_nswindow(window);
+        if !win_ptr.is_null() {
+            let _: () = unsafe { msg_send![win_ptr, center] };
+            return;
+        }
+    }
+    if let Some(monitor) = window
+        .current_monitor()
+        .or_else(|| event_loop.primary_monitor())
+        .or_else(|| event_loop.available_monitors().next())
+    {
+        let m_pos = monitor.position();
+        let m_size = monitor.size();
+        let win_size = window.outer_size();
+        let cx = m_pos.x + (m_size.width as i32 - win_size.width as i32) / 2;
+        let cy = m_pos.y + (m_size.height as i32 - win_size.height as i32) / 2;
+        window.set_outer_position(PhysicalPosition::new(cx, cy));
+    }
+}
 
 impl App {
     /// Create a new Terminal Session. On macOS, this window attaches as a native NSWindow tab!
@@ -24,19 +96,48 @@ impl App {
         let init_cols = self.config_manager.current_config.window.columns as f32;
         let init_rows = self.config_manager.current_config.window.rows as f32;
         let font_size_pt = self.config_manager.current_config.font.size;
+        let line_height = self.config_manager.current_config.font.line_height;
         let pad_x = self.config_manager.current_config.window.padding_x;
         let pad_y = self.config_manager.current_config.window.padding_y;
 
         let existing_geometry = self
             .active_session_id
             .and_then(|id| self.sessions.get(&id))
-            .map(|s| (s.window.inner_size(), s.workspace.sidebar_width));
+            .map(|s| {
+                let pos = s.window.outer_position().ok().map(|p| {
+                    let logical = p.to_logical::<f64>(s.window.scale_factor());
+                    (logical.x.round() as i32, logical.y.round() as i32)
+                });
+                (s.window.inner_size(), s.workspace.sidebar_width, pos)
+            });
+
+        let saved_position = self
+            .config_manager
+            .current_config
+            .window
+            .position_x
+            .zip(self.config_manager.current_config.window.position_y);
+        let desired_position = if let Some((_, _, existing_pos)) = existing_geometry {
+            existing_pos.map(|(x, y)| (x + 24, y + 24))
+        } else {
+            saved_position
+        };
+
+        let est_w = (init_cols * font_size_pt * 0.6 + pad_x * 2.0).ceil() as f64;
+        let est_h = (init_rows * font_size_pt * line_height + pad_y * 2.0).ceil() as f64;
 
         let mut window_attrs = WindowAttributes::default().with_title("skTerm");
-        if let Some((phys_size, _)) = existing_geometry {
+        if let Some((phys_size, _, _)) = existing_geometry {
             window_attrs = window_attrs.with_inner_size(phys_size);
         } else {
-            window_attrs = window_attrs.with_inner_size(LogicalSize::new(800.0, 500.0));
+            window_attrs = window_attrs.with_inner_size(LogicalSize::new(est_w, est_h));
+        }
+        if let Some((pos_x, pos_y)) = desired_position {
+            if is_position_visible_on_monitors(event_loop, pos_x as f64, pos_y as f64, est_w, est_h)
+            {
+                window_attrs =
+                    window_attrs.with_position(LogicalPosition::new(pos_x as f64, pos_y as f64));
+            }
         }
 
         #[cfg(target_os = "macos")]
@@ -69,20 +170,6 @@ impl App {
         let window = Arc::new(event_loop.create_window(window_attrs)?);
         crate::icon::apply_window_icon(&window);
         window.set_ime_allowed(true);
-
-        if existing_geometry.is_none() {
-            match self
-                .config_manager
-                .current_config
-                .window
-                .startup_mode
-                .as_str()
-            {
-                "maximized" => window.set_maximized(true),
-                "fullscreen" => window.set_fullscreen(Some(Fullscreen::Borderless(None))),
-                _ => {}
-            }
-        }
 
         // On macOS: Disallow native NSWindow tabbing so AppKit never inserts a
         // full-width NSTabBar above the right-hand Agents sidebar. Tabs are
@@ -120,12 +207,65 @@ impl App {
             let scale = renderer.scale_factor;
             let cell_w_logical = renderer.cell_width() / scale;
             let cell_h_logical = renderer.cell_height() / scale;
+            let init_tab_bar_logical_h = if self
+                .config_manager
+                .current_config
+                .window
+                .tab_bar_style
+                .as_str()
+                == "always"
+            {
+                36.0
+            } else {
+                0.0
+            };
             let target_logical_w = (init_cols * cell_w_logical + pad_x * 2.0).ceil();
-            let target_logical_h = (init_rows * cell_h_logical + pad_y * 2.0).ceil();
+            let target_logical_h =
+                (init_rows * cell_h_logical + pad_y * 2.0 + init_tab_bar_logical_h).ceil();
             let _ = window.request_inner_size(LogicalSize::new(
                 target_logical_w as f64,
                 target_logical_h as f64,
             ));
+            let new_phys = window.inner_size();
+            if new_phys.width > 0 && new_phys.height > 0 {
+                renderer.resize(new_phys.width, new_phys.height);
+            }
+        }
+
+        // Apply final window position AFTER `request_inner_size`.
+        // On macOS, `-[NSWindow setContentSize:]` anchors the bottom-left corner in
+        // AppKit coordinates, which shifts the top-left `y` whenever the window
+        // height changes; if no saved position exists, `winit` centered the initial
+        // estimate rather than the final size.
+        let outer_logical = window
+            .outer_size()
+            .to_logical::<f64>(window.scale_factor());
+        if let Some((pos_x, pos_y)) = desired_position.filter(|&(x, y)| {
+            is_position_visible_on_monitors(
+                event_loop,
+                x as f64,
+                y as f64,
+                outer_logical.width,
+                outer_logical.height,
+            )
+        }) {
+            window.set_outer_position(LogicalPosition::new(pos_x as f64, pos_y as f64));
+        } else {
+            center_window_on_screen(&window, event_loop);
+        }
+
+        if existing_geometry.is_none() {
+            match self
+                .config_manager
+                .current_config
+                .window
+                .startup_mode
+                .as_str()
+            {
+                "maximized" => window.set_maximized(true),
+                "fullscreen" => window.set_fullscreen(Some(Fullscreen::Borderless(None))),
+                _ => {}
+            }
         }
 
         let pty_opts = self.build_pty_options();
@@ -138,7 +278,7 @@ impl App {
             pty_opts,
         )?;
         workspace.sidebar_open = self.sidebar_open;
-        if let Some((_, sidebar_w)) = existing_geometry {
+        if let Some((_, sidebar_w, _)) = existing_geometry {
             workspace.sidebar_width = sidebar_w;
         }
 
@@ -201,8 +341,61 @@ impl App {
         self.sessions.insert(window_id, session);
         self.session_order.push(window_id);
         self.active_session_id = Some(window_id);
+        if existing_geometry.is_none() {
+            self.record_session_window_position(window_id);
+        }
         info!("Initialized Terminal Window Session (ID: {:?})", window_id);
         Ok(window_id)
+    }
+
+    /// Persist `window_id`'s current outer position (in logical desktop coordinates)
+    /// into `current_config.window`, scheduling a debounced config save if it changed.
+    pub(crate) fn record_session_window_position(&mut self, window_id: WindowId) {
+        if let Some(session) = self.sessions.get(&window_id) {
+            if session.window.is_minimized() == Some(true) || session.window.fullscreen().is_some()
+            {
+                return;
+            }
+            if let Ok(pos) = session.window.outer_position() {
+                let logical = pos.to_logical::<f64>(session.window.scale_factor());
+                let new_x = logical.x.round() as i32;
+                let new_y = logical.y.round() as i32;
+                let cur_x = self.config_manager.current_config.window.position_x;
+                let cur_y = self.config_manager.current_config.window.position_y;
+                if cur_x != Some(new_x) || cur_y != Some(new_y) {
+                    self.config_manager.current_config.window.position_x = Some(new_x);
+                    self.config_manager.current_config.window.position_y = Some(new_y);
+                    self.pending_config_save = true;
+                    self.last_config_change = Some(Instant::now());
+                }
+            }
+        }
+    }
+
+    /// Handles `WindowEvent::Moved` for a terminal window.
+    pub(crate) fn handle_moved(
+        &mut self,
+        window_id: WindowId,
+        physical_position: PhysicalPosition<i32>,
+    ) {
+        if let Some(session) = self.sessions.get(&window_id) {
+            if session.window.is_minimized() == Some(true) || session.window.fullscreen().is_some()
+            {
+                return;
+            }
+            let pos = session.window.outer_position().unwrap_or(physical_position);
+            let logical = pos.to_logical::<f64>(session.window.scale_factor());
+            let new_x = logical.x.round() as i32;
+            let new_y = logical.y.round() as i32;
+            let cur_x = self.config_manager.current_config.window.position_x;
+            let cur_y = self.config_manager.current_config.window.position_y;
+            if cur_x != Some(new_x) || cur_y != Some(new_y) {
+                self.config_manager.current_config.window.position_x = Some(new_x);
+                self.config_manager.current_config.window.position_y = Some(new_y);
+                self.pending_config_save = true;
+                self.last_config_change = Some(Instant::now());
+            }
+        }
     }
 
     /// Handles `WindowEvent::CloseRequested` for a terminal window.
@@ -212,6 +405,7 @@ impl App {
         window_id: WindowId,
     ) {
         info!("Terminal window close requested for {:?}", window_id);
+        self.record_session_window_position(window_id);
         // Read the NSWindow pointer while the session still owns the
         // winit window -- it is unobtainable after the remove below.
         #[cfg(target_os = "macos")]
@@ -279,6 +473,7 @@ impl App {
             }
             session.window.request_redraw();
         }
+        self.record_session_window_position(window_id);
     }
 
     /// Handles `WindowEvent::ScaleFactorChanged` for a terminal window.

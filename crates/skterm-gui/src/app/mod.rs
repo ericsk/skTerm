@@ -26,6 +26,7 @@ pub use menu::{
     build_context_menu, build_top_dropdown_menu, hit_test_dropdown_menu, TopMenuAction,
 };
 pub use session::{ScrollbarDragState, TerminalSession};
+pub use window::is_rect_visible_on_monitors;
 
 use crate::config::ConfigManager;
 use crate::preferences_window::PreferencesWindow;
@@ -403,6 +404,10 @@ impl ApplicationHandler<AppEvent> for App {
 
         match event {
             WindowEvent::CloseRequested => self.handle_close_requested(event_loop, window_id),
+
+            WindowEvent::Moved(physical_position) => {
+                self.handle_moved(window_id, physical_position)
+            }
 
             WindowEvent::Resized(physical_size) => {
                 self.handle_resized(window_id, tab_bar_h, physical_size)
