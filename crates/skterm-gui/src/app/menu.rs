@@ -1,8 +1,11 @@
-//! Top dropdown menu and right-click context menu model, builder, hit-testing, and action execution.
+//! Top dropdown menu, right-click context menu, and native OS menu action execution.
 
+use super::events::NativeMenuAction;
 use super::App;
+use crate::i18n::{current_locale, strings, Locale};
 use crate::layout::SplitDirection;
 use skterm_render::{TopDropdownMenu, TopDropdownMenuItem};
+use std::time::Instant;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
@@ -34,13 +37,24 @@ pub fn build_top_dropdown_menu(
     tab_bar_h: f32,
     hovered_idx: Option<usize>,
 ) -> (TopDropdownMenu, Vec<Option<TopMenuAction>>) {
+    build_top_dropdown_menu_for_locale(current_locale(), scale, menu_x, tab_bar_h, hovered_idx)
+}
+
+pub fn build_top_dropdown_menu_for_locale(
+    locale: Locale,
+    scale: f32,
+    menu_x: f32,
+    tab_bar_h: f32,
+    hovered_idx: Option<usize>,
+) -> (TopDropdownMenu, Vec<Option<TopMenuAction>>) {
     let mut items = Vec::new();
     let mut actions = Vec::new();
     let is_mac = cfg!(target_os = "macos");
+    let tr = strings(locale);
 
     // 1. Preferences
     items.push(TopDropdownMenuItem {
-        label: "⚙ 偏好設定...".to_string(),
+        label: tr.ctx_preferences.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+,".to_string()
         } else {
@@ -60,7 +74,7 @@ pub fn build_top_dropdown_menu(
 
     // 2. Default New Tab
     items.push(TopDropdownMenuItem {
-        label: "＋ 新增分頁 (預設)".to_string(),
+        label: tr.ctx_new_tab_default.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+T".to_string()
         } else {
@@ -72,7 +86,7 @@ pub fn build_top_dropdown_menu(
 
     // 3. Split Panes
     items.push(TopDropdownMenuItem {
-        label: "◫ 左右分割窗格".to_string(),
+        label: tr.ctx_split_horizontal.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+D".to_string()
         } else {
@@ -83,7 +97,7 @@ pub fn build_top_dropdown_menu(
     actions.push(Some(TopMenuAction::SplitHorizontal));
 
     items.push(TopDropdownMenuItem {
-        label: "⬒ 上下分割窗格".to_string(),
+        label: tr.ctx_split_vertical.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+Shift+D".to_string()
         } else {
@@ -95,7 +109,7 @@ pub fn build_top_dropdown_menu(
 
     // 4. Toggle AI Sidebar
     items.push(TopDropdownMenuItem {
-        label: "🤖 切換 AI 側邊欄".to_string(),
+        label: tr.ctx_toggle_ai_sidebar.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+Shift+A".to_string()
         } else {
@@ -123,7 +137,7 @@ pub fn build_top_dropdown_menu(
         }
         if has_bash {
             items.push(TopDropdownMenuItem {
-                label: "🐚 新增 Bash 分頁".to_string(),
+                label: tr.ctx_new_tab_bash.to_string(),
                 shortcut: None,
                 is_separator: false,
             });
@@ -131,7 +145,7 @@ pub fn build_top_dropdown_menu(
         }
         if has_zsh {
             items.push(TopDropdownMenuItem {
-                label: "⚡ 新增 Zsh 分頁".to_string(),
+                label: tr.ctx_new_tab_zsh.to_string(),
                 shortcut: None,
                 is_separator: false,
             });
@@ -139,7 +153,7 @@ pub fn build_top_dropdown_menu(
         }
         if has_fish {
             items.push(TopDropdownMenuItem {
-                label: "🐟 新增 Fish 分頁".to_string(),
+                label: tr.ctx_new_tab_fish.to_string(),
                 shortcut: None,
                 is_separator: false,
             });
@@ -158,7 +172,7 @@ pub fn build_top_dropdown_menu(
         actions.push(None);
 
         items.push(TopDropdownMenuItem {
-            label: "💻 命令提示字元".to_string(),
+            label: tr.ctx_new_tab_cmd.to_string(),
             shortcut: None,
             is_separator: false,
         });
@@ -166,7 +180,7 @@ pub fn build_top_dropdown_menu(
 
         if skterm_core::find_windows_powershell().is_some() {
             items.push(TopDropdownMenuItem {
-                label: "⚡ Windows PowerShell".to_string(),
+                label: tr.ctx_new_tab_win_powershell.to_string(),
                 shortcut: None,
                 is_separator: false,
             });
@@ -175,7 +189,7 @@ pub fn build_top_dropdown_menu(
 
         if skterm_core::find_pwsh_path().is_some() {
             items.push(TopDropdownMenuItem {
-                label: "🚀 PowerShell 7 (pwsh)".to_string(),
+                label: tr.ctx_new_tab_pwsh.to_string(),
                 shortcut: None,
                 is_separator: false,
             });
@@ -184,7 +198,7 @@ pub fn build_top_dropdown_menu(
 
         if skterm_core::find_git_bash_path().is_some() {
             items.push(TopDropdownMenuItem {
-                label: "🦝 Git Bash".to_string(),
+                label: tr.ctx_new_tab_git_bash.to_string(),
                 shortcut: None,
                 is_separator: false,
             });
@@ -202,7 +216,7 @@ pub fn build_top_dropdown_menu(
 
     // Exit
     items.push(TopDropdownMenuItem {
-        label: "✖ 結束 skTerm".to_string(),
+        label: tr.ctx_exit.to_string(),
         shortcut: None,
         is_separator: false,
     });
@@ -235,12 +249,33 @@ pub fn build_context_menu(
     screen_h: f32,
     hovered_idx: Option<usize>,
 ) -> (TopDropdownMenu, Vec<Option<TopMenuAction>>) {
+    build_context_menu_for_locale(
+        current_locale(),
+        scale,
+        anchor_x,
+        anchor_y,
+        screen_w,
+        screen_h,
+        hovered_idx,
+    )
+}
+
+pub fn build_context_menu_for_locale(
+    locale: Locale,
+    scale: f32,
+    anchor_x: f32,
+    anchor_y: f32,
+    screen_w: f32,
+    screen_h: f32,
+    hovered_idx: Option<usize>,
+) -> (TopDropdownMenu, Vec<Option<TopMenuAction>>) {
     let mut items = Vec::new();
     let mut actions = Vec::new();
     let is_mac = cfg!(target_os = "macos");
+    let tr = strings(locale);
 
     items.push(TopDropdownMenuItem {
-        label: "📋 複製".to_string(),
+        label: tr.ctx_copy.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+C".to_string()
         } else {
@@ -251,7 +286,7 @@ pub fn build_context_menu(
     actions.push(Some(TopMenuAction::Copy));
 
     items.push(TopDropdownMenuItem {
-        label: "📄 貼上".to_string(),
+        label: tr.ctx_paste.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+V".to_string()
         } else {
@@ -262,7 +297,7 @@ pub fn build_context_menu(
     actions.push(Some(TopMenuAction::Paste));
 
     items.push(TopDropdownMenuItem {
-        label: "🔍 搜尋...".to_string(),
+        label: tr.ctx_find.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+F".to_string()
         } else {
@@ -273,7 +308,7 @@ pub fn build_context_menu(
     actions.push(Some(TopMenuAction::Find));
 
     items.push(TopDropdownMenuItem {
-        label: "🧹 清除畫面".to_string(),
+        label: tr.ctx_clear_scrollback.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+K".to_string()
         } else {
@@ -291,7 +326,7 @@ pub fn build_context_menu(
     actions.push(None);
 
     items.push(TopDropdownMenuItem {
-        label: "◫ 左右分割窗格".to_string(),
+        label: tr.ctx_split_horizontal.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+D".to_string()
         } else {
@@ -302,7 +337,7 @@ pub fn build_context_menu(
     actions.push(Some(TopMenuAction::SplitHorizontal));
 
     items.push(TopDropdownMenuItem {
-        label: "⬒ 上下分割窗格".to_string(),
+        label: tr.ctx_split_vertical.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+Shift+D".to_string()
         } else {
@@ -313,7 +348,7 @@ pub fn build_context_menu(
     actions.push(Some(TopMenuAction::SplitVertical));
 
     items.push(TopDropdownMenuItem {
-        label: "＋ 新增分頁".to_string(),
+        label: tr.ctx_new_tab.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+T".to_string()
         } else {
@@ -324,7 +359,7 @@ pub fn build_context_menu(
     actions.push(Some(TopMenuAction::NewTabDefault));
 
     items.push(TopDropdownMenuItem {
-        label: "🤖 切換 AI 側邊欄".to_string(),
+        label: tr.ctx_toggle_ai_sidebar.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+Shift+A".to_string()
         } else {
@@ -342,7 +377,7 @@ pub fn build_context_menu(
     actions.push(None);
 
     items.push(TopDropdownMenuItem {
-        label: "⚙ 偏好設定...".to_string(),
+        label: tr.ctx_preferences.to_string(),
         shortcut: Some(if is_mac {
             "Cmd+,".to_string()
         } else {
@@ -642,6 +677,196 @@ impl App {
             }
             TopMenuAction::Exit => {
                 event_loop.exit();
+            }
+        }
+    }
+
+    /// Executes an action dispatched from a native OS menu bar item (such as macOS `NSMenu`).
+    pub fn execute_native_menu_action(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        action: NativeMenuAction,
+    ) {
+        self.last_native_menu_action_time = Some(Instant::now());
+
+        let pref_focused = self
+            .preferences_window
+            .as_ref()
+            .is_some_and(|p| p.window.has_focus());
+
+        if pref_focused {
+            match action {
+                NativeMenuAction::CloseTabOrPane | NativeMenuAction::CloseWindow => {
+                    self.preferences_window = None;
+                    return;
+                }
+                NativeMenuAction::Copy => {
+                    if let Some(pref) = &mut self.preferences_window {
+                        pref.egui_ctx
+                            .input_mut(|i| i.events.push(egui::Event::Copy));
+                        pref.window.request_redraw();
+                    }
+                    return;
+                }
+                NativeMenuAction::Paste => {
+                    let pasted = self
+                        .clipboard
+                        .as_ref()
+                        .and_then(|cb| cb.lock().ok().and_then(|mut c| c.get_text().ok()));
+                    if let (Some(pref), Some(text)) = (&mut self.preferences_window, pasted) {
+                        pref.egui_ctx
+                            .input_mut(|i| i.events.push(egui::Event::Paste(text)));
+                        pref.window.request_redraw();
+                    }
+                    return;
+                }
+                NativeMenuAction::SelectAll => {
+                    if let Some(pref) = &mut self.preferences_window {
+                        pref.egui_ctx.input_mut(|i| {
+                            i.events.push(egui::Event::Key {
+                                key: egui::Key::A,
+                                physical_key: Some(egui::Key::A),
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::COMMAND,
+                            });
+                        });
+                        pref.window.request_redraw();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let target_wid = self
+            .active_session_id
+            .or_else(|| self.session_order.last().copied());
+        let tab_bar_h = self.get_tab_bar_height();
+
+        match action {
+            NativeMenuAction::OpenPreferences => {
+                self.open_preferences_window(event_loop);
+            }
+            NativeMenuAction::Quit => {
+                event_loop.exit();
+            }
+            NativeMenuAction::NewWindow => {
+                let _ = self.create_terminal_session(event_loop);
+            }
+            NativeMenuAction::NewTab => {
+                if let Some(wid) = target_wid {
+                    self.execute_top_menu_action(
+                        event_loop,
+                        wid,
+                        tab_bar_h,
+                        TopMenuAction::NewTabDefault,
+                    );
+                } else {
+                    let _ = self.create_terminal_session(event_loop);
+                }
+            }
+            NativeMenuAction::SplitHorizontal => {
+                if let Some(wid) = target_wid {
+                    self.execute_top_menu_action(
+                        event_loop,
+                        wid,
+                        tab_bar_h,
+                        TopMenuAction::SplitHorizontal,
+                    );
+                }
+            }
+            NativeMenuAction::SplitVertical => {
+                if let Some(wid) = target_wid {
+                    self.execute_top_menu_action(
+                        event_loop,
+                        wid,
+                        tab_bar_h,
+                        TopMenuAction::SplitVertical,
+                    );
+                }
+            }
+            NativeMenuAction::CloseTabOrPane => {
+                if let Some(wid) = target_wid {
+                    let all_panes_closed = if let Some(session) = self.sessions.get_mut(&wid) {
+                        let closed = session.workspace.close_active_pane();
+                        session.last_tab_label_refresh = None;
+                        closed
+                    } else {
+                        false
+                    };
+                    if all_panes_closed {
+                        self.handle_close_requested(event_loop, wid);
+                    } else {
+                        let new_tab_bar_h = self.get_tab_bar_height();
+                        if let Some(session) = self.sessions.get_mut(&wid) {
+                            session.sync_all_pane_sizes(new_tab_bar_h);
+                            session.window.request_redraw();
+                        }
+                    }
+                }
+            }
+            NativeMenuAction::CloseWindow => {
+                if let Some(wid) = target_wid {
+                    self.handle_close_requested(event_loop, wid);
+                }
+            }
+            NativeMenuAction::Copy => {
+                if let Some(wid) = target_wid {
+                    self.execute_top_menu_action(event_loop, wid, tab_bar_h, TopMenuAction::Copy);
+                }
+            }
+            NativeMenuAction::Paste => {
+                if let Some(wid) = target_wid {
+                    self.execute_top_menu_action(event_loop, wid, tab_bar_h, TopMenuAction::Paste);
+                }
+            }
+            NativeMenuAction::SelectAll => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            if let Some(term) = tab.active_terminal_mut() {
+                                term.grid_mut().active_mut().select_all();
+                                session.window.request_redraw();
+                            }
+                        }
+                    }
+                }
+            }
+            NativeMenuAction::Find => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        session.search_open = !session.search_open;
+                        if session.search_open {
+                            session.update_search_matches();
+                        } else {
+                            session.search_matches.clear();
+                            session.active_search_idx = None;
+                        }
+                        session.window.request_redraw();
+                    }
+                }
+            }
+            NativeMenuAction::ClearScrollback => {
+                if let Some(wid) = target_wid {
+                    self.execute_top_menu_action(
+                        event_loop,
+                        wid,
+                        tab_bar_h,
+                        TopMenuAction::ClearScrollback,
+                    );
+                }
+            }
+            NativeMenuAction::OpenGitHub => {
+                let _ = super::input_mouse::open_url_in_browser("https://github.com/ericsk/skTerm");
+            }
+            NativeMenuAction::ReportIssue => {
+                let _ = super::input_mouse::open_url_in_browser(
+                    "https://github.com/ericsk/skTerm/issues",
+                );
+            }
+            NativeMenuAction::OpenConfigFile => {
+                self.config_manager.open_in_editor();
             }
         }
     }

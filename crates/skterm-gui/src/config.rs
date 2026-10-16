@@ -103,6 +103,8 @@ pub struct WindowConfig {
     pub decorations: String,
     #[serde(default = "default_tab_bar_style")]
     pub tab_bar_style: String,
+    #[serde(default = "default_language")]
+    pub language: String,
 }
 
 fn default_columns() -> u16 {
@@ -133,6 +135,9 @@ fn default_tab_bar_style() -> String {
         "always".to_string()
     }
 }
+fn default_language() -> String {
+    "auto".to_string()
+}
 
 impl Default for WindowConfig {
     fn default() -> Self {
@@ -147,6 +152,7 @@ impl Default for WindowConfig {
             startup_mode: default_startup_mode(),
             decorations: default_decorations(),
             tab_bar_style: default_tab_bar_style(),
+            language: default_language(),
         }
     }
 }
@@ -846,6 +852,9 @@ decorations = "full"
 # 分頁標籤列顯示策略 ("auto": 多於1個分頁時自動顯示, "always": 恆顯示, "never": 恆隱藏)
 tab_bar_style = "auto"
 
+# 介面與選單顯示語言 ("auto": 自動偵測系統語系, "zh-TW": 繁體中文, "en": English)
+language = "auto"
+
 
 [terminal]
 # 終端模擬器 TERM 環境變數 (預設: "xterm-256color")
@@ -968,6 +977,9 @@ decorations = "full"
 
 # 分頁標籤列顯示策略 ("always": 恆顯示, "auto": 多於1個分頁時自動顯示, "never": 恆隱藏)
 tab_bar_style = "always"
+
+# 介面與選單顯示語言 ("auto": 自動偵測系統語系, "zh-TW": 繁體中文, "en": English)
+language = "auto"
 
 
 [terminal]

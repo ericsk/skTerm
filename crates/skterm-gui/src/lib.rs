@@ -3,9 +3,12 @@
 pub mod app;
 pub mod config;
 pub mod egui_fonts;
+pub mod i18n;
 pub mod icon;
 pub mod input;
 pub mod layout;
+#[cfg(target_os = "macos")]
+pub mod macos_menu;
 #[cfg(target_os = "macos")]
 pub mod macos_textfield;
 #[cfg(target_os = "macos")]
@@ -14,10 +17,11 @@ pub mod preferences_window;
 pub mod tab_title;
 
 pub use app::{
-    build_top_dropdown_menu, hit_test_dropdown_menu, is_rect_visible_on_monitors, App,
-    TopMenuAction,
+    build_context_menu_for_locale, build_top_dropdown_menu, build_top_dropdown_menu_for_locale,
+    hit_test_dropdown_menu, is_rect_visible_on_monitors, App, NativeMenuAction, TopMenuAction,
 };
 pub use config::{default_config_template, parse_hex_color, Config, ConfigManager, Theme};
+pub use i18n::{current_locale, set_locale, strings, tr, I18nStrings, Locale};
 pub use icon::{apply_window_icon, configure_window_attributes, get_app_icon};
 pub use input::{
     check_tab_switch, check_tab_switch_for_os, encode_key, encode_key_event,
@@ -1245,5 +1249,62 @@ mod tests {
         ));
         // Empty monitor list falls back to allowing the position
         assert!(is_rect_visible_on_monitors(2000.0, 120.0, 900.0, 600.0, &[]));
+    }
+
+    #[test]
+    fn test_i18n_menu_localization_and_native_menu_action_tags() {
+        let (menu_zh, actions_zh) =
+            build_top_dropdown_menu_for_locale(Locale::ZhTw, 1.0, 100.0, 36.0, None);
+        let (menu_en, actions_en) =
+            build_top_dropdown_menu_for_locale(Locale::En, 1.0, 100.0, 36.0, None);
+
+        assert_eq!(actions_zh, actions_en);
+        assert!(menu_zh.items[0].label.contains("偏好設定"));
+        assert!(menu_en.items[0].label.contains("Settings"));
+
+        let (ctx_zh, _) =
+            build_context_menu_for_locale(Locale::ZhTw, 1.0, 100.0, 100.0, 800.0, 600.0, None);
+        let (ctx_en, _) =
+            build_context_menu_for_locale(Locale::En, 1.0, 100.0, 100.0, 800.0, 600.0, None);
+        assert!(ctx_zh.items[0].label.contains("複製"));
+        assert!(ctx_en.items[0].label.contains("Copy"));
+
+        // Verify NativeMenuAction tag roundtrip
+        let sample_actions = [
+            NativeMenuAction::OpenPreferences,
+            NativeMenuAction::NewWindow,
+            NativeMenuAction::NewTab,
+            NativeMenuAction::SplitHorizontal,
+            NativeMenuAction::SplitVertical,
+            NativeMenuAction::CloseTabOrPane,
+            NativeMenuAction::CloseWindow,
+            NativeMenuAction::Copy,
+            NativeMenuAction::Paste,
+            NativeMenuAction::SelectAll,
+            NativeMenuAction::Find,
+            NativeMenuAction::ClearScrollback,
+            NativeMenuAction::OpenGitHub,
+            NativeMenuAction::ReportIssue,
+            NativeMenuAction::OpenConfigFile,
+        ];
+        for action in sample_actions {
+            assert_eq!(NativeMenuAction::from_tag(action as isize), Some(action));
+        }
+        assert_eq!(NativeMenuAction::from_tag(9999), None);
+    }
+
+    #[test]
+    fn test_screen_buffer_select_all() {
+        use skterm_core::Terminal;
+
+        let mut term = Terminal::new_headless(4, 20, 100);
+        term.feed_bytes(b"Hello World\r\nSecond Line");
+
+        term.grid_mut().active_mut().select_all();
+        assert!(term.grid().active().selection.is_some());
+
+        let selected = term.grid().active().extract_selected_text();
+        assert!(selected.contains("Hello World"));
+        assert!(selected.contains("Second Line"));
     }
 }

@@ -1635,6 +1635,26 @@ impl ScreenBuffer {
         self.selection = Some(Selection::new(start, end, SelectionMode::Line));
     }
 
+    /// Select all content on the visible screen (`Cmd+A` behavior).
+    pub fn select_all(&mut self) {
+        if self.rows == 0 || self.cols == 0 {
+            return;
+        }
+        let last_non_empty_row = (0..self.rows)
+            .rev()
+            .find(|&r| {
+                self.get_visible_row(r)
+                    .is_some_and(|row| row.content_len() > 0)
+            })
+            .unwrap_or(self.rows.saturating_sub(1));
+        let last_col = self.cols.saturating_sub(1);
+        self.selection = Some(Selection::new(
+            (0, 0),
+            (last_non_empty_row, last_col),
+            SelectionMode::Line,
+        ));
+    }
+
     /// Update the active selection when dragging from `anchor` to `target`,
     /// preserving word and logical-line boundaries for `Word` and `Line` modes.
     pub fn extend_selection_to(&mut self, anchor: (usize, usize), target: (usize, usize)) {

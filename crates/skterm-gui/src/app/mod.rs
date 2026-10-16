@@ -18,12 +18,13 @@ mod tick;
 mod window;
 
 pub use agents::{AgentList, AgentRow};
-pub use events::AppEvent;
+pub use events::{AppEvent, NativeMenuAction};
 pub use input_mouse::open_url_in_browser;
 #[cfg(target_os = "macos")]
 pub use macos::{center_macos_window_title, set_macos_tab_label, style_macos_tab_bar};
 pub use menu::{
-    build_context_menu, build_top_dropdown_menu, hit_test_dropdown_menu, TopMenuAction,
+    build_context_menu, build_context_menu_for_locale, build_top_dropdown_menu,
+    build_top_dropdown_menu_for_locale, hit_test_dropdown_menu, TopMenuAction,
 };
 pub use session::{ScrollbarDragState, TerminalSession};
 pub use window::is_rect_visible_on_monitors;
@@ -88,6 +89,9 @@ pub struct App {
     /// window saw a "recent" click, bumped the count to 2 and selected a word from
     /// what the user meant as a single click.
     pub last_agent_card_click: Option<(AgentRow, Instant)>,
+    /// Timestamp of the last action dispatched from the native macOS NSMenu bar,
+    /// used to guard against duplicate execution if winit also forwards the key equivalent.
+    pub last_native_menu_action_time: Option<Instant>,
     #[cfg(target_os = "macos")]
     pub macos_editor: crate::macos_textfield::NativeSidebarEditor,
 }
@@ -101,6 +105,9 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         let config_manager = ConfigManager::load_or_create();
+        let initial_locale =
+            crate::i18n::Locale::resolve(&config_manager.current_config.window.language);
+        crate::i18n::set_locale(initial_locale);
 
         let clipboard = match Clipboard::new() {
             Ok(cb) => Some(Arc::new(Mutex::new(cb))),
@@ -134,6 +141,7 @@ impl App {
             cached_ai_agents: AgentList::default(),
             last_agent_card_click: None,
             last_ai_agent_scan: None,
+            last_native_menu_action_time: None,
             #[cfg(target_os = "macos")]
             macos_editor: crate::macos_textfield::NativeSidebarEditor::new(),
         }
@@ -143,6 +151,8 @@ impl App {
         let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
         let proxy = event_loop.create_proxy();
         self.event_proxy = Some(proxy.clone());
+        #[cfg(target_os = "macos")]
+        crate::macos_menu::set_event_proxy(proxy.clone());
         self.config_manager.set_wakeup(Arc::new(move || {
             let _ = proxy.send_event(AppEvent::ConfigChanged);
         }));
@@ -264,7 +274,7 @@ impl App {
 }
 
 impl ApplicationHandler<AppEvent> for App {
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::PtyWakeup => {
                 // Clear before draining: any output that arrives while we are polling
@@ -294,10 +304,16 @@ impl ApplicationHandler<AppEvent> for App {
             // Nothing to do here: waking the loop is the whole point, and
             // `about_to_wait` drains the config channel right after this returns.
             AppEvent::ConfigChanged => {}
+            AppEvent::MenuAction(action) => {
+                self.execute_native_menu_action(event_loop, action);
+            }
         }
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        crate::macos_menu::install_or_update_macos_menu(crate::i18n::current_locale());
+
         if self.sessions.is_empty() {
             if let Err(e) = self.create_terminal_session(event_loop) {
                 error!("Failed to create initial terminal window: {:?}", e);

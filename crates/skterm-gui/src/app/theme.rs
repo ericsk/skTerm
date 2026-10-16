@@ -166,6 +166,11 @@ impl App {
         let decorations_changed = old_decorations != new_cfg.window.decorations;
 
         self.config_manager.current_config = new_cfg.clone();
+        let new_locale = crate::i18n::Locale::resolve(&new_cfg.window.language);
+        crate::i18n::set_locale(new_locale);
+        #[cfg(target_os = "macos")]
+        crate::macos_menu::install_or_update_macos_menu(new_locale);
+
         let render_theme = self.build_render_theme();
         let tab_bar_h = self.get_tab_bar_height();
 

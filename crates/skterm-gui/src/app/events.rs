@@ -2,6 +2,52 @@
 
 use std::time::Duration;
 
+/// Action dispatched from a native OS menu bar item (such as macOS `NSMenu`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(isize)]
+pub enum NativeMenuAction {
+    OpenPreferences = 1,
+    Quit = 2,
+    NewWindow = 10,
+    NewTab = 11,
+    SplitHorizontal = 12,
+    SplitVertical = 13,
+    CloseTabOrPane = 14,
+    CloseWindow = 15,
+    Copy = 20,
+    Paste = 21,
+    SelectAll = 22,
+    Find = 23,
+    ClearScrollback = 24,
+    OpenGitHub = 30,
+    ReportIssue = 31,
+    OpenConfigFile = 32,
+}
+
+impl NativeMenuAction {
+    pub fn from_tag(tag: isize) -> Option<Self> {
+        match tag {
+            1 => Some(Self::OpenPreferences),
+            2 => Some(Self::Quit),
+            10 => Some(Self::NewWindow),
+            11 => Some(Self::NewTab),
+            12 => Some(Self::SplitHorizontal),
+            13 => Some(Self::SplitVertical),
+            14 => Some(Self::CloseTabOrPane),
+            15 => Some(Self::CloseWindow),
+            20 => Some(Self::Copy),
+            21 => Some(Self::Paste),
+            22 => Some(Self::SelectAll),
+            23 => Some(Self::Find),
+            24 => Some(Self::ClearScrollback),
+            30 => Some(Self::OpenGitHub),
+            31 => Some(Self::ReportIssue),
+            32 => Some(Self::OpenConfigFile),
+            _ => None,
+        }
+    }
+}
+
 /// Custom application events for asynchronous wakeups.
 #[derive(Debug, Clone, Copy)]
 pub enum AppEvent {
@@ -10,6 +56,8 @@ pub enum AppEvent {
     /// `ControlFlow::Wait`, so the watcher has to wake it explicitly or a hot
     /// reload would sit in the channel until the next unrelated event.
     ConfigChanged,
+    /// Triggered by a native OS menu bar action (e.g. macOS `NSMenuItem`).
+    MenuAction(NativeMenuAction),
 }
 
 /// How long the scrollbar stays visible after the last scroll.

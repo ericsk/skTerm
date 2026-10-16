@@ -468,6 +468,7 @@ pub struct PreferencesWindow {
     pub startup_mode: String,
     pub decorations: String,
     pub tab_bar_style: String,
+    pub language: String,
 
     pub theme: String,
     pub fg_override: String,
@@ -617,6 +618,7 @@ impl PreferencesWindow {
             startup_mode: "normal".to_string(),
             decorations: "full".to_string(),
             tab_bar_style: "auto".to_string(),
+            language: "auto".to_string(),
 
             theme: "catppuccin-mocha".to_string(),
             fg_override: String::new(),
@@ -706,6 +708,7 @@ impl PreferencesWindow {
         self.startup_mode = config.window.startup_mode.clone();
         self.decorations = config.window.decorations.clone();
         self.tab_bar_style = config.window.tab_bar_style.clone();
+        self.language = config.window.language.clone();
 
         self.theme = config.colors.theme.clone();
         self.fg_override = config.colors.foreground.clone().unwrap_or_default();
@@ -762,6 +765,7 @@ impl PreferencesWindow {
         cfg.window.startup_mode = self.startup_mode.clone();
         cfg.window.decorations = self.decorations.clone();
         cfg.window.tab_bar_style = self.tab_bar_style.clone();
+        cfg.window.language = self.language.clone();
 
         cfg.colors.theme = self.theme.clone();
         cfg.colors.foreground = if self.fg_override.trim().is_empty() {
@@ -1742,6 +1746,23 @@ impl PreferencesWindow {
                     ];
                     if render_macos_segmented_control(ui, &mut cur, &opts) {
                         self.tab_bar_style = cur.to_string();
+                    }
+                },
+            );
+
+            let s = crate::i18n::tr();
+            b.row(
+                s.pref_language_label,
+                Some(s.pref_language_subtitle),
+                |ui| {
+                    let mut cur = self.language.as_str();
+                    let opts = [
+                        ("auto", s.pref_language_auto),
+                        ("zh-TW", s.pref_language_zh_tw),
+                        ("en", s.pref_language_en),
+                    ];
+                    if render_macos_segmented_control(ui, &mut cur, &opts) {
+                        self.language = cur.to_string();
                     }
                 },
             );

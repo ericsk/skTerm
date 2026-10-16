@@ -323,6 +323,12 @@ impl App {
         if is_cmd {
             self.ime_preedit.clear();
             self.ime_preedit_cursor = None;
+            if self
+                .last_native_menu_action_time
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(25))
+            {
+                return;
+            }
             // Check NamedKey first (Enter, Arrow keys)
             match event.logical_key {
                 Key::Named(NamedKey::Enter) if is_shift => {
@@ -437,8 +443,17 @@ impl App {
                             return;
                         }
                     }
-                    "a" if is_shift => {
-                        self.toggle_sidebar();
+                    "a" => {
+                        if is_shift {
+                            self.toggle_sidebar();
+                        } else if let Some(session) = self.sessions.get_mut(&window_id) {
+                            if let Some(tab) = session.workspace.active_tab_mut() {
+                                if let Some(term) = tab.active_terminal_mut() {
+                                    term.grid_mut().active_mut().select_all();
+                                    session.window.request_redraw();
+                                }
+                            }
+                        }
                         return;
                     }
                     "t" => {
@@ -463,6 +478,10 @@ impl App {
                         return;
                     }
                     "w" => {
+                        if is_shift {
+                            self.handle_close_requested(event_loop, window_id);
+                            return;
+                        }
                         // Close Pane or Window Session
                         let all_panes_closed =
                             if let Some(session) = self.sessions.get_mut(&window_id) {
@@ -473,11 +492,7 @@ impl App {
                                 false
                             };
                         if all_panes_closed {
-                            self.sessions.remove(&window_id);
-                            self.session_order.retain(|&id| id != window_id);
-                            if self.sessions.is_empty() {
-                                event_loop.exit();
-                            }
+                            self.handle_close_requested(event_loop, window_id);
                         } else {
                             let new_tab_bar_h = self.get_tab_bar_height();
                             if let Some(session) = self.sessions.get_mut(&window_id) {
