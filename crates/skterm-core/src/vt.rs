@@ -51,6 +51,105 @@ pub enum DcsMode {
     DecRqss,
 }
 
+/// Program lifecycle state reported via `OSC 7501` (`ESC ] 7501 ; ... ST/BEL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProgramStatusState {
+    Idle,
+    Working,
+    Done,
+    Blocked,
+    Error,
+    Clear,
+}
+
+impl ProgramStatusState {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "idle" => Some(Self::Idle),
+            "working" => Some(Self::Working),
+            "done" => Some(Self::Done),
+            "blocked" => Some(Self::Blocked),
+            "error" => Some(Self::Error),
+            "clear" => Some(Self::Clear),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+            Self::Error => "error",
+            Self::Clear => "clear",
+        }
+    }
+
+    /// Selection priority when multiple status records exist in the same pane.
+    /// Higher value wins (`Blocked > Error > Working > Done > Idle`).
+    pub fn priority(&self) -> u8 {
+        match self {
+            Self::Blocked => 4,
+            Self::Error => 3,
+            Self::Working => 2,
+            Self::Done => 1,
+            Self::Idle | Self::Clear => 0,
+        }
+    }
+}
+
+/// Optional sub-kind reported via `OSC 7501` (`kind=...`), refining [`ProgramStatusState::Blocked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ProgramStatusKind {
+    #[default]
+    None,
+    Permission,
+    Question,
+    Auth,
+}
+
+impl ProgramStatusKind {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "permission" => Self::Permission,
+            "question" => Self::Question,
+            "auth" => Self::Auth,
+            _ => Self::None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Permission => "permission",
+            Self::Question => "question",
+            Self::Auth => "auth",
+        }
+    }
+}
+
+/// A single program status entry stored per `id` in [`TerminalState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramStatusRecord {
+    /// Program/session status identifier (`None` for the default unnamed slot).
+    pub id: Option<String>,
+    /// Current lifecycle state (`Idle`, `Working`, `Done`, `Blocked`, `Error`).
+    pub state: ProgramStatusState,
+    /// Sub-kind (`Permission`, `Question`, `Auth`, `None`).
+    pub kind: ProgramStatusKind,
+    /// Application identifier (e.g. `"agy"`, `"jetski"`, `"claude"`, `"gemini"`).
+    pub app: Option<String>,
+    /// Decoded UTF-8 session/task title (from Base64 `title=`).
+    pub title: Option<String>,
+    /// Decoded UTF-8 status detail message (from Base64 `msg=`).
+    pub msg: Option<String>,
+    /// Optional progress percentage (`0..=100`, from `progress=`).
+    pub progress: Option<u8>,
+    /// Monotonic sequence number for tie-breaking between records of equal priority.
+    pub seq: u64,
+}
+
 /// Terminal state engine combining ScreenGrid and VTE event handlers.
 #[derive(Debug, Clone)]
 pub struct TerminalState {
@@ -92,6 +191,9 @@ pub struct TerminalState {
     pub g0_charset: Charset,
     pub g1_charset: Charset,
     pub active_charset: u8,
+    pub program_statuses: HashMap<String, ProgramStatusRecord>,
+    pub program_status_seq: u64,
+    pub program_status_dirty: bool,
 }
 
 impl TerminalState {
@@ -135,7 +237,20 @@ impl TerminalState {
             g0_charset: Charset::Ascii,
             g1_charset: Charset::Ascii,
             active_charset: 0,
+            program_statuses: HashMap::new(),
+            program_status_seq: 0,
+            program_status_dirty: false,
         }
+    }
+
+    /// Return the highest-priority active OSC 7501 program status record in this terminal.
+    ///
+    /// Priority order: `Blocked > Error > Working > Done > Idle`, with ties broken by the
+    /// most recently updated sequence number (`seq`).
+    pub fn active_program_status(&self) -> Option<&ProgramStatusRecord> {
+        self.program_statuses
+            .values()
+            .max_by_key(|rec| (rec.state.priority(), rec.seq))
     }
 
     pub fn reset_sgr(&mut self) {
@@ -783,6 +898,24 @@ impl Perform for TerminalState {
                     }
                 }
             }
+            b"7501" => {
+                if params.len() > 1 {
+                    let payload_cow: std::borrow::Cow<'_, [u8]> = if params.len() == 2 {
+                        std::borrow::Cow::Borrowed(params[1])
+                    } else {
+                        std::borrow::Cow::Owned(params[1..].join(&b';'))
+                    };
+                    let trimmed = trim_ascii_bytes(&payload_cow);
+                    if trimmed == b"?" {
+                        let resp = format!("\x1b]7501;?{terminator}");
+                        self.pending_responses.extend_from_slice(resp.as_bytes());
+                    } else if let Ok(payload_str) = std::str::from_utf8(trimmed) {
+                        if let Some(parsed) = parse_osc7501_payload(payload_str) {
+                            self.apply_osc7501_update(parsed);
+                        }
+                    }
+                }
+            }
             _ => {
                 // Check Kitty Graphics via OSC or APC
                 if let Ok(cmd) = std::str::from_utf8(params[0]) {
@@ -1401,11 +1534,326 @@ impl Perform for TerminalState {
                 let rows = self.grid.active().rows;
                 let cols = self.grid.active().cols;
                 let max_scroll = self.grid.primary.max_scrollback;
+                let had_status = !self.program_statuses.is_empty();
                 *self = Self::new(rows, cols, max_scroll);
+                self.program_status_dirty = had_status;
             }
             _ => {}
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedOsc7501 {
+    id: Option<String>,
+    state: ProgramStatusState,
+    kind: ProgramStatusKind,
+    app: Option<String>,
+    title: Option<String>,
+    msg: Option<String>,
+    progress: Option<u8>,
+}
+
+impl TerminalState {
+    fn apply_osc7501_update(&mut self, parsed: ParsedOsc7501) {
+        const MAX_PROGRAM_STATUS_RECORDS: usize = 256;
+
+        if parsed.state == ProgramStatusState::Clear {
+            match parsed.id {
+                None => {
+                    if !self.program_statuses.is_empty() {
+                        self.program_statuses.clear();
+                        self.program_status_dirty = true;
+                    }
+                }
+                Some(target_id) => {
+                    let prev_len = self.program_statuses.len();
+                    self.program_statuses.retain(|k, _| {
+                        !(k == &target_id
+                            || (k.starts_with(&target_id)
+                                && k.as_bytes().get(target_id.len()) == Some(&b'/')))
+                    });
+                    if self.program_statuses.len() != prev_len {
+                        self.program_status_dirty = true;
+                    }
+                }
+            }
+            return;
+        }
+
+        let key = parsed.id.clone().unwrap_or_default();
+        self.program_status_seq = self.program_status_seq.wrapping_add(1);
+
+        let inherited_app = parsed.app.or_else(|| self.resolve_inherited_app(&key));
+        let inherited_title = parsed
+            .title
+            .or_else(|| self.program_statuses.get(&key).and_then(|r| r.title.clone()));
+
+        let new_record = ProgramStatusRecord {
+            id: parsed.id,
+            state: parsed.state,
+            kind: if parsed.state == ProgramStatusState::Blocked {
+                parsed.kind
+            } else {
+                ProgramStatusKind::None
+            },
+            app: inherited_app,
+            title: inherited_title,
+            msg: parsed.msg,
+            progress: parsed.progress,
+            seq: self.program_status_seq,
+        };
+
+        let content_changed = match self.program_statuses.get(&key) {
+            Some(existing) => {
+                existing.state != new_record.state
+                    || existing.kind != new_record.kind
+                    || existing.app != new_record.app
+                    || existing.title != new_record.title
+                    || existing.msg != new_record.msg
+                    || existing.progress != new_record.progress
+            }
+            None => true,
+        };
+
+        self.program_statuses.insert(key, new_record);
+        if content_changed {
+            self.program_status_dirty = true;
+        }
+
+        if self.program_statuses.len() > MAX_PROGRAM_STATUS_RECORDS {
+            if let Some(oldest_key) = self
+                .program_statuses
+                .iter()
+                .min_by_key(|(_, rec)| rec.seq)
+                .map(|(k, _)| k.clone())
+            {
+                self.program_statuses.remove(&oldest_key);
+                self.program_status_dirty = true;
+            }
+        }
+    }
+
+    fn resolve_inherited_app(&self, key: &str) -> Option<String> {
+        if let Some(rec) = self.program_statuses.get(key) {
+            if rec.app.is_some() {
+                return rec.app.clone();
+            }
+        }
+        let mut prefix = key;
+        while let Some((parent, _)) = prefix.rsplit_once('/') {
+            if let Some(rec) = self.program_statuses.get(parent) {
+                if rec.app.is_some() {
+                    return rec.app.clone();
+                }
+            }
+            prefix = parent;
+        }
+        if !key.is_empty() {
+            if let Some(rec) = self.program_statuses.get("") {
+                if rec.app.is_some() {
+                    return rec.app.clone();
+                }
+            }
+        }
+        None
+    }
+}
+
+fn trim_ascii_bytes(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |i| i + 1);
+    &bytes[start..end]
+}
+
+fn is_valid_osc7501_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-')
+}
+
+fn validate_osc7501_token(s: &str, max_len: usize) -> bool {
+    !s.is_empty() && s.len() <= max_len && s.bytes().all(is_valid_osc7501_token_byte)
+}
+
+fn validate_osc7501_id(s: &str) -> bool {
+    const MAX_ID_LEN: usize = 128;
+    const MAX_SEGMENTS: usize = 8;
+    const MAX_SEGMENT_LEN: usize = 32;
+
+    if s.is_empty() || s.len() > MAX_ID_LEN {
+        return false;
+    }
+    let mut count = 0;
+    for seg in s.split('/') {
+        count += 1;
+        if count > MAX_SEGMENTS || !validate_osc7501_token(seg, MAX_SEGMENT_LEN) {
+            return false;
+        }
+    }
+    count > 0
+}
+
+fn decode_osc7501_base64_field(
+    encoded: &str,
+    max_encoded_len: usize,
+    max_decoded_len: usize,
+) -> Option<Option<String>> {
+    if encoded.is_empty() {
+        return Some(None);
+    }
+    if encoded.len() > max_encoded_len {
+        return None;
+    }
+
+    // Normalize URL-safe Base64 (`-` -> `+`, `_` -> `/`) and validate alphabet.
+    let mut normalized = Vec::with_capacity(encoded.len() + 2);
+    for b in encoded.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' => normalized.push(b),
+            b'-' => normalized.push(b'+'),
+            b'_' => normalized.push(b'/'),
+            _ => return None,
+        }
+    }
+
+    match normalized.len() % 4 {
+        0 => {}
+        1 => return None,
+        2 => normalized.extend_from_slice(b"=="),
+        3 => normalized.push(b'='),
+        _ => unreachable!(),
+    }
+
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&normalized)
+        .ok()?;
+    if decoded.len() > max_decoded_len {
+        return None;
+    }
+
+    let text = String::from_utf8(decoded).ok()?;
+    // Reject C0 (< 0x20), DEL (0x7f), and C1 (0x80..=0x9f) control characters.
+    if text
+        .chars()
+        .any(|c| (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)))
+    {
+        return None;
+    }
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(trimmed.to_string()))
+    }
+}
+
+fn parse_osc7501_payload(payload: &str) -> Option<ParsedOsc7501> {
+    const MAX_PAYLOAD_LEN: usize = 4087;
+    const MAX_TITLE_ENCODED_LEN: usize = 256;
+    const MAX_TITLE_DECODED_LEN: usize = 192;
+    const MAX_MSG_ENCODED_LEN: usize = 2732;
+    const MAX_MSG_DECODED_LEN: usize = 2048;
+
+    let trimmed = payload.trim_ascii();
+    if trimmed.is_empty() || trimmed.len() > MAX_PAYLOAD_LEN {
+        return None;
+    }
+
+    let mut state: Option<ProgramStatusState> = None;
+    let mut id: Option<String> = None;
+    let mut kind = ProgramStatusKind::None;
+    let mut app: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut msg: Option<String> = None;
+    let mut progress: Option<u8> = None;
+
+    for pair in trimmed.split(':') {
+        let pair = pair.trim_ascii();
+        if pair.is_empty() {
+            return None;
+        }
+        let (raw_key, raw_val) = pair.split_once('=')?;
+        let key = raw_key.trim_ascii();
+        let val = raw_val.trim_ascii();
+        if key.is_empty() {
+            return None;
+        }
+
+        match key {
+            "state" => {
+                state = Some(ProgramStatusState::parse(val)?);
+            }
+            "id" => {
+                if val.is_empty() {
+                    id = None;
+                } else if validate_osc7501_id(val) {
+                    id = Some(val.to_string());
+                } else {
+                    return None;
+                }
+            }
+            "app" => {
+                if val.is_empty() {
+                    app = None;
+                } else if validate_osc7501_token(val, 32) {
+                    app = Some(val.to_string());
+                } else {
+                    return None;
+                }
+            }
+            "kind" => {
+                if val.is_empty() {
+                    kind = ProgramStatusKind::None;
+                } else if validate_osc7501_token(val, 32) {
+                    kind = ProgramStatusKind::parse(val);
+                } else {
+                    return None;
+                }
+            }
+            "title" => {
+                title = decode_osc7501_base64_field(
+                    val,
+                    MAX_TITLE_ENCODED_LEN,
+                    MAX_TITLE_DECODED_LEN,
+                )?;
+            }
+            "msg" => {
+                msg = decode_osc7501_base64_field(val, MAX_MSG_ENCODED_LEN, MAX_MSG_DECODED_LEN)?;
+            }
+            "progress" => {
+                if val.is_empty() {
+                    progress = None;
+                } else {
+                    let num_str = val.strip_suffix('%').unwrap_or(val);
+                    let pct = num_str.parse::<u8>().ok()?;
+                    if pct > 100 {
+                        return None;
+                    }
+                    progress = Some(pct);
+                }
+            }
+            _ => {
+                // Ignore unknown keys for forward compatibility.
+            }
+        }
+    }
+
+    Some(ParsedOsc7501 {
+        id,
+        state: state?,
+        kind,
+        app,
+        title,
+        msg,
+        progress,
+    })
 }
 
 fn format_osc_rgb(r: u8, g: u8, b: u8) -> String {

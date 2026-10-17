@@ -80,6 +80,8 @@ impl App {
             .as_ref()
             .map(|s| s.program.as_str());
 
+        let mut any_program_status_changed = false;
+
         for (id, session) in self.sessions.iter_mut() {
             if session.workspace.has_dead_sessions() {
                 let all_dead = session.workspace.cleanup_dead_sessions();
@@ -97,6 +99,10 @@ impl App {
                 }
                 if outcome.any_output && active_session != Some(*id) {
                     session.mark_unseen_output();
+                }
+                if outcome.program_status_changed {
+                    session.last_tab_label_refresh = None;
+                    any_program_status_changed = true;
                 }
                 if outcome.needs_redraw() {
                     session.request_output_redraw();
@@ -157,6 +163,10 @@ impl App {
             info!("All terminal sessions closed. Exiting skTerm.");
             event_loop.exit();
             return;
+        }
+
+        if any_program_status_changed && self.sidebar_open {
+            self.refresh_agent_cache();
         }
 
         // 3. Debounced config auto-save. This is the only place that writes

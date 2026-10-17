@@ -18,7 +18,10 @@ pub use pty::{
 #[cfg(target_os = "macos")]
 pub use pty::process_cwd;
 pub use terminal::Terminal;
-pub use vt::{Charset, MouseFormat, MouseProtocol, TerminalState};
+pub use vt::{
+    Charset, MouseFormat, MouseProtocol, ProgramStatusKind, ProgramStatusRecord,
+    ProgramStatusState, TerminalState,
+};
 
 /// skterm-core library version and basic info
 pub fn core_info() -> &'static str {
@@ -687,5 +690,112 @@ mod tests {
             });
             assert!(has_cmd, "cmd.exe preset must be present on Windows");
         }
+    }
+
+    #[test]
+    fn test_osc_7501_capability_query_bel_and_st() {
+        let mut term = Terminal::new_headless(24, 80, 100);
+        term.feed_bytes(b"\x1b]7501;?\x07");
+        assert_eq!(term.state.pending_responses, b"\x1b]7501;?\x07");
+
+        term.state.pending_responses.clear();
+        term.feed_bytes(b"\x1b]7501;?\x1b\\");
+        assert_eq!(term.state.pending_responses, b"\x1b]7501;?\x1b\\");
+    }
+
+    #[test]
+    fn test_osc_7501_status_lifecycle_and_base64() {
+        let mut term = Terminal::new_headless(24, 80, 100);
+        assert!(term.active_program_status().is_none());
+        assert!(!term.take_program_status_dirty());
+
+        // "Fix OSC 7501" -> Rml4IE9TQyA3NTAx, "Running tests" -> UnVubmluZyB0ZXN0cw==
+        term.feed_bytes(
+            b"\x1b]7501;state=working:app=agy:title=Rml4IE9TQyA3NTAx:msg=UnVubmluZyB0ZXN0cw==\x07",
+        );
+        assert!(term.take_program_status_dirty());
+        assert!(!term.take_program_status_dirty());
+
+        let status = term.active_program_status().expect("active status");
+        assert_eq!(status.state, ProgramStatusState::Working);
+        assert_eq!(status.kind, ProgramStatusKind::None);
+        assert_eq!(status.app.as_deref(), Some("agy"));
+        assert_eq!(status.title.as_deref(), Some("Fix OSC 7501"));
+        assert_eq!(status.msg.as_deref(), Some("Running tests"));
+
+        // Follow-up update without app/title inherits previous app and title.
+        // "Approve bash" -> QXBwcm92ZSBiYXNo
+        term.feed_bytes(b"\x1b]7501;state=blocked:kind=permission:msg=QXBwcm92ZSBiYXNo\x07");
+        assert!(term.take_program_status_dirty());
+        let status = term.active_program_status().expect("active status");
+        assert_eq!(status.state, ProgramStatusState::Blocked);
+        assert_eq!(status.kind, ProgramStatusKind::Permission);
+        assert_eq!(status.app.as_deref(), Some("agy"));
+        assert_eq!(status.title.as_deref(), Some("Fix OSC 7501"));
+        assert_eq!(status.msg.as_deref(), Some("Approve bash"));
+
+        // Clear all statuses when id is omitted.
+        term.feed_bytes(b"\x1b]7501;state=clear\x07");
+        assert!(term.take_program_status_dirty());
+        assert!(term.active_program_status().is_none());
+    }
+
+    #[test]
+    fn test_osc_7501_multi_id_priority_and_hierarchical_clear() {
+        let mut term = Terminal::new_headless(24, 80, 100);
+        term.feed_bytes(b"\x1b]7501;id=agent-1:state=working:app=agy\x07");
+        // "Answer question" -> QW5zd2VyIHF1ZXN0aW9u
+        term.feed_bytes(
+            b"\x1b]7501;id=agent-1/sub-1:state=blocked:kind=question:msg=QW5zd2VyIHF1ZXN0aW9u\x07",
+        );
+        // "Agent stopped with an error" -> QWdlbnQgc3RvcHBlZCB3aXRoIGFuIGVycm9y
+        term.feed_bytes(
+            b"\x1b]7501;id=agent-2:state=error:app=claude:msg=QWdlbnQgc3RvcHBlZCB3aXRoIGFuIGVycm9y\x07",
+        );
+
+        // Blocked (4) beats Error (3) and Working (2).
+        let active = term.active_program_status().expect("active status");
+        assert_eq!(active.id.as_deref(), Some("agent-1/sub-1"));
+        assert_eq!(active.state, ProgramStatusState::Blocked);
+        assert_eq!(active.kind, ProgramStatusKind::Question);
+
+        // Clearing `id=agent-1` also clears hierarchical descendant `agent-1/sub-1`.
+        term.feed_bytes(b"\x1b]7501;id=agent-1:state=clear\x07");
+        let active = term.active_program_status().expect("remaining status");
+        assert_eq!(active.id.as_deref(), Some("agent-2"));
+        assert_eq!(active.state, ProgramStatusState::Error);
+        assert_eq!(
+            active.msg.as_deref(),
+            Some("Agent stopped with an error")
+        );
+
+        // Full reset (RIS: ESC c) clears all program statuses.
+        term.feed_bytes(b"\x1bc");
+        assert!(term.active_program_status().is_none());
+    }
+
+    #[test]
+    fn test_osc_7501_progress_and_control_char_rejection() {
+        let mut term = Terminal::new_headless(24, 80, 100);
+        term.feed_bytes(b"\x1b]7501;state=working:progress=65%\x07");
+        let active = term.active_program_status().expect("active status");
+        assert_eq!(active.state, ProgramStatusState::Working);
+        assert_eq!(active.progress, Some(65));
+
+        // Base64 for "bad\x1btitle" -> YmFkG3RpdGxl (contains ESC 0x1b control character).
+        // The entire malformed OSC 7501 message is rejected without corrupting existing state.
+        term.feed_bytes(b"\x1b]7501;state=done:title=YmFkG3RpdGxl\x07");
+        let active = term.active_program_status().expect("active status");
+        assert_eq!(active.state, ProgramStatusState::Working);
+        assert!(
+            active.title.is_none(),
+            "Base64 payload containing control characters must be rejected"
+        );
+
+        // Out-of-range progress (> 100) is also rejected without overwriting existing state.
+        term.feed_bytes(b"\x1b]7501;state=done:progress=120\x07");
+        let active = term.active_program_status().expect("active status");
+        assert_eq!(active.state, ProgramStatusState::Working);
+        assert_eq!(active.progress, Some(65));
     }
 }

@@ -281,6 +281,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // will flip the flag again and schedule another wakeup, so nothing is lost.
                 self.pty_wakeup_pending.store(false, Ordering::Release);
                 let active_session = self.active_session_id;
+                let mut any_program_status_changed = false;
                 for (id, session) in self.sessions.iter_mut() {
                     let outcome = session.workspace.poll_all_ptys();
                     if outcome.any_output {
@@ -288,6 +289,10 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     if outcome.any_output && active_session != Some(*id) {
                         session.mark_unseen_output();
+                    }
+                    if outcome.program_status_changed {
+                        session.last_tab_label_refresh = None;
+                        any_program_status_changed = true;
                     }
                     // Only repaint if something visible changed. Output in a
                     // background tab updates that tab's buffer and activity dot
@@ -299,6 +304,9 @@ impl ApplicationHandler<AppEvent> for App {
                     if outcome.needs_redraw() {
                         session.request_output_redraw();
                     }
+                }
+                if any_program_status_changed {
+                    self.last_ai_agent_scan = None;
                 }
             }
             // Nothing to do here: waking the loop is the whole point, and

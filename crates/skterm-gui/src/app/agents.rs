@@ -337,6 +337,8 @@ mod tests {
             title_summary: String::new(),
             is_active_output: false,
             is_focused: false,
+            status: skterm_render::AgentStatus::Idle,
+            status_message: None,
         }
     }
 
@@ -562,6 +564,59 @@ mod tests {
             ProcessTreeCache::match_agent_command("jetski-sidecar --port 9000"),
             None
         );
+    }
+
+    #[test]
+    fn scan_ai_agents_integrates_osc_7501_status_and_titles() {
+        use crate::layout::{ProcessTreeCache, Workspace};
+        use skterm_render::AgentStatus;
+
+        let mut ws = Workspace::new_headless(24, 80);
+        let mut cache = ProcessTreeCache::new();
+        // Pre-populate last_refresh so the unit test doesn't spawn `ps` in the background.
+        let _ = &mut cache;
+
+        let term = ws.tabs[0].active_terminal_mut().expect("active terminal");
+        // Emit OSC 7501 working status for `app=agy` with Base64 title "Fix OSC 7501"
+        // and Base64 msg "Running cargo test" (UnVubmluZyBjYXJnbyB0ZXN0)
+        term.feed_bytes(
+            b"\x1b]7501;state=working:app=agy:title=Rml4IE9TQyA3NTAx:msg=UnVubmluZyBjYXJnbyB0ZXN0\x07",
+        );
+
+        let scanned = ws.scan_ai_agents(&mut cache);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].agent_name, "Antigravity CLI");
+        assert_eq!(scanned[0].title_summary, "Fix OSC 7501");
+        assert_eq!(scanned[0].status, AgentStatus::Working);
+        assert_eq!(
+            scanned[0].status_message.as_deref(),
+            Some("Running cargo test")
+        );
+        assert_eq!(scanned[0].status_display(), "Running cargo test");
+        assert!(scanned[0].is_active_output);
+
+        // Transition to blocked with kind=permission and msg="Approve bash" (QXBwcm92ZSBiYXNo)
+        let term = ws.tabs[0].active_terminal_mut().expect("active terminal");
+        term.feed_bytes(b"\x1b]7501;state=blocked:kind=permission:msg=QXBwcm92ZSBiYXNo\x07");
+
+        let scanned = ws.scan_ai_agents(&mut cache);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].status, AgentStatus::NeedsPermission);
+        assert!(scanned[0].status.is_blocked());
+        assert_eq!(scanned[0].status_display(), "Approve bash");
+        assert!(!scanned[0].is_active_output);
+
+        // User custom_label overrides OSC 7501 title
+        let term = ws.tabs[0].active_terminal_mut().expect("active terminal");
+        term.custom_label = Some("My Custom Task".to_string());
+        let scanned = ws.scan_ai_agents(&mut cache);
+        assert_eq!(scanned[0].title_summary, "My Custom Task");
+
+        // Clearing OSC 7501 status removes the headless pane from the agent list
+        let term = ws.tabs[0].active_terminal_mut().expect("active terminal");
+        term.feed_bytes(b"\x1b]7501;state=clear\x07");
+        let scanned = ws.scan_ai_agents(&mut cache);
+        assert!(scanned.is_empty());
     }
 
     #[cfg(target_os = "linux")]

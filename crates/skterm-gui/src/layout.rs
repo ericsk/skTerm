@@ -435,6 +435,17 @@ impl PaneNode {
         }
     }
 
+    pub fn take_program_status_dirty(&mut self) -> bool {
+        match self {
+            PaneNode::Leaf { terminal, .. } => terminal.take_program_status_dirty(),
+            PaneNode::Split { first, second, .. } => {
+                let d1 = first.take_program_status_dirty();
+                let d2 = second.take_program_status_dirty();
+                d1 || d2
+            }
+        }
+    }
+
     pub fn update_cursor_shape(&mut self, shape: CursorShape) {
         match self {
             PaneNode::Leaf { terminal, .. } => {
@@ -690,6 +701,9 @@ pub struct PollOutcome {
     /// Any pane at all produced output, visible or not. Used for window-level
     /// activity tracking, not for deciding whether to repaint.
     pub any_output: bool,
+    /// An OSC 7501 program status record changed in any pane, so the global AI Agents
+    /// sidebar and tab/window titles should refresh immediately.
+    pub program_status_changed: bool,
 }
 
 impl PollOutcome {
@@ -743,6 +757,28 @@ impl Workspace {
             next_tab_id,
             next_pane_id,
         })
+    }
+
+    #[cfg(test)]
+    pub fn new_headless(rows: usize, cols: usize) -> Self {
+        let terminal = Terminal::new_headless(rows, cols, 100);
+        let tab = Tab {
+            id: 1,
+            title: "Tab 1".to_string(),
+            root: PaneNode::Leaf { id: 1, terminal },
+            active_pane_id: 1,
+            zoomed_pane_id: None,
+            next_split_id: 1,
+            has_unseen_output: false,
+        };
+        Self {
+            tabs: vec![tab],
+            active_tab_idx: 0,
+            sidebar_open: false,
+            sidebar_width: 220.0,
+            next_tab_id: 2,
+            next_pane_id: 2,
+        }
     }
 
     pub fn active_tab(&self) -> Option<&Tab> {
@@ -967,6 +1003,9 @@ impl Workspace {
         for (idx, tab) in self.tabs.iter_mut().enumerate() {
             if tab.root.poll_all_ptys() {
                 outcome.any_output = true;
+                if tab.root.take_program_status_dirty() {
+                    outcome.program_status_changed = true;
+                }
                 if idx == active_idx {
                     outcome.active_tab_dirty = true;
                 } else if !tab.has_unseen_output {
@@ -1133,6 +1172,20 @@ impl Workspace {
                     }
                 }
 
+                let osc_status = terminal.active_program_status();
+
+                if found_agent.is_none() {
+                    if let Some(rec) = osc_status {
+                        if let Some(ref app) = rec.app {
+                            let pid = terminal
+                                .foreground_process_group_id()
+                                .or(shell_pid)
+                                .unwrap_or(0);
+                            found_agent = Some((pid, osc7501_app_to_agent_name(app)));
+                        }
+                    }
+                }
+
                 if found_agent.is_none() {
                     let title_lower = terminal.state.title.to_lowercase();
                     if title_lower.contains("jetski") {
@@ -1153,6 +1206,16 @@ impl Workspace {
                     } else if title_lower.contains("codex") {
                         let pid = shell_pid.unwrap_or(0);
                         found_agent = Some((pid, "Codex CLI".to_string()));
+                    } else if osc_status.is_some() {
+                        let pid = terminal
+                            .foreground_process_group_id()
+                            .or(shell_pid)
+                            .unwrap_or(0);
+                        let fallback_name = terminal
+                            .foreground_process_name()
+                            .filter(|n| !n.trim().is_empty())
+                            .unwrap_or_else(|| "AI Agent".to_string());
+                        found_agent = Some((pid, fallback_name));
                     }
                 }
 
@@ -1178,16 +1241,19 @@ impl Workspace {
                     }
 
                     let location_label = format!("Tab {} · #{}", tab_idx + 1, pane_id);
-                    let title_summary = if let Some(ref custom) = terminal.custom_label {
-                        if !custom.trim().is_empty() {
-                            custom.clone()
-                        } else if terminal.state.title != "skTerm"
-                            && !terminal.state.title.is_empty()
-                        {
-                            terminal.state.title.clone()
-                        } else {
-                            "Double-click to name...".to_string()
-                        }
+                    let osc7501_title = osc_status
+                        .and_then(|r| r.title.as_deref())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let title_summary = if let Some(custom) = terminal
+                        .custom_label
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        custom.to_string()
+                    } else if let Some(osc_t) = osc7501_title {
+                        osc_t.to_string()
                     } else if terminal.state.title != "skTerm" && !terminal.state.title.is_empty() {
                         terminal.state.title.clone()
                     } else {
@@ -1197,6 +1263,22 @@ impl Workspace {
                     let is_focused =
                         tab_idx == self.active_tab_idx && tab.active_pane_id == pane_id;
 
+                    let (status, status_message, is_active_output) = if let Some(rec) = osc_status {
+                        let st = skterm_render::AgentStatus::from_program_status(rec);
+                        let msg = rec
+                            .msg
+                            .clone()
+                            .or_else(|| rec.progress.map(|p| format!("{} ({p}%)", st.label())));
+                        let active = rec.state == skterm_core::ProgramStatusState::Working;
+                        (st, msg, active)
+                    } else {
+                        (
+                            skterm_render::AgentStatus::Idle,
+                            None,
+                            terminal.is_active_output(),
+                        )
+                    };
+
                     items.push(skterm_render::AgentSidebarItem {
                         tab_id: tab.id,
                         pane_id,
@@ -1204,14 +1286,36 @@ impl Workspace {
                         project_name,
                         location_label,
                         title_summary,
-                        is_active_output: terminal.is_active_output(),
+                        is_active_output,
                         is_focused,
+                        status,
+                        status_message,
                     });
                 }
             }
         }
 
         items
+    }
+}
+
+/// Map an `OSC 7501` `app=...` identifier to its canonical display name in the AI Agents sidebar.
+pub fn osc7501_app_to_agent_name(app: &str) -> String {
+    match app.trim().to_ascii_lowercase().as_str() {
+        "agy" | "antigravity" | "antigravity-cli" => "Antigravity CLI".to_string(),
+        "jetski" => "Jetski".to_string(),
+        "claude" | "claude-code" => "Claude Code".to_string(),
+        "gemini" | "gemini-cli" => "Gemini CLI".to_string(),
+        "codex" | "codex-cli" => "Codex CLI".to_string(),
+        "aider" => "Aider".to_string(),
+        other if !other.is_empty() => {
+            if let Some(brand) = ProcessTreeCache::match_agent_command(other) {
+                brand.to_string()
+            } else {
+                app.trim().to_string()
+            }
+        }
+        _ => "AI Agent".to_string(),
     }
 }
 

@@ -262,8 +262,18 @@ impl Terminal {
         self.state.pending_clipboard.take()
     }
 
-    /// Take any pending VT device query responses (DA1, DA2, DSR, CPR, DECRQM, OSC 10/11/12, Kitty `a=q`).
+    /// Take any pending VT device query responses (DA1, DA2, DSR, CPR, DECRQM, OSC 10/11/12, OSC 7501, Kitty `a=q`).
     pub fn take_pending_responses(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.state.pending_responses)
+    }
+
+    /// Return the highest-priority active OSC 7501 program status record in this terminal, if any.
+    pub fn active_program_status(&self) -> Option<&crate::vt::ProgramStatusRecord> {
+        self.state.active_program_status()
+    }
+
+    /// Take and clear the `program_status_dirty` flag indicating that an OSC 7501 status record changed.
+    pub fn take_program_status_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.state.program_status_dirty, false)
     }
 }

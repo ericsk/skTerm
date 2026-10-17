@@ -277,6 +277,83 @@ pub struct TabItem {
     pub is_active: bool,
 }
 
+/// Lifecycle status of an AI Agent displayed in the global agents sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentStatus {
+    /// Idle / waiting for user prompt (Warm Yellow indicator).
+    #[default]
+    Idle,
+    /// Actively working / generating output (Emerald Green indicator).
+    Working,
+    /// Task finished (`OSC 7501` `state=done`, Sky Cyan indicator).
+    Done,
+    /// Blocked waiting for user input (`OSC 7501` `state=blocked`, Amber indicator).
+    NeedsInput,
+    /// Blocked waiting for tool/action permission (`OSC 7501` `state=blocked:kind=permission`, Amber indicator).
+    NeedsPermission,
+    /// Blocked waiting for user to answer a question (`OSC 7501` `state=blocked:kind=question`, Amber indicator).
+    NeedsAnswer,
+    /// Blocked waiting for authentication (`OSC 7501` `state=blocked:kind=auth`, Amber indicator).
+    NeedsSignIn,
+    /// Stopped with an error (`OSC 7501` `state=error`, Crimson Red indicator).
+    Error,
+}
+
+impl AgentStatus {
+    /// Map an [`skterm_core::ProgramStatusRecord`] to its sidebar [`AgentStatus`].
+    pub fn from_program_status(rec: &skterm_core::ProgramStatusRecord) -> Self {
+        use skterm_core::{ProgramStatusKind, ProgramStatusState};
+        match rec.state {
+            ProgramStatusState::Working => Self::Working,
+            ProgramStatusState::Done => Self::Done,
+            ProgramStatusState::Blocked => match rec.kind {
+                ProgramStatusKind::Permission => Self::NeedsPermission,
+                ProgramStatusKind::Question => Self::NeedsAnswer,
+                ProgramStatusKind::Auth => Self::NeedsSignIn,
+                ProgramStatusKind::None => Self::NeedsInput,
+            },
+            ProgramStatusState::Error => Self::Error,
+            ProgramStatusState::Idle | ProgramStatusState::Clear => Self::Idle,
+        }
+    }
+
+    /// Short human-readable status label when no custom `status_message` is provided.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Working => "Working",
+            Self::Done => "Done",
+            Self::NeedsPermission => "Needs permission",
+            Self::NeedsAnswer => "Needs answer",
+            Self::NeedsSignIn => "Needs sign-in",
+            Self::NeedsInput => "Needs input",
+            Self::Error => "Error",
+            Self::Idle => "Idle",
+        }
+    }
+
+    /// True if the agent is blocked waiting on user interaction.
+    pub fn is_blocked(self) -> bool {
+        matches!(
+            self,
+            Self::NeedsInput | Self::NeedsPermission | Self::NeedsAnswer | Self::NeedsSignIn
+        )
+    }
+
+    /// Status indicator dot RGBA color.
+    pub fn dot_color(self) -> [f32; 4] {
+        match self {
+            Self::Working => [0.18, 0.88, 0.46, 1.0],
+            Self::Done => [0.28, 0.78, 0.96, 1.0],
+            Self::NeedsInput
+            | Self::NeedsPermission
+            | Self::NeedsAnswer
+            | Self::NeedsSignIn => [1.0, 0.62, 0.18, 1.0],
+            Self::Error => [0.96, 0.32, 0.34, 1.0],
+            Self::Idle => [0.96, 0.76, 0.22, 1.0],
+        }
+    }
+}
+
 /// Render descriptor for an AI Agent item in the global agents panel
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSidebarItem {
@@ -288,6 +365,43 @@ pub struct AgentSidebarItem {
     pub title_summary: String,
     pub is_active_output: bool,
     pub is_focused: bool,
+    pub status: AgentStatus,
+    pub status_message: Option<String>,
+}
+
+impl AgentSidebarItem {
+    /// Indicator dot color for this agent card, taking both `status` and `is_active_output` into account.
+    pub fn dot_color(&self) -> [f32; 4] {
+        if self.status != AgentStatus::Idle {
+            self.status.dot_color()
+        } else if self.is_active_output {
+            AgentStatus::Working.dot_color()
+        } else {
+            AgentStatus::Idle.dot_color()
+        }
+    }
+
+    /// Formatted status string for the bottom subtitle line of the sidebar card.
+    pub fn status_display(&self) -> String {
+        if let Some(ref msg) = self.status_message {
+            let trimmed = msg.trim();
+            if !trimmed.is_empty() {
+                if self.status == AgentStatus::Error
+                    && !trimmed.to_ascii_lowercase().contains("error")
+                {
+                    return format!("Error: {trimmed}");
+                }
+                return trimmed.to_string();
+            }
+        }
+        if self.status != AgentStatus::Idle {
+            self.status.label().to_string()
+        } else if self.is_active_output {
+            "Running".to_string()
+        } else {
+            "Idle".to_string()
+        }
+    }
 }
 
 /// Everything the renderer needs to draw the global AI agents panel.
@@ -977,14 +1091,24 @@ impl TermRenderer {
         // Small active-agent indicator dot in top-right corner of [AI] button
         if !state.agents.is_empty() {
             let dot = (4.5 * scale).round().max(3.0);
-            let any_running = state.agents.iter().any(|a| a.is_active_output);
+            let dot_color = if state.agents.iter().any(|a| a.status.is_blocked()) {
+                AgentStatus::NeedsInput.dot_color()
+            } else if state.agents.iter().any(|a| a.status == AgentStatus::Error) {
+                AgentStatus::Error.dot_color()
+            } else if state
+                .agents
+                .iter()
+                .any(|a| a.status == AgentStatus::Working || a.is_active_output)
+            {
+                AgentStatus::Working.dot_color()
+            } else if state.agents.iter().any(|a| a.status == AgentStatus::Done) {
+                AgentStatus::Done.dot_color()
+            } else {
+                AgentStatus::Idle.dot_color()
+            };
             bg.push(BgInstance {
                 rect: [ax + aw - dot - 2.0 * scale, ay_btn + 2.0 * scale, dot, dot],
-                color: if any_running {
-                    [0.18, 0.88, 0.46, 1.0]
-                } else {
-                    [0.96, 0.76, 0.22, 1.0]
-                },
+                color: dot_color,
             });
         }
 
@@ -1255,17 +1379,13 @@ impl TermRenderer {
                 });
             }
 
-            // Status dot (Green = Active/Thinking, Yellow = Waiting/Idle)
+            // Status dot (Green = Working/Running, Amber = Blocked/Needs Action, Red = Error, Cyan = Done, Yellow = Idle)
             let dot_size = 7.0 * scale;
             let dot_x = card.x + 10.0 * scale;
             let dot_y = cy + 9.0 * scale + (cell_h - dot_size) / 2.0;
             bg.push(BgInstance {
                 rect: [dot_x, dot_y, dot_size, dot_size],
-                color: if item.is_active_output {
-                    [0.18, 0.88, 0.46, 1.0]
-                } else {
-                    [0.96, 0.76, 0.22, 1.0]
-                },
+                color: item.dot_color(),
             });
 
             // Location pill ("Tab 2 · #3"): says which tab owns this agent, so a
@@ -1295,11 +1415,7 @@ impl TermRenderer {
 
             let has_custom_task =
                 !item.title_summary.is_empty() && item.title_summary != "Double-click to name...";
-            let status_str = if item.is_active_output {
-                "Running"
-            } else {
-                "Idle"
-            };
+            let status_str = item.status_display();
             let (top_title, bottom_subtitle) = if has_custom_task {
                 (
                     item.title_summary.as_str(),
@@ -1334,13 +1450,20 @@ impl TermRenderer {
                 false,
             );
             // Line 3: agent type • status
+            let subtitle_color = if item.status.is_blocked() {
+                [0.98, 0.78, 0.42, 0.95]
+            } else if item.status == AgentStatus::Error {
+                [0.98, 0.52, 0.54, 0.95]
+            } else {
+                [0.58, 0.63, 0.72, 0.88]
+            };
             self.draw_text_line(
                 glyphs,
                 &bottom_subtitle,
                 card.x + 10.0 * scale,
                 cy + 46.0 * scale,
                 card.w - 16.0 * scale,
-                [0.58, 0.63, 0.72, 0.88],
+                subtitle_color,
                 false,
             );
         }

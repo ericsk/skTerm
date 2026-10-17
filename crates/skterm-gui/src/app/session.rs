@@ -216,6 +216,11 @@ impl TerminalSession {
                 let process = terminal.foreground_process_name();
                 let cmdline = terminal.foreground_process_cmdline();
                 let cwd = terminal.current_working_directory();
+                let osc7501_status = terminal.active_program_status().cloned();
+                let osc7501_agent_brand = osc7501_status
+                    .as_ref()
+                    .and_then(|rec| rec.app.as_deref())
+                    .map(crate::layout::osc7501_app_to_agent_name);
                 let descendant_agent = terminal
                     .foreground_process_group_id()
                     .and_then(|pid| {
@@ -229,7 +234,8 @@ impl TerminalSession {
                                 .find_agent_descendant(pid)
                                 .map(|(_, name)| name)
                         })
-                    });
+                    })
+                    .or(osc7501_agent_brand.as_deref());
 
                 // Clear stale OSC titles left behind by an exited foreground program
                 // once the terminal returns to an idle shell prompt with a known CWD.
@@ -240,9 +246,19 @@ impl TerminalSession {
                     &terminal.state.title,
                     configured_shell,
                 );
-                if running_prog.is_none() && cwd.is_some() && terminal.state.title != "skTerm" {
+                if running_prog.is_none()
+                    && osc7501_status.is_none()
+                    && cwd.is_some()
+                    && terminal.state.title != "skTerm"
+                {
                     terminal.state.title = "skTerm".to_string();
                 }
+
+                let effective_osc_title = osc7501_status
+                    .as_ref()
+                    .and_then(|rec| rec.title.as_deref())
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or(&terminal.state.title);
 
                 let fallback = format!("Tab {}", idx + 1);
                 let label = crate::tab_title::build_tab_label(
@@ -253,7 +269,7 @@ impl TerminalSession {
                     cwd.as_deref(),
                     home.as_deref(),
                     configured_shell,
-                    &terminal.state.title,
+                    effective_osc_title,
                     &fallback,
                 );
                 let win_title = if idx == active_idx {
@@ -265,7 +281,7 @@ impl TerminalSession {
                         cwd.as_deref(),
                         home.as_deref(),
                         configured_shell,
-                        &terminal.state.title,
+                        effective_osc_title,
                     ))
                 } else {
                     None
