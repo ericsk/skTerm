@@ -265,6 +265,7 @@ pub struct GlyphAtlas {
 
 const SYSTEM_CJK_CANDIDATES: &[&str] = &[
     // macOS
+    "/System/Library/Fonts/Menlo.ttc",
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/STHeiti Medium.ttc",
     "/System/Library/Fonts/STHeiti Light.ttc",
@@ -446,18 +447,19 @@ impl GlyphAtlas {
             let path = SYSTEM_CJK_CANDIDATES[self.system_fallback_cursor];
             self.system_fallback_cursor += 1;
             if let Ok(bytes) = std::fs::read(path) {
-                let companion_bold = if path.ends_with("Hiragino Sans GB.ttc") {
-                    FontFace::from_bytes(
-                        bytes.clone(),
-                        FontSettings {
-                            collection_index: 1,
-                            ..Default::default()
-                        },
-                    )
-                    .ok()
-                } else {
-                    None
-                };
+                let companion_bold =
+                    if path.ends_with("Hiragino Sans GB.ttc") || path.ends_with("Menlo.ttc") {
+                        FontFace::from_bytes(
+                            bytes.clone(),
+                            FontSettings {
+                                collection_index: 1,
+                                ..Default::default()
+                            },
+                        )
+                        .ok()
+                    } else {
+                        None
+                    };
                 if let Ok(regular) = FontFace::from_bytes(bytes, FontSettings::default()) {
                     info!("Loaded system CJK fallback font: {}", path);
                     let bold = companion_bold.or_else(|| regular.with_weight(BOLD_WEIGHT));
@@ -498,19 +500,83 @@ impl GlyphAtlas {
         };
 
         let (metrics, bitmap) = if primary.lookup_glyph_index(c) != 0 {
-            primary.rasterize(c, self.font_size)
+            rasterize_fitted_glyph(primary, c, self.font_size, self.cell_width, self.cell_height)
         } else {
-            // 2. Check already-loaded fallback chain (selecting Bold face when `is_bold` is true)
+            let target_cells = unicode_width::UnicodeWidthChar::width(c)
+                .unwrap_or(1)
+                .max(1);
             let mut found = None;
-            for fallback in &self.fallback_fonts {
-                let face = if is_bold {
-                    fallback.bold.as_ref().unwrap_or(&fallback.regular)
-                } else {
-                    &fallback.regular
-                };
-                if face.lookup_glyph_index(c) != 0 {
-                    found = Some(face.rasterize(c, self.font_size));
-                    break;
+
+            // For single-cell characters (e.g. `⌘`, `⇧`, `⌥`, `⌃`, `↩`), prefer a fallback
+            // font whose glyph is natively single-cell (`advance_width <= cell_width * 1.25`)
+            // over a CJK font where the same codepoint is drawn as a 2-cell full-width glyph.
+            if target_cells == 1 {
+                for fallback in &self.fallback_fonts {
+                    let face = if is_bold {
+                        fallback.bold.as_ref().unwrap_or(&fallback.regular)
+                    } else {
+                        &fallback.regular
+                    };
+                    if face.lookup_glyph_index(c) != 0 {
+                        let m = face.metrics(c, self.font_size);
+                        if m.advance_width <= self.cell_width * 1.25 {
+                            found = Some(rasterize_fitted_glyph(
+                                face,
+                                c,
+                                self.font_size,
+                                self.cell_width,
+                                self.cell_height,
+                            ));
+                            break;
+                        }
+                    }
+                }
+
+                // If no configured fallback had a native 1-cell glyph, also check the first
+                // system monospace fallback (e.g. Menlo.ttc on macOS) before accepting a
+                // 2-cell CJK glyph.
+                if found.is_none() && self.system_fallback_cursor == 0 {
+                    if let Some(idx) = self.load_next_system_fallback() {
+                        let fallback = &self.fallback_fonts[idx];
+                        let face = if is_bold {
+                            fallback.bold.as_ref().unwrap_or(&fallback.regular)
+                        } else {
+                            &fallback.regular
+                        };
+                        if face.lookup_glyph_index(c) != 0 {
+                            let m = face.metrics(c, self.font_size);
+                            if m.advance_width <= self.cell_width * 1.25 {
+                                found = Some(rasterize_fitted_glyph(
+                                    face,
+                                    c,
+                                    self.font_size,
+                                    self.cell_width,
+                                    self.cell_height,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Check already-loaded fallback chain (selecting Bold face when `is_bold` is true)
+            if found.is_none() {
+                for fallback in &self.fallback_fonts {
+                    let face = if is_bold {
+                        fallback.bold.as_ref().unwrap_or(&fallback.regular)
+                    } else {
+                        &fallback.regular
+                    };
+                    if face.lookup_glyph_index(c) != 0 {
+                        found = Some(rasterize_fitted_glyph(
+                            face,
+                            c,
+                            self.font_size,
+                            self.cell_width,
+                            self.cell_height,
+                        ));
+                        break;
+                    }
                 }
             }
 
@@ -526,7 +592,13 @@ impl GlyphAtlas {
                     &fallback.regular
                 };
                 if face.lookup_glyph_index(c) != 0 {
-                    found = Some(face.rasterize(c, self.font_size));
+                    found = Some(rasterize_fitted_glyph(
+                        face,
+                        c,
+                        self.font_size,
+                        self.cell_width,
+                        self.cell_height,
+                    ));
                 }
             }
 
@@ -615,6 +687,106 @@ impl GlyphAtlas {
         self.cache.insert(key, info);
         Some(info)
     }
+}
+
+/// Rasterize `c` using `face` at `font_size`, fitting and centering the glyph
+/// within its allocated terminal cell width (`unicode_width(c) * cell_width`)
+/// when the font's glyph metrics exceed the cell bounds (e.g., 1-cell modifier
+/// symbols like `⌘`, `⇧`, `⌥`, `⌃`, `↩` rasterized from a full-width CJK fallback
+/// font or a wide symbol glyph).
+pub fn rasterize_fitted_glyph(
+    face: &FontFace,
+    c: char,
+    font_size: f32,
+    cell_width: f32,
+    cell_height: f32,
+) -> (fontdue::Metrics, Vec<u8>) {
+    let (mut metrics, mut bitmap) = face.rasterize(c, font_size);
+    if c.is_ascii() || metrics.width == 0 || metrics.height == 0 || cell_width <= 0.0 {
+        return (metrics, bitmap);
+    }
+
+    let target_cells = unicode_width::UnicodeWidthChar::width(c)
+        .unwrap_or(1)
+        .max(1) as f32;
+    let allocated_width = (cell_width * target_cells).max(1.0);
+
+    let orig_w = metrics.width as f32;
+    let orig_h = metrics.height as f32;
+    let orig_xmin = metrics.xmin as f32;
+    let orig_ymin = metrics.ymin as f32;
+    let orig_advance = metrics.advance_width;
+    let orig_center_y = orig_ymin + orig_h * 0.5;
+
+    let advance_overflows = orig_advance > allocated_width * 1.05;
+
+    // Glyphs authored for a single-cell monospace advance box (such as MesloLGS NF,
+    // Menlo, Nerd Font icons, and Powerline seam triangles like U+E0B0/U+E0B2 which
+    // intentionally overhang cell edges by ~1px to form gapless diamonds/ribbons)
+    // must keep their exact native bitmap and bearings untouched.
+    if !advance_overflows && orig_w <= allocated_width * 1.15 {
+        return (metrics, bitmap);
+    }
+
+    // Allow symbols from wider fallback fonts (e.g. 2-cell CJK fonts) to use the
+    // cell width minus a 1px separation margin so scaled symbols remain legible
+    // without colliding with adjacent cells.
+    let side_pad = if allocated_width >= 8.0 { 0.5 } else { 0.0 };
+    let max_ink_w = (allocated_width - 2.0 * side_pad).max(1.0);
+    let max_ink_h = (cell_height - 2.0).max(1.0);
+
+    let width_overflows = orig_w > max_ink_w;
+    let height_overflows = orig_h > max_ink_h;
+
+    if width_overflows || height_overflows {
+        let scale_w = if orig_w > max_ink_w {
+            max_ink_w / orig_w
+        } else {
+            1.0
+        };
+        let scale_h = if orig_h > max_ink_h {
+            max_ink_h / orig_h
+        } else {
+            1.0
+        };
+        let scale = scale_w.min(scale_h).clamp(0.35, 1.0);
+
+        if scale < 0.99 {
+            let mut scaled_px = (font_size * scale).max(4.0);
+            // When scaling a Variable Font down to fit a narrower cell, compensate its
+            // `wght` axis inversely so stroke thickness and brightness are preserved.
+            let weighted_face = face
+                .variable_weight()
+                .and_then(|w| face.with_weight((w / scale).clamp(w, 900.0)));
+            let raster_face = weighted_face.as_ref().unwrap_or(face);
+
+            let (mut sm, mut sb) = raster_face.rasterize(c, scaled_px);
+
+            // Guard against integer grid-fitting rounding the rasterized width 1px over `max_ink_w`
+            if sm.width as f32 > max_ink_w.ceil() && sm.width > 1 {
+                scaled_px = (scaled_px * (max_ink_w / sm.width as f32)).max(4.0);
+                let (sm2, sb2) = raster_face.rasterize(c, scaled_px);
+                if sm2.width > 0 && sm2.height > 0 {
+                    sm = sm2;
+                    sb = sb2;
+                }
+            }
+
+            if sm.width > 0 && sm.height > 0 {
+                metrics = sm;
+                bitmap = sb;
+                metrics.ymin = (orig_center_y - (metrics.height as f32) * 0.5).round() as i32;
+            }
+        }
+
+        metrics.xmin = ((allocated_width - metrics.width as f32) * 0.5).round() as i32;
+    } else if advance_overflows || orig_xmin < 0.0 || (orig_xmin + orig_w) > allocated_width {
+        // Glyph ink already fits within `max_ink_w`, but its advance box or horizontal
+        // bearing was authored for a wider cell; center it inside its allocated cell(s).
+        metrics.xmin = ((allocated_width - orig_w) * 0.5).round() as i32;
+    }
+
+    (metrics, bitmap)
 }
 
 fn clean_name(s: &str) -> String {
@@ -933,11 +1105,28 @@ pub fn find_font_file(query: &str) -> Option<(FontFace, PathBuf)> {
 ///    file, checks if a Variable Font candidate for `query` exists and loads it at `wght = 700`.
 fn load_bold_companion(query: &str, regular_face: &FontFace) -> Option<FontFace> {
     let clean_q = clean_name(query);
-    if clean_q == "menlo" || clean_q == "monaco" {
+    if clean_q == "menlo" {
+        if let Some(path) = direct_candidate("menlo") {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(face) = FontFace::from_bytes(
+                    bytes,
+                    FontSettings {
+                        collection_index: 1,
+                        ..Default::default()
+                    },
+                ) {
+                    return Some(face);
+                }
+            }
+        }
+        return None;
+    }
+    if clean_q == "monaco" {
         return None;
     }
 
-    let bold_query = format!("{}Bold", query);
+    let base_q = family_of(query.trim());
+    let bold_query = format!("{}Bold", base_q);
     if let Some((b_font, _)) = find_font_file(&bold_query) {
         return Some(b_font);
     }
@@ -1000,6 +1189,7 @@ pub fn is_terminal_friendly_font(family: &str) -> bool {
         "consolas",
         "courier",
         "menlo",
+        "meslo",
         "monaco",
         "cascadia",
         "jetbrains",
@@ -1064,6 +1254,20 @@ fn family_of(stem: &str) -> String {
             break;
         }
     }
+    // Handle space-separated style suffixes (e.g. "MesloLGS NF Regular" -> "MesloLGS NF",
+    // "MesloLGS NF Bold Italic" -> "MesloLGS NF").
+    while let Some((head, tail)) = current.rsplit_once(' ') {
+        let clean_tail = clean_name(tail);
+        let is_style = clean_tail == "regular"
+            || clean_tail == "roman"
+            || clean_tail == "book"
+            || STYLE_TOKENS.iter().any(|t| clean_tail == *t);
+        if is_style && !head.is_empty() {
+            current = head;
+        } else {
+            break;
+        }
+    }
     current.to_string()
 }
 
@@ -1107,11 +1311,12 @@ pub fn load_configured_font_chain(
                 // Query italic/oblique variants if not a single-file TTC like Menlo
                 let clean_q = clean_name(q);
                 if clean_q != "menlo" && clean_q != "monaco" {
-                    let italic_query = format!("{}Italic", q);
+                    let base_q = family_of(q.trim());
+                    let italic_query = format!("{}Italic", base_q);
                     if let Some((i_font, _)) = find_font_file(&italic_query) {
                         italic_font = Some(i_font);
                     } else {
-                        let oblique_query = format!("{}Oblique", q);
+                        let oblique_query = format!("{}Oblique", base_q);
                         if let Some((o_font, _)) = find_font_file(&oblique_query) {
                             italic_font = Some(o_font);
                         }
@@ -1300,6 +1505,8 @@ mod tests {
         assert_eq!(family_of("Courier_New_Bold_Italic"), "Courier_New");
         assert_eq!(family_of("Times_New_Roman_Bold"), "Times_New_Roman");
         assert_eq!(family_of("Andale_Mono"), "Andale_Mono");
+        assert_eq!(family_of("MesloLGS NF Regular"), "MesloLGS NF");
+        assert_eq!(family_of("MesloLGS NF Bold Italic"), "MesloLGS NF");
         // ...but a dash that is part of the name itself must survive, otherwise
         // the family would be truncated to something that resolves elsewhere.
         assert_eq!(family_of("Andale Mono"), "Andale Mono");
@@ -1401,6 +1608,183 @@ mod tests {
                 !fallbacks.is_empty() && fallbacks[0].bold.is_some(),
                 "Fallback chain entry for NotoSansTC must include a Bold companion"
             );
+        }
+    }
+
+    #[test]
+    fn modifier_and_technical_symbols_fit_within_single_cell_bounds() {
+        let font_size = 32.0;
+        let (primary, _, _, mut fallbacks) =
+            load_configured_font_chain("NotoSansMNerdFontMono, NotoSansTC, Menlo", &[]);
+        for path in SYSTEM_CJK_CANDIDATES {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(regular) = FontFace::from_bytes(bytes, FontSettings::default()) {
+                    fallbacks.push(FallbackFont {
+                        regular,
+                        bold: None,
+                    });
+                }
+            }
+        }
+
+        let m_metrics = primary.metrics('M', font_size);
+        let cell_width = m_metrics.advance_width.ceil().max(1.0);
+        let cell_height = primary
+            .horizontal_line_metrics(font_size)
+            .map(|m| (m.ascent - m.descent + m.line_gap).ceil())
+            .unwrap_or(font_size * 1.3)
+            .max(1.0);
+
+        let resolve_face = |c: char, is_bold: bool| -> &FontFace {
+            if primary.lookup_glyph_index(c) != 0 {
+                return &primary;
+            }
+            let target_cells = unicode_width::UnicodeWidthChar::width(c)
+                .unwrap_or(1)
+                .max(1);
+            if target_cells == 1 {
+                if let Some(f) = fallbacks.iter().find_map(|fb| {
+                    let face = if is_bold {
+                        fb.bold.as_ref().unwrap_or(&fb.regular)
+                    } else {
+                        &fb.regular
+                    };
+                    (face.lookup_glyph_index(c) != 0
+                        && face.metrics(c, font_size).advance_width <= cell_width * 1.25)
+                        .then_some(face)
+                }) {
+                    return f;
+                }
+            }
+            fallbacks
+                .iter()
+                .map(|fb| {
+                    if is_bold {
+                        fb.bold.as_ref().unwrap_or(&fb.regular)
+                    } else {
+                        &fb.regular
+                    }
+                })
+                .find(|f| f.lookup_glyph_index(c) != 0)
+                .unwrap_or(&primary)
+        };
+
+        if let Some((meslo, _)) = find_font_file("MesloLGS NF Regular") {
+            for sym in ['\u{E0B0}', '\u{E0B2}', '\u{E0B4}', '\u{E0B6}'] {
+                let raw_m = meslo.metrics(sym, font_size);
+                let (fit_m, _) =
+                    rasterize_fitted_glyph(&meslo, sym, font_size, cell_width, cell_height);
+                assert_eq!(
+                    (fit_m.width, fit_m.height, fit_m.xmin, fit_m.ymin),
+                    (raw_m.width, raw_m.height, raw_m.xmin, raw_m.ymin),
+                    "Powerline glyph U+{:04X} must preserve its exact native metrics",
+                    sym as u32
+                );
+            }
+            // Powerlevel10k diamond test places U+E0B2 ('') at col 0 and U+E0B0 ('') at col 1;
+            // their horizontal ink spans must meet or overlap with zero gap.
+            let (left_half, _) =
+                rasterize_fitted_glyph(&meslo, '\u{E0B2}', font_size, cell_width, cell_height);
+            let (right_half, _) =
+                rasterize_fitted_glyph(&meslo, '\u{E0B0}', font_size, cell_width, cell_height);
+            let left_right_edge = left_half.xmin as f32 + left_half.width as f32;
+            let right_left_edge = cell_width + right_half.xmin as f32;
+            assert!(
+                left_right_edge >= right_left_edge,
+                "Powerline diamond halves U+E0B2 (right edge {:.1}) and U+E0B0 (left edge {:.1}) must not have a gap",
+                left_right_edge,
+                right_left_edge
+            );
+        }
+
+        for sym in ['⌘', '⇧', '⌥', '⌃', '↩', '⚙'] {
+            for is_bold in [false, true] {
+                let face = resolve_face(sym, is_bold);
+                if face.lookup_glyph_index(sym) == 0 {
+                    continue;
+                }
+                let (fit_m, fit_bmp) =
+                    rasterize_fitted_glyph(face, sym, font_size, cell_width, cell_height);
+                assert!(fit_m.width > 0 && !fit_bmp.is_empty());
+                assert!(
+                    fit_m.xmin >= 0,
+                    "Symbol '{}' (bold={}) left offset ({}) must not bleed into previous cell",
+                    sym,
+                    is_bold,
+                    fit_m.xmin
+                );
+                assert!(
+                    (fit_m.xmin as f32 + fit_m.width as f32) <= cell_width,
+                    "Symbol '{}' (bold={}) right edge ({} + {}) must not exceed cell_width ({})",
+                    sym,
+                    is_bold,
+                    fit_m.xmin,
+                    fit_m.width,
+                    cell_width
+                );
+            }
+        }
+
+        // Also verify direct rasterization against CJK / symbol fallback faces (e.g. Hiragino Sans GB,
+        // NotoSansTC, Apple Symbols) where modifier symbols are authored on a 2-cell / proportional em-square.
+        for fallback in &fallbacks {
+            let face = &fallback.regular;
+            for sym in ['⌘', '⇧', '⌥', '⌃', '↩', '⚙'] {
+                if face.lookup_glyph_index(sym) == 0 {
+                    continue;
+                }
+                let (fit_m, fit_bmp) =
+                    rasterize_fitted_glyph(face, sym, font_size, cell_width, cell_height);
+                assert!(fit_m.width > 0 && !fit_bmp.is_empty());
+                assert!(
+                    fit_m.xmin >= 0,
+                    "Fallback symbol '{}' left offset ({}) must be >= 0",
+                    sym,
+                    fit_m.xmin
+                );
+                assert!(
+                    (fit_m.xmin as f32 + fit_m.width as f32) <= cell_width,
+                    "Fallback symbol '{}' right edge ({} + {}) must not exceed cell_width ({})",
+                    sym,
+                    fit_m.xmin,
+                    fit_m.width,
+                    cell_width
+                );
+            }
+        }
+
+        // Verify adjacent symbol sequences like "(⇧⌘A)", "(⇧⌘[)", "(⌥⌘[)", "(⇧⌘↩)", "(⌃⌘F)"
+        // have strictly non-overlapping horizontal ink spans across consecutive columns.
+        for seq in ["(⇧⌘A)", "(⇧⌘[)", "(⌥⌘[)", "(⌘[)", "(⇧⌘↩)", "(⌥⌘=)", "(⌃⌘F)"] {
+            let mut prev_right: Option<(char, f32)> = None;
+            let mut col = 0usize;
+            for c in seq.chars() {
+                let w_cells = unicode_width::UnicodeWidthChar::width(c)
+                    .unwrap_or(1)
+                    .max(1);
+                let face = resolve_face(c, false);
+                if face.lookup_glyph_index(c) != 0 {
+                    let (m, _) =
+                        rasterize_fitted_glyph(face, c, font_size, cell_width, cell_height);
+                    let cell_x = col as f32 * cell_width;
+                    let glyph_left = cell_x + m.xmin as f32;
+                    let glyph_right = glyph_left + m.width as f32;
+                    if let Some((prev_c, pr)) = prev_right {
+                        assert!(
+                            glyph_left >= pr,
+                            "In sequence {:?}: '{}' at [{:.1}, {:.1}] overlaps previous '{}' ending at {:.1}",
+                            seq,
+                            c,
+                            glyph_left,
+                            glyph_right,
+                            prev_c,
+                            pr
+                        );
+                    }
+                    prev_right = Some((c, glyph_right));
+                }
+                col += w_cells;
+            }
         }
     }
 }

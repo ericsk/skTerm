@@ -868,6 +868,128 @@ impl App {
             NativeMenuAction::OpenConfigFile => {
                 self.config_manager.open_in_editor();
             }
+            NativeMenuAction::ToggleAiSidebar => {
+                self.toggle_sidebar();
+            }
+            NativeMenuAction::SelectPrevTab => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        session.workspace.prev_tab();
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                    }
+                }
+            }
+            NativeMenuAction::SelectNextTab => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        session.workspace.next_tab();
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                    }
+                }
+            }
+            NativeMenuAction::MoveTabLeft => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        session.workspace.move_tab_left();
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                    }
+                }
+            }
+            NativeMenuAction::MoveTabRight => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        session.workspace.move_tab_right();
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                    }
+                }
+            }
+            NativeMenuAction::FocusPrevPane => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            tab.focus_prev();
+                        }
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                    }
+                }
+            }
+            NativeMenuAction::FocusNextPane => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            tab.focus_next();
+                        }
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                    }
+                }
+            }
+            NativeMenuAction::ToggleZoomPane => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        session.workspace.toggle_zoom_active_pane();
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                    }
+                }
+            }
+            NativeMenuAction::EqualizePanes => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        session.workspace.equalize_active_panes();
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                    }
+                }
+            }
+            NativeMenuAction::ZoomIn => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        let cur_pt = session.renderer.font_size_pt;
+                        let _ = session.renderer.update_font_size(cur_pt + 1.0);
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                    }
+                }
+            }
+            NativeMenuAction::ZoomOut => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        let cur_pt = session.renderer.font_size_pt;
+                        let _ = session.renderer.update_font_size((cur_pt - 1.0).max(8.0));
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                    }
+                }
+            }
+            NativeMenuAction::ResetZoom => {
+                if let Some(wid) = target_wid {
+                    let def_pt = self.config_manager.current_config.font.size;
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        let _ = session.renderer.update_font_size(def_pt);
+                        session.sync_all_pane_sizes(tab_bar_h);
+                        session.window.request_redraw();
+                    }
+                }
+            }
+            NativeMenuAction::ToggleFullScreen => {
+                if let Some(wid) = target_wid {
+                    if let Some(session) = self.sessions.get_mut(&wid) {
+                        if session.window.fullscreen().is_some() {
+                            session.window.set_fullscreen(None);
+                        } else {
+                            session
+                                .window
+                                .set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                        }
+                    }
+                }
+            }
         }
     }
 }

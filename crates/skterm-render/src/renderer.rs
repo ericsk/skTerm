@@ -2481,7 +2481,7 @@ impl TermRenderer {
                     );
 
                     if let Some(ref sc) = item.shortcut {
-                        let sc_w = sc.len() as f32 * cell_w;
+                        let sc_w = text_display_cells(sc) as f32 * cell_w;
                         self.draw_text_line(
                             &mut glyph_instances,
                             sc,

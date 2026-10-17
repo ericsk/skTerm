@@ -175,6 +175,22 @@ pub struct I18nStrings {
     pub edit_find: &'static str,
     pub edit_clear_scrollback: &'static str,
 
+    // macOS View Menu
+    pub menu_view: &'static str,
+    pub view_toggle_ai_sidebar: &'static str,
+    pub view_prev_tab: &'static str,
+    pub view_next_tab: &'static str,
+    pub view_move_tab_left: &'static str,
+    pub view_move_tab_right: &'static str,
+    pub view_focus_prev_pane: &'static str,
+    pub view_focus_next_pane: &'static str,
+    pub view_zoom_pane: &'static str,
+    pub view_equalize_panes: &'static str,
+    pub view_zoom_in: &'static str,
+    pub view_zoom_out: &'static str,
+    pub view_reset_zoom: &'static str,
+    pub view_toggle_fullscreen: &'static str,
+
     // macOS Help Menu
     pub menu_help: &'static str,
     pub help_github: &'static str,
@@ -236,6 +252,21 @@ pub const ZH_TW: I18nStrings = I18nStrings {
     edit_find: "尋找...",
     edit_clear_scrollback: "清除畫面",
 
+    menu_view: "顯示方式",
+    view_toggle_ai_sidebar: "切換 AI 代理側邊欄",
+    view_prev_tab: "切換至上一個分頁",
+    view_next_tab: "切換至下一個分頁",
+    view_move_tab_left: "將分頁向左移動",
+    view_move_tab_right: "將分頁向右移動",
+    view_focus_prev_pane: "聚焦上一個窗格",
+    view_focus_next_pane: "聚焦下一個窗格",
+    view_zoom_pane: "放大/還原當前窗格",
+    view_equalize_panes: "平均分配窗格大小",
+    view_zoom_in: "放大字型",
+    view_zoom_out: "縮小字型",
+    view_reset_zoom: "實際大小",
+    view_toggle_fullscreen: "進入/離開全螢幕",
+
     menu_help: "輔助說明",
     help_github: "GitHub 專案首頁",
     help_report_issue: "回報問題...",
@@ -294,6 +325,21 @@ pub const EN: I18nStrings = I18nStrings {
     edit_find: "Find...",
     edit_clear_scrollback: "Clear Scrollback",
 
+    menu_view: "View",
+    view_toggle_ai_sidebar: "Toggle AI Agents Sidebar",
+    view_prev_tab: "Show Previous Tab",
+    view_next_tab: "Show Next Tab",
+    view_move_tab_left: "Move Tab Left",
+    view_move_tab_right: "Move Tab Right",
+    view_focus_prev_pane: "Select Previous Pane",
+    view_focus_next_pane: "Select Next Pane",
+    view_zoom_pane: "Zoom Active Pane",
+    view_equalize_panes: "Equalize Pane Sizes",
+    view_zoom_in: "Zoom In",
+    view_zoom_out: "Zoom Out",
+    view_reset_zoom: "Actual Size",
+    view_toggle_fullscreen: "Toggle Full Screen",
+
     menu_help: "Help",
     help_github: "GitHub Repository",
     help_report_issue: "Report an Issue...",
@@ -347,15 +393,27 @@ mod tests {
         let zh = strings(Locale::ZhTw);
         assert_eq!(zh.menu_file, "檔案");
         assert_eq!(zh.menu_edit, "編輯");
+        assert_eq!(zh.menu_view, "顯示方式");
         assert_eq!(zh.menu_help, "輔助說明");
         assert_eq!(zh.file_new_window, "新增視窗");
         assert_eq!(zh.file_new_tab, "新增分頁");
+        assert_eq!(zh.view_toggle_ai_sidebar, "切換 AI 代理側邊欄");
+        assert_eq!(zh.view_prev_tab, "切換至上一個分頁");
+        assert_eq!(zh.view_next_tab, "切換至下一個分頁");
+        assert_eq!(zh.view_focus_prev_pane, "聚焦上一個窗格");
+        assert_eq!(zh.view_focus_next_pane, "聚焦下一個窗格");
 
         let en = strings(Locale::En);
         assert_eq!(en.menu_file, "File");
         assert_eq!(en.menu_edit, "Edit");
+        assert_eq!(en.menu_view, "View");
         assert_eq!(en.menu_help, "Help");
         assert_eq!(en.file_new_window, "New Window");
         assert_eq!(en.file_new_tab, "New Tab");
+        assert_eq!(en.view_toggle_ai_sidebar, "Toggle AI Agents Sidebar");
+        assert_eq!(en.view_prev_tab, "Show Previous Tab");
+        assert_eq!(en.view_next_tab, "Show Next Tab");
+        assert_eq!(en.view_focus_prev_pane, "Select Previous Pane");
+        assert_eq!(en.view_focus_next_pane, "Select Next Pane");
     }
 }

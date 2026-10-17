@@ -1286,6 +1286,19 @@ mod tests {
             NativeMenuAction::OpenGitHub,
             NativeMenuAction::ReportIssue,
             NativeMenuAction::OpenConfigFile,
+            NativeMenuAction::ToggleAiSidebar,
+            NativeMenuAction::SelectPrevTab,
+            NativeMenuAction::SelectNextTab,
+            NativeMenuAction::MoveTabLeft,
+            NativeMenuAction::MoveTabRight,
+            NativeMenuAction::FocusPrevPane,
+            NativeMenuAction::FocusNextPane,
+            NativeMenuAction::ToggleZoomPane,
+            NativeMenuAction::EqualizePanes,
+            NativeMenuAction::ZoomIn,
+            NativeMenuAction::ZoomOut,
+            NativeMenuAction::ResetZoom,
+            NativeMenuAction::ToggleFullScreen,
         ];
         for action in sample_actions {
             assert_eq!(NativeMenuAction::from_tag(action as isize), Some(action));

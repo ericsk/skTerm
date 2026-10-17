@@ -225,6 +225,12 @@ impl App {
         let is_zoom_or_reset = self.modifiers.control_key() && !self.modifiers.super_key();
 
         if is_zoom_or_reset {
+            if self
+                .last_native_menu_action_time
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(25))
+            {
+                return;
+            }
             if let Some(s) = normalize_shortcut_char(&event.logical_key, event.physical_key) {
                 match s.as_str() {
                     "+" | "=" => {

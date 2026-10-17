@@ -14,6 +14,7 @@ use std::sync::{Mutex, Once, OnceLock};
 use winit::event_loop::EventLoopProxy;
 
 const NSEVENT_MODIFIER_SHIFT: usize = 1 << 17;
+const NSEVENT_MODIFIER_CONTROL: usize = 1 << 18;
 const NSEVENT_MODIFIER_OPTION: usize = 1 << 19;
 const NSEVENT_MODIFIER_COMMAND: usize = 1 << 20;
 
@@ -55,6 +56,23 @@ struct MacMenuHandles {
     edit_select_all: usize,
     edit_find: usize,
     edit_clear_scrollback: usize,
+
+    // View menu
+    view_menu_item: usize,
+    view_menu: usize,
+    view_toggle_ai_sidebar: usize,
+    view_prev_tab: usize,
+    view_next_tab: usize,
+    view_move_tab_left: usize,
+    view_move_tab_right: usize,
+    view_focus_prev_pane: usize,
+    view_focus_next_pane: usize,
+    view_zoom_pane: usize,
+    view_equalize_panes: usize,
+    view_zoom_in: usize,
+    view_zoom_out: usize,
+    view_reset_zoom: usize,
+    view_toggle_fullscreen: usize,
 
     // Help menu
     help_menu_item: usize,
@@ -326,6 +344,43 @@ pub fn install_or_update_macos_menu(locale: Locale) {
                 tr.edit_clear_scrollback,
             );
 
+            set_title(handles.view_menu_item as *mut Object, tr.menu_view);
+            set_title(handles.view_menu as *mut Object, tr.menu_view);
+            set_title(
+                handles.view_toggle_ai_sidebar as *mut Object,
+                tr.view_toggle_ai_sidebar,
+            );
+            set_title(handles.view_prev_tab as *mut Object, tr.view_prev_tab);
+            set_title(handles.view_next_tab as *mut Object, tr.view_next_tab);
+            set_title(
+                handles.view_move_tab_left as *mut Object,
+                tr.view_move_tab_left,
+            );
+            set_title(
+                handles.view_move_tab_right as *mut Object,
+                tr.view_move_tab_right,
+            );
+            set_title(
+                handles.view_focus_prev_pane as *mut Object,
+                tr.view_focus_prev_pane,
+            );
+            set_title(
+                handles.view_focus_next_pane as *mut Object,
+                tr.view_focus_next_pane,
+            );
+            set_title(handles.view_zoom_pane as *mut Object, tr.view_zoom_pane);
+            set_title(
+                handles.view_equalize_panes as *mut Object,
+                tr.view_equalize_panes,
+            );
+            set_title(handles.view_zoom_in as *mut Object, tr.view_zoom_in);
+            set_title(handles.view_zoom_out as *mut Object, tr.view_zoom_out);
+            set_title(handles.view_reset_zoom as *mut Object, tr.view_reset_zoom);
+            set_title(
+                handles.view_toggle_fullscreen as *mut Object,
+                tr.view_toggle_fullscreen,
+            );
+
             set_title(handles.help_menu_item as *mut Object, tr.menu_help);
             set_title(handles.help_menu as *mut Object, tr.menu_help);
             set_title(handles.help_github as *mut Object, tr.help_github);
@@ -571,7 +626,130 @@ pub fn install_or_update_macos_menu(locale: Locale) {
         let _: () = msg_send![main_menu, addItem: edit_menu_item];
 
         // ====================================================================
-        // 4. Help Menu (輔助說明 / Help)
+        // 4. View Menu (顯示方式 / View)
+        // ====================================================================
+        let view_menu_item: *mut Object = msg_send![class!(NSMenuItem), new];
+        set_title(view_menu_item, tr.menu_view);
+        let view_menu = create_menu(tr.menu_view);
+
+        // Group 1: AI Agents Sidebar
+        let view_toggle_ai_sidebar = create_action_item(
+            tr.view_toggle_ai_sidebar,
+            NativeMenuAction::ToggleAiSidebar,
+            "a",
+            NSEVENT_MODIFIER_COMMAND | NSEVENT_MODIFIER_SHIFT,
+        );
+        let _: () = msg_send![view_menu, addItem: view_toggle_ai_sidebar];
+        let _: () = msg_send![view_menu, addItem: create_separator()];
+
+        // Group 2: Tab Navigation & Reordering
+        let view_prev_tab = create_action_item(
+            tr.view_prev_tab,
+            NativeMenuAction::SelectPrevTab,
+            "[",
+            NSEVENT_MODIFIER_COMMAND | NSEVENT_MODIFIER_SHIFT,
+        );
+        let _: () = msg_send![view_menu, addItem: view_prev_tab];
+
+        let view_next_tab = create_action_item(
+            tr.view_next_tab,
+            NativeMenuAction::SelectNextTab,
+            "]",
+            NSEVENT_MODIFIER_COMMAND | NSEVENT_MODIFIER_SHIFT,
+        );
+        let _: () = msg_send![view_menu, addItem: view_next_tab];
+
+        let view_move_tab_left = create_action_item(
+            tr.view_move_tab_left,
+            NativeMenuAction::MoveTabLeft,
+            "[",
+            NSEVENT_MODIFIER_COMMAND | NSEVENT_MODIFIER_OPTION,
+        );
+        let _: () = msg_send![view_menu, addItem: view_move_tab_left];
+
+        let view_move_tab_right = create_action_item(
+            tr.view_move_tab_right,
+            NativeMenuAction::MoveTabRight,
+            "]",
+            NSEVENT_MODIFIER_COMMAND | NSEVENT_MODIFIER_OPTION,
+        );
+        let _: () = msg_send![view_menu, addItem: view_move_tab_right];
+        let _: () = msg_send![view_menu, addItem: create_separator()];
+
+        // Group 3: Split Pane / Workspace Focus & Layout
+        let view_focus_prev_pane = create_action_item(
+            tr.view_focus_prev_pane,
+            NativeMenuAction::FocusPrevPane,
+            "[",
+            NSEVENT_MODIFIER_COMMAND,
+        );
+        let _: () = msg_send![view_menu, addItem: view_focus_prev_pane];
+
+        let view_focus_next_pane = create_action_item(
+            tr.view_focus_next_pane,
+            NativeMenuAction::FocusNextPane,
+            "]",
+            NSEVENT_MODIFIER_COMMAND,
+        );
+        let _: () = msg_send![view_menu, addItem: view_focus_next_pane];
+
+        let view_zoom_pane = create_action_item(
+            tr.view_zoom_pane,
+            NativeMenuAction::ToggleZoomPane,
+            "\r",
+            NSEVENT_MODIFIER_COMMAND | NSEVENT_MODIFIER_SHIFT,
+        );
+        let _: () = msg_send![view_menu, addItem: view_zoom_pane];
+
+        let view_equalize_panes = create_action_item(
+            tr.view_equalize_panes,
+            NativeMenuAction::EqualizePanes,
+            "=",
+            NSEVENT_MODIFIER_COMMAND | NSEVENT_MODIFIER_OPTION,
+        );
+        let _: () = msg_send![view_menu, addItem: view_equalize_panes];
+        let _: () = msg_send![view_menu, addItem: create_separator()];
+
+        // Group 4: Font Size Zoom
+        let view_zoom_in = create_action_item(
+            tr.view_zoom_in,
+            NativeMenuAction::ZoomIn,
+            "=",
+            NSEVENT_MODIFIER_COMMAND,
+        );
+        let _: () = msg_send![view_menu, addItem: view_zoom_in];
+
+        let view_zoom_out = create_action_item(
+            tr.view_zoom_out,
+            NativeMenuAction::ZoomOut,
+            "-",
+            NSEVENT_MODIFIER_COMMAND,
+        );
+        let _: () = msg_send![view_menu, addItem: view_zoom_out];
+
+        let view_reset_zoom = create_action_item(
+            tr.view_reset_zoom,
+            NativeMenuAction::ResetZoom,
+            "0",
+            NSEVENT_MODIFIER_COMMAND,
+        );
+        let _: () = msg_send![view_menu, addItem: view_reset_zoom];
+        let _: () = msg_send![view_menu, addItem: create_separator()];
+
+        // Group 5: Full Screen
+        let view_toggle_fullscreen = create_action_item(
+            tr.view_toggle_fullscreen,
+            NativeMenuAction::ToggleFullScreen,
+            "f",
+            NSEVENT_MODIFIER_COMMAND | NSEVENT_MODIFIER_CONTROL,
+        );
+        let _: () = msg_send![view_menu, addItem: view_toggle_fullscreen];
+
+        let _: () = msg_send![view_menu_item, setSubmenu: view_menu];
+        let _: () = msg_send![main_menu, addItem: view_menu_item];
+
+        // ====================================================================
+        // 5. Help Menu (輔助說明 / Help)
         // ====================================================================
         let help_menu_item: *mut Object = msg_send![class!(NSMenuItem), new];
         set_title(help_menu_item, tr.menu_help);
@@ -632,6 +810,21 @@ pub fn install_or_update_macos_menu(locale: Locale) {
             edit_select_all: edit_select_all as usize,
             edit_find: edit_find as usize,
             edit_clear_scrollback: edit_clear_scrollback as usize,
+            view_menu_item: view_menu_item as usize,
+            view_menu: view_menu as usize,
+            view_toggle_ai_sidebar: view_toggle_ai_sidebar as usize,
+            view_prev_tab: view_prev_tab as usize,
+            view_next_tab: view_next_tab as usize,
+            view_move_tab_left: view_move_tab_left as usize,
+            view_move_tab_right: view_move_tab_right as usize,
+            view_focus_prev_pane: view_focus_prev_pane as usize,
+            view_focus_next_pane: view_focus_next_pane as usize,
+            view_zoom_pane: view_zoom_pane as usize,
+            view_equalize_panes: view_equalize_panes as usize,
+            view_zoom_in: view_zoom_in as usize,
+            view_zoom_out: view_zoom_out as usize,
+            view_reset_zoom: view_reset_zoom as usize,
+            view_toggle_fullscreen: view_toggle_fullscreen as usize,
             help_menu_item: help_menu_item as usize,
             help_menu: help_menu as usize,
             help_github: help_github as usize,
