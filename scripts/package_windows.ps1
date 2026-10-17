@@ -1,6 +1,3 @@
-Write-Host "=== Building skTerm for Windows (Release) ==="
-cargo build --release -p skterm-app
-
 # 1. Ensure Windows Icon exists
 $IcoPath = "assets\app_icon.ico"
 if (-not (Test-Path $IcoPath)) {
@@ -8,7 +5,11 @@ if (-not (Test-Path $IcoPath)) {
     & pwsh -NoProfile -ExecutionPolicy Bypass -File "scripts\generate_ico.ps1"
 }
 
-# 2. Package Portable Executable & Directory
+# 2. Build Release Executable
+Write-Host "=== Building skTerm for Windows (Release) ==="
+cargo build --release -p skterm-app
+
+# 3. Package Portable Executable & Directory
 $DistDir = "dist\windows\skterm-v0.1.0-windows-x64"
 if (Test-Path $DistDir) { Remove-Item -Recurse -Force $DistDir }
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
@@ -25,7 +26,7 @@ if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
 Compress-Archive -Path "$DistDir\*" -DestinationPath $ZipPath -Force
 Write-Host "Successfully packaged portable skTerm at $ZipPath"
 
-# 3. Build Windows Installer (Inno Setup)
+# 4. Build Windows Installer (Inno Setup)
 $IsccCandidates = @(
     "ISCC.exe",
     "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
