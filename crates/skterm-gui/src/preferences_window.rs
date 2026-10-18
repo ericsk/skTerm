@@ -517,7 +517,7 @@ impl PreferencesWindow {
         let window = Arc::new(event_loop.create_window(window_attrs)?);
         crate::icon::apply_window_icon(&window);
 
-        let instance = Instance::new(&InstanceDescriptor::default());
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window.clone())?;
 
         let adapter = instance
@@ -525,22 +525,18 @@ impl PreferencesWindow {
                 power_preference: PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
-            .await
-            .ok_or_else(|| {
-                anyhow::anyhow!("Failed to find suitable GPU adapter for Preferences")
-            })?;
+            .await?;
 
         let (device, queue) = adapter
-            .request_device(
-                &DeviceDescriptor {
-                    label: Some("skterm_pref_device"),
-                    required_features: Features::empty(),
-                    required_limits: Limits::default(),
-                    memory_hints: Default::default(),
-                },
-                None,
-            )
+            .request_device(&DeviceDescriptor {
+                label: Some("skterm_pref_device"),
+                required_features: Features::empty(),
+                required_limits: Limits::default(),
+                memory_hints: Default::default(),
+                ..Default::default()
+            })
             .await?;
 
         let size = window.inner_size();
@@ -558,6 +554,7 @@ impl PreferencesWindow {
         let config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
             present_mode: PresentMode::AutoVsync,
@@ -581,7 +578,11 @@ impl PreferencesWindow {
             None,
         );
 
-        let egui_renderer = egui_wgpu::Renderer::new(&device, surface_format, None, 1, false);
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            surface_format,
+            egui_wgpu::RendererOptions::default(),
+        );
 
         let detected_fonts = skterm_render::atlas::installed_font_families();
 
@@ -835,10 +836,11 @@ impl PreferencesWindow {
         let raw_input = self.egui_state.take_egui_input(&self.window);
 
         let egui_ctx = self.egui_ctx.clone();
-        let full_output = egui_ctx.run(raw_input, |ctx| {
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
             // Support closing the Preferences window via Esc (when no text box has focus) or Ctrl/Cmd+W
-            let close_shortcut = ctx.input(|i| {
-                let esc = i.key_pressed(egui::Key::Escape) && !ctx.wants_keyboard_input();
+            let wants_kb = ui.ctx().egui_wants_keyboard_input();
+            let close_shortcut = ui.ctx().input(|i| {
+                let esc = i.key_pressed(egui::Key::Escape) && !wants_kb;
                 let cmd_w = i.key_pressed(egui::Key::W) && (i.modifiers.command || i.modifiers.ctrl);
                 esc || cmd_w
             });
@@ -847,14 +849,14 @@ impl PreferencesWindow {
             }
 
             // macOS Sonoma Sidebar Navigation (with embedded bottom utility actions)
-            egui::SidePanel::left("pref_sidebar")
-                .exact_width(195.0)
+            egui::Panel::left("pref_sidebar")
+                .exact_size(195.0)
                 .frame(
                     Frame::new()
                         .fill(Color32::from_rgb(22, 23, 30))
                         .inner_margin(Margin::symmetric(14, 18)),
                 )
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             // macOS green status dot + title
@@ -972,7 +974,7 @@ impl PreferencesWindow {
                         .fill(Color32::from_rgb(28, 29, 38))
                         .inner_margin(Margin::symmetric(26, 22)),
                 )
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| match self.active_category {
                         PreferencesCategory::Appearance => self.render_appearance_view(ui),
                         PreferencesCategory::Colors => self.render_colors_view(ui),
@@ -988,9 +990,10 @@ impl PreferencesWindow {
 
         // Render to GPU surface
         let output = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(e) => {
-                info!("Surface error in preferences window: {:?}", e);
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            other => {
+                info!("Surface status in preferences window: {:?}", other);
                 return self.check_changed(config_manager);
             }
         };
@@ -1013,9 +1016,11 @@ impl PreferencesWindow {
             .egui_ctx
             .tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
 
-        for (id, delta) in full_output.textures_delta.set {
-            self.egui_renderer
-                .update_texture(&self.device, &self.queue, id, &delta);
+        for (&id, deltas) in &full_output.textures_delta.set {
+            for delta in deltas {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, id, delta);
+            }
         }
 
         self.egui_renderer.update_buffers(
@@ -1032,6 +1037,7 @@ impl PreferencesWindow {
                     label: Some("pref_render_pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -1046,6 +1052,7 @@ impl PreferencesWindow {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 })
                 .forget_lifetime();
 
@@ -1053,12 +1060,12 @@ impl PreferencesWindow {
                 .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
         }
 
-        for id in full_output.textures_delta.free {
-            self.egui_renderer.free_texture(&id);
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
         }
 
         self.queue.submit(Some(encoder.finish()));
-        output.present();
+        self.queue.present(output);
 
         self.check_changed(config_manager)
     }

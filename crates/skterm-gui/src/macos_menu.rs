@@ -6,9 +6,8 @@
 
 use crate::app::{AppEvent, NativeMenuAction};
 use crate::i18n::{strings, Locale};
-use objc::declare::ClassDecl;
-use objc::runtime::{Class, Object, Sel, BOOL, YES};
-use objc::{class, msg_send, sel, sel_impl};
+use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
+use objc2::{class, msg_send, sel};
 use std::os::raw::c_void;
 use std::sync::{Mutex, Once, OnceLock};
 use winit::event_loop::EventLoopProxy;
@@ -100,13 +99,13 @@ fn dispatch_menu_action(action: NativeMenuAction) {
     }
 }
 
-fn menu_target_class() -> &'static Class {
+fn menu_target_class() -> &'static AnyClass {
     REGISTER_MENU_TARGET.call_once(|| {
         let superclass = class!(NSObject);
-        let mut decl = ClassDecl::new("SkTermNativeMenuTarget", superclass)
+        let mut decl = ClassBuilder::new(c"SkTermNativeMenuTarget", superclass)
             .expect("Failed to declare SkTermNativeMenuTarget");
 
-        extern "C" fn perform_menu_action(_this: &Object, _cmd: Sel, sender: *mut Object) {
+        extern "C" fn perform_menu_action(_this: &AnyObject, _cmd: Sel, sender: *mut AnyObject) {
             if sender.is_null() {
                 return;
             }
@@ -124,17 +123,18 @@ fn menu_target_class() -> &'static Class {
                     NativeMenuAction::Copy | NativeMenuAction::Paste | NativeMenuAction::SelectAll
                 ) && is_appkit_text_responder_active()
                 {
-                    let ns_app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+                    let ns_app: *mut AnyObject =
+                        msg_send![class!(NSApplication), sharedApplication];
                     let sel = match action {
                         NativeMenuAction::Copy => sel!(copy:),
                         NativeMenuAction::Paste => sel!(paste:),
                         NativeMenuAction::SelectAll => sel!(selectAll:),
                         _ => unreachable!(),
                     };
-                    let _: BOOL = msg_send![
+                    let _: Bool = msg_send![
                         ns_app,
-                        sendAction: sel
-                        to: std::ptr::null::<Object>()
+                        sendAction: sel,
+                        to: std::ptr::null::<AnyObject>(),
                         from: sender
                     ];
                     return;
@@ -147,52 +147,52 @@ fn menu_target_class() -> &'static Class {
         unsafe {
             decl.add_method(
                 sel!(skTermPerformMenuAction:),
-                perform_menu_action as extern "C" fn(&Object, Sel, *mut Object),
+                perform_menu_action as extern "C" fn(_, Sel, *mut AnyObject),
             );
         }
         decl.register();
     });
-    Class::get("SkTermNativeMenuTarget").unwrap()
+    AnyClass::get(c"SkTermNativeMenuTarget").unwrap()
 }
 
-fn shared_menu_target() -> *mut Object {
+fn shared_menu_target() -> *mut AnyObject {
     static TARGET: OnceLock<usize> = OnceLock::new();
     *TARGET.get_or_init(|| unsafe {
-        let obj: *mut Object = msg_send![menu_target_class(), new];
+        let obj: *mut AnyObject = msg_send![menu_target_class(), new];
         obj as usize
-    }) as *mut Object
+    }) as *mut AnyObject
 }
 
 unsafe fn is_appkit_text_responder_active() -> bool {
-    let ns_app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+    let ns_app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
     if ns_app.is_null() {
         return false;
     }
-    let key_win: *mut Object = msg_send![ns_app, keyWindow];
+    let key_win: *mut AnyObject = msg_send![ns_app, keyWindow];
     if key_win.is_null() {
         return false;
     }
-    let responder: *mut Object = msg_send![key_win, firstResponder];
+    let responder: *mut AnyObject = msg_send![key_win, firstResponder];
     if responder.is_null() {
         return false;
     }
-    let is_text: BOOL = msg_send![responder, isKindOfClass: class!(NSText)];
-    let is_tf: BOOL = msg_send![responder, isKindOfClass: class!(NSTextField)];
-    is_text == YES || is_tf == YES
+    let is_text: Bool = msg_send![responder, isKindOfClass: class!(NSText)];
+    let is_tf: Bool = msg_send![responder, isKindOfClass: class!(NSTextField)];
+    is_text.as_bool() || is_tf.as_bool()
 }
 
-unsafe fn nsstring(s: &str) -> *mut Object {
+unsafe fn nsstring(s: &str) -> *mut AnyObject {
     let bytes = s.as_bytes();
-    let alloc: *mut Object = msg_send![class!(NSString), alloc];
+    let alloc: *mut AnyObject = msg_send![class!(NSString), alloc];
     msg_send![
         alloc,
-        initWithBytes: bytes.as_ptr() as *const c_void
-        length: bytes.len()
+        initWithBytes: bytes.as_ptr() as *const c_void,
+        length: bytes.len(),
         encoding: 4usize // NSUTF8StringEncoding
     ]
 }
 
-unsafe fn set_title(obj: *mut Object, title: &str) {
+unsafe fn set_title(obj: *mut AnyObject, title: &str) {
     if obj.is_null() {
         return;
     }
@@ -201,15 +201,15 @@ unsafe fn set_title(obj: *mut Object, title: &str) {
     let _: () = msg_send![ns_str, release];
 }
 
-unsafe fn create_menu(title: &str) -> *mut Object {
+unsafe fn create_menu(title: &str) -> *mut AnyObject {
     let ns_title = nsstring(title);
-    let alloc: *mut Object = msg_send![class!(NSMenu), alloc];
-    let menu: *mut Object = msg_send![alloc, initWithTitle: ns_title];
+    let alloc: *mut AnyObject = msg_send![class!(NSMenu), alloc];
+    let menu: *mut AnyObject = msg_send![alloc, initWithTitle: ns_title];
     let _: () = msg_send![ns_title, release];
     menu
 }
 
-unsafe fn create_separator() -> *mut Object {
+unsafe fn create_separator() -> *mut AnyObject {
     msg_send![class!(NSMenuItem), separatorItem]
 }
 
@@ -218,14 +218,14 @@ unsafe fn create_action_item(
     action: NativeMenuAction,
     key_equiv: &str,
     modifiers: usize,
-) -> *mut Object {
+) -> *mut AnyObject {
     let ns_title = nsstring(title);
     let ns_key = nsstring(key_equiv);
-    let alloc: *mut Object = msg_send![class!(NSMenuItem), alloc];
-    let item: *mut Object = msg_send![
+    let alloc: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+    let item: *mut AnyObject = msg_send![
         alloc,
-        initWithTitle: ns_title
-        action: sel!(skTermPerformMenuAction:)
+        initWithTitle: ns_title,
+        action: sel!(skTermPerformMenuAction:),
         keyEquivalent: ns_key
     ];
     let _: () = msg_send![ns_title, release];
@@ -244,17 +244,17 @@ unsafe fn create_action_item(
 unsafe fn create_selector_item(
     title: &str,
     selector: Sel,
-    target: *mut Object,
+    target: *mut AnyObject,
     key_equiv: &str,
     modifiers: usize,
-) -> *mut Object {
+) -> *mut AnyObject {
     let ns_title = nsstring(title);
     let ns_key = nsstring(key_equiv);
-    let alloc: *mut Object = msg_send![class!(NSMenuItem), alloc];
-    let item: *mut Object = msg_send![
+    let alloc: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+    let item: *mut AnyObject = msg_send![
         alloc,
-        initWithTitle: ns_title
-        action: selector
+        initWithTitle: ns_title,
+        action: selector,
         keyEquivalent: ns_key
     ];
     let _: () = msg_send![ns_title, release];
@@ -269,17 +269,20 @@ unsafe fn create_selector_item(
     item
 }
 
-unsafe fn detach_submenu_from_existing_menus(main_menu: *mut Object, target_submenu: *mut Object) {
+unsafe fn detach_submenu_from_existing_menus(
+    main_menu: *mut AnyObject,
+    target_submenu: *mut AnyObject,
+) {
     if main_menu.is_null() || target_submenu.is_null() {
         return;
     }
     let count: isize = msg_send![main_menu, numberOfItems];
     for i in 0..count {
-        let item: *mut Object = msg_send![main_menu, itemAtIndex: i];
+        let item: *mut AnyObject = msg_send![main_menu, itemAtIndex: i];
         if !item.is_null() {
-            let sub: *mut Object = msg_send![item, submenu];
+            let sub: *mut AnyObject = msg_send![item, submenu];
             if sub == target_submenu {
-                let _: () = msg_send![item, setSubmenu: std::ptr::null_mut::<Object>()];
+                let _: () = msg_send![item, setSubmenu: std::ptr::null_mut::<AnyObject>()];
             } else if !sub.is_null() {
                 detach_submenu_from_existing_menus(sub, target_submenu);
             }
@@ -303,101 +306,116 @@ pub fn install_or_update_macos_menu(locale: Locale) {
     unsafe {
         if let Some(handles) = guard.as_ref() {
             // Update all titles in-place
-            set_title(handles.app_about as *mut Object, tr.app_about);
-            set_title(handles.app_preferences as *mut Object, tr.app_preferences);
-            set_title(handles.app_services_item as *mut Object, tr.app_services);
-            set_title(handles.app_services_menu as *mut Object, tr.app_services);
-            set_title(handles.app_hide as *mut Object, tr.app_hide);
-            set_title(handles.app_hide_others as *mut Object, tr.app_hide_others);
-            set_title(handles.app_show_all as *mut Object, tr.app_show_all);
-            set_title(handles.app_quit as *mut Object, tr.app_quit);
-
-            set_title(handles.file_menu_item as *mut Object, tr.menu_file);
-            set_title(handles.file_menu as *mut Object, tr.menu_file);
-            set_title(handles.file_new_window as *mut Object, tr.file_new_window);
-            set_title(handles.file_new_tab as *mut Object, tr.file_new_tab);
+            set_title(handles.app_about as *mut AnyObject, tr.app_about);
             set_title(
-                handles.file_split_horizontal as *mut Object,
+                handles.app_preferences as *mut AnyObject,
+                tr.app_preferences,
+            );
+            set_title(handles.app_services_item as *mut AnyObject, tr.app_services);
+            set_title(handles.app_services_menu as *mut AnyObject, tr.app_services);
+            set_title(handles.app_hide as *mut AnyObject, tr.app_hide);
+            set_title(
+                handles.app_hide_others as *mut AnyObject,
+                tr.app_hide_others,
+            );
+            set_title(handles.app_show_all as *mut AnyObject, tr.app_show_all);
+            set_title(handles.app_quit as *mut AnyObject, tr.app_quit);
+
+            set_title(handles.file_menu_item as *mut AnyObject, tr.menu_file);
+            set_title(handles.file_menu as *mut AnyObject, tr.menu_file);
+            set_title(handles.file_new_window as *mut AnyObject, tr.file_new_window);
+            set_title(handles.file_new_tab as *mut AnyObject, tr.file_new_tab);
+            set_title(
+                handles.file_split_horizontal as *mut AnyObject,
                 tr.file_split_horizontal,
             );
             set_title(
-                handles.file_split_vertical as *mut Object,
+                handles.file_split_vertical as *mut AnyObject,
                 tr.file_split_vertical,
             );
-            set_title(handles.file_close_tab as *mut Object, tr.file_close_tab);
+            set_title(handles.file_close_tab as *mut AnyObject, tr.file_close_tab);
             set_title(
-                handles.file_close_window as *mut Object,
+                handles.file_close_window as *mut AnyObject,
                 tr.file_close_window,
             );
 
-            set_title(handles.edit_menu_item as *mut Object, tr.menu_edit);
-            set_title(handles.edit_menu as *mut Object, tr.menu_edit);
-            set_title(handles.edit_undo as *mut Object, tr.edit_undo);
-            set_title(handles.edit_redo as *mut Object, tr.edit_redo);
-            set_title(handles.edit_cut as *mut Object, tr.edit_cut);
-            set_title(handles.edit_copy as *mut Object, tr.edit_copy);
-            set_title(handles.edit_paste as *mut Object, tr.edit_paste);
-            set_title(handles.edit_select_all as *mut Object, tr.edit_select_all);
-            set_title(handles.edit_find as *mut Object, tr.edit_find);
+            set_title(handles.edit_menu_item as *mut AnyObject, tr.menu_edit);
+            set_title(handles.edit_menu as *mut AnyObject, tr.menu_edit);
+            set_title(handles.edit_undo as *mut AnyObject, tr.edit_undo);
+            set_title(handles.edit_redo as *mut AnyObject, tr.edit_redo);
+            set_title(handles.edit_cut as *mut AnyObject, tr.edit_cut);
+            set_title(handles.edit_copy as *mut AnyObject, tr.edit_copy);
+            set_title(handles.edit_paste as *mut AnyObject, tr.edit_paste);
             set_title(
-                handles.edit_clear_scrollback as *mut Object,
+                handles.edit_select_all as *mut AnyObject,
+                tr.edit_select_all,
+            );
+            set_title(handles.edit_find as *mut AnyObject, tr.edit_find);
+            set_title(
+                handles.edit_clear_scrollback as *mut AnyObject,
                 tr.edit_clear_scrollback,
             );
 
-            set_title(handles.view_menu_item as *mut Object, tr.menu_view);
-            set_title(handles.view_menu as *mut Object, tr.menu_view);
+            set_title(handles.view_menu_item as *mut AnyObject, tr.menu_view);
+            set_title(handles.view_menu as *mut AnyObject, tr.menu_view);
             set_title(
-                handles.view_toggle_ai_sidebar as *mut Object,
+                handles.view_toggle_ai_sidebar as *mut AnyObject,
                 tr.view_toggle_ai_sidebar,
             );
-            set_title(handles.view_prev_tab as *mut Object, tr.view_prev_tab);
-            set_title(handles.view_next_tab as *mut Object, tr.view_next_tab);
+            set_title(handles.view_prev_tab as *mut AnyObject, tr.view_prev_tab);
+            set_title(handles.view_next_tab as *mut AnyObject, tr.view_next_tab);
             set_title(
-                handles.view_move_tab_left as *mut Object,
+                handles.view_move_tab_left as *mut AnyObject,
                 tr.view_move_tab_left,
             );
             set_title(
-                handles.view_move_tab_right as *mut Object,
+                handles.view_move_tab_right as *mut AnyObject,
                 tr.view_move_tab_right,
             );
             set_title(
-                handles.view_focus_prev_pane as *mut Object,
+                handles.view_focus_prev_pane as *mut AnyObject,
                 tr.view_focus_prev_pane,
             );
             set_title(
-                handles.view_focus_next_pane as *mut Object,
+                handles.view_focus_next_pane as *mut AnyObject,
                 tr.view_focus_next_pane,
             );
-            set_title(handles.view_zoom_pane as *mut Object, tr.view_zoom_pane);
+            set_title(handles.view_zoom_pane as *mut AnyObject, tr.view_zoom_pane);
             set_title(
-                handles.view_equalize_panes as *mut Object,
+                handles.view_equalize_panes as *mut AnyObject,
                 tr.view_equalize_panes,
             );
-            set_title(handles.view_zoom_in as *mut Object, tr.view_zoom_in);
-            set_title(handles.view_zoom_out as *mut Object, tr.view_zoom_out);
-            set_title(handles.view_reset_zoom as *mut Object, tr.view_reset_zoom);
+            set_title(handles.view_zoom_in as *mut AnyObject, tr.view_zoom_in);
+            set_title(handles.view_zoom_out as *mut AnyObject, tr.view_zoom_out);
             set_title(
-                handles.view_toggle_fullscreen as *mut Object,
+                handles.view_reset_zoom as *mut AnyObject,
+                tr.view_reset_zoom,
+            );
+            set_title(
+                handles.view_toggle_fullscreen as *mut AnyObject,
                 tr.view_toggle_fullscreen,
             );
 
-            set_title(handles.help_menu_item as *mut Object, tr.menu_help);
-            set_title(handles.help_menu as *mut Object, tr.menu_help);
-            set_title(handles.help_github as *mut Object, tr.help_github);
+            set_title(handles.help_menu_item as *mut AnyObject, tr.menu_help);
+            set_title(handles.help_menu as *mut AnyObject, tr.menu_help);
+            set_title(handles.help_github as *mut AnyObject, tr.help_github);
             set_title(
-                handles.help_report_issue as *mut Object,
+                handles.help_report_issue as *mut AnyObject,
                 tr.help_report_issue,
             );
-            set_title(handles.help_open_config as *mut Object, tr.help_open_config);
+            set_title(
+                handles.help_open_config as *mut AnyObject,
+                tr.help_open_config,
+            );
 
-            let main_menu = handles.main_menu as *mut Object;
+            let main_menu = handles.main_menu as *mut AnyObject;
             if !main_menu.is_null() {
                 let _: () = msg_send![main_menu, update];
             }
             return;
         }
 
-        let ns_app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let ns_app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         if ns_app.is_null() {
             return;
         }
@@ -407,7 +425,7 @@ pub fn install_or_update_macos_menu(locale: Locale) {
         // ====================================================================
         // 1. Application Menu (skTerm)
         // ====================================================================
-        let app_menu_item: *mut Object = msg_send![class!(NSMenuItem), new];
+        let app_menu_item: *mut AnyObject = msg_send![class!(NSMenuItem), new];
         set_title(app_menu_item, "skTerm");
         let app_menu = create_menu("skTerm");
 
@@ -430,11 +448,11 @@ pub fn install_or_update_macos_menu(locale: Locale) {
         let _: () = msg_send![app_menu, addItem: app_preferences];
         let _: () = msg_send![app_menu, addItem: create_separator()];
 
-        let app_services_item: *mut Object = msg_send![class!(NSMenuItem), new];
+        let app_services_item: *mut AnyObject = msg_send![class!(NSMenuItem), new];
         set_title(app_services_item, tr.app_services);
-        let existing_services: *mut Object = msg_send![ns_app, servicesMenu];
+        let existing_services: *mut AnyObject = msg_send![ns_app, servicesMenu];
         let app_services_menu = if !existing_services.is_null() {
-            let old_main: *mut Object = msg_send![ns_app, mainMenu];
+            let old_main: *mut AnyObject = msg_send![ns_app, mainMenu];
             detach_submenu_from_existing_menus(old_main, existing_services);
             set_title(existing_services, tr.app_services);
             existing_services
@@ -489,7 +507,7 @@ pub fn install_or_update_macos_menu(locale: Locale) {
         // ====================================================================
         // 2. File Menu (檔案 / File)
         // ====================================================================
-        let file_menu_item: *mut Object = msg_send![class!(NSMenuItem), new];
+        let file_menu_item: *mut AnyObject = msg_send![class!(NSMenuItem), new];
         set_title(file_menu_item, tr.menu_file);
         let file_menu = create_menu(tr.menu_file);
 
@@ -549,7 +567,7 @@ pub fn install_or_update_macos_menu(locale: Locale) {
         // ====================================================================
         // 3. Edit Menu (編輯 / Edit)
         // ====================================================================
-        let edit_menu_item: *mut Object = msg_send![class!(NSMenuItem), new];
+        let edit_menu_item: *mut AnyObject = msg_send![class!(NSMenuItem), new];
         set_title(edit_menu_item, tr.menu_edit);
         let edit_menu = create_menu(tr.menu_edit);
 
@@ -628,7 +646,7 @@ pub fn install_or_update_macos_menu(locale: Locale) {
         // ====================================================================
         // 4. View Menu (顯示方式 / View)
         // ====================================================================
-        let view_menu_item: *mut Object = msg_send![class!(NSMenuItem), new];
+        let view_menu_item: *mut AnyObject = msg_send![class!(NSMenuItem), new];
         set_title(view_menu_item, tr.menu_view);
         let view_menu = create_menu(tr.menu_view);
 
@@ -751,7 +769,7 @@ pub fn install_or_update_macos_menu(locale: Locale) {
         // ====================================================================
         // 5. Help Menu (輔助說明 / Help)
         // ====================================================================
-        let help_menu_item: *mut Object = msg_send![class!(NSMenuItem), new];
+        let help_menu_item: *mut AnyObject = msg_send![class!(NSMenuItem), new];
         set_title(help_menu_item, tr.menu_help);
         let help_menu = create_menu(tr.menu_help);
 

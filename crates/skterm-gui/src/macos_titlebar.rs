@@ -8,9 +8,9 @@
 //!
 //! The module is gated on macOS by its declaration in `lib.rs`.
 
-use objc::declare::ClassDecl;
-use objc::runtime::{Class, Object, Sel};
-use objc::{class, msg_send, sel, sel_impl};
+use objc2::encode::{Encode, Encoding, RefEncode};
+use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
+use objc2::{class, msg_send, sel};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,38 +29,38 @@ fn buttons() -> &'static Mutex<HashMap<usize, usize>> {
 
 static REGISTER_TARGET_CLASS: Once = Once::new();
 
-fn target_class() -> &'static Class {
+fn target_class() -> &'static AnyClass {
     REGISTER_TARGET_CLASS.call_once(|| {
         let superclass = class!(NSObject);
-        let mut decl = ClassDecl::new("SkTermAgentToggleTarget", superclass)
+        let mut decl = ClassBuilder::new(c"SkTermAgentToggleTarget", superclass)
             .expect("Failed to declare SkTermAgentToggleTarget");
 
-        extern "C" fn toggle_clicked(_this: &Object, _cmd: Sel, _sender: *mut Object) {
+        extern "C" fn toggle_clicked(_this: &AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
             CLICK_COUNT.fetch_add(1, Ordering::SeqCst);
         }
 
         unsafe {
             decl.add_method(
                 sel!(skTermToggleAgents:),
-                toggle_clicked as extern "C" fn(&Object, Sel, *mut Object),
+                toggle_clicked as extern "C" fn(_, Sel, *mut AnyObject),
             );
         }
         decl.register();
     });
-    Class::get("SkTermAgentToggleTarget").unwrap()
+    AnyClass::get(c"SkTermAgentToggleTarget").unwrap()
 }
 
 /// The shared action target. AppKit does not retain targets, so this one is
 /// created once and deliberately leaked for the lifetime of the process.
-fn shared_target() -> *mut Object {
+fn shared_target() -> *mut AnyObject {
     static TARGET: OnceLock<usize> = OnceLock::new();
     *TARGET.get_or_init(|| unsafe {
-        let obj: *mut Object = msg_send![target_class(), new];
+        let obj: *mut AnyObject = msg_send![target_class(), new];
         obj as usize
-    }) as *mut Object
+    }) as *mut AnyObject
 }
 
-unsafe fn nsstring(s: &str) -> *mut Object {
+unsafe fn nsstring(s: &str) -> *mut AnyObject {
     let c = CString::new(s).unwrap_or_else(|_| CString::new("").unwrap());
     let cls = class!(NSString);
     msg_send![cls, stringWithUTF8String: c.as_ptr()]
@@ -73,7 +73,7 @@ unsafe fn nsstring(s: &str) -> *mut Object {
 /// # Safety
 /// `win_ptr` must be null or a valid pointer to a live `NSWindow` on the main
 /// thread.
-pub unsafe fn install_agent_toggle(win_ptr: *mut Object) {
+pub unsafe fn install_agent_toggle(win_ptr: *mut AnyObject) {
     if win_ptr.is_null() {
         return;
     }
@@ -85,10 +85,10 @@ pub unsafe fn install_agent_toggle(win_ptr: *mut Object) {
     }
 
     let title = nsstring("AI");
-    let button: *mut Object = msg_send![
+    let button: *mut AnyObject = msg_send![
         class!(NSButton),
-        buttonWithTitle: title
-        target: shared_target()
+        buttonWithTitle: title,
+        target: shared_target(),
         action: sel!(skTermToggleAgents:)
     ];
     if button.is_null() {
@@ -104,8 +104,8 @@ pub unsafe fn install_agent_toggle(win_ptr: *mut Object) {
         size: NSSize { width: 44.0, height: 22.0 },
     }];
 
-    let vc: *mut Object = msg_send![class!(NSTitlebarAccessoryViewController), alloc];
-    let vc: *mut Object = msg_send![vc, init];
+    let vc: *mut AnyObject = msg_send![class!(NSTitlebarAccessoryViewController), alloc];
+    let vc: *mut AnyObject = msg_send![vc, init];
     if vc.is_null() {
         return;
     }
@@ -125,14 +125,14 @@ pub unsafe fn install_agent_toggle(win_ptr: *mut Object) {
 ///
 /// # Safety
 /// Must run on the main thread, with `win_ptr` a live `NSWindow` or null.
-pub unsafe fn set_agent_toggle_state(win_ptr: *mut Object, open: bool) {
+pub unsafe fn set_agent_toggle_state(win_ptr: *mut AnyObject, open: bool) {
     if win_ptr.is_null() {
         return;
     }
     let button = {
         let map = buttons().lock().unwrap();
         match map.get(&(win_ptr as usize)) {
-            Some(&b) => b as *mut Object,
+            Some(&b) => b as *mut AnyObject,
             None => return,
         }
     };
@@ -141,7 +141,7 @@ pub unsafe fn set_agent_toggle_state(win_ptr: *mut Object, open: bool) {
 }
 
 /// Forgets a closed window's button so the map does not grow without bound.
-pub fn forget_window(win_ptr: *mut Object) {
+pub fn forget_window(win_ptr: *mut AnyObject) {
     buttons().lock().unwrap().remove(&(win_ptr as usize));
 }
 
@@ -174,20 +174,23 @@ struct NSRect {
     size: NSSize,
 }
 
-unsafe impl objc::Encode for NSPoint {
-    fn encode() -> objc::Encoding {
-        unsafe { objc::Encoding::from_str("{CGPoint=dd}") }
-    }
+unsafe impl Encode for NSPoint {
+    const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+}
+unsafe impl RefEncode for NSPoint {
+    const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
 }
 
-unsafe impl objc::Encode for NSSize {
-    fn encode() -> objc::Encoding {
-        unsafe { objc::Encoding::from_str("{CGSize=dd}") }
-    }
+unsafe impl Encode for NSSize {
+    const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+}
+unsafe impl RefEncode for NSSize {
+    const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
 }
 
-unsafe impl objc::Encode for NSRect {
-    fn encode() -> objc::Encoding {
-        unsafe { objc::Encoding::from_str("{CGRect={CGPoint=dd}{CGSize=dd}}") }
-    }
+unsafe impl Encode for NSRect {
+    const ENCODING: Encoding = Encoding::Struct("CGRect", &[NSPoint::ENCODING, NSSize::ENCODING]);
+}
+unsafe impl RefEncode for NSRect {
+    const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
 }

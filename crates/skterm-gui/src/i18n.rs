@@ -88,12 +88,12 @@ impl Locale {
 
 #[cfg(target_os = "macos")]
 fn detect_macos_preferred_language() -> Option<String> {
-    use objc::runtime::Object;
-    use objc::{class, msg_send, sel, sel_impl};
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
     use std::ffi::CStr;
 
     unsafe {
-        let langs: *mut Object = msg_send![class!(NSLocale), preferredLanguages];
+        let langs: *mut AnyObject = msg_send![class!(NSLocale), preferredLanguages];
         if langs.is_null() {
             return None;
         }
@@ -101,7 +101,7 @@ fn detect_macos_preferred_language() -> Option<String> {
         if count == 0 {
             return None;
         }
-        let first: *mut Object = msg_send![langs, objectAtIndex: 0usize];
+        let first: *mut AnyObject = msg_send![langs, objectAtIndex: 0usize];
         if first.is_null() {
             return None;
         }

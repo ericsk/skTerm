@@ -780,11 +780,11 @@ impl App {
                         {
                             let ns_win = get_nswindow(&target_session.window);
                             if !ns_win.is_null() {
-                                use objc::{msg_send, sel, sel_impl};
+                                use objc2::msg_send;
                                 let _: () = unsafe {
                                     msg_send![
                                         ns_win,
-                                        makeKeyAndOrderFront: std::ptr::null::<objc::runtime::Object>()
+                                        makeKeyAndOrderFront: std::ptr::null::<objc2::runtime::AnyObject>()
                                     ]
                                 };
                             }

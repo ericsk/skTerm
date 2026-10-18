@@ -217,14 +217,14 @@ impl TerminalPipeline {
 
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("skterm_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         let image_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("skterm_image_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout, &image_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&image_bind_group_layout)],
+            immediate_size: 0,
         });
 
         let bg_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -233,7 +233,7 @@ impl TerminalPipeline {
             vertex: VertexState {
                 module: &shader,
                 entry_point: Some("vs_bg"),
-                buffers: &[BgInstance::desc()],
+                buffers: &[Some(BgInstance::desc())],
                 compilation_options: PipelineCompilationOptions::default(),
             },
             fragment: Some(FragmentState {
@@ -257,7 +257,7 @@ impl TerminalPipeline {
             },
             depth_stencil: None,
             multisample: MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -267,7 +267,7 @@ impl TerminalPipeline {
             vertex: VertexState {
                 module: &shader,
                 entry_point: Some("vs_glyph"),
-                buffers: &[GlyphInstance::desc()],
+                buffers: &[Some(GlyphInstance::desc())],
                 compilation_options: PipelineCompilationOptions::default(),
             },
             fragment: Some(FragmentState {
@@ -291,7 +291,7 @@ impl TerminalPipeline {
             },
             depth_stencil: None,
             multisample: MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -301,7 +301,7 @@ impl TerminalPipeline {
             vertex: VertexState {
                 module: &shader,
                 entry_point: Some("vs_image"),
-                buffers: &[ImageInstance::desc()],
+                buffers: &[Some(ImageInstance::desc())],
                 compilation_options: PipelineCompilationOptions::default(),
             },
             fragment: Some(FragmentState {
@@ -325,7 +325,7 @@ impl TerminalPipeline {
             },
             depth_stencil: None,
             multisample: MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 

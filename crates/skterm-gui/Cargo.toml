@@ -25,8 +25,5 @@ arboard = { workspace = true }
 image = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc = "0.2"
-
-[lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(cargo_clippy)'] }
+objc2 = "0.6"
 

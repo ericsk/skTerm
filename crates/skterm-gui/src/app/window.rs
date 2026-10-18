@@ -66,7 +66,7 @@ fn is_position_visible_on_monitors(
 fn center_window_on_screen(window: &Window, event_loop: &ActiveEventLoop) {
     #[cfg(target_os = "macos")]
     {
-        use objc::{msg_send, sel, sel_impl};
+        use objc2::msg_send;
         let win_ptr = get_nswindow(window);
         if !win_ptr.is_null() {
             let _: () = unsafe { msg_send![win_ptr, center] };
@@ -176,7 +176,7 @@ impl App {
         // managed inside the workspace and drawn in the left main area.
         #[cfg(target_os = "macos")]
         {
-            use objc::{msg_send, sel, sel_impl};
+            use objc2::msg_send;
 
             let new_ptr = get_nswindow(&window);
             if !new_ptr.is_null() {

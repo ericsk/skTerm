@@ -736,9 +736,9 @@ impl TermRenderer {
         let height = size.height.max(1);
         let scale_factor = (window.scale_factor() as f32).max(1.0);
 
-        let instance = Instance::new(&InstanceDescriptor {
+        let instance = Instance::new(InstanceDescriptor {
             backends: Backends::all(),
-            ..Default::default()
+            ..InstanceDescriptor::new_without_display_handle()
         });
 
         let surface = instance.create_surface(window.clone())?;
@@ -748,22 +748,20 @@ impl TermRenderer {
                 power_preference: PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
-            .await
-            .ok_or_else(|| anyhow::anyhow!("Failed to find suitable GPU adapter"))?;
+            .await?;
 
         info!("Selected GPU Adapter: {:?}", adapter.get_info());
 
         let (device, queue) = adapter
-            .request_device(
-                &DeviceDescriptor {
-                    label: Some("skterm_render_device"),
-                    required_features: Features::empty(),
-                    required_limits: Limits::default(),
-                    memory_hints: Default::default(),
-                },
-                None,
-            )
+            .request_device(&DeviceDescriptor {
+                label: Some("skterm_render_device"),
+                required_features: Features::empty(),
+                required_limits: Limits::default(),
+                memory_hints: Default::default(),
+                ..Default::default()
+            })
             .await?;
 
         let surface_caps = surface.get_capabilities(&adapter);
@@ -800,6 +798,7 @@ impl TermRenderer {
         let config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
             present_mode,
@@ -831,7 +830,7 @@ impl TermRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
@@ -1536,16 +1535,17 @@ impl TermRenderer {
         let frame_start = self.perf.now();
 
         let output = match self.surface.get_current_texture() {
-            Ok(texture) => texture,
-            Err(wgpu::SurfaceError::Lost) => {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.resize(self.config.width, self.config.height);
                 return Ok(());
             }
-            Err(wgpu::SurfaceError::OutOfMemory) => {
-                return Err(anyhow::anyhow!("GPU Out of memory"));
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(());
             }
-            Err(e) => {
-                return Err(anyhow::anyhow!("Surface error: {:?}", e));
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(anyhow::anyhow!("Surface validation error"));
             }
         };
 
@@ -2684,6 +2684,7 @@ impl TermRenderer {
                 label: Some("skterm_render_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -2698,6 +2699,7 @@ impl TermRenderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             render_pass.set_bind_group(0, &self.pipeline.bind_group, &[]);
@@ -2756,7 +2758,7 @@ impl TermRenderer {
         let upload_and_submit_ns = self.perf.since(gpu_start);
         let present_start = self.perf.now();
 
-        output.present();
+        self.queue.present(output);
 
         self.perf.record(
             acquire_ns,
