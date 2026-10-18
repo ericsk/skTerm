@@ -89,18 +89,31 @@ pub fn apply_window_icon(window: &Window) {
                         #[cfg(target_pointer_width = "64")]
                         #[link(name = "user32")]
                         extern "system" {
-                            fn SetClassLongPtrW(hWnd: isize, nIndex: i32, dwNewLong: usize) -> usize;
+                            fn SetClassLongPtrW(
+                                hWnd: isize,
+                                nIndex: i32,
+                                dwNewLong: usize,
+                            ) -> usize;
                         }
                         #[cfg(target_pointer_width = "32")]
                         #[link(name = "user32")]
                         extern "system" {
                             #[link_name = "SetClassLongW"]
-                            fn SetClassLongPtrW(hWnd: isize, nIndex: i32, dwNewLong: usize) -> usize;
+                            fn SetClassLongPtrW(
+                                hWnd: isize,
+                                nIndex: i32,
+                                dwNewLong: usize,
+                            ) -> usize;
                         }
 
                         #[link(name = "user32")]
                         extern "system" {
-                            fn SendMessageW(hWnd: isize, Msg: u32, wParam: usize, lParam: isize) -> isize;
+                            fn SendMessageW(
+                                hWnd: isize,
+                                Msg: u32,
+                                wParam: usize,
+                                lParam: isize,
+                            ) -> isize;
                             fn LoadImageW(
                                 hInst: isize,
                                 name: *const u16,
@@ -133,14 +146,8 @@ pub fn apply_window_icon(window: &Window) {
                             0,
                             LR_DEFAULTSIZE | LR_SHARED,
                         );
-                        let hicon_small = LoadImageW(
-                            hinstance,
-                            1 as *const u16,
-                            IMAGE_ICON,
-                            16,
-                            16,
-                            LR_SHARED,
-                        );
+                        let hicon_small =
+                            LoadImageW(hinstance, 1 as *const u16, IMAGE_ICON, 16, 16, LR_SHARED);
 
                         if hicon_big != 0 {
                             SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big);

@@ -159,7 +159,12 @@ impl App {
     pub fn apply_config_live(&mut self, new_cfg: &Config, persist: bool) {
         info!("Applying live configuration update to all terminal sessions...");
         let old_font = self.config_manager.current_config.font.clone();
-        let old_decorations = self.config_manager.current_config.window.decorations.clone();
+        let old_decorations = self
+            .config_manager
+            .current_config
+            .window
+            .decorations
+            .clone();
         let font_changed = old_font.family != new_cfg.font.family
             || (old_font.size - new_cfg.font.size).abs() > 0.01
             || old_font.fallback_families != new_cfg.font.fallback_families;

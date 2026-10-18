@@ -323,7 +323,10 @@ pub fn install_or_update_macos_menu(locale: Locale) {
 
             set_title(handles.file_menu_item as *mut AnyObject, tr.menu_file);
             set_title(handles.file_menu as *mut AnyObject, tr.menu_file);
-            set_title(handles.file_new_window as *mut AnyObject, tr.file_new_window);
+            set_title(
+                handles.file_new_window as *mut AnyObject,
+                tr.file_new_window,
+            );
             set_title(handles.file_new_tab as *mut AnyObject, tr.file_new_tab);
             set_title(
                 handles.file_split_horizontal as *mut AnyObject,
@@ -483,13 +486,8 @@ pub fn install_or_update_macos_menu(locale: Locale) {
         );
         let _: () = msg_send![app_menu, addItem: app_hide_others];
 
-        let app_show_all = create_selector_item(
-            tr.app_show_all,
-            sel!(unhideAllApplications:),
-            ns_app,
-            "",
-            0,
-        );
+        let app_show_all =
+            create_selector_item(tr.app_show_all, sel!(unhideAllApplications:), ns_app, "", 0);
         let _: () = msg_send![app_menu, addItem: app_show_all];
         let _: () = msg_send![app_menu, addItem: create_separator()];
 
@@ -773,25 +771,16 @@ pub fn install_or_update_macos_menu(locale: Locale) {
         set_title(help_menu_item, tr.menu_help);
         let help_menu = create_menu(tr.menu_help);
 
-        let help_github =
-            create_action_item(tr.help_github, NativeMenuAction::OpenGitHub, "", 0);
+        let help_github = create_action_item(tr.help_github, NativeMenuAction::OpenGitHub, "", 0);
         let _: () = msg_send![help_menu, addItem: help_github];
 
-        let help_report_issue = create_action_item(
-            tr.help_report_issue,
-            NativeMenuAction::ReportIssue,
-            "",
-            0,
-        );
+        let help_report_issue =
+            create_action_item(tr.help_report_issue, NativeMenuAction::ReportIssue, "", 0);
         let _: () = msg_send![help_menu, addItem: help_report_issue];
         let _: () = msg_send![help_menu, addItem: create_separator()];
 
-        let help_open_config = create_action_item(
-            tr.help_open_config,
-            NativeMenuAction::OpenConfigFile,
-            "",
-            0,
-        );
+        let help_open_config =
+            create_action_item(tr.help_open_config, NativeMenuAction::OpenConfigFile, "", 0);
         let _: () = msg_send![help_menu, addItem: help_open_config];
 
         let _: () = msg_send![help_menu_item, setSubmenu: help_menu];

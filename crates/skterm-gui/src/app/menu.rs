@@ -457,7 +457,10 @@ impl App {
                 if let Some(session) = self.sessions.get_mut(&window_id) {
                     if let Some(tab) = session.workspace.active_tab_mut() {
                         if let Some(terminal) = tab.active_terminal_mut() {
-                            terminal.grid_mut().active_mut().clear_scrollback_and_screen();
+                            terminal
+                                .grid_mut()
+                                .active_mut()
+                                .clear_scrollback_and_screen();
                             let _ = terminal.write_to_pty(b"\x0c");
                             session.window.request_redraw();
                         }

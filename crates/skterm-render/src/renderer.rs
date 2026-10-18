@@ -344,10 +344,9 @@ impl AgentStatus {
         match self {
             Self::Working => [0.18, 0.88, 0.46, 1.0],
             Self::Done => [0.28, 0.78, 0.96, 1.0],
-            Self::NeedsInput
-            | Self::NeedsPermission
-            | Self::NeedsAnswer
-            | Self::NeedsSignIn => [1.0, 0.62, 0.18, 1.0],
+            Self::NeedsInput | Self::NeedsPermission | Self::NeedsAnswer | Self::NeedsSignIn => {
+                [1.0, 0.62, 0.18, 1.0]
+            }
             Self::Error => [0.96, 0.32, 0.34, 1.0],
             Self::Idle => [0.96, 0.76, 0.22, 1.0],
         }
@@ -1999,12 +1998,9 @@ impl TermRenderer {
                                 // If a wide character starts at `start_col - 1`, its right half overlaps
                                 // `start_col`, so skip it cleanly while preedit occupies `start_col`.
                                 if c_idx + 1 == start_col
-                                    && row
-                                        .cells
-                                        .get(start_col)
-                                        .is_some_and(|next| {
-                                            next.flags.contains(CellFlags::WIDE_CHAR_SPACER)
-                                        })
+                                    && row.cells.get(start_col).is_some_and(|next| {
+                                        next.flags.contains(CellFlags::WIDE_CHAR_SPACER)
+                                    })
                                 {
                                     continue;
                                 }
@@ -2289,10 +2285,12 @@ impl TermRenderer {
                                         color: preedit_bg,
                                     });
                                     if c != ' ' && c != '\0' {
-                                        if let Some(glyph_info) = self
-                                            .atlas
-                                            .get_or_insert_glyph(&self.queue, c, false, false)
-                                        {
+                                        if let Some(glyph_info) = self.atlas.get_or_insert_glyph(
+                                            &self.queue,
+                                            c,
+                                            false,
+                                            false,
+                                        ) {
                                             if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0
                                             {
                                                 let glyph_x = x + glyph_info.offset[0];

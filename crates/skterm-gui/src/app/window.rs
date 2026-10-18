@@ -34,8 +34,7 @@ pub fn is_rect_visible_on_monitors(
             continue;
         }
         any_valid_monitor = true;
-        let horiz_ok =
-            pos_x + win_w >= mx + min_visible_w && pos_x <= mx + mw - min_visible_w;
+        let horiz_ok = pos_x + win_w >= mx + min_visible_w && pos_x <= mx + mw - min_visible_w;
         let vert_ok = pos_y >= my - 10.0 && pos_y <= my + mh - min_visible_h;
         if horiz_ok && vert_ok {
             return true;
@@ -237,9 +236,7 @@ impl App {
         // AppKit coordinates, which shifts the top-left `y` whenever the window
         // height changes; if no saved position exists, `winit` centered the initial
         // estimate rather than the final size.
-        let outer_logical = window
-            .outer_size()
-            .to_logical::<f64>(window.scale_factor());
+        let outer_logical = window.outer_size().to_logical::<f64>(window.scale_factor());
         if let Some((pos_x, pos_y)) = desired_position.filter(|&(x, y)| {
             is_position_visible_on_monitors(
                 event_loop,

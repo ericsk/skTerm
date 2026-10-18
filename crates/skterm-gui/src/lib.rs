@@ -1236,9 +1236,13 @@ mod tests {
 
         let monitors = [(0.0, 0.0, 1728.0, 1117.0), (1728.0, 0.0, 2560.0, 1440.0)];
         // Normal position on primary monitor
-        assert!(is_rect_visible_on_monitors(140.0, 85.0, 900.0, 600.0, &monitors));
+        assert!(is_rect_visible_on_monitors(
+            140.0, 85.0, 900.0, 600.0, &monitors
+        ));
         // Normal position on secondary monitor
-        assert!(is_rect_visible_on_monitors(2000.0, 120.0, 900.0, 600.0, &monitors));
+        assert!(is_rect_visible_on_monitors(
+            2000.0, 120.0, 900.0, 600.0, &monitors
+        ));
         // Off-screen after unplugging secondary monitor
         assert!(!is_rect_visible_on_monitors(
             2000.0,
@@ -1248,7 +1252,13 @@ mod tests {
             &monitors[..1]
         ));
         // Empty monitor list falls back to allowing the position
-        assert!(is_rect_visible_on_monitors(2000.0, 120.0, 900.0, 600.0, &[]));
+        assert!(is_rect_visible_on_monitors(
+            2000.0,
+            120.0,
+            900.0,
+            600.0,
+            &[]
+        ));
     }
 
     #[test]

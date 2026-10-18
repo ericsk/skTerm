@@ -11,12 +11,12 @@ pub use grid::{
     Cell, CellFlags, Color, Cursor, CursorShape, NamedColor, Row, ScreenBuffer, ScreenGrid,
     SearchMatch, Selection, SelectionMode,
 };
+#[cfg(target_os = "macos")]
+pub use pty::process_cwd;
 pub use pty::{
     available_shell_presets, find_cmd, find_git_bash_path, find_pwsh_path, find_windows_powershell,
     PtyEvent, PtyProcess, PtySpawnOptions, ShellPresetInfo,
 };
-#[cfg(target_os = "macos")]
-pub use pty::process_cwd;
 pub use terminal::Terminal;
 pub use vt::{
     Charset, MouseFormat, MouseProtocol, ProgramStatusKind, ProgramStatusRecord,
@@ -764,10 +764,7 @@ mod tests {
         let active = term.active_program_status().expect("remaining status");
         assert_eq!(active.id.as_deref(), Some("agent-2"));
         assert_eq!(active.state, ProgramStatusState::Error);
-        assert_eq!(
-            active.msg.as_deref(),
-            Some("Agent stopped with an error")
-        );
+        assert_eq!(active.msg.as_deref(), Some("Agent stopped with an error"));
 
         // Full reset (RIS: ESC c) clears all program statuses.
         term.feed_bytes(b"\x1bc");

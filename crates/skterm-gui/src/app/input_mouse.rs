@@ -84,7 +84,8 @@ impl App {
             // Update top-right [AI] and [⚙] button hover state (and floating pill visibility when tab_bar_h == 0)
             let top_btns = session.top_right_buttons(tab_bar_h);
             let in_zone = top_btns.in_hover_zone(mx, my, scale);
-            let btns_visible = tab_bar_h > 0.0 || in_zone || (session.menu_open && !session.menu_is_context);
+            let btns_visible =
+                tab_bar_h > 0.0 || in_zone || (session.menu_open && !session.menu_is_context);
             let over_ai = btns_visible && top_btns.hit_ai(mx, my, scale);
             let over_prefs = btns_visible && top_btns.hit_prefs(mx, my, scale);
             if in_zone != session.top_right_hover
@@ -328,12 +329,8 @@ impl App {
                 } else {
                     let menu_w = 240.0 * scale;
                     let menu_x = session.get_dropdown_menu_x(tab_bar_h, menu_w);
-                    let (mut m, acts) = build_top_dropdown_menu(
-                        scale,
-                        menu_x,
-                        tab_bar_h,
-                        session.menu_hovered_idx,
-                    );
+                    let (mut m, acts) =
+                        build_top_dropdown_menu(scale, menu_x, tab_bar_h, session.menu_hovered_idx);
                     m.clamp_to_screen(screen_w, screen_h, scale);
                     (m, acts)
                 };
@@ -401,8 +398,9 @@ impl App {
                 let scale = session.renderer.scale_factor;
                 let (mx, my) = session.mouse_pos;
                 let top_btns = session.top_right_buttons(tab_bar_h);
-                let btns_active =
-                    tab_bar_h > 0.0 || session.top_right_hover || top_btns.in_hover_zone(mx, my, scale);
+                let btns_active = tab_bar_h > 0.0
+                    || session.top_right_hover
+                    || top_btns.in_hover_zone(mx, my, scale);
                 if btns_active {
                     if top_btns.hit_ai(mx, my, scale) && button == MouseButton::Left {
                         tr_action = Some(TopRightAction::ToggleAiSidebar);
@@ -469,13 +467,9 @@ impl App {
                     let chevron_w = 20.0 * scale;
                     let right_btns_w = TopRightButtons::reserved_width(scale);
                     let tab_gap = 4.0 * scale;
-                    let avail_w = (main_w
-                        - start_x
-                        - plus_btn_w
-                        - chevron_w
-                        - right_btns_w
-                        - 16.0 * scale)
-                        .max(80.0);
+                    let avail_w =
+                        (main_w - start_x - plus_btn_w - chevron_w - right_btns_w - 16.0 * scale)
+                            .max(80.0);
                     let total_gaps = (tabs_len.saturating_sub(1) as f32) * tab_gap;
                     let tab_w = ((avail_w - total_gaps) / tabs_len as f32)
                         .clamp(75.0 * scale, 190.0 * scale);

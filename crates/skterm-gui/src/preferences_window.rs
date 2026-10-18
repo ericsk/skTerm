@@ -718,8 +718,10 @@ impl PreferencesWindow {
         self.selection_override = config.colors.selection.clone().unwrap_or_default();
         if let Some(pal) = &config.colors.palette {
             for idx in 0..16 {
-                self.palette_overrides[idx] =
-                    pal.get_index(idx).map(|s| s.to_string()).unwrap_or_default();
+                self.palette_overrides[idx] = pal
+                    .get_index(idx)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
             }
         } else {
             for slot in &mut self.palette_overrides {
@@ -841,7 +843,8 @@ impl PreferencesWindow {
             let wants_kb = ui.ctx().egui_wants_keyboard_input();
             let close_shortcut = ui.ctx().input(|i| {
                 let esc = i.key_pressed(egui::Key::Escape) && !wants_kb;
-                let cmd_w = i.key_pressed(egui::Key::W) && (i.modifiers.command || i.modifiers.ctrl);
+                let cmd_w =
+                    i.key_pressed(egui::Key::W) && (i.modifiers.command || i.modifiers.ctrl);
                 esc || cmd_w
             });
             if close_shortcut {
@@ -1110,10 +1113,14 @@ impl PreferencesWindow {
     /// Resolve effective theme + custom overrides for live preview inside Preferences.
     fn effective_colors(&self) -> (Color32, Color32, Color32, Color32, [Color32; 16]) {
         let preset = crate::config::Theme::get(&self.theme);
-        let bg = parse_hex_color(&self.bg_override).unwrap_or_else(|| rgba_to_color32(preset.background));
-        let fg = parse_hex_color(&self.fg_override).unwrap_or_else(|| rgba_to_color32(preset.foreground));
-        let cur = parse_hex_color(&self.cursor_override).unwrap_or_else(|| rgba_to_color32(preset.cursor));
-        let sel = parse_hex_color(&self.selection_override).unwrap_or_else(|| rgba_to_color32(preset.selection));
+        let bg = parse_hex_color(&self.bg_override)
+            .unwrap_or_else(|| rgba_to_color32(preset.background));
+        let fg = parse_hex_color(&self.fg_override)
+            .unwrap_or_else(|| rgba_to_color32(preset.foreground));
+        let cur = parse_hex_color(&self.cursor_override)
+            .unwrap_or_else(|| rgba_to_color32(preset.cursor));
+        let sel = parse_hex_color(&self.selection_override)
+            .unwrap_or_else(|| rgba_to_color32(preset.selection));
         let pal = std::array::from_fn(|i| {
             parse_hex_color(&self.palette_overrides[i])
                 .unwrap_or_else(|| rgba_to_color32(preset.palette[i]))
@@ -1230,12 +1237,7 @@ impl PreferencesWindow {
                             .size(12.0)
                             .color(pal[3]),
                     );
-                    ui.label(
-                        RichText::new("ERR: 0")
-                            .monospace()
-                            .size(12.0)
-                            .color(pal[1]),
-                    );
+                    ui.label(RichText::new("ERR: 0").monospace().size(12.0).color(pal[1]));
                 });
 
                 ui.add_space(row_spacing);
@@ -1302,8 +1304,7 @@ impl PreferencesWindow {
             .iter()
             .filter(|f| {
                 let name_match = needle.is_empty() || f.to_lowercase().contains(&needle);
-                let type_match =
-                    self.show_all_fonts || skterm_render::is_terminal_friendly_font(f);
+                let type_match = self.show_all_fonts || skterm_render::is_terminal_friendly_font(f);
                 name_match && type_match
             })
             .collect();
@@ -1334,8 +1335,11 @@ impl PreferencesWindow {
 
     // 1. Appearance Tab View
     fn render_appearance_view(&mut self, ui: &mut Ui) {
-        render_inset_card(ui, "字型與備援鏈 (Typography & Fallback Chain)", |b| {
-            b.block(
+        render_inset_card(
+            ui,
+            "字型與備援鏈 (Typography & Fallback Chain)",
+            |b| {
+                b.block(
                 "字型家族與優先順序 (Font Family & Fallback Order)",
                 Some("排在第一順位的為主字型，遇到缺字（如 Nerd 圖示或中文）時自動依序往後遞補。"),
                 |ui| {
@@ -1643,22 +1647,27 @@ impl PreferencesWindow {
                 },
             );
 
-            b.row("字型大小 (Font Size)", Some("終端文字大小 (pt)"), |ui| {
-                ui.add(
-                    egui::Slider::new(&mut self.font_size, 9.0..=36.0)
-                        .suffix(" pt")
-                        .step_by(0.5),
+                b.row(
+                    "字型大小 (Font Size)",
+                    Some("終端文字大小 (pt)"),
+                    |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.font_size, 9.0..=36.0)
+                                .suffix(" pt")
+                                .step_by(0.5),
+                        );
+                    },
                 );
-            });
 
-            b.row(
-                "行高倍率 (Line Height)",
-                Some("1.0 為緊湊，1.2 為標準舒適（即時套用）"),
-                |ui| {
-                    ui.add(egui::Slider::new(&mut self.line_height, 1.0..=2.0).step_by(0.05));
-                },
-            );
-        });
+                b.row(
+                    "行高倍率 (Line Height)",
+                    Some("1.0 為緊湊，1.2 為標準舒適（即時套用）"),
+                    |ui| {
+                        ui.add(egui::Slider::new(&mut self.line_height, 1.0..=2.0).step_by(0.05));
+                    },
+                );
+            },
+        );
 
         render_inset_card(ui, "視窗幾何與邊距 (Window & Layout)", |b| {
             b.row(
@@ -1798,8 +1807,8 @@ impl PreferencesWindow {
                     let avail_w = ui.available_width();
                     let cols = 3usize;
                     let spacing_x = 12.0;
-                    let card_w = ((avail_w - spacing_x * (cols as f32 - 1.0)) / cols as f32)
-                        .max(150.0);
+                    let card_w =
+                        ((avail_w - spacing_x * (cols as f32 - 1.0)) / cols as f32).max(150.0);
 
                     egui::Grid::new("theme_swatch_grid")
                         .num_columns(cols)
@@ -1934,18 +1943,22 @@ impl PreferencesWindow {
                     );
                 },
             );
-            b.row("游標顏色 (Cursor)", Some("留空則繼承主題預設游標色"), |ui| {
-                render_color_row_with_presets(
-                    ui,
-                    rgba_to_color32(preset.cursor),
-                    &mut self.cursor_override,
-                    &[
-                        ("#0a84ff", Color32::from_rgb(10, 132, 255), "macOS 藍"),
-                        ("#30d158", Color32::from_rgb(48, 209, 88), "翠綠"),
-                        ("#ff453a", Color32::from_rgb(255, 69, 58), "鮮紅"),
-                    ],
-                );
-            });
+            b.row(
+                "游標顏色 (Cursor)",
+                Some("留空則繼承主題預設游標色"),
+                |ui| {
+                    render_color_row_with_presets(
+                        ui,
+                        rgba_to_color32(preset.cursor),
+                        &mut self.cursor_override,
+                        &[
+                            ("#0a84ff", Color32::from_rgb(10, 132, 255), "macOS 藍"),
+                            ("#30d158", Color32::from_rgb(48, 209, 88), "翠綠"),
+                            ("#ff453a", Color32::from_rgb(255, 69, 58), "鮮紅"),
+                        ],
+                    );
+                },
+            );
             b.row(
                 "選取文字底色 (Selection)",
                 Some("滑鼠反白選取範圍的背景色"),
@@ -1963,114 +1976,117 @@ impl PreferencesWindow {
             );
         });
 
-        render_inset_card(ui, "進階 ANSI 16 色調色盤 (ANSI 16-Color Palette)", |b| {
-            b.block(
-                "個別覆寫終端機 ANSI 16 色 (color0 ~ color15)",
-                Some("可微調標準 8 色與高亮 8 色；留空代表使用當前主題預設值。"),
-                |ui| {
-                    ui.horizontal(|ui| {
-                        let btn_label = if self.show_ansi_palette {
-                            "▼ 收合 ANSI 16 色設定表"
-                        } else {
-                            "▶ 展開 ANSI 16 色設定表 (0~15)"
-                        };
-                        if ui.button(btn_label).clicked() {
-                            self.show_ansi_palette = !self.show_ansi_palette;
-                        }
-
-                        let any_override = self
-                            .palette_overrides
-                            .iter()
-                            .any(|s| !s.trim().is_empty());
-                        if any_override
-                            && ui
-                                .button("🔄 全部重設為主題預設")
-                                .on_hover_text("清除所有 color0 ~ color15 自訂覆寫")
-                                .clicked()
-                        {
-                            for slot in &mut self.palette_overrides {
-                                slot.clear();
+        render_inset_card(
+            ui,
+            "進階 ANSI 16 色調色盤 (ANSI 16-Color Palette)",
+            |b| {
+                b.block(
+                    "個別覆寫終端機 ANSI 16 色 (color0 ~ color15)",
+                    Some("可微調標準 8 色與高亮 8 色；留空代表使用當前主題預設值。"),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            let btn_label = if self.show_ansi_palette {
+                                "▼ 收合 ANSI 16 色設定表"
+                            } else {
+                                "▶ 展開 ANSI 16 色設定表 (0~15)"
+                            };
+                            if ui.button(btn_label).clicked() {
+                                self.show_ansi_palette = !self.show_ansi_palette;
                             }
-                        }
-                    });
 
-                    if self.show_ansi_palette {
-                        ui.add_space(8.0);
-                        let color_names = [
-                            "0 黑 (Black)",
-                            "1 紅 (Red)",
-                            "2 綠 (Green)",
-                            "3 黃 (Yellow)",
-                            "4 藍 (Blue)",
-                            "5 洋紅 (Magenta)",
-                            "6 青 (Cyan)",
-                            "7 白 (White)",
-                            "8 亮黑 (BrBlack)",
-                            "9 亮紅 (BrRed)",
-                            "10 亮綠 (BrGreen)",
-                            "11 亮黃 (BrYellow)",
-                            "12 亮藍 (BrBlue)",
-                            "13 亮洋紅 (BrMag)",
-                            "14 亮青 (BrCyan)",
-                            "15 亮白 (BrWhite)",
-                        ];
-
-                        egui::Grid::new("ansi_16_palette_grid")
-                            .num_columns(2)
-                            .spacing(egui::vec2(20.0, 8.0))
-                            .show(ui, |ui| {
-                                for (idx, color_name) in color_names.iter().enumerate() {
-                                    ui.push_id(idx, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(format!("{:<16}", color_name))
-                                                    .size(11.5)
-                                                    .monospace()
-                                                    .color(Color32::from_rgb(200, 206, 222)),
-                                            );
-                                            let fallback = rgba_to_color32(preset.palette[idx]);
-                                            let mut cur = parse_hex_color(&self.palette_overrides[idx])
-                                                .unwrap_or(fallback);
-                                            if ui.color_edit_button_srgba(&mut cur).changed() {
-                                                self.palette_overrides[idx] = format!(
-                                                    "#{:02x}{:02x}{:02x}",
-                                                    cur.r(),
-                                                    cur.g(),
-                                                    cur.b()
-                                                );
-                                            }
-                                            ui.add(
-                                                egui::TextEdit::singleline(
-                                                    &mut self.palette_overrides[idx],
-                                                )
-                                                .hint_text(format!(
-                                                    "#{:02x}{:02x}{:02x}",
-                                                    fallback.r(),
-                                                    fallback.g(),
-                                                    fallback.b()
-                                                ))
-                                                .desired_width(74.0)
-                                                .font(egui::TextStyle::Monospace),
-                                            );
-                                            if !self.palette_overrides[idx].trim().is_empty()
-                                                && ui
-                                                    .small_button("✖")
-                                                    .on_hover_text("重設為主題預設")
-                                                    .clicked()
-                                            {
-                                                self.palette_overrides[idx].clear();
-                                            }
-                                        });
-                                    });
-                                    if idx % 2 == 1 {
-                                        ui.end_row();
-                                    }
+                            let any_override =
+                                self.palette_overrides.iter().any(|s| !s.trim().is_empty());
+                            if any_override
+                                && ui
+                                    .button("🔄 全部重設為主題預設")
+                                    .on_hover_text("清除所有 color0 ~ color15 自訂覆寫")
+                                    .clicked()
+                            {
+                                for slot in &mut self.palette_overrides {
+                                    slot.clear();
                                 }
-                            });
-                    }
-                },
-            );
-        });
+                            }
+                        });
+
+                        if self.show_ansi_palette {
+                            ui.add_space(8.0);
+                            let color_names = [
+                                "0 黑 (Black)",
+                                "1 紅 (Red)",
+                                "2 綠 (Green)",
+                                "3 黃 (Yellow)",
+                                "4 藍 (Blue)",
+                                "5 洋紅 (Magenta)",
+                                "6 青 (Cyan)",
+                                "7 白 (White)",
+                                "8 亮黑 (BrBlack)",
+                                "9 亮紅 (BrRed)",
+                                "10 亮綠 (BrGreen)",
+                                "11 亮黃 (BrYellow)",
+                                "12 亮藍 (BrBlue)",
+                                "13 亮洋紅 (BrMag)",
+                                "14 亮青 (BrCyan)",
+                                "15 亮白 (BrWhite)",
+                            ];
+
+                            egui::Grid::new("ansi_16_palette_grid")
+                                .num_columns(2)
+                                .spacing(egui::vec2(20.0, 8.0))
+                                .show(ui, |ui| {
+                                    for (idx, color_name) in color_names.iter().enumerate() {
+                                        ui.push_id(idx, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new(format!("{:<16}", color_name))
+                                                        .size(11.5)
+                                                        .monospace()
+                                                        .color(Color32::from_rgb(200, 206, 222)),
+                                                );
+                                                let fallback = rgba_to_color32(preset.palette[idx]);
+                                                let mut cur =
+                                                    parse_hex_color(&self.palette_overrides[idx])
+                                                        .unwrap_or(fallback);
+                                                if ui.color_edit_button_srgba(&mut cur).changed() {
+                                                    self.palette_overrides[idx] = format!(
+                                                        "#{:02x}{:02x}{:02x}",
+                                                        cur.r(),
+                                                        cur.g(),
+                                                        cur.b()
+                                                    );
+                                                }
+                                                ui.add(
+                                                    egui::TextEdit::singleline(
+                                                        &mut self.palette_overrides[idx],
+                                                    )
+                                                    .hint_text(format!(
+                                                        "#{:02x}{:02x}{:02x}",
+                                                        fallback.r(),
+                                                        fallback.g(),
+                                                        fallback.b()
+                                                    ))
+                                                    .desired_width(74.0)
+                                                    .font(egui::TextStyle::Monospace),
+                                                );
+                                                if !self.palette_overrides[idx].trim().is_empty()
+                                                    && ui
+                                                        .small_button("✖")
+                                                        .on_hover_text("重設為主題預設")
+                                                        .clicked()
+                                                {
+                                                    self.palette_overrides[idx].clear();
+                                                }
+                                            });
+                                        });
+                                        if idx % 2 == 1 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+                        }
+                    },
+                );
+            },
+        );
     }
 
     // 3. Terminal & Shell Tab View
@@ -2113,7 +2129,8 @@ impl PreferencesWindow {
             #[cfg(target_os = "windows")]
             let shell_subtitle = "自由切換命令提示字元、Windows PowerShell 或 PowerShell 7";
             #[cfg(not(target_os = "windows"))]
-            let shell_subtitle = "自動偵測系統已安裝的 Shell（如 Bash、Zsh、Fish 等）並去除重複連結";
+            let shell_subtitle =
+                "自動偵測系統已安裝的 Shell（如 Bash、Zsh、Fish 等）並去除重複連結";
 
             b.row("預設 Shell 核心", Some(shell_subtitle), |ui| {
                 egui::ComboBox::from_id_salt("pref_window_shell_preset")
@@ -2175,10 +2192,7 @@ impl PreferencesWindow {
                     ui.horizontal_wrapped(|ui| {
                         let is_sys_default =
                             !self.custom_shell_enabled || self.shell_program.trim().is_empty();
-                        if ui
-                            .selectable_label(is_sys_default, "🌟 系統預設")
-                            .clicked()
-                        {
+                        if ui.selectable_label(is_sys_default, "🌟 系統預設").clicked() {
                             self.custom_shell_enabled = false;
                             self.shell_program.clear();
                             self.shell_args.clear();
@@ -2262,10 +2276,7 @@ impl PreferencesWindow {
                 Some("按住 Shift + 右鍵 可隨時執行另一種行為"),
                 |ui| {
                     let mut cur = self.right_click_action.as_str();
-                    let opts = [
-                        ("menu", "開啟快捷選單 (預設)"),
-                        ("paste", "直接貼上剪貼簿"),
-                    ];
+                    let opts = [("menu", "開啟快捷選單 (預設)"), ("paste", "直接貼上剪貼簿")];
                     if render_macos_segmented_control(ui, &mut cur, &opts) {
                         self.right_click_action = cur.to_string();
                     }
@@ -2376,7 +2387,9 @@ impl PreferencesWindow {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.keybinding_filter)
-                            .hint_text("🔍 搜尋快捷鍵或功能名稱 (例如：分割、搜尋、AI、偏好設定)...")
+                            .hint_text(
+                                "🔍 搜尋快捷鍵或功能名稱 (例如：分割、搜尋、AI、偏好設定)...",
+                            )
                             .desired_width(280.0),
                     );
                     if !self.keybinding_filter.is_empty() && ui.small_button("✖").clicked() {
@@ -2396,7 +2409,10 @@ impl PreferencesWindow {
 
         ui.add_space(12.0);
 
-        type ShortcutGroup<'a> = (&'a str, &'a [(&'a str, Option<&'a str>, &'a [&'a str], &'a [&'a str])]);
+        type ShortcutGroup<'a> = (
+            &'a str,
+            &'a [(&'a str, Option<&'a str>, &'a [&'a str], &'a [&'a str])],
+        );
 
         let groups: &[ShortcutGroup] = &[
             (
@@ -2539,12 +2555,7 @@ impl PreferencesWindow {
                         &["⌃", "C"],
                         &["Ctrl", "C"],
                     ),
-                    (
-                        "傳送 EOF / 登出 Shell",
-                        None,
-                        &["⌃", "D"],
-                        &["Ctrl", "D"],
-                    ),
+                    ("傳送 EOF / 登出 Shell", None, &["⌃", "D"], &["Ctrl", "D"]),
                 ],
             ),
         ];
@@ -2571,7 +2582,9 @@ impl PreferencesWindow {
                         return true;
                     }
                     desc.to_lowercase().contains(&needle)
-                        || sub.map(|s| s.to_lowercase().contains(&needle)).unwrap_or(false)
+                        || sub
+                            .map(|s| s.to_lowercase().contains(&needle))
+                            .unwrap_or(false)
                         || mac_k.iter().any(|k| k.to_lowercase().contains(&needle))
                         || win_k.iter().any(|k| k.to_lowercase().contains(&needle))
                 })

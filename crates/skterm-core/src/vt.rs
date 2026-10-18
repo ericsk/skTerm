@@ -1585,9 +1585,11 @@ impl TerminalState {
         self.program_status_seq = self.program_status_seq.wrapping_add(1);
 
         let inherited_app = parsed.app.or_else(|| self.resolve_inherited_app(&key));
-        let inherited_title = parsed
-            .title
-            .or_else(|| self.program_statuses.get(&key).and_then(|r| r.title.clone()));
+        let inherited_title = parsed.title.or_else(|| {
+            self.program_statuses
+                .get(&key)
+                .and_then(|r| r.title.clone())
+        });
 
         let new_record = ProgramStatusRecord {
             id: parsed.id,
@@ -1818,11 +1820,8 @@ fn parse_osc7501_payload(payload: &str) -> Option<ParsedOsc7501> {
                 }
             }
             "title" => {
-                title = decode_osc7501_base64_field(
-                    val,
-                    MAX_TITLE_ENCODED_LEN,
-                    MAX_TITLE_DECODED_LEN,
-                )?;
+                title =
+                    decode_osc7501_base64_field(val, MAX_TITLE_ENCODED_LEN, MAX_TITLE_DECODED_LEN)?;
             }
             "msg" => {
                 msg = decode_osc7501_base64_field(val, MAX_MSG_ENCODED_LEN, MAX_MSG_DECODED_LEN)?;

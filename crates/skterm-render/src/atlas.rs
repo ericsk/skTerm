@@ -16,7 +16,9 @@ pub const REGULAR_WEIGHT: f32 = 400.0;
 pub const BOLD_WEIGHT: f32 = 700.0;
 
 fn px_to_ab_scale(font: &ab_glyph::FontVec, px: f32) -> ab_glyph::PxScale {
-    let upem = ab_glyph::Font::units_per_em(font).unwrap_or(1000.0).max(1.0);
+    let upem = ab_glyph::Font::units_per_em(font)
+        .unwrap_or(1000.0)
+        .max(1.0);
     let height = ab_glyph::Font::height_unscaled(font);
     ab_glyph::PxScale::from(px * height / upem)
 }
@@ -47,7 +49,10 @@ impl FontFace {
         let collection_index = settings.collection_index;
         if let Ok(mut var_font) = ab_glyph::FontVec::try_from_vec_and_index(bytes, collection_index)
         {
-            let has_wght = var_font.variations().iter().any(|axis| &axis.tag == b"wght");
+            let has_wght = var_font
+                .variations()
+                .iter()
+                .any(|axis| &axis.tag == b"wght");
             if has_wght {
                 var_font.set_variation(b"wght", weight);
                 return Ok(Self::Variable {
@@ -500,7 +505,13 @@ impl GlyphAtlas {
         };
 
         let (metrics, bitmap) = if primary.lookup_glyph_index(c) != 0 {
-            rasterize_fitted_glyph(primary, c, self.font_size, self.cell_width, self.cell_height)
+            rasterize_fitted_glyph(
+                primary,
+                c,
+                self.font_size,
+                self.cell_width,
+                self.cell_height,
+            )
         } else {
             let target_cells = unicode_width::UnicodeWidthChar::width(c)
                 .unwrap_or(1)
@@ -1602,8 +1613,7 @@ mod tests {
                 );
             }
 
-            let (_, _, _, fallbacks) =
-                load_configured_font_chain("Menlo, NotoSansTC", &[]);
+            let (_, _, _, fallbacks) = load_configured_font_chain("Menlo, NotoSansTC", &[]);
             assert!(
                 !fallbacks.is_empty() && fallbacks[0].bold.is_some(),
                 "Fallback chain entry for NotoSansTC must include a Bold companion"
@@ -1755,7 +1765,8 @@ mod tests {
 
         // Verify adjacent symbol sequences like "(⇧⌘A)", "(⇧⌘[)", "(⌥⌘[)", "(⇧⌘↩)", "(⌃⌘F)"
         // have strictly non-overlapping horizontal ink spans across consecutive columns.
-        for seq in ["(⇧⌘A)", "(⇧⌘[)", "(⌥⌘[)", "(⌘[)", "(⇧⌘↩)", "(⌥⌘=)", "(⌃⌘F)"] {
+        for seq in ["(⇧⌘A)", "(⇧⌘[)", "(⌥⌘[)", "(⌘[)", "(⇧⌘↩)", "(⌥⌘=)", "(⌃⌘F)"]
+        {
             let mut prev_right: Option<(char, f32)> = None;
             let mut col = 0usize;
             for c in seq.chars() {
