@@ -61,6 +61,26 @@ impl FramePacer {
         self.interval
     }
 
+    /// Whether a deferred frame is currently owed.
+    pub fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Record that output arrived while rendering was held back (for example,
+    /// during a DEC Mode `?2026` Synchronized Output batch) so [`FramePacer::poll`]
+    /// will release the frame once the batch finishes.
+    pub fn defer(&mut self) {
+        self.pending = true;
+    }
+
+    /// Schedule a retry frame after a transient surface acquisition failure
+    /// (`Lost`, `Outdated`, or `Timeout`), paced by one refresh interval so a
+    /// persistently unavailable swapchain (e.g. display asleep) cannot spin the CPU.
+    pub fn schedule_retry(&mut self, now: Instant) {
+        self.last_frame = now;
+        self.pending = true;
+    }
+
     /// PTY output changed something visible.
     ///
     /// Returns `true` when the caller should repaint right away; otherwise the
@@ -364,5 +384,32 @@ mod tests {
         p.set_interval(frame_interval_from_millihertz(Some(120_000)), at(t0, 1_500));
         assert_eq!(p.interval(), Duration::from_nanos(8_333_333));
         assert!(!p.interval_refresh_due(at(t0, 1_600)));
+    }
+
+    #[test]
+    fn deferred_synchronized_output_releases_when_polled() {
+        let t0 = Instant::now();
+        let mut p = FramePacer::new(HZ60, t0);
+        p.on_frame_start(at(t0, 100));
+
+        // Output arrives during DEC ?2026 synchronized output and is deferred.
+        p.defer();
+        assert!(p.is_pending());
+
+        // Once synchronized output ends after an interval, poll releases it immediately.
+        assert_eq!(p.poll(at(t0, 120)), PacerPoll::RedrawNow);
+        assert!(!p.is_pending());
+    }
+
+    #[test]
+    fn schedule_retry_paces_failed_surface_present_by_one_interval() {
+        let t0 = Instant::now();
+        let mut p = FramePacer::new(HZ60, t0);
+        // Suppose a frame attempt at 500ms failed due to surface Timeout/Outdated.
+        p.schedule_retry(at(t0, 500));
+        assert!(p.is_pending());
+        assert_eq!(p.poll(at(t0, 501)), PacerPoll::WakeAt(at(t0, 500) + HZ60));
+        assert_eq!(p.poll(at(t0, 517)), PacerPoll::RedrawNow);
+        assert!(!p.is_pending());
     }
 }

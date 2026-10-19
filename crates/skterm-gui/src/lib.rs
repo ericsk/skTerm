@@ -1330,4 +1330,100 @@ mod tests {
         assert!(selected.contains("Hello World"));
         assert!(selected.contains("Second Line"));
     }
+
+    #[test]
+    fn test_tab_synchronized_output_and_dirty_visible_panes_across_splits() {
+        use skterm_core::Terminal;
+        use std::time::{Duration, Instant};
+
+        let mut term1 = Terminal::new_headless(24, 80, 100);
+        let mut term2 = Terminal::new_headless(24, 80, 100);
+        term1.grid_mut().clear_dirty();
+        term2.grid_mut().clear_dirty();
+
+        let mut tab = Tab {
+            id: 1,
+            title: "Split Tab".to_string(),
+            root: PaneNode::Split {
+                id: 1,
+                direction: SplitDirection::Horizontal,
+                ratio: 0.5,
+                first: Box::new(PaneNode::Leaf {
+                    id: 1,
+                    terminal: term1,
+                }),
+                second: Box::new(PaneNode::Leaf {
+                    id: 2,
+                    terminal: term2,
+                }),
+            },
+            active_pane_id: 1,
+            zoomed_pane_id: None,
+            next_split_id: 2,
+            has_unseen_output: false,
+        };
+
+        assert!(!tab.has_dirty_visible_pane());
+        assert!(!tab.is_synchronized_output_active());
+
+        // Output in non-active pane 2 marks visible pane dirty and activates ?2026 sync output
+        let pane2 = tab.root.find_terminal_mut(2).unwrap();
+        pane2.feed_bytes(b"\x1b[?2026hAgent output in secondary split");
+
+        assert!(tab.has_dirty_visible_pane());
+        assert!(tab.is_synchronized_output_active());
+
+        // When pane 1 is zoomed, pane 2 is not visible so it does not block or dirty the tab
+        tab.zoomed_pane_id = Some(1);
+        assert!(!tab.has_dirty_visible_pane());
+        assert!(!tab.is_synchronized_output_active());
+
+        // Unzooming restores pane 2 visibility; timeout releases stuck ?2026
+        tab.zoomed_pane_id = None;
+        assert!(tab.is_synchronized_output_active());
+        let future = Instant::now() + Duration::from_secs(2);
+        let (released, next_deadline) = tab.poll_synchronized_output_timeout(future);
+        assert!(released);
+        assert!(next_deadline.is_none());
+        assert!(!tab.is_synchronized_output_active());
+    }
+
+    #[test]
+    fn test_poll_outcome_and_active_output_expiry() {
+        use skterm_core::Terminal;
+        use std::time::{Duration, Instant};
+
+        let outcome = PollOutcome {
+            any_output: false,
+            active_tab_dirty: false,
+            tab_bar_dirty: false,
+            program_status_changed: true,
+        };
+        assert!(outcome.needs_redraw());
+
+        let mut term = Terminal::new_headless(24, 80, 100);
+        term.feed_bytes(b"Thinking...");
+        let mut ws = Workspace::new(24, 80).expect("Failed to create workspace");
+        ws.tabs = vec![Tab {
+            id: 1,
+            title: "Agent".to_string(),
+            root: PaneNode::Leaf {
+                id: 1,
+                terminal: term,
+            },
+            active_pane_id: 1,
+            zoomed_pane_id: None,
+            next_split_id: 1,
+            has_unseen_output: false,
+        }];
+        ws.active_tab_idx = 0;
+
+        let now = Instant::now();
+        let expiry = ws.next_active_output_expiry(now, None);
+        assert!(expiry.is_some());
+        assert!(expiry.unwrap() > now);
+
+        let after_window = now + Duration::from_millis(1600);
+        assert!(ws.next_active_output_expiry(after_window, None).is_none());
+    }
 }

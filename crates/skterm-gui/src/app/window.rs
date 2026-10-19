@@ -332,7 +332,12 @@ impl App {
             top_right_hover: false,
             ai_btn_hovered: false,
             prefs_btn_hovered: false,
+            redraw_queued: true,
+            is_occluded: false,
+            is_window_focused: true,
+            focused_pane_target: None,
         };
+        session.sync_focus_events();
         session.update_ime_position(tab_bar_h, "");
 
         self.sessions.insert(window_id, session);
@@ -468,7 +473,8 @@ impl App {
                     style_macos_tab_bar(win_ptr);
                 }
             }
-            session.window.request_redraw();
+            session.is_occluded = false;
+            session.request_redraw();
         }
         self.record_session_window_position(window_id);
     }
@@ -483,7 +489,8 @@ impl App {
         if let Some(session) = self.sessions.get_mut(&window_id) {
             let _ = session.renderer.update_scale_factor(scale_factor as f32);
             session.sync_all_pane_sizes(tab_bar_h);
-            session.window.request_redraw();
+            session.is_occluded = false;
+            session.request_redraw();
         }
     }
 

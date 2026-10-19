@@ -41,10 +41,17 @@ impl App {
         // closed nothing reads `cached_ai_agents`, and the scan walks the whole
         // process tree, so doing it anyway would keep the machine awake for nothing.
         if self.sidebar_open {
-            let need_scan = match self.last_ai_agent_scan {
-                Some(last) => last.elapsed() >= AGENT_SCAN_INTERVAL,
-                None => true,
-            };
+            let now_scan = Instant::now();
+            let active_output_expired = self.sessions.values().any(|s| {
+                s.workspace
+                    .next_active_output_expiry(now_scan, self.last_ai_agent_scan)
+                    .is_some_and(|at| at <= now_scan)
+            });
+            let need_scan = active_output_expired
+                || match self.last_ai_agent_scan {
+                    Some(last) => now_scan.duration_since(last) >= AGENT_SCAN_INTERVAL,
+                    None => true,
+                };
             if need_scan {
                 self.refresh_agent_cache();
             }
@@ -90,7 +97,7 @@ impl App {
                     continue;
                 } else {
                     session.sync_all_pane_sizes(tab_bar_h);
-                    session.window.request_redraw();
+                    session.request_redraw();
                 }
             } else {
                 let outcome = session.workspace.poll_all_ptys();
@@ -146,7 +153,7 @@ impl App {
                 let deadline = last + SCROLLBAR_FADE_AFTER;
                 if now >= deadline {
                     session.last_scroll_time = None;
-                    session.window.request_redraw();
+                    session.request_redraw();
                 } else {
                     arm(deadline);
                 }
@@ -167,6 +174,23 @@ impl App {
 
         if any_program_status_changed && self.sidebar_open {
             self.refresh_agent_cache();
+        }
+
+        // On macOS, `winit` drains `pending_redraw` *before* calling `about_to_wait`,
+        // and `CFRunLoopWakeUp` called inside `about_to_wait` (`kCFRunLoopBeforeWaiting`)
+        // is a no-op because CoreFoundation has not yet set `__CFRunLoopSetSleeping`.
+        // If any session queued a redraw during `about_to_wait` (or still has dirty
+        // visible terminal cells ready to draw), arm `now` so `EventLoopWaker` sets
+        // its `CFRunLoopTimer` fire date to `f64::MIN` and the runloop turns around
+        // immediately to service `WindowEvent::RedrawRequested`.
+        for session in self.sessions.values_mut() {
+            session.sync_focus_events();
+            if session.needs_immediate_redraw() {
+                if !session.redraw_queued {
+                    session.request_redraw();
+                }
+                arm(now);
+            }
         }
 
         // 3. Debounced config auto-save. This is the only place that writes
@@ -199,6 +223,14 @@ impl App {
             arm(self
                 .last_ai_agent_scan
                 .map_or(now, |last| last + AGENT_SCAN_INTERVAL));
+            for session in self.sessions.values() {
+                if let Some(expiry) = session
+                    .workspace
+                    .next_active_output_expiry(now, self.last_ai_agent_scan)
+                {
+                    arm(expiry);
+                }
+            }
         }
 
         // A child can exit without the pty ever reaching EOF (e.g. another process is

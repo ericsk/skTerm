@@ -7,7 +7,8 @@ use super::macos::{
 };
 use super::menu::{build_context_menu, build_top_dropdown_menu};
 use super::App;
-use skterm_render::{AgentPanelState, PaneRenderItem, TabItem};
+use skterm_render::{AgentPanelState, PaneRenderItem, RenderSurfaceOutcome, TabItem};
+use std::time::Instant;
 use tracing::warn;
 use winit::window::WindowId;
 
@@ -49,7 +50,26 @@ impl App {
         let total_tab_count: usize = self.sessions.values().map(|s| s.workspace.tabs.len()).sum();
 
         if let Some(session) = self.sessions.get_mut(&window_id) {
-            session.mark_frame_start();
+            session.redraw_queued = false;
+            session.sync_focus_events();
+
+            let ui_overlay_active = session.menu_open
+                || session.search_open
+                || session.dragging_sidebar
+                || session.dragging_splitter.is_some()
+                || session.dragging_scrollbar.is_some()
+                || self.editing_agent_pane.is_some();
+            if !ui_overlay_active
+                && session
+                    .workspace
+                    .active_tab()
+                    .is_some_and(|t| t.is_synchronized_output_active())
+            {
+                session.pacer.defer();
+                return;
+            }
+
+            let frame_start = Instant::now();
 
             if self.editing_agent_pane.is_none() {
                 session.update_ime_position(tab_bar_h, &self.ime_preedit);
@@ -219,7 +239,7 @@ impl App {
                 (None, Vec::new())
             };
 
-            if let Err(e) = session.renderer.render_workspace_with_agent_panel(
+            match session.renderer.render_workspace_with_agent_panel(
                 &tabs,
                 &render_panes,
                 tab_bar_h,
@@ -234,14 +254,25 @@ impl App {
                     ),
                 >,
             ) {
-                warn!("Render error on session {:?}: {:?}", window_id, e);
-            }
-
-            if let Some(active_tab) = session.workspace.active_tab_mut() {
-                for (id, _) in &pane_rects {
-                    if let Some(t) = active_tab.root.find_terminal_mut(*id) {
-                        t.grid_mut().clear_dirty();
+                Ok(RenderSurfaceOutcome::Presented) => {
+                    session.is_occluded = false;
+                    session.mark_frame_start_at(frame_start);
+                    if let Some(active_tab) = session.workspace.active_tab_mut() {
+                        for (id, _) in &pane_rects {
+                            if let Some(t) = active_tab.root.find_terminal_mut(*id) {
+                                t.grid_mut().clear_dirty();
+                            }
+                        }
                     }
+                }
+                Ok(RenderSurfaceOutcome::Reconfigured) | Ok(RenderSurfaceOutcome::Timeout) => {
+                    session.pacer.schedule_retry(frame_start);
+                }
+                Ok(RenderSurfaceOutcome::Occluded) => {
+                    session.is_occluded = true;
+                }
+                Err(e) => {
+                    warn!("Render error on session {:?}: {:?}", window_id, e);
                 }
             }
         }

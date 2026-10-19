@@ -119,7 +119,7 @@ impl App {
                             }
                         }
                         target_s.last_tab_label_refresh = None;
-                        target_s.window.request_redraw();
+                        target_s.request_redraw();
                     }
                     self.editing_agent_pane = None;
                     // The new label reaches the panel through the cache, so
@@ -129,14 +129,14 @@ impl App {
                     if self.sidebar_open {
                         self.refresh_agent_cache();
                     }
-                    for s in self.sessions.values() {
-                        s.window.request_redraw();
+                    for s in self.sessions.values_mut() {
+                        s.request_redraw();
                     }
                 }
                 crate::macos_textfield::TextFieldEvent::Cancelled => {
                     self.editing_agent_pane = None;
-                    for s in self.sessions.values() {
-                        s.window.request_redraw();
+                    for s in self.sessions.values_mut() {
+                        s.request_redraw();
                     }
                 }
             }
@@ -196,7 +196,7 @@ impl App {
                     }
                 }
                 target_s.last_tab_label_refresh = None;
-                target_s.window.request_redraw();
+                target_s.request_redraw();
             }
             self.ime_preedit.clear();
             self.ime_preedit_cursor = None;
@@ -205,8 +205,8 @@ impl App {
             if self.sidebar_open {
                 self.refresh_agent_cache();
             }
-            for s in self.sessions.values() {
-                s.window.request_redraw();
+            for s in self.sessions.values_mut() {
+                s.request_redraw();
             }
         }
     }
@@ -234,7 +234,7 @@ impl App {
             unsafe {
                 crate::macos_titlebar::set_agent_toggle_state(get_nswindow(&session.window), open);
             }
-            session.window.request_redraw();
+            session.request_redraw();
         }
     }
 
@@ -247,8 +247,8 @@ impl App {
         self.last_ai_agent_scan = Some(Instant::now());
         let scanned = self.scan_all_ai_agents();
         if self.cached_ai_agents.set(scanned) {
-            for s in self.sessions.values() {
-                s.window.request_redraw();
+            for s in self.sessions.values_mut() {
+                s.request_redraw();
             }
         }
     }

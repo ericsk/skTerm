@@ -12,8 +12,9 @@ pub use atlas::{is_terminal_friendly_font, GlyphAtlas, GlyphInfo, GlyphKey};
 pub use pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
 pub use renderer::{
     color_to_rgba_themed, color_to_rgba_with_dynamic_palette, text_display_cells, AgentPanelState,
-    AgentSidebarItem, AgentStatus, PaneRenderItem, PreeditOverlayLayout, RenderTheme,
-    ScrollbarMetrics, TabItem, TermRenderer, TopDropdownMenu, TopDropdownMenuItem, TopRightButtons,
+    AgentSidebarItem, AgentStatus, PaneRenderItem, PreeditOverlayLayout, RenderSurfaceOutcome,
+    RenderTheme, ScrollbarMetrics, TabItem, TermRenderer, TopDropdownMenu, TopDropdownMenuItem,
+    TopRightButtons,
 };
 
 /// skterm-render version and basic info

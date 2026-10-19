@@ -43,17 +43,35 @@ impl App {
                         session.update_search_matches();
                         session.update_ime_position(tab_bar_h, &self.ime_preedit);
                         session.window.request_redraw();
-                    } else if let Some(tab) = session.workspace.active_tab_mut() {
-                        if let Some(term) = tab.active_terminal_mut() {
-                            let was_scrolled = term.grid().active().scroll_offset != 0;
-                            term.grid_mut().active_mut().scroll_offset = 0;
-                            let _ = term.write_to_pty(text.as_bytes());
-                            std::thread::yield_now();
-                            let pty_updated = term.poll_pty();
-                            session.update_ime_position(tab_bar_h, &self.ime_preedit);
-                            if had_preedit || was_scrolled || pty_updated {
-                                session.window.request_redraw();
+                    } else {
+                        let mut pty_updated = false;
+                        let mut status_changed = false;
+                        let mut need_immediate_redraw = had_preedit;
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            if let Some(term) = tab.active_terminal_mut() {
+                                let was_scrolled = term.grid().active().scroll_offset != 0;
+                                term.grid_mut().active_mut().scroll_offset = 0;
+                                let _ = term.write_to_pty(text.as_bytes());
+                                std::thread::yield_now();
+                                pty_updated = term.poll_pty();
+                                status_changed = term.take_program_status_dirty();
+                                need_immediate_redraw = had_preedit || was_scrolled;
                             }
+                        }
+                        if pty_updated {
+                            session.flush_osc52_clipboard(self.clipboard.as_ref());
+                        }
+                        if status_changed {
+                            session.last_tab_label_refresh = None;
+                        }
+                        session.update_ime_position(tab_bar_h, &self.ime_preedit);
+                        if need_immediate_redraw {
+                            session.request_redraw();
+                        } else if pty_updated || status_changed {
+                            session.request_output_redraw();
+                        }
+                        if status_changed && self.sidebar_open {
+                            self.refresh_agent_cache();
                         }
                     }
                 }
@@ -912,7 +930,10 @@ impl App {
         }
 
         // Send Normal Key to PTY
+        let mut status_changed = false;
         if let Some(session) = self.sessions.get_mut(&window_id) {
+            let mut pty_updated = false;
+            let mut was_scrolled = false;
             if let Some(tab) = session.workspace.active_tab_mut() {
                 if let Some(term) = tab.active_terminal_mut() {
                     let app_cursor = term.state.application_cursor_keys;
@@ -925,16 +946,29 @@ impl App {
                         kitty_flags,
                         modify_other_keys,
                     ) {
-                        let was_scrolled = term.grid().active().scroll_offset != 0;
+                        was_scrolled = term.grid().active().scroll_offset != 0;
                         term.grid_mut().active_mut().scroll_offset = 0;
                         let _ = term.write_to_pty(&bytes);
                         std::thread::yield_now();
-                        if was_scrolled || term.poll_pty() {
-                            session.window.request_redraw();
-                        }
+                        pty_updated = term.poll_pty();
+                        status_changed = term.take_program_status_dirty();
                     }
                 }
             }
+            if pty_updated {
+                session.flush_osc52_clipboard(self.clipboard.as_ref());
+            }
+            if status_changed {
+                session.last_tab_label_refresh = None;
+            }
+            if was_scrolled {
+                session.request_redraw();
+            } else if pty_updated || status_changed {
+                session.request_output_redraw();
+            }
+        }
+        if status_changed && self.sidebar_open {
+            self.refresh_agent_cache();
         }
     }
 }

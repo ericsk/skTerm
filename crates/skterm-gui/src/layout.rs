@@ -686,6 +686,71 @@ impl Tab {
     pub fn equalize_panes(&mut self) {
         self.root.equalize_ratios();
     }
+
+    /// Return the IDs of all panes currently visible in this tab (either the single
+    /// zoomed pane if valid, or all leaf panes in the split tree).
+    pub fn visible_leaf_ids(&self) -> Vec<PaneId> {
+        if let Some(zid) = self.zoomed_pane_id {
+            if self.root.find_terminal(zid).is_some() {
+                return vec![zid];
+            }
+        }
+        self.root.all_leaf_ids()
+    }
+
+    /// Whether any visible pane in this tab is currently inside a DEC Mode `?2026`
+    /// (Synchronized Output) batch within its 100ms safety timeout.
+    pub fn is_synchronized_output_active(&self) -> bool {
+        self.visible_leaf_ids().into_iter().any(|id| {
+            self.root
+                .find_terminal(id)
+                .is_some_and(|t| t.state.is_synchronized_output_active())
+        })
+    }
+
+    /// Enforce the 100ms safety timeout for DEC Mode `?2026` (Synchronized Output)
+    /// across all visible panes in this tab.
+    ///
+    /// Returns `(expired, next_deadline)` where `expired` is `true` if any pane's
+    /// synchronized output timed out and was cleared, and `next_deadline` is the
+    /// earliest remaining timeout among panes still in synchronized output.
+    pub fn poll_synchronized_output_timeout(
+        &mut self,
+        now: std::time::Instant,
+    ) -> (bool, Option<std::time::Instant>) {
+        let mut expired = false;
+        let mut earliest_deadline: Option<std::time::Instant> = None;
+        for id in self.visible_leaf_ids() {
+            if let Some(term) = self.root.find_terminal_mut(id) {
+                if term.state.synchronized_output {
+                    if let Some(since) = term.state.synchronized_output_since {
+                        let timeout_at = since + std::time::Duration::from_millis(100);
+                        if now < timeout_at {
+                            earliest_deadline = Some(match earliest_deadline {
+                                Some(cur) if cur <= timeout_at => cur,
+                                _ => timeout_at,
+                            });
+                            continue;
+                        }
+                    }
+                    term.state.synchronized_output = false;
+                    term.state.synchronized_output_since = None;
+                    expired = true;
+                }
+            }
+        }
+        (expired, earliest_deadline)
+    }
+
+    /// Whether any visible pane in this tab still has a dirty screen grid that has
+    /// not yet been presented to the window surface.
+    pub fn has_dirty_visible_pane(&self) -> bool {
+        self.visible_leaf_ids().into_iter().any(|id| {
+            self.root
+                .find_terminal(id)
+                .is_some_and(|t| t.grid().is_dirty())
+        })
+    }
 }
 
 /// What a `Workspace::poll_all_ptys` sweep actually changed.
@@ -709,7 +774,7 @@ pub struct PollOutcome {
 impl PollOutcome {
     /// Whether anything currently on screen changed and a repaint is warranted.
     pub fn needs_redraw(&self) -> bool {
-        self.active_tab_dirty || self.tab_bar_dirty
+        self.active_tab_dirty || self.tab_bar_dirty || self.program_status_changed
     }
 }
 
@@ -1001,11 +1066,12 @@ impl Workspace {
         let mut outcome = PollOutcome::default();
         let active_idx = self.active_tab_idx;
         for (idx, tab) in self.tabs.iter_mut().enumerate() {
-            if tab.root.poll_all_ptys() {
+            let had_output = tab.root.poll_all_ptys();
+            if tab.root.take_program_status_dirty() {
+                outcome.program_status_changed = true;
+            }
+            if had_output {
                 outcome.any_output = true;
-                if tab.root.take_program_status_dirty() {
-                    outcome.program_status_changed = true;
-                }
                 if idx == active_idx {
                     outcome.active_tab_dirty = true;
                 } else if !tab.has_unseen_output {
@@ -1296,6 +1362,33 @@ impl Workspace {
         }
 
         items
+    }
+
+    /// Return the earliest instant at which any pane's 1.5s `is_active_output()`
+    /// window will expire, or `Some(now)` if a pane's active-output window has
+    /// expired since `last_scan`.
+    pub fn next_active_output_expiry(
+        &self,
+        now: std::time::Instant,
+        last_scan: Option<std::time::Instant>,
+    ) -> Option<std::time::Instant> {
+        let mut earliest: Option<std::time::Instant> = None;
+        for tab in &self.tabs {
+            let mut leaves = Vec::new();
+            tab.root.collect_leaves(&mut leaves);
+            for (_, term) in leaves {
+                let expiry = term.last_output_time + std::time::Duration::from_millis(1500);
+                if now < expiry {
+                    earliest = Some(match earliest {
+                        Some(cur) if cur <= expiry => cur,
+                        _ => expiry,
+                    });
+                } else if last_scan.is_some_and(|scan| scan < expiry) {
+                    return Some(now);
+                }
+            }
+        }
+        earliest
     }
 }
 

@@ -208,7 +208,7 @@ impl App {
             }
             session.workspace.update_cursor_shape(cursor_shape);
             session.sync_all_pane_sizes(tab_bar_h);
-            session.window.request_redraw();
+            session.request_redraw();
         }
 
         // Mark dirty rather than writing here. `check_changed` fires on *every*

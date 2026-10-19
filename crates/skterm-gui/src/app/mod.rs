@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::window::WindowId;
@@ -274,6 +274,16 @@ impl App {
 }
 
 impl ApplicationHandler<AppEvent> for App {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: StartCause) {
+        // On macOS, `new_events` runs in `kCFRunLoopAfterWaiting`, before `cleared()`
+        // drains `pending_redraw`. Flushing due paced frames here queues
+        // `window.request_redraw()` *before* `pending_redraw` is drained, so a
+        // timer-released frame is drawn on this pass of the runloop.
+        for session in self.sessions.values_mut() {
+            let _ = session.flush_paced_redraw();
+        }
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::PtyWakeup => {
@@ -304,9 +314,10 @@ impl ApplicationHandler<AppEvent> for App {
                     if outcome.needs_redraw() {
                         session.request_output_redraw();
                     }
+                    let _ = session.flush_paced_redraw();
                 }
-                if any_program_status_changed {
-                    self.last_ai_agent_scan = None;
+                if any_program_status_changed && self.sidebar_open {
+                    self.refresh_agent_cache();
                 }
             }
             // Nothing to do here: waking the loop is the whole point, and
@@ -395,12 +406,11 @@ impl ApplicationHandler<AppEvent> for App {
             } else if !self.ime_preedit.is_empty() {
                 self.ime_preedit.clear();
                 self.ime_preedit_cursor = None;
-                if let Some(session) = self.sessions.get(&window_id) {
-                    session.window.request_redraw();
-                }
             }
             if let Some(session) = self.sessions.get_mut(&window_id) {
+                session.is_window_focused = focused;
                 if focused {
+                    session.is_occluded = false;
                     // Selecting a tab is the user seeing it, so retire its activity dot.
                     session.clear_unseen_output();
                     #[cfg(target_os = "macos")]
@@ -412,14 +422,11 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                 }
-                if let Some(tab) = session.workspace.active_tab_mut() {
-                    if let Some(term) = tab.active_terminal_mut() {
-                        if term.state.focus_events {
-                            let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
-                            let _ = term.write_to_pty(seq);
-                        }
-                    }
-                }
+                session.sync_focus_events();
+                session.request_redraw();
+            }
+            if self.sidebar_open {
+                self.refresh_agent_cache();
             }
         }
 
@@ -428,6 +435,16 @@ impl ApplicationHandler<AppEvent> for App {
 
         match event {
             WindowEvent::CloseRequested => self.handle_close_requested(event_loop, window_id),
+
+            WindowEvent::Occluded(occluded) => {
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    session.is_occluded = occluded;
+                    if !occluded {
+                        session.refresh_frame_interval();
+                        session.request_redraw();
+                    }
+                }
+            }
 
             WindowEvent::Moved(physical_position) => {
                 self.handle_moved(window_id, physical_position)

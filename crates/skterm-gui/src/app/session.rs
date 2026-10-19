@@ -77,6 +77,16 @@ pub struct TerminalSession {
     pub ai_btn_hovered: bool,
     /// Whether the pointer is hovering over the `[⚙]` Preferences button.
     pub prefs_btn_hovered: bool,
+    /// True when `window.request_redraw()` has been queued since the last
+    /// `WindowEvent::RedrawRequested` was serviced.
+    pub redraw_queued: bool,
+    /// True when the window surface is occluded (e.g. on another Space or covered).
+    pub is_occluded: bool,
+    /// Whether this window currently holds OS keyboard focus.
+    pub is_window_focused: bool,
+    /// The `(tab_id, pane_id)` that currently holds terminal focus in this window
+    /// for DEC Mode `?1004` (`focus_events`) reporting.
+    pub focused_pane_target: Option<(u32, u32)>,
 }
 
 /// Refresh period of the monitor `window` currently sits on.
@@ -89,57 +99,120 @@ pub fn monitor_frame_interval(window: &Window) -> Duration {
 }
 
 impl TerminalSession {
+    /// Request a window repaint and record that a redraw is queued so
+    /// `about_to_wait` can ensure the event loop wakes immediately if the request
+    /// was made after `winit` already drained `pending_redraw` for the current pass.
+    pub fn request_redraw(&mut self) {
+        self.redraw_queued = true;
+        self.window.request_redraw();
+    }
+
     /// Repaint because PTY output changed something visible, at most once per
     /// refresh period. See [`FramePacer`] for why this is a leading-edge
     /// throttle and what that has to do with typing latency.
     ///
-    /// If the active terminal is mid-batch in DEC Mode `?2026` (Synchronized Output),
-    /// hold the repaint until `?2026l` arrives or the 100ms safety timeout expires.
+    /// If any visible pane in the active tab is mid-batch in DEC Mode `?2026`
+    /// (Synchronized Output), defer the repaint in [`FramePacer`] until `?2026l`
+    /// arrives or the 100ms safety timeout expires.
     pub fn request_output_redraw(&mut self) {
         if self
             .workspace
             .active_tab()
-            .and_then(|t| t.active_terminal())
-            .is_some_and(|term| term.state.is_synchronized_output_active())
+            .is_some_and(|t| t.is_synchronized_output_active())
         {
+            self.pacer.defer();
             return;
         }
         if self.pacer.on_output(Instant::now()) {
-            self.window.request_redraw();
+            self.request_redraw();
         }
     }
 
     /// Release a frame the pacer deferred, or report when it comes due so the
     /// caller can arm the event loop's timer. Also enforces the 100ms safety
-    /// timeout for DEC Mode `?2026` (Synchronized Output).
+    /// timeout for DEC Mode `?2026` (Synchronized Output) across all visible panes.
     pub fn flush_paced_redraw(&mut self) -> Option<Instant> {
         let now = Instant::now();
-        if let Some(term) = self
-            .workspace
-            .active_tab_mut()
-            .and_then(|t| t.active_terminal_mut())
-        {
-            if term.state.synchronized_output {
-                if let Some(since) = term.state.synchronized_output_since {
-                    let timeout_at = since + Duration::from_millis(100);
-                    if now < timeout_at {
-                        return Some(timeout_at);
-                    }
-                }
-                term.state.synchronized_output = false;
-                term.state.synchronized_output_since = None;
-                self.window.request_redraw();
-                return None;
+        if let Some(tab) = self.workspace.active_tab_mut() {
+            let (expired, next_sync_deadline) = tab.poll_synchronized_output_timeout(now);
+            if let Some(deadline) = next_sync_deadline {
+                self.pacer.defer();
+                return Some(deadline);
+            }
+            if expired {
+                self.pacer.defer();
             }
         }
         match self.pacer.poll(now) {
             PacerPoll::Idle => None,
             PacerPoll::RedrawNow => {
-                self.window.request_redraw();
+                self.request_redraw();
                 None
             }
             PacerPoll::WakeAt(due) => Some(due),
         }
+    }
+
+    /// Whether this session has an unserviced redraw or dirty visible terminal grid
+    /// that is ready to be presented right now (not occluded, not held in `?2026`
+    /// synchronized output, and not waiting on a future `FramePacer` deadline).
+    pub fn needs_immediate_redraw(&self) -> bool {
+        if self.is_occluded {
+            return false;
+        }
+        if self.redraw_queued {
+            return true;
+        }
+        let sync_active = self
+            .workspace
+            .active_tab()
+            .is_some_and(|t| t.is_synchronized_output_active());
+        if sync_active || self.pacer.is_pending() {
+            return false;
+        }
+        self.workspace
+            .active_tab()
+            .is_some_and(|t| t.has_dirty_visible_pane())
+    }
+
+    /// Synchronize DEC Mode `?1004` (`focus_events`) across window focus, tab switches,
+    /// and split-pane focus changes so the previously focused pane receives `CSI O`
+    /// and the newly focused pane receives `CSI I`.
+    pub fn sync_focus_events(&mut self) {
+        let desired = if self.is_window_focused {
+            self.workspace
+                .active_tab()
+                .map(|t| (t.id, t.active_pane_id))
+        } else {
+            None
+        };
+        if desired == self.focused_pane_target {
+            return;
+        }
+        if let Some((old_tab_id, old_pane_id)) = self.focused_pane_target {
+            if let Some(old_tab) = self.workspace.tabs.iter_mut().find(|t| t.id == old_tab_id) {
+                if let Some(old_term) = old_tab.root.find_terminal_mut(old_pane_id) {
+                    if old_term.state.focus_events {
+                        let _ = old_term.write_to_pty(b"\x1b[O");
+                    }
+                }
+            }
+        }
+        self.focused_pane_target = desired;
+        if let Some((new_tab_id, new_pane_id)) = desired {
+            if let Some(new_tab) = self.workspace.tabs.iter_mut().find(|t| t.id == new_tab_id) {
+                if let Some(new_term) = new_tab.root.find_terminal_mut(new_pane_id) {
+                    if new_term.state.focus_events {
+                        let _ = new_term.write_to_pty(b"\x1b[I");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record that a frame was presented starting at `frame_start`.
+    pub fn mark_frame_start_at(&mut self, frame_start: Instant) {
+        self.pacer.on_frame_start(frame_start);
     }
 
     /// Record that a frame is starting, whatever caused it.
@@ -313,7 +386,7 @@ impl TerminalSession {
         }
 
         if any_tab_changed {
-            self.window.request_redraw();
+            self.request_redraw();
         }
 
         let label = active_label?;

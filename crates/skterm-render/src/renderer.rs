@@ -1495,6 +1495,7 @@ impl TermRenderer {
             None,
             None::<fn(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration)>,
         )
+        .map(|_| ())
     }
 
     /// Render workspace with optional custom overlay (e.g. egui UI).
@@ -1516,6 +1517,7 @@ impl TermRenderer {
             None,
             overlay_fn,
         )
+        .map(|_| ())
     }
 
     /// Render workspace with the global AI agents panel, floating top dropdown menu, and an optional overlay.
@@ -1527,21 +1529,24 @@ impl TermRenderer {
         panel_state: AgentPanelState<'_>,
         top_menu: Option<&TopDropdownMenu>,
         overlay_fn: Option<F>,
-    ) -> anyhow::Result<()>
+    ) -> anyhow::Result<RenderSurfaceOutcome>
     where
         F: FnOnce(&Device, &Queue, &wgpu::TextureView, &SurfaceConfiguration),
     {
         let frame_start = self.perf.now();
 
-        let output = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+        let (output, suboptimal) = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture) => (texture, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => (texture, true),
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.resize(self.config.width, self.config.height);
-                return Ok(());
+                return Ok(RenderSurfaceOutcome::Reconfigured);
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                return Ok(RenderSurfaceOutcome::Timeout);
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(RenderSurfaceOutcome::Occluded);
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 return Err(anyhow::anyhow!("Surface validation error"));
@@ -2757,6 +2762,9 @@ impl TermRenderer {
         let present_start = self.perf.now();
 
         self.queue.present(output);
+        if suboptimal {
+            self.resize(self.config.width, self.config.height);
+        }
 
         self.perf.record(
             acquire_ns,
@@ -2773,8 +2781,24 @@ impl TermRenderer {
         self.glyph_instances = glyph_instances;
         self.image_draw_calls = image_draw_calls;
 
-        Ok(())
+        Ok(RenderSurfaceOutcome::Presented)
     }
+}
+
+/// Outcome of attempting to acquire and present a frame on the window's GPU surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderSurfaceOutcome {
+    /// A swapchain texture was acquired, rendered, and presented to the compositor.
+    Presented,
+    /// The surface was lost or outdated and has been reconfigured; the caller should
+    /// schedule another redraw so the frame is actually presented.
+    Reconfigured,
+    /// `get_current_texture()` timed out waiting for a drawable; the caller should
+    /// retry on the next frame tick.
+    Timeout,
+    /// The window's surface is currently occluded (e.g. covered or on another Space);
+    /// no frame was drawn, and dirty state should be preserved until un-occluded.
+    Occluded,
 }
 
 /// Convert skterm Color to RGBA considering active theme, custom palette, and bold_is_bright.
