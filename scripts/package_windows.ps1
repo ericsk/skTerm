@@ -1,3 +1,15 @@
+# 0. Determine Version from Cargo.toml (or VERSION env var)
+$Version = $env:VERSION
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $CargoToml = Get-Content "Cargo.toml" -Raw
+    if ($CargoToml -match '(?m)^version\s*=\s*"([^"]+)"') {
+        $Version = $Matches[1]
+    } else {
+        $Version = "0.1.0"
+    }
+}
+$Version = $Version.TrimStart('v')
+
 # 1. Ensure Windows Icon exists
 $IcoPath = "assets\app_icon.ico"
 if (-not (Test-Path $IcoPath)) {
@@ -6,11 +18,11 @@ if (-not (Test-Path $IcoPath)) {
 }
 
 # 2. Build Release Executable
-Write-Host "=== Building skTerm for Windows (Release) ==="
+Write-Host "=== Building skTerm v$Version for Windows (Release) ==="
 cargo build --release -p skterm-app
 
 # 3. Package Portable Executable & Directory
-$DistDir = "dist\windows\skterm-v0.1.0-windows-x64"
+$DistDir = "dist\windows\skterm-v$Version-windows-x64"
 if (Test-Path $DistDir) { Remove-Item -Recurse -Force $DistDir }
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 
@@ -21,7 +33,7 @@ if (Test-Path $IcoPath) {
     Copy-Item $IcoPath "$DistDir\app_icon.ico"
 }
 
-$ZipPath = "dist\windows\skterm-v0.1.0-windows-x64.zip"
+$ZipPath = "dist\windows\skterm-v$Version-windows-x64.zip"
 if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
 Compress-Archive -Path "$DistDir\*" -DestinationPath $ZipPath -Force
 Write-Host "Successfully packaged portable skTerm at $ZipPath"
@@ -48,8 +60,8 @@ foreach ($c in $IsccCandidates) {
 
 if ($IsccPath) {
     Write-Host "Compiling Windows Installer using $IsccPath..."
-    & $IsccPath "scripts\installer_windows.iss"
-    $InstallerPath = "dist\windows\skterm-setup-v0.1.0-windows-x64.exe"
+    & $IsccPath "/DMyAppVersion=$Version" "scripts\installer_windows.iss"
+    $InstallerPath = "dist\windows\skterm-setup-v$Version-windows-x64.exe"
     if (Test-Path $InstallerPath) {
         Write-Host "Successfully packaged Windows Installer at $InstallerPath"
     }

@@ -2,10 +2,23 @@
 set -euo pipefail
 umask 022
 
-echo "=== Building skTerm for Linux (Release) ==="
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+if [ -z "${VERSION:-}" ]; then
+    if [ $# -ge 1 ] && [ -n "$1" ]; then
+        VERSION="${1#v}"
+    else
+        VERSION="$(grep -E '^version\s*=\s*"[^"]+"' Cargo.toml | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')"
+    fi
+fi
+VERSION="${VERSION#v}"
+
+echo "=== Building skTerm v${VERSION} for Linux (Release) ==="
 cargo build --release -p skterm-app
 
-PKG_DIR="dist/linux/skterm-0.1.0"
+PKG_DIR="dist/linux/skterm-${VERSION}"
 rm -rf dist/linux
 mkdir -p "${PKG_DIR}/usr/bin" "${PKG_DIR}/usr/share/applications" "${PKG_DIR}/usr/share/pixmaps" "${PKG_DIR}/DEBIAN"
 chmod 755 "${PKG_DIR}" "${PKG_DIR}/DEBIAN" "${PKG_DIR}/usr" "${PKG_DIR}/usr/bin" "${PKG_DIR}/usr/share" "${PKG_DIR}/usr/share/applications" "${PKG_DIR}/usr/share/pixmaps"
@@ -53,9 +66,9 @@ Keywords=terminal;emulator;shell;prompt;command;commandline;skterm;
 DESKTOP
 chmod 644 "${PKG_DIR}/usr/share/applications/skterm.desktop"
 
-cat << 'CONTROL' > "${PKG_DIR}/DEBIAN/control"
+cat << CONTROL > "${PKG_DIR}/DEBIAN/control"
 Package: skterm
-Version: 0.1.0
+Version: ${VERSION}
 Section: utils
 Priority: optional
 Architecture: amd64
@@ -97,12 +110,12 @@ POSTRM
 chmod 755 "${PKG_DIR}/DEBIAN/postrm"
 
 if command -v dpkg-deb >/dev/null 2>&1; then
-    dpkg-deb --root-owner-group --build "${PKG_DIR}" "dist/linux/skterm_0.1.0_amd64.deb"
-    echo "Built .deb package at dist/linux/skterm_0.1.0_amd64.deb"
+    dpkg-deb --root-owner-group --build "${PKG_DIR}" "dist/linux/skterm_${VERSION}_amd64.deb"
+    echo "Built .deb package at dist/linux/skterm_${VERSION}_amd64.deb"
 fi
 
 # Also create portable standalone tarball
-PORTABLE_DIR="dist/linux/skterm-v0.1.0-linux-x86_64"
+PORTABLE_DIR="dist/linux/skterm-v${VERSION}-linux-x86_64"
 mkdir -p "${PORTABLE_DIR}"
 cp target/release/skterm "${PORTABLE_DIR}/skterm"
 chmod 755 "${PORTABLE_DIR}/skterm"
@@ -122,7 +135,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 exec "${DIR}/skterm" "$@"
 RUNNER
 chmod +x "${PORTABLE_DIR}/run.sh"
-tar -czf "dist/linux/skterm-v0.1.0-linux-x86_64.tar.gz" -C dist/linux "skterm-v0.1.0-linux-x86_64"
-echo "Built portable tarball at dist/linux/skterm-v0.1.0-linux-x86_64.tar.gz"
+tar -czf "dist/linux/skterm-v${VERSION}-linux-x86_64.tar.gz" -C dist/linux "skterm-v${VERSION}-linux-x86_64"
+echo "Built portable tarball at dist/linux/skterm-v${VERSION}-linux-x86_64.tar.gz"
 
 echo "Successfully built Linux package bundle at ${PKG_DIR}"

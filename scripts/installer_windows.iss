@@ -1,7 +1,9 @@
 ; Inno Setup Script for skTerm on Windows (x64)
 
 #define MyAppName "skTerm"
-#define MyAppVersion "0.1.0"
+#ifndef MyAppVersion
+  #define MyAppVersion "0.1.0"
+#endif
 #define MyAppPublisher "skTerm Developers"
 #define MyAppURL "https://github.com/ericsk/skTerm"
 #define MyAppExeName "skterm.exe"

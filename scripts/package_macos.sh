@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+if [ -z "${VERSION:-}" ]; then
+    if [ $# -ge 1 ] && [ -n "$1" ]; then
+        VERSION="${1#v}"
+    else
+        VERSION="$(grep -E '^version\s*=\s*"[^"]+"' Cargo.toml | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')"
+    fi
+fi
+VERSION="${VERSION#v}"
 ARCH="$(uname -m)"
 APP_NAME="skTerm.app"
 BUNDLE_DIR="dist/macos/${APP_NAME}"
