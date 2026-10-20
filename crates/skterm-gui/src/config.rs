@@ -858,7 +858,7 @@ decorations = "full"
 # 分頁標籤列顯示策略 ("auto": 多於1個分頁時自動顯示, "always": 恆顯示, "never": 恆隱藏)
 tab_bar_style = "auto"
 
-# 介面與選單顯示語言 ("auto": 自動偵測系統語系, "zh-TW": 繁體中文, "zh-CN": 簡體中文, "en": English)
+# 介面與選單顯示語言 ("auto": 自動偵測系統語系, "zh-TW": 繁體中文, "zh-CN": 簡體中文, "en": English, "ja": 日本語, "ko": 한국어, "es": Español, "fr": Français, "de": Deutsch)
 language = "auto"
 
 # 啟動時自動檢查 GitHub Releases OTA 新版本 (true / false)
@@ -987,7 +987,7 @@ decorations = "full"
 # 分頁標籤列顯示策略 ("always": 恆顯示, "auto": 多於1個分頁時自動顯示, "never": 恆隱藏)
 tab_bar_style = "always"
 
-# 介面與選單顯示語言 ("auto": 自動偵測系統語系, "zh-TW": 繁體中文, "zh-CN": 簡體中文, "en": English)
+# 介面與選單顯示語言 ("auto": 自動偵測系統語系, "zh-TW": 繁體中文, "zh-CN": 簡體中文, "en": English, "ja": 日本語, "ko": 한국어, "es": Español, "fr": Français, "de": Deutsch)
 language = "auto"
 
 # 啟動時自動檢查 GitHub Releases OTA 新版本 (true / false)

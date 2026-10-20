@@ -1,7 +1,8 @@
 //! Lightweight, strongly-typed internationalization (i18n) framework for skTerm.
 //!
-//! Provides compile-time checked translation tables (`ZhTw`, `ZhCn`, and `En`) with zero
-//! heap allocations on lookup, automatic OS locale detection, and live switching.
+//! Provides compile-time checked translation tables (`ZhTw`, `ZhCn`, `En`, `Ja`, `Ko`,
+//! `Es`, `Fr`, and `De`) with zero heap allocations on lookup, automatic OS locale
+//! detection, and live switching.
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -14,13 +15,19 @@ pub enum Locale {
     ZhTw = 0,
     En = 1,
     ZhCn = 2,
+    Ja = 3,
+    Ko = 4,
+    Es = 5,
+    Fr = 6,
+    De = 7,
 }
 
 static CURRENT_LOCALE: AtomicU8 = AtomicU8::new(Locale::ZhTw as u8);
 
 impl Locale {
     /// Parse a BCP-47 or POSIX locale tag (e.g. `"zh-TW"`, `"zh-CN"`, `"zh_CN.UTF-8"`,
-    /// `"zh-Hans-CN"`, `"zh-Hant-TW"`, `"en-US"`) into a supported [`Locale`].
+    /// `"zh-Hans-CN"`, `"zh-Hant-TW"`, `"en-US"`, `"ja-JP"`, `"ko-KR"`, `"es-ES"`,
+    /// `"fr-FR"`, `"de-DE"`) into a supported [`Locale`].
     /// Returns `None` for `"auto"` or unrecognized tags.
     pub fn from_tag(tag: &str) -> Option<Self> {
         let cleaned = tag
@@ -38,20 +45,28 @@ impl Locale {
             return None;
         }
 
-        if cleaned.starts_with("zh") {
-            if cleaned.contains("hans") {
-                Some(Self::ZhCn)
-            } else if cleaned.contains("hant") {
-                Some(Self::ZhTw)
-            } else if cleaned.contains("cn") || cleaned.contains("sg") || cleaned.contains("my") {
-                Some(Self::ZhCn)
-            } else {
-                Some(Self::ZhTw)
+        let primary = cleaned.split(['-', '_']).next().unwrap_or("");
+
+        match primary {
+            "zh" => {
+                if cleaned.contains("hans") {
+                    Some(Self::ZhCn)
+                } else if cleaned.contains("hant") {
+                    Some(Self::ZhTw)
+                } else if cleaned.contains("cn") || cleaned.contains("sg") || cleaned.contains("my")
+                {
+                    Some(Self::ZhCn)
+                } else {
+                    Some(Self::ZhTw)
+                }
             }
-        } else if cleaned.starts_with("en") {
-            Some(Self::En)
-        } else {
-            None
+            "en" => Some(Self::En),
+            "ja" | "jp" => Some(Self::Ja),
+            "ko" | "kr" => Some(Self::Ko),
+            "es" => Some(Self::Es),
+            "fr" => Some(Self::Fr),
+            "de" => Some(Self::De),
+            _ => None,
         }
     }
 
@@ -77,7 +92,8 @@ impl Locale {
         Self::ZhTw
     }
 
-    /// Resolve a configuration language string (`"auto"`, `"zh-TW"`, `"zh-CN"`, `"en"`) into an active [`Locale`].
+    /// Resolve a configuration language string (`"auto"`, `"zh-TW"`, `"zh-CN"`, `"en"`,
+    /// `"ja"`, `"ko"`, `"es"`, `"fr"`, `"de"`) into an active [`Locale`].
     pub fn resolve(config_lang: &str) -> Self {
         let trimmed = config_lang.trim();
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
@@ -93,6 +109,11 @@ impl Locale {
             Self::ZhTw => "zh-TW",
             Self::ZhCn => "zh-CN",
             Self::En => "en",
+            Self::Ja => "ja",
+            Self::Ko => "ko",
+            Self::Es => "es",
+            Self::Fr => "fr",
+            Self::De => "de",
         }
     }
 }
@@ -130,6 +151,11 @@ pub fn current_locale() -> Locale {
     match CURRENT_LOCALE.load(Ordering::Relaxed) {
         1 => Locale::En,
         2 => Locale::ZhCn,
+        3 => Locale::Ja,
+        4 => Locale::Ko,
+        5 => Locale::Es,
+        6 => Locale::Fr,
+        7 => Locale::De,
         _ => Locale::ZhTw,
     }
 }
@@ -153,6 +179,11 @@ pub const fn strings(locale: Locale) -> &'static I18nStrings {
         Locale::ZhTw => &ZH_TW,
         Locale::ZhCn => &ZH_CN,
         Locale::En => &EN,
+        Locale::Ja => &JA,
+        Locale::Ko => &KO,
+        Locale::Es => &ES,
+        Locale::Fr => &FR,
+        Locale::De => &DE,
     }
 }
 
@@ -239,6 +270,11 @@ pub struct I18nStrings {
     pub pref_language_zh_tw: &'static str,
     pub pref_language_zh_cn: &'static str,
     pub pref_language_en: &'static str,
+    pub pref_language_ja: &'static str,
+    pub pref_language_ko: &'static str,
+    pub pref_language_es: &'static str,
+    pub pref_language_fr: &'static str,
+    pub pref_language_de: &'static str,
 }
 
 pub const ZH_TW: I18nStrings = I18nStrings {
@@ -315,6 +351,11 @@ pub const ZH_TW: I18nStrings = I18nStrings {
     pref_language_zh_tw: "繁體中文",
     pref_language_zh_cn: "简体中文",
     pref_language_en: "English",
+    pref_language_ja: "日本語",
+    pref_language_ko: "한국어",
+    pref_language_es: "Español",
+    pref_language_fr: "Français",
+    pref_language_de: "Deutsch",
 };
 
 pub const ZH_CN: I18nStrings = I18nStrings {
@@ -391,6 +432,11 @@ pub const ZH_CN: I18nStrings = I18nStrings {
     pref_language_zh_tw: "繁體中文",
     pref_language_zh_cn: "简体中文",
     pref_language_en: "English",
+    pref_language_ja: "日本語",
+    pref_language_ko: "한국어",
+    pref_language_es: "Español",
+    pref_language_fr: "Français",
+    pref_language_de: "Deutsch",
 };
 
 pub const EN: I18nStrings = I18nStrings {
@@ -467,6 +513,417 @@ pub const EN: I18nStrings = I18nStrings {
     pref_language_zh_tw: "繁體中文",
     pref_language_zh_cn: "简体中文",
     pref_language_en: "English",
+    pref_language_ja: "日本語",
+    pref_language_ko: "한국어",
+    pref_language_es: "Español",
+    pref_language_fr: "Français",
+    pref_language_de: "Deutsch",
+};
+
+pub const JA: I18nStrings = I18nStrings {
+    app_about: "skTerm について",
+    app_check_updates: "アップデートを確認...",
+    app_preferences: "設定...",
+    app_services: "サービス",
+    app_hide: "skTerm を非表示",
+    app_hide_others: "ほかを非表示",
+    app_show_all: "すべてを表示",
+    app_quit: "skTerm を終了",
+
+    menu_file: "ファイル",
+    file_new_window: "新規ウインドウ",
+    file_new_tab: "新規タブ",
+    file_split_horizontal: "ペインを左右に分割",
+    file_split_vertical: "ペインを上下に分割",
+    file_close_tab: "タブ/ペインを閉じる",
+    file_close_window: "ウインドウを閉じる",
+
+    menu_edit: "編集",
+    edit_undo: "取り消す",
+    edit_redo: "やり直す",
+    edit_cut: "カット",
+    edit_copy: "コピー",
+    edit_paste: "ペースト",
+    edit_select_all: "すべてを選択",
+    edit_find: "検索...",
+    edit_clear_scrollback: "スクロールバックを消去",
+
+    menu_view: "表示",
+    view_toggle_ai_sidebar: "AI エージェントサイドバーを切り替え",
+    view_prev_tab: "前のタブを表示",
+    view_next_tab: "次のタブを表示",
+    view_move_tab_left: "タブを左へ移動",
+    view_move_tab_right: "タブを右へ移動",
+    view_focus_prev_pane: "前のペインを選択",
+    view_focus_next_pane: "次のペインを選択",
+    view_zoom_pane: "現在のペインを拡大/復元",
+    view_equalize_panes: "ペインサイズを均等化",
+    view_zoom_in: "拡大",
+    view_zoom_out: "縮小",
+    view_reset_zoom: "実際のサイズ",
+    view_toggle_fullscreen: "フルスクリーンを切り替え",
+
+    menu_help: "ヘルプ",
+    help_github: "GitHub リポジトリ",
+    help_report_issue: "問題を報告...",
+    help_open_config: "設定ファイルを開く (config.toml)",
+
+    ctx_preferences: "⚙ 設定...",
+    ctx_check_updates: "🔄 アップデートを確認...",
+    ctx_new_tab_default: "＋ 新規タブ (デフォルト)",
+    ctx_new_tab: "＋ 新規タブ",
+    ctx_split_horizontal: "◫ 左右に分割",
+    ctx_split_vertical: "⬒ 上下に分割",
+    ctx_toggle_ai_sidebar: "🤖 AI サイドバー",
+    ctx_new_tab_bash: "🐚 新規 Bash タブ",
+    ctx_new_tab_zsh: "⚡ 新規 Zsh タブ",
+    ctx_new_tab_fish: "🐟 新規 Fish タブ",
+    ctx_new_tab_cmd: "💻 コマンド プロンプト",
+    ctx_new_tab_win_powershell: "⚡ Windows PowerShell",
+    ctx_new_tab_pwsh: "🚀 PowerShell 7 (pwsh)",
+    ctx_new_tab_git_bash: "🦝 Git Bash",
+    ctx_exit: "✖ skTerm を終了",
+    ctx_copy: "📋 コピー",
+    ctx_paste: "📄 ペースト",
+    ctx_find: "🔍 検索...",
+    ctx_clear_scrollback: "🧹 画面を消去",
+
+    pref_language_label: "表示言語 (Language)",
+    pref_language_subtitle: "メニューバーとコンテキストメニューの表示言語（即時反映）",
+    pref_language_auto: "自動 (システム設定)",
+    pref_language_zh_tw: "繁體中文",
+    pref_language_zh_cn: "简体中文",
+    pref_language_en: "English",
+    pref_language_ja: "日本語",
+    pref_language_ko: "한국어",
+    pref_language_es: "Español",
+    pref_language_fr: "Français",
+    pref_language_de: "Deutsch",
+};
+
+pub const KO: I18nStrings = I18nStrings {
+    app_about: "skTerm에 관하여",
+    app_check_updates: "업데이트 확인...",
+    app_preferences: "설정...",
+    app_services: "서비스",
+    app_hide: "skTerm 가리기",
+    app_hide_others: "기타 가리기",
+    app_show_all: "모두 보기",
+    app_quit: "skTerm 종료",
+
+    menu_file: "파일",
+    file_new_window: "새로운 윈도우",
+    file_new_tab: "새로운 탭",
+    file_split_horizontal: "좌우로 패널 분할",
+    file_split_vertical: "상하로 패널 분할",
+    file_close_tab: "탭/패널 닫기",
+    file_close_window: "윈도우 닫기",
+
+    menu_edit: "편집",
+    edit_undo: "실행 취소",
+    edit_redo: "실행 복귀",
+    edit_cut: "오려두기",
+    edit_copy: "복사하기",
+    edit_paste: "붙여넣기",
+    edit_select_all: "전체 선택",
+    edit_find: "찾기...",
+    edit_clear_scrollback: "스크롤백 지우기",
+
+    menu_view: "보기",
+    view_toggle_ai_sidebar: "AI 에이전트 사이드바 토글",
+    view_prev_tab: "이전 탭 보기",
+    view_next_tab: "다음 탭 보기",
+    view_move_tab_left: "탭을 왼쪽으로 이동",
+    view_move_tab_right: "탭을 오른쪽으로 이동",
+    view_focus_prev_pane: "이전 패널 선택",
+    view_focus_next_pane: "다음 패널 선택",
+    view_zoom_pane: "현재 패널 확대/복원",
+    view_equalize_panes: "패널 크기 균등화",
+    view_zoom_in: "확대",
+    view_zoom_out: "축소",
+    view_reset_zoom: "실제 크기",
+    view_toggle_fullscreen: "전체 화면 토글",
+
+    menu_help: "도움말",
+    help_github: "GitHub 저장소",
+    help_report_issue: "문제 보고...",
+    help_open_config: "설정 파일 열기 (config.toml)",
+
+    ctx_preferences: "⚙ 설정...",
+    ctx_check_updates: "🔄 업데이트 확인...",
+    ctx_new_tab_default: "＋ 새 탭 (기본)",
+    ctx_new_tab: "＋ 새 탭",
+    ctx_split_horizontal: "◫ 좌우 분할",
+    ctx_split_vertical: "⬒ 상하 분할",
+    ctx_toggle_ai_sidebar: "🤖 AI 사이드바",
+    ctx_new_tab_bash: "🐚 새 Bash 탭",
+    ctx_new_tab_zsh: "⚡ 새 Zsh 탭",
+    ctx_new_tab_fish: "🐟 새 Fish 탭",
+    ctx_new_tab_cmd: "💻 명령 프롬프트",
+    ctx_new_tab_win_powershell: "⚡ Windows PowerShell",
+    ctx_new_tab_pwsh: "🚀 PowerShell 7 (pwsh)",
+    ctx_new_tab_git_bash: "🦝 Git Bash",
+    ctx_exit: "✖ skTerm 종료",
+    ctx_copy: "📋 복사",
+    ctx_paste: "📄 붙여넣기",
+    ctx_find: "🔍 찾기...",
+    ctx_clear_scrollback: "🧹 화면 지우기",
+
+    pref_language_label: "인터페이스 언어 (Language)",
+    pref_language_subtitle: "메뉴 막대 및 컨텍스트 메뉴 표시 언어 (즉시 적용)",
+    pref_language_auto: "자동 (시스템 기본값)",
+    pref_language_zh_tw: "繁體中文",
+    pref_language_zh_cn: "简体中文",
+    pref_language_en: "English",
+    pref_language_ja: "日本語",
+    pref_language_ko: "한국어",
+    pref_language_es: "Español",
+    pref_language_fr: "Français",
+    pref_language_de: "Deutsch",
+};
+
+pub const ES: I18nStrings = I18nStrings {
+    app_about: "Acerca de skTerm",
+    app_check_updates: "Buscar actualizaciones...",
+    app_preferences: "Ajustes...",
+    app_services: "Servicios",
+    app_hide: "Ocultar skTerm",
+    app_hide_others: "Ocultar otros",
+    app_show_all: "Mostrar todo",
+    app_quit: "Salir de skTerm",
+
+    menu_file: "Archivo",
+    file_new_window: "Nueva ventana",
+    file_new_tab: "Nueva pestaña",
+    file_split_horizontal: "Dividir panel izquierda/derecha",
+    file_split_vertical: "Dividir panel arriba/abajo",
+    file_close_tab: "Cerrar pestaña/panel",
+    file_close_window: "Cerrar ventana",
+
+    menu_edit: "Edición",
+    edit_undo: "Deshacer",
+    edit_redo: "Rehacer",
+    edit_cut: "Cortar",
+    edit_copy: "Copiar",
+    edit_paste: "Pegar",
+    edit_select_all: "Seleccionar todo",
+    edit_find: "Buscar...",
+    edit_clear_scrollback: "Limpiar historial",
+
+    menu_view: "Visualización",
+    view_toggle_ai_sidebar: "Mostrar/ocultar barra lateral de IA",
+    view_prev_tab: "Mostrar pestaña anterior",
+    view_next_tab: "Mostrar pestaña siguiente",
+    view_move_tab_left: "Mover pestaña a la izquierda",
+    view_move_tab_right: "Mover pestaña a la derecha",
+    view_focus_prev_pane: "Seleccionar panel anterior",
+    view_focus_next_pane: "Seleccionar panel siguiente",
+    view_zoom_pane: "Ampliar/restaurar panel activo",
+    view_equalize_panes: "Igualar tamaño de paneles",
+    view_zoom_in: "Ampliar",
+    view_zoom_out: "Reducir",
+    view_reset_zoom: "Tamaño real",
+    view_toggle_fullscreen: "Pantalla completa",
+
+    menu_help: "Ayuda",
+    help_github: "Repositorio en GitHub",
+    help_report_issue: "Informar de un problema...",
+    help_open_config: "Abrir archivo de configuración (config.toml)",
+
+    ctx_preferences: "⚙ Ajustes...",
+    ctx_check_updates: "🔄 Buscar actualizaciones...",
+    ctx_new_tab_default: "＋ Nueva pestaña",
+    ctx_new_tab: "＋ Nueva pestaña",
+    ctx_split_horizontal: "◫ Dividir izq./der.",
+    ctx_split_vertical: "⬒ Dividir arr./abj.",
+    ctx_toggle_ai_sidebar: "🤖 Barra lateral IA",
+    ctx_new_tab_bash: "🐚 Nueva pestaña Bash",
+    ctx_new_tab_zsh: "⚡ Nueva pestaña Zsh",
+    ctx_new_tab_fish: "🐟 Nueva pestaña Fish",
+    ctx_new_tab_cmd: "💻 Símbolo del sistema",
+    ctx_new_tab_win_powershell: "⚡ Windows PowerShell",
+    ctx_new_tab_pwsh: "🚀 PowerShell 7 (pwsh)",
+    ctx_new_tab_git_bash: "🦝 Git Bash",
+    ctx_exit: "✖ Salir de skTerm",
+    ctx_copy: "📋 Copiar",
+    ctx_paste: "📄 Pegar",
+    ctx_find: "🔍 Buscar...",
+    ctx_clear_scrollback: "🧹 Limpiar pantalla",
+
+    pref_language_label: "Idioma de la interfaz",
+    pref_language_subtitle: "Idioma de la barra de menús y menús contextuales (aplicación inmediata)",
+    pref_language_auto: "Automático (Sistema)",
+    pref_language_zh_tw: "繁體中文",
+    pref_language_zh_cn: "简体中文",
+    pref_language_en: "English",
+    pref_language_ja: "日本語",
+    pref_language_ko: "한국어",
+    pref_language_es: "Español",
+    pref_language_fr: "Français",
+    pref_language_de: "Deutsch",
+};
+
+pub const FR: I18nStrings = I18nStrings {
+    app_about: "À propos de skTerm",
+    app_check_updates: "Rechercher des mises à jour...",
+    app_preferences: "Réglages...",
+    app_services: "Services",
+    app_hide: "Masquer skTerm",
+    app_hide_others: "Masquer les autres",
+    app_show_all: "Tout afficher",
+    app_quit: "Quitter skTerm",
+
+    menu_file: "Fichier",
+    file_new_window: "Nouvelle fenêtre",
+    file_new_tab: "Nouvel onglet",
+    file_split_horizontal: "Scinder le volet gauche/droite",
+    file_split_vertical: "Scinder le volet haut/bas",
+    file_close_tab: "Fermer l’onglet/le volet",
+    file_close_window: "Fermer la fenêtre",
+
+    menu_edit: "Édition",
+    edit_undo: "Annuler",
+    edit_redo: "Rétablir",
+    edit_cut: "Couper",
+    edit_copy: "Copier",
+    edit_paste: "Coller",
+    edit_select_all: "Tout sélectionner",
+    edit_find: "Rechercher...",
+    edit_clear_scrollback: "Effacer l’historique",
+
+    menu_view: "Présentation",
+    view_toggle_ai_sidebar: "Afficher/masquer la barre latérale IA",
+    view_prev_tab: "Afficher l’onglet précédent",
+    view_next_tab: "Afficher l’onglet suivant",
+    view_move_tab_left: "Déplacer l’onglet vers la gauche",
+    view_move_tab_right: "Déplacer l’onglet vers la droite",
+    view_focus_prev_pane: "Sélectionner le volet précédent",
+    view_focus_next_pane: "Sélectionner le volet suivant",
+    view_zoom_pane: "Agrandir/restaurer le volet actif",
+    view_equalize_panes: "Égaliser la taille des volets",
+    view_zoom_in: "Agrandir",
+    view_zoom_out: "Réduire",
+    view_reset_zoom: "Taille réelle",
+    view_toggle_fullscreen: "Activer/désactiver le plein écran",
+
+    menu_help: "Aide",
+    help_github: "Dépôt GitHub",
+    help_report_issue: "Signaler un problème...",
+    help_open_config: "Ouvrir le fichier de configuration (config.toml)",
+
+    ctx_preferences: "⚙ Réglages...",
+    ctx_check_updates: "🔄 Mises à jour...",
+    ctx_new_tab_default: "＋ Nouvel onglet",
+    ctx_new_tab: "＋ Nouvel onglet",
+    ctx_split_horizontal: "◫ Scinder gauche/droite",
+    ctx_split_vertical: "⬒ Scinder haut/bas",
+    ctx_toggle_ai_sidebar: "🤖 Barre latérale IA",
+    ctx_new_tab_bash: "🐚 Nouvel onglet Bash",
+    ctx_new_tab_zsh: "⚡ Nouvel onglet Zsh",
+    ctx_new_tab_fish: "🐟 Nouvel onglet Fish",
+    ctx_new_tab_cmd: "💻 Invite de commandes",
+    ctx_new_tab_win_powershell: "⚡ Windows PowerShell",
+    ctx_new_tab_pwsh: "🚀 PowerShell 7 (pwsh)",
+    ctx_new_tab_git_bash: "🦝 Git Bash",
+    ctx_exit: "✖ Quitter skTerm",
+    ctx_copy: "📋 Copier",
+    ctx_paste: "📄 Coller",
+    ctx_find: "🔍 Rechercher...",
+    ctx_clear_scrollback: "🧹 Effacer l’écran",
+
+    pref_language_label: "Langue de l’interface",
+    pref_language_subtitle:
+        "Langue de la barre des menus et des menus contextuels (effet immédiat)",
+    pref_language_auto: "Automatique (Système)",
+    pref_language_zh_tw: "繁體中文",
+    pref_language_zh_cn: "简体中文",
+    pref_language_en: "English",
+    pref_language_ja: "日本語",
+    pref_language_ko: "한국어",
+    pref_language_es: "Español",
+    pref_language_fr: "Français",
+    pref_language_de: "Deutsch",
+};
+
+pub const DE: I18nStrings = I18nStrings {
+    app_about: "Über skTerm",
+    app_check_updates: "Nach Updates suchen...",
+    app_preferences: "Einstellungen...",
+    app_services: "Dienste",
+    app_hide: "skTerm ausblenden",
+    app_hide_others: "Andere ausblenden",
+    app_show_all: "Alle einblenden",
+    app_quit: "skTerm beenden",
+
+    menu_file: "Ablage",
+    file_new_window: "Neues Fenster",
+    file_new_tab: "Neuer Tab",
+    file_split_horizontal: "Bereich links/rechts teilen",
+    file_split_vertical: "Bereich oben/unten teilen",
+    file_close_tab: "Tab/Bereich schließen",
+    file_close_window: "Fenster schließen",
+
+    menu_edit: "Bearbeiten",
+    edit_undo: "Widerrufen",
+    edit_redo: "Wiederholen",
+    edit_cut: "Ausschneiden",
+    edit_copy: "Kopieren",
+    edit_paste: "Einsetzen",
+    edit_select_all: "Alles auswählen",
+    edit_find: "Suchen...",
+    edit_clear_scrollback: "Verlauf löschen",
+
+    menu_view: "Darstellung",
+    view_toggle_ai_sidebar: "KI-Agenten-Seitenleiste ein-/ausblenden",
+    view_prev_tab: "Vorherigen Tab zeigen",
+    view_next_tab: "Nächsten Tab zeigen",
+    view_move_tab_left: "Tab nach links bewegen",
+    view_move_tab_right: "Tab nach rechts bewegen",
+    view_focus_prev_pane: "Vorherigen Bereich auswählen",
+    view_focus_next_pane: "Nächsten Bereich auswählen",
+    view_zoom_pane: "Aktiven Bereich maximieren/wiederherstellen",
+    view_equalize_panes: "Bereichsgrößen angleichen",
+    view_zoom_in: "Vergrößern",
+    view_zoom_out: "Verkleinern",
+    view_reset_zoom: "Originalgröße",
+    view_toggle_fullscreen: "Vollbild ein-/ausblenden",
+
+    menu_help: "Hilfe",
+    help_github: "GitHub-Repository",
+    help_report_issue: "Problem melden...",
+    help_open_config: "Konfigurationsdatei öffnen (config.toml)",
+
+    ctx_preferences: "⚙ Einstellungen...",
+    ctx_check_updates: "🔄 Updates suchen...",
+    ctx_new_tab_default: "＋ Neuer Tab (Standard)",
+    ctx_new_tab: "＋ Neuer Tab",
+    ctx_split_horizontal: "◫ Links/rechts teilen",
+    ctx_split_vertical: "⬒ Oben/unten teilen",
+    ctx_toggle_ai_sidebar: "🤖 KI-Seitenleiste",
+    ctx_new_tab_bash: "🐚 Neuer Bash-Tab",
+    ctx_new_tab_zsh: "⚡ Neuer Zsh-Tab",
+    ctx_new_tab_fish: "🐟 Neuer Fish-Tab",
+    ctx_new_tab_cmd: "💻 Eingabeaufforderung",
+    ctx_new_tab_win_powershell: "⚡ Windows PowerShell",
+    ctx_new_tab_pwsh: "🚀 PowerShell 7 (pwsh)",
+    ctx_new_tab_git_bash: "🦝 Git Bash",
+    ctx_exit: "✖ skTerm beenden",
+    ctx_copy: "📋 Kopieren",
+    ctx_paste: "📄 Einsetzen",
+    ctx_find: "🔍 Suchen...",
+    ctx_clear_scrollback: "🧹 Bildschirm löschen",
+
+    pref_language_label: "Oberflächensprache",
+    pref_language_subtitle: "Anzeigesprache für Menüleiste und Kontextmenüs (sofort wirksam)",
+    pref_language_auto: "Automatisch (System)",
+    pref_language_zh_tw: "繁體中文",
+    pref_language_zh_cn: "简体中文",
+    pref_language_en: "English",
+    pref_language_ja: "日本語",
+    pref_language_ko: "한국어",
+    pref_language_es: "Español",
+    pref_language_fr: "Français",
+    pref_language_de: "Deutsch",
 };
 
 #[cfg(test)]
@@ -489,6 +946,24 @@ mod tests {
         assert_eq!(Locale::from_tag("en"), Some(Locale::En));
         assert_eq!(Locale::from_tag("en-US"), Some(Locale::En));
         assert_eq!(Locale::from_tag("en_GB.UTF-8"), Some(Locale::En));
+        assert_eq!(Locale::from_tag("ja"), Some(Locale::Ja));
+        assert_eq!(Locale::from_tag("ja-JP"), Some(Locale::Ja));
+        assert_eq!(Locale::from_tag("ja_JP.UTF-8"), Some(Locale::Ja));
+        assert_eq!(Locale::from_tag("ko"), Some(Locale::Ko));
+        assert_eq!(Locale::from_tag("ko-KR"), Some(Locale::Ko));
+        assert_eq!(Locale::from_tag("ko_KR.UTF-8"), Some(Locale::Ko));
+        assert_eq!(Locale::from_tag("es"), Some(Locale::Es));
+        assert_eq!(Locale::from_tag("es-ES"), Some(Locale::Es));
+        assert_eq!(Locale::from_tag("es-MX"), Some(Locale::Es));
+        assert_eq!(Locale::from_tag("es_ES.UTF-8"), Some(Locale::Es));
+        assert_eq!(Locale::from_tag("fr"), Some(Locale::Fr));
+        assert_eq!(Locale::from_tag("fr-FR"), Some(Locale::Fr));
+        assert_eq!(Locale::from_tag("fr-CA"), Some(Locale::Fr));
+        assert_eq!(Locale::from_tag("fr_FR.UTF-8"), Some(Locale::Fr));
+        assert_eq!(Locale::from_tag("de"), Some(Locale::De));
+        assert_eq!(Locale::from_tag("de-DE"), Some(Locale::De));
+        assert_eq!(Locale::from_tag("de-AT"), Some(Locale::De));
+        assert_eq!(Locale::from_tag("de_DE.UTF-8"), Some(Locale::De));
         assert_eq!(Locale::from_tag("auto"), None);
         assert_eq!(Locale::from_tag(""), None);
         assert_eq!(Locale::from_tag("C"), None);
@@ -496,6 +971,11 @@ mod tests {
         assert_eq!(Locale::ZhTw.code(), "zh-TW");
         assert_eq!(Locale::ZhCn.code(), "zh-CN");
         assert_eq!(Locale::En.code(), "en");
+        assert_eq!(Locale::Ja.code(), "ja");
+        assert_eq!(Locale::Ko.code(), "ko");
+        assert_eq!(Locale::Es.code(), "es");
+        assert_eq!(Locale::Fr.code(), "fr");
+        assert_eq!(Locale::De.code(), "de");
     }
 
     #[test]
@@ -541,5 +1021,40 @@ mod tests {
         assert_eq!(en.view_focus_prev_pane, "Select Previous Pane");
         assert_eq!(en.view_focus_next_pane, "Select Next Pane");
         assert_eq!(en.pref_language_zh_cn, "简体中文");
+
+        let ja = strings(Locale::Ja);
+        assert_eq!(ja.menu_file, "ファイル");
+        assert_eq!(ja.menu_edit, "編集");
+        assert_eq!(ja.menu_view, "表示");
+        assert_eq!(ja.menu_help, "ヘルプ");
+        assert_eq!(ja.pref_language_ja, "日本語");
+
+        let ko = strings(Locale::Ko);
+        assert_eq!(ko.menu_file, "파일");
+        assert_eq!(ko.menu_edit, "편집");
+        assert_eq!(ko.menu_view, "보기");
+        assert_eq!(ko.menu_help, "도움말");
+        assert_eq!(ko.pref_language_ko, "한국어");
+
+        let es = strings(Locale::Es);
+        assert_eq!(es.menu_file, "Archivo");
+        assert_eq!(es.menu_edit, "Edición");
+        assert_eq!(es.menu_view, "Visualización");
+        assert_eq!(es.menu_help, "Ayuda");
+        assert_eq!(es.pref_language_es, "Español");
+
+        let fr = strings(Locale::Fr);
+        assert_eq!(fr.menu_file, "Fichier");
+        assert_eq!(fr.menu_edit, "Édition");
+        assert_eq!(fr.menu_view, "Présentation");
+        assert_eq!(fr.menu_help, "Aide");
+        assert_eq!(fr.pref_language_fr, "Français");
+
+        let de = strings(Locale::De);
+        assert_eq!(de.menu_file, "Ablage");
+        assert_eq!(de.menu_edit, "Bearbeiten");
+        assert_eq!(de.menu_view, "Darstellung");
+        assert_eq!(de.menu_help, "Hilfe");
+        assert_eq!(de.pref_language_de, "Deutsch");
     }
 }

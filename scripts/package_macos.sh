@@ -70,6 +70,11 @@ cat << PLIST > "${CONTENTS_DIR}/Info.plist"
         <string>zh_TW</string>
         <string>zh_CN</string>
         <string>en</string>
+        <string>ja</string>
+        <string>ko</string>
+        <string>es</string>
+        <string>fr</string>
+        <string>de</string>
     </array>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>

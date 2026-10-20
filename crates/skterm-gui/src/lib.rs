@@ -1270,12 +1270,32 @@ mod tests {
             build_top_dropdown_menu_for_locale(Locale::ZhCn, 1.0, 100.0, 36.0, None);
         let (menu_en, actions_en) =
             build_top_dropdown_menu_for_locale(Locale::En, 1.0, 100.0, 36.0, None);
+        let (menu_ja, actions_ja) =
+            build_top_dropdown_menu_for_locale(Locale::Ja, 1.0, 100.0, 36.0, None);
+        let (menu_ko, actions_ko) =
+            build_top_dropdown_menu_for_locale(Locale::Ko, 1.0, 100.0, 36.0, None);
+        let (menu_es, actions_es) =
+            build_top_dropdown_menu_for_locale(Locale::Es, 1.0, 100.0, 36.0, None);
+        let (menu_fr, actions_fr) =
+            build_top_dropdown_menu_for_locale(Locale::Fr, 1.0, 100.0, 36.0, None);
+        let (menu_de, actions_de) =
+            build_top_dropdown_menu_for_locale(Locale::De, 1.0, 100.0, 36.0, None);
 
         assert_eq!(actions_zh, actions_cn);
         assert_eq!(actions_zh, actions_en);
+        assert_eq!(actions_zh, actions_ja);
+        assert_eq!(actions_zh, actions_ko);
+        assert_eq!(actions_zh, actions_es);
+        assert_eq!(actions_zh, actions_fr);
+        assert_eq!(actions_zh, actions_de);
         assert!(menu_zh.items[0].label.contains("偏好設定"));
         assert!(menu_cn.items[0].label.contains("偏好设置"));
         assert!(menu_en.items[0].label.contains("Settings"));
+        assert!(menu_ja.items[0].label.contains("設定"));
+        assert!(menu_ko.items[0].label.contains("설정"));
+        assert!(menu_es.items[0].label.contains("Ajustes"));
+        assert!(menu_fr.items[0].label.contains("Réglages"));
+        assert!(menu_de.items[0].label.contains("Einstellungen"));
 
         let (ctx_zh, _) =
             build_context_menu_for_locale(Locale::ZhTw, 1.0, 100.0, 100.0, 800.0, 600.0, None);
@@ -1283,9 +1303,24 @@ mod tests {
             build_context_menu_for_locale(Locale::ZhCn, 1.0, 100.0, 100.0, 800.0, 600.0, None);
         let (ctx_en, _) =
             build_context_menu_for_locale(Locale::En, 1.0, 100.0, 100.0, 800.0, 600.0, None);
+        let (ctx_ja, _) =
+            build_context_menu_for_locale(Locale::Ja, 1.0, 100.0, 100.0, 800.0, 600.0, None);
+        let (ctx_ko, _) =
+            build_context_menu_for_locale(Locale::Ko, 1.0, 100.0, 100.0, 800.0, 600.0, None);
+        let (ctx_es, _) =
+            build_context_menu_for_locale(Locale::Es, 1.0, 100.0, 100.0, 800.0, 600.0, None);
+        let (ctx_fr, _) =
+            build_context_menu_for_locale(Locale::Fr, 1.0, 100.0, 100.0, 800.0, 600.0, None);
+        let (ctx_de, _) =
+            build_context_menu_for_locale(Locale::De, 1.0, 100.0, 100.0, 800.0, 600.0, None);
         assert!(ctx_zh.items[0].label.contains("複製"));
         assert!(ctx_cn.items[0].label.contains("复制"));
         assert!(ctx_en.items[0].label.contains("Copy"));
+        assert!(ctx_ja.items[0].label.contains("コピー"));
+        assert!(ctx_ko.items[0].label.contains("복사"));
+        assert!(ctx_es.items[0].label.contains("Copiar"));
+        assert!(ctx_fr.items[0].label.contains("Copier"));
+        assert!(ctx_de.items[0].label.contains("Kopieren"));
 
         // Verify NativeMenuAction tag roundtrip
         let sample_actions = [
