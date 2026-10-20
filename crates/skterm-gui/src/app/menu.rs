@@ -28,6 +28,7 @@ pub enum TopMenuAction {
     NewTabGitBash,
     ToggleAiSidebar,
     OpenPreferences,
+    CheckForUpdates,
     Exit,
 }
 
@@ -213,6 +214,14 @@ pub fn build_top_dropdown_menu_for_locale(
         is_separator: true,
     });
     actions.push(None);
+
+    // Check for Updates
+    items.push(TopDropdownMenuItem {
+        label: tr.ctx_check_updates.to_string(),
+        shortcut: None,
+        is_separator: false,
+    });
+    actions.push(Some(TopMenuAction::CheckForUpdates));
 
     // Exit
     items.push(TopDropdownMenuItem {
@@ -503,6 +512,10 @@ impl App {
             TopMenuAction::OpenPreferences => {
                 self.open_preferences_window(event_loop);
             }
+            TopMenuAction::CheckForUpdates => {
+                crate::updater::trigger_check_for_updates(true);
+                self.open_preferences_window(event_loop);
+            }
             TopMenuAction::NewTabDefault => {
                 let pty_opts = self.build_pty_options();
                 let scrollback = self.config_manager.current_config.terminal.scrollback_lines;
@@ -749,6 +762,10 @@ impl App {
 
         match action {
             NativeMenuAction::OpenPreferences => {
+                self.open_preferences_window(event_loop);
+            }
+            NativeMenuAction::CheckForUpdates => {
+                crate::updater::trigger_check_for_updates(true);
                 self.open_preferences_window(event_loop);
             }
             NativeMenuAction::Quit => {

@@ -1,6 +1,6 @@
 //! Lightweight, strongly-typed internationalization (i18n) framework for skTerm.
 //!
-//! Provides compile-time checked translation tables (`ZhTw` and `En`) with zero
+//! Provides compile-time checked translation tables (`ZhTw`, `ZhCn`, and `En`) with zero
 //! heap allocations on lookup, automatic OS locale detection, and live switching.
 
 use serde::{Deserialize, Serialize};
@@ -13,13 +13,15 @@ pub enum Locale {
     #[default]
     ZhTw = 0,
     En = 1,
+    ZhCn = 2,
 }
 
 static CURRENT_LOCALE: AtomicU8 = AtomicU8::new(Locale::ZhTw as u8);
 
 impl Locale {
-    /// Parse a BCP-47 or POSIX locale tag (e.g. `"zh-TW"`, `"zh_TW.UTF-8"`, `"zh-Hant-TW"`, `"en-US"`)
-    /// into a supported [`Locale`]. Returns `None` for `"auto"` or unrecognized tags.
+    /// Parse a BCP-47 or POSIX locale tag (e.g. `"zh-TW"`, `"zh-CN"`, `"zh_CN.UTF-8"`,
+    /// `"zh-Hans-CN"`, `"zh-Hant-TW"`, `"en-US"`) into a supported [`Locale`].
+    /// Returns `None` for `"auto"` or unrecognized tags.
     pub fn from_tag(tag: &str) -> Option<Self> {
         let cleaned = tag
             .trim()
@@ -37,7 +39,15 @@ impl Locale {
         }
 
         if cleaned.starts_with("zh") {
-            Some(Self::ZhTw)
+            if cleaned.contains("hans") {
+                Some(Self::ZhCn)
+            } else if cleaned.contains("hant") {
+                Some(Self::ZhTw)
+            } else if cleaned.contains("cn") || cleaned.contains("sg") || cleaned.contains("my") {
+                Some(Self::ZhCn)
+            } else {
+                Some(Self::ZhTw)
+            }
         } else if cleaned.starts_with("en") {
             Some(Self::En)
         } else {
@@ -67,7 +77,7 @@ impl Locale {
         Self::ZhTw
     }
 
-    /// Resolve a configuration language string (`"auto"`, `"zh-TW"`, `"en"`) into an active [`Locale`].
+    /// Resolve a configuration language string (`"auto"`, `"zh-TW"`, `"zh-CN"`, `"en"`) into an active [`Locale`].
     pub fn resolve(config_lang: &str) -> Self {
         let trimmed = config_lang.trim();
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
@@ -81,6 +91,7 @@ impl Locale {
     pub const fn code(self) -> &'static str {
         match self {
             Self::ZhTw => "zh-TW",
+            Self::ZhCn => "zh-CN",
             Self::En => "en",
         }
     }
@@ -118,6 +129,7 @@ fn detect_macos_preferred_language() -> Option<String> {
 pub fn current_locale() -> Locale {
     match CURRENT_LOCALE.load(Ordering::Relaxed) {
         1 => Locale::En,
+        2 => Locale::ZhCn,
         _ => Locale::ZhTw,
     }
 }
@@ -139,6 +151,7 @@ pub fn tr() -> &'static I18nStrings {
 pub const fn strings(locale: Locale) -> &'static I18nStrings {
     match locale {
         Locale::ZhTw => &ZH_TW,
+        Locale::ZhCn => &ZH_CN,
         Locale::En => &EN,
     }
 }
@@ -148,6 +161,7 @@ pub const fn strings(locale: Locale) -> &'static I18nStrings {
 pub struct I18nStrings {
     // macOS Application Menu (skTerm)
     pub app_about: &'static str,
+    pub app_check_updates: &'static str,
     pub app_preferences: &'static str,
     pub app_services: &'static str,
     pub app_hide: &'static str,
@@ -199,6 +213,7 @@ pub struct I18nStrings {
 
     // In-window Top Dropdown & Context Menu
     pub ctx_preferences: &'static str,
+    pub ctx_check_updates: &'static str,
     pub ctx_new_tab_default: &'static str,
     pub ctx_new_tab: &'static str,
     pub ctx_split_horizontal: &'static str,
@@ -222,11 +237,13 @@ pub struct I18nStrings {
     pub pref_language_subtitle: &'static str,
     pub pref_language_auto: &'static str,
     pub pref_language_zh_tw: &'static str,
+    pub pref_language_zh_cn: &'static str,
     pub pref_language_en: &'static str,
 }
 
 pub const ZH_TW: I18nStrings = I18nStrings {
     app_about: "關於 skTerm",
+    app_check_updates: "檢查更新...",
     app_preferences: "偏好設定...",
     app_services: "服務",
     app_hide: "隱藏 skTerm",
@@ -273,6 +290,7 @@ pub const ZH_TW: I18nStrings = I18nStrings {
     help_open_config: "開啟設定檔 (config.toml)",
 
     ctx_preferences: "⚙ 偏好設定...",
+    ctx_check_updates: "🔄 檢查更新...",
     ctx_new_tab_default: "＋ 新增分頁 (預設)",
     ctx_new_tab: "＋ 新增分頁",
     ctx_split_horizontal: "◫ 左右分割窗格",
@@ -295,11 +313,89 @@ pub const ZH_TW: I18nStrings = I18nStrings {
     pref_language_subtitle: "控制系統選單列與快捷選單的顯示語言（即時生效）",
     pref_language_auto: "自動 (系統預設)",
     pref_language_zh_tw: "繁體中文",
+    pref_language_zh_cn: "简体中文",
+    pref_language_en: "English",
+};
+
+pub const ZH_CN: I18nStrings = I18nStrings {
+    app_about: "关于 skTerm",
+    app_check_updates: "检查更新...",
+    app_preferences: "偏好设置...",
+    app_services: "服务",
+    app_hide: "隐藏 skTerm",
+    app_hide_others: "隐藏其他",
+    app_show_all: "显示全部",
+    app_quit: "退出 skTerm",
+
+    menu_file: "文件",
+    file_new_window: "新建窗口",
+    file_new_tab: "新建标签页",
+    file_split_horizontal: "左右拆分窗格",
+    file_split_vertical: "上下拆分窗格",
+    file_close_tab: "关闭标签页/窗格",
+    file_close_window: "关闭窗口",
+
+    menu_edit: "编辑",
+    edit_undo: "撤销",
+    edit_redo: "重做",
+    edit_cut: "剪切",
+    edit_copy: "复制",
+    edit_paste: "粘贴",
+    edit_select_all: "全选",
+    edit_find: "查找...",
+    edit_clear_scrollback: "清除屏幕",
+
+    menu_view: "显示",
+    view_toggle_ai_sidebar: "切换 AI 代理侧边栏",
+    view_prev_tab: "切换至上一个标签页",
+    view_next_tab: "切换至下一个标签页",
+    view_move_tab_left: "将标签页向左移动",
+    view_move_tab_right: "将标签页向右移动",
+    view_focus_prev_pane: "聚焦上一个窗格",
+    view_focus_next_pane: "聚焦下一个窗格",
+    view_zoom_pane: "放大/还原当前窗格",
+    view_equalize_panes: "平均分配窗格大小",
+    view_zoom_in: "放大字体",
+    view_zoom_out: "缩小字体",
+    view_reset_zoom: "实际大小",
+    view_toggle_fullscreen: "进入/退出全屏幕",
+
+    menu_help: "帮助",
+    help_github: "GitHub 项目首页",
+    help_report_issue: "反馈问题...",
+    help_open_config: "打开配置文件 (config.toml)",
+
+    ctx_preferences: "⚙ 偏好设置...",
+    ctx_check_updates: "🔄 检查更新...",
+    ctx_new_tab_default: "＋ 新建标签页 (默认)",
+    ctx_new_tab: "＋ 新建标签页",
+    ctx_split_horizontal: "◫ 左右拆分窗格",
+    ctx_split_vertical: "⬒ 上下拆分窗格",
+    ctx_toggle_ai_sidebar: "🤖 切换 AI 侧边栏",
+    ctx_new_tab_bash: "🐚 新建 Bash 标签页",
+    ctx_new_tab_zsh: "⚡ 新建 Zsh 标签页",
+    ctx_new_tab_fish: "🐟 新建 Fish 标签页",
+    ctx_new_tab_cmd: "💻 命令提示符",
+    ctx_new_tab_win_powershell: "⚡ Windows PowerShell",
+    ctx_new_tab_pwsh: "🚀 PowerShell 7 (pwsh)",
+    ctx_new_tab_git_bash: "🦝 Git Bash",
+    ctx_exit: "✖ 退出 skTerm",
+    ctx_copy: "📋 复制",
+    ctx_paste: "📄 粘贴",
+    ctx_find: "🔍 查找...",
+    ctx_clear_scrollback: "🧹 清除屏幕",
+
+    pref_language_label: "界面语言 (Language)",
+    pref_language_subtitle: "控制系统菜单栏与快捷菜单的显示语言（即时生效）",
+    pref_language_auto: "自动 (系统默认)",
+    pref_language_zh_tw: "繁體中文",
+    pref_language_zh_cn: "简体中文",
     pref_language_en: "English",
 };
 
 pub const EN: I18nStrings = I18nStrings {
     app_about: "About skTerm",
+    app_check_updates: "Check for Updates...",
     app_preferences: "Settings...",
     app_services: "Services",
     app_hide: "Hide skTerm",
@@ -346,6 +442,7 @@ pub const EN: I18nStrings = I18nStrings {
     help_open_config: "Open Config File (config.toml)",
 
     ctx_preferences: "⚙ Settings...",
+    ctx_check_updates: "🔄 Check for Updates...",
     ctx_new_tab_default: "＋ New Tab (Default)",
     ctx_new_tab: "＋ New Tab",
     ctx_split_horizontal: "◫ Split Pane Left/Right",
@@ -368,6 +465,7 @@ pub const EN: I18nStrings = I18nStrings {
     pref_language_subtitle: "Display language for the menu bar and context menus (applied live)",
     pref_language_auto: "Auto (System)",
     pref_language_zh_tw: "繁體中文",
+    pref_language_zh_cn: "简体中文",
     pref_language_en: "English",
 };
 
@@ -380,12 +478,24 @@ mod tests {
         assert_eq!(Locale::from_tag("zh-TW"), Some(Locale::ZhTw));
         assert_eq!(Locale::from_tag("zh_TW.UTF-8"), Some(Locale::ZhTw));
         assert_eq!(Locale::from_tag("zh-Hant-TW"), Some(Locale::ZhTw));
+        assert_eq!(Locale::from_tag("zh-Hant-HK"), Some(Locale::ZhTw));
+        assert_eq!(Locale::from_tag("zh-HK"), Some(Locale::ZhTw));
+        assert_eq!(Locale::from_tag("zh-CN"), Some(Locale::ZhCn));
+        assert_eq!(Locale::from_tag("zh_CN.UTF-8"), Some(Locale::ZhCn));
+        assert_eq!(Locale::from_tag("zh-Hans"), Some(Locale::ZhCn));
+        assert_eq!(Locale::from_tag("zh-Hans-CN"), Some(Locale::ZhCn));
+        assert_eq!(Locale::from_tag("zh-Hans-HK"), Some(Locale::ZhCn));
+        assert_eq!(Locale::from_tag("zh_SG.UTF-8"), Some(Locale::ZhCn));
         assert_eq!(Locale::from_tag("en"), Some(Locale::En));
         assert_eq!(Locale::from_tag("en-US"), Some(Locale::En));
         assert_eq!(Locale::from_tag("en_GB.UTF-8"), Some(Locale::En));
         assert_eq!(Locale::from_tag("auto"), None);
         assert_eq!(Locale::from_tag(""), None);
         assert_eq!(Locale::from_tag("C"), None);
+
+        assert_eq!(Locale::ZhTw.code(), "zh-TW");
+        assert_eq!(Locale::ZhCn.code(), "zh-CN");
+        assert_eq!(Locale::En.code(), "en");
     }
 
     #[test]
@@ -402,6 +512,21 @@ mod tests {
         assert_eq!(zh.view_next_tab, "切換至下一個分頁");
         assert_eq!(zh.view_focus_prev_pane, "聚焦上一個窗格");
         assert_eq!(zh.view_focus_next_pane, "聚焦下一個窗格");
+        assert_eq!(zh.pref_language_zh_cn, "简体中文");
+
+        let zh_cn = strings(Locale::ZhCn);
+        assert_eq!(zh_cn.menu_file, "文件");
+        assert_eq!(zh_cn.menu_edit, "编辑");
+        assert_eq!(zh_cn.menu_view, "显示");
+        assert_eq!(zh_cn.menu_help, "帮助");
+        assert_eq!(zh_cn.file_new_window, "新建窗口");
+        assert_eq!(zh_cn.file_new_tab, "新建标签页");
+        assert_eq!(zh_cn.view_toggle_ai_sidebar, "切换 AI 代理侧边栏");
+        assert_eq!(zh_cn.view_prev_tab, "切换至上一个标签页");
+        assert_eq!(zh_cn.view_next_tab, "切换至下一个标签页");
+        assert_eq!(zh_cn.view_focus_prev_pane, "聚焦上一个窗格");
+        assert_eq!(zh_cn.view_focus_next_pane, "聚焦下一个窗格");
+        assert_eq!(zh_cn.pref_language_zh_cn, "简体中文");
 
         let en = strings(Locale::En);
         assert_eq!(en.menu_file, "File");
@@ -415,5 +540,6 @@ mod tests {
         assert_eq!(en.view_next_tab, "Show Next Tab");
         assert_eq!(en.view_focus_prev_pane, "Select Previous Pane");
         assert_eq!(en.view_focus_next_pane, "Select Next Pane");
+        assert_eq!(en.pref_language_zh_cn, "简体中文");
     }
 }

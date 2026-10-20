@@ -973,6 +973,9 @@ fn direct_candidate(clean_q: &str) -> Option<PathBuf> {
         ("menlo", "/System/Library/Fonts/Menlo.ttc"),
         ("monaco", "/System/Library/Fonts/Monaco.ttf"),
         ("sfmono", "/System/Library/Fonts/SFMono-Regular.otf"),
+        ("pingfang", "/System/Library/Fonts/PingFang.ttc"),
+        ("pingfangtc", "/System/Library/Fonts/PingFang.ttc"),
+        ("pingfangsc", "/System/Library/Fonts/PingFang.ttc"),
         (
             "dejavusansmono",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
@@ -986,6 +989,10 @@ fn direct_candidate(clean_q: &str) -> Option<PathBuf> {
             "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
         ),
         ("consolas", "C:\\Windows\\Fonts\\consola.ttf"),
+        ("microsoftyahei", "C:\\Windows\\Fonts\\msyh.ttc"),
+        ("microsoftyaheiui", "C:\\Windows\\Fonts\\msyh.ttc"),
+        ("microsoftjhenghei", "C:\\Windows\\Fonts\\msjh.ttc"),
+        ("microsoftjhengheiui", "C:\\Windows\\Fonts\\msjh.ttc"),
     ];
     direct_candidates
         .iter()
@@ -1028,8 +1035,14 @@ fn ranked_candidates(query: &str) -> Vec<PathBuf> {
             // "NotoSansMNerdFont-Condensed..." ("fon-tc-ondensed"), which would pull in
             // a completely unrelated family.
             vec!["sanstc"]
+        } else if clean_q.contains("sanssc") {
+            // Anchor on "sanssc" rather than a bare "sc": "sc" also occurs inside
+            // "NotoSans-Condensed..." ("san-sc-ondensed").
+            vec!["sanssc"]
         } else if clean_q.contains("noto") && clean_q.contains("tc") {
             vec!["noto", "tc"]
+        } else if clean_q.contains("cjksc") {
+            vec!["noto", "cjk"]
         } else {
             vec![]
         };

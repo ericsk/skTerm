@@ -8,6 +8,7 @@ use std::time::Duration;
 pub enum NativeMenuAction {
     OpenPreferences = 1,
     Quit = 2,
+    CheckForUpdates = 3,
     NewWindow = 10,
     NewTab = 11,
     SplitHorizontal = 12,
@@ -42,6 +43,7 @@ impl NativeMenuAction {
         match tag {
             1 => Some(Self::OpenPreferences),
             2 => Some(Self::Quit),
+            3 => Some(Self::CheckForUpdates),
             10 => Some(Self::NewWindow),
             11 => Some(Self::NewTab),
             12 => Some(Self::SplitHorizontal),
@@ -84,6 +86,8 @@ pub enum AppEvent {
     ConfigChanged,
     /// Triggered by a native OS menu bar action (e.g. macOS `NSMenuItem`).
     MenuAction(NativeMenuAction),
+    /// Sent from the background OTA updater thread when update state changes.
+    UpdateStateChanged,
 }
 
 /// How long the scrollbar stays visible after the last scroll.

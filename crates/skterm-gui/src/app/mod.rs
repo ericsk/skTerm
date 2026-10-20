@@ -151,6 +151,7 @@ impl App {
         let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
         let proxy = event_loop.create_proxy();
         self.event_proxy = Some(proxy.clone());
+        crate::updater::set_update_event_proxy(proxy.clone());
         #[cfg(target_os = "macos")]
         crate::macos_menu::set_event_proxy(proxy.clone());
         self.config_manager.set_wakeup(Arc::new(move || {
@@ -326,6 +327,11 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::MenuAction(action) => {
                 self.execute_native_menu_action(event_loop, action);
             }
+            AppEvent::UpdateStateChanged => {
+                if let Some(pref) = &self.preferences_window {
+                    pref.window.request_redraw();
+                }
+            }
         }
     }
 
@@ -334,6 +340,10 @@ impl ApplicationHandler<AppEvent> for App {
         crate::macos_menu::install_or_update_macos_menu(crate::i18n::current_locale());
 
         if self.sessions.is_empty() {
+            crate::updater::cleanup_old_executable_on_startup();
+            if self.config_manager.current_config.window.auto_check_updates {
+                crate::updater::trigger_check_for_updates(false);
+            }
             if let Err(e) = self.create_terminal_session(event_loop) {
                 error!("Failed to create initial terminal window: {:?}", e);
                 event_loop.exit();

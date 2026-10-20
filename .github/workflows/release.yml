@@ -6,39 +6,90 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
-    name: Build on ${{ matrix.os }} (${{ matrix.target }})
+    name: Package on ${{ matrix.os }} (${{ matrix.arch_label }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: skterm-macos-arm64
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact_name: skterm-macos-x64
+            arch_label: macos-arm64
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: skterm-linux-x64
+            arch_label: linux-x64
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: skterm-windows-x64.exe
+            arch_label: windows-x64
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
-      - name: Build skTerm
-        run: cargo build --release --target ${{ matrix.target }} -p skterm-app
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
 
-      - name: Upload Artifact
+      - name: Linux Dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libasound2-dev
+
+      - name: Package macOS (.dmg + .app.tar.gz + SHA256SUMS.txt)
+        if: runner.os == 'macOS'
+        run: |
+          SKIP_LOCAL_INSTALL=1 ./scripts/package_macos.sh
+          mkdir -p release_assets
+          cp dist/macos/*.dmg dist/macos/*.app.tar.gz release_assets/
+
+      - name: Package Linux (.deb + .tar.gz)
+        if: runner.os == 'Linux'
+        run: |
+          ./scripts/package_linux.sh
+          mkdir -p release_assets
+          cp dist/linux/*.deb dist/linux/*.tar.gz release_assets/
+
+      - name: Package Windows (.zip + Installer)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/package_windows.ps1
+          New-Item -ItemType Directory -Force -Path release_assets | Out-Null
+          Copy-Item "dist\windows\*.zip" "release_assets\"
+          if (Test-Path "dist\windows\*.exe") {
+            Copy-Item "dist\windows\*.exe" "release_assets\"
+          }
+
+      - name: Upload Packaged Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: target/${{ matrix.target }}/release/skterm*
+          name: release-${{ matrix.arch_label }}
+          path: release_assets/*
+
+  release:
+    name: Publish GitHub Release & OTA Checksums
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Packaged Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_artifacts
+          merge-multiple: true
+
+      - name: Generate Unified SHA256SUMS.txt
+        run: |
+          cd all_artifacts
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: all_artifacts/*
+          generate_release_notes: true

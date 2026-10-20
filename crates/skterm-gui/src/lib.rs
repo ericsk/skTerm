@@ -15,6 +15,7 @@ pub mod macos_textfield;
 pub mod macos_titlebar;
 pub mod preferences_window;
 pub mod tab_title;
+pub mod updater;
 
 pub use app::{
     build_context_menu_for_locale, build_top_dropdown_menu, build_top_dropdown_menu_for_locale,
@@ -1265,23 +1266,31 @@ mod tests {
     fn test_i18n_menu_localization_and_native_menu_action_tags() {
         let (menu_zh, actions_zh) =
             build_top_dropdown_menu_for_locale(Locale::ZhTw, 1.0, 100.0, 36.0, None);
+        let (menu_cn, actions_cn) =
+            build_top_dropdown_menu_for_locale(Locale::ZhCn, 1.0, 100.0, 36.0, None);
         let (menu_en, actions_en) =
             build_top_dropdown_menu_for_locale(Locale::En, 1.0, 100.0, 36.0, None);
 
+        assert_eq!(actions_zh, actions_cn);
         assert_eq!(actions_zh, actions_en);
         assert!(menu_zh.items[0].label.contains("偏好設定"));
+        assert!(menu_cn.items[0].label.contains("偏好设置"));
         assert!(menu_en.items[0].label.contains("Settings"));
 
         let (ctx_zh, _) =
             build_context_menu_for_locale(Locale::ZhTw, 1.0, 100.0, 100.0, 800.0, 600.0, None);
+        let (ctx_cn, _) =
+            build_context_menu_for_locale(Locale::ZhCn, 1.0, 100.0, 100.0, 800.0, 600.0, None);
         let (ctx_en, _) =
             build_context_menu_for_locale(Locale::En, 1.0, 100.0, 100.0, 800.0, 600.0, None);
         assert!(ctx_zh.items[0].label.contains("複製"));
+        assert!(ctx_cn.items[0].label.contains("复制"));
         assert!(ctx_en.items[0].label.contains("Copy"));
 
         // Verify NativeMenuAction tag roundtrip
         let sample_actions = [
             NativeMenuAction::OpenPreferences,
+            NativeMenuAction::CheckForUpdates,
             NativeMenuAction::NewWindow,
             NativeMenuAction::NewTab,
             NativeMenuAction::SplitHorizontal,

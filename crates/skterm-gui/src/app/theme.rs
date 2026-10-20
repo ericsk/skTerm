@@ -175,6 +175,9 @@ impl App {
         crate::i18n::set_locale(new_locale);
         #[cfg(target_os = "macos")]
         crate::macos_menu::install_or_update_macos_menu(new_locale);
+        if let Some(pref_win) = &self.preferences_window {
+            pref_win.window.request_redraw();
+        }
 
         let render_theme = self.build_render_theme();
         let tab_bar_h = self.get_tab_bar_height();

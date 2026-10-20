@@ -105,6 +105,8 @@ pub struct WindowConfig {
     pub tab_bar_style: String,
     #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default = "default_auto_check_updates")]
+    pub auto_check_updates: bool,
 }
 
 fn default_columns() -> u16 {
@@ -138,6 +140,9 @@ fn default_tab_bar_style() -> String {
 fn default_language() -> String {
     "auto".to_string()
 }
+fn default_auto_check_updates() -> bool {
+    true
+}
 
 impl Default for WindowConfig {
     fn default() -> Self {
@@ -153,6 +158,7 @@ impl Default for WindowConfig {
             decorations: default_decorations(),
             tab_bar_style: default_tab_bar_style(),
             language: default_language(),
+            auto_check_updates: default_auto_check_updates(),
         }
     }
 }
@@ -852,8 +858,11 @@ decorations = "full"
 # 分頁標籤列顯示策略 ("auto": 多於1個分頁時自動顯示, "always": 恆顯示, "never": 恆隱藏)
 tab_bar_style = "auto"
 
-# 介面與選單顯示語言 ("auto": 自動偵測系統語系, "zh-TW": 繁體中文, "en": English)
+# 介面與選單顯示語言 ("auto": 自動偵測系統語系, "zh-TW": 繁體中文, "zh-CN": 簡體中文, "en": English)
 language = "auto"
+
+# 啟動時自動檢查 GitHub Releases OTA 新版本 (true / false)
+auto_check_updates = true
 
 
 [terminal]
@@ -978,8 +987,11 @@ decorations = "full"
 # 分頁標籤列顯示策略 ("always": 恆顯示, "auto": 多於1個分頁時自動顯示, "never": 恆隱藏)
 tab_bar_style = "always"
 
-# 介面與選單顯示語言 ("auto": 自動偵測系統語系, "zh-TW": 繁體中文, "en": English)
+# 介面與選單顯示語言 ("auto": 自動偵測系統語系, "zh-TW": 繁體中文, "zh-CN": 簡體中文, "en": English)
 language = "auto"
+
+# 啟動時自動檢查 GitHub Releases OTA 新版本 (true / false)
+auto_check_updates = true
 
 
 [terminal]

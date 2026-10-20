@@ -26,6 +26,7 @@ struct MacMenuHandles {
 
     // App menu (skTerm)
     app_about: usize,
+    app_check_updates: usize,
     app_preferences: usize,
     app_services_item: usize,
     app_services_menu: usize,
@@ -308,6 +309,10 @@ pub fn install_or_update_macos_menu(locale: Locale) {
             // Update all titles in-place
             set_title(handles.app_about as *mut AnyObject, tr.app_about);
             set_title(
+                handles.app_check_updates as *mut AnyObject,
+                tr.app_check_updates,
+            );
+            set_title(
                 handles.app_preferences as *mut AnyObject,
                 tr.app_preferences,
             );
@@ -440,6 +445,14 @@ pub fn install_or_update_macos_menu(locale: Locale) {
             0,
         );
         let _: () = msg_send![app_menu, addItem: app_about];
+
+        let app_check_updates = create_action_item(
+            tr.app_check_updates,
+            NativeMenuAction::CheckForUpdates,
+            "",
+            0,
+        );
+        let _: () = msg_send![app_menu, addItem: app_check_updates];
         let _: () = msg_send![app_menu, addItem: create_separator()];
 
         let app_preferences = create_action_item(
@@ -792,6 +805,7 @@ pub fn install_or_update_macos_menu(locale: Locale) {
         *guard = Some(MacMenuHandles {
             main_menu: main_menu as usize,
             app_about: app_about as usize,
+            app_check_updates: app_check_updates as usize,
             app_preferences: app_preferences as usize,
             app_services_item: app_services_item as usize,
             app_services_menu: app_services_menu as usize,
