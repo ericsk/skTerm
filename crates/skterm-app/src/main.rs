@@ -15,17 +15,6 @@ fn main() -> anyhow::Result<()> {
         // Attach to parent console if started from CMD/PowerShell,
         // so CLI logging still works when run from a command prompt.
         let _ = AttachConsole(0xFFFFFFFF);
-
-        #[link(name = "shell32")]
-        extern "system" {
-            fn SetCurrentProcessExplicitAppUserModelID(AppID: *const u16) -> i32;
-        }
-        use std::os::windows::ffi::OsStrExt;
-        let app_id: Vec<u16> = std::ffi::OsStr::new("ericsk.skTerm")
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let _ = SetCurrentProcessExplicitAppUserModelID(app_id.as_ptr());
     }
 
     tracing_subscriber::fmt::init();

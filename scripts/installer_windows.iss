@@ -7,7 +7,6 @@
 #define MyAppPublisher "skTerm Developers"
 #define MyAppURL "https://github.com/ericsk/skTerm"
 #define MyAppExeName "skterm.exe"
-#define MyAppAppUserModelId "ericsk.skTerm"
 
 [Setup]
 AppId={{8B8A8812-C853-4CE8-8C64-07119DFECA30}
@@ -24,6 +23,7 @@ LicenseFile=..\LICENSE
 OutputDir=..\dist\windows
 OutputBaseFilename=skterm-setup-v{#MyAppVersion}-windows-x64
 SetupIconFile=..\assets\app_icon.ico
+UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -44,9 +44,9 @@ Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\app_icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app_icon.ico"; AppUserModelID: "{#MyAppAppUserModelId}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app_icon.ico"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app_icon.ico"; Tasks: desktopicon; AppUserModelID: "{#MyAppAppUserModelId}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app_icon.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
