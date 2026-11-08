@@ -129,15 +129,92 @@ impl ScrollbarMetrics {
     }
 }
 
+/// Display width in terminal grid cells for a single character (`1` for narrow/ASCII,
+/// `2` for wide CJK/Emoji).
+#[inline]
+pub fn char_display_cells(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c)
+        .unwrap_or(1)
+        .max(1)
+}
+
 /// Number of terminal grid cells occupied by `text` when rendered inline.
 pub fn text_display_cells(text: &str) -> usize {
-    text.chars()
-        .map(|c| {
-            unicode_width::UnicodeWidthChar::width(c)
-                .unwrap_or(1)
-                .max(1)
-        })
-        .sum()
+    text.chars().map(char_display_cells).sum()
+}
+
+/// Horizontal pixel offset to center a multi-cell wide glyph's typographic advance box
+/// inside its allocated `cells * cell_w` terminal grid span (e.g. centering a `1.0em` CJK
+/// glyph inside a `2 * cell_w` = `1.25em` monospace double-cell), while leaving all
+/// single-cell glyphs (ASCII, Nerd Font icons, Powerline triangles) untouched at `0.0`.
+#[inline]
+pub fn wide_cell_center_offset(c: char, glyph_advance: f32, cell_w: f32) -> f32 {
+    let cells = char_display_cells(c);
+    if cells > 1 && glyph_advance > 0.0 {
+        let span_w = cells as f32 * cell_w;
+        if glyph_advance < span_w {
+            return ((span_w - glyph_advance) * 0.5).round();
+        }
+    }
+    0.0
+}
+
+/// Lay out `text` inside `[x, x + max_w]` using per-glyph `(advance_px, payload)` from
+/// `lookup(c)`. Advancing by each glyph's true typographic advance width ensures uniform
+/// visual spacing across mixed ASCII/digits and full-width CJK characters in UI text
+/// (such as tab capsules, menus, and sidebars). When `text` exceeds `max_w`, truncates on
+/// a character boundary and appends `'…'` (if `'…'` itself fits).
+pub fn for_each_ellipsized_glyph<T>(
+    text: &str,
+    x: f32,
+    max_w: f32,
+    mut lookup: impl FnMut(char) -> (f32, T),
+    mut emit: impl FnMut(char, f32, T),
+) {
+    if text.is_empty() || max_w <= 0.0 {
+        return;
+    }
+
+    let mut total_w = 0.0_f32;
+    let mut overflows = false;
+    for c in text.chars() {
+        let (adv, _) = lookup(c);
+        total_w += adv.max(0.0);
+        if total_w > max_w + 1e-3 {
+            overflows = true;
+            break;
+        }
+    }
+
+    if !overflows {
+        let mut cur_x = x;
+        for c in text.chars() {
+            let (adv, payload) = lookup(c);
+            emit(c, cur_x, payload);
+            cur_x += adv.max(0.0);
+        }
+        return;
+    }
+
+    let ellipsis = '…';
+    let (ellipsis_adv_raw, ellipsis_payload) = lookup(ellipsis);
+    let ellipsis_adv = ellipsis_adv_raw.max(0.0);
+    if ellipsis_adv <= 0.0 || ellipsis_adv > max_w + 1e-3 {
+        return;
+    }
+
+    let prefix_budget = (max_w - ellipsis_adv).max(0.0);
+    let mut used = 0.0_f32;
+    for c in text.chars() {
+        let (adv_raw, payload) = lookup(c);
+        let adv = adv_raw.max(0.0);
+        if used + adv > prefix_budget + 1e-3 {
+            break;
+        }
+        emit(c, x + used, payload);
+        used += adv;
+    }
+    emit(ellipsis, x + used, ellipsis_payload);
 }
 
 /// Computed horizontal geometry for an inline IME preedit overlay inside a pane.
@@ -948,6 +1025,11 @@ impl TermRenderer {
         self.atlas.cell_height
     }
 
+    /// Measure the typographic advance width in physical pixels of `text` for UI layout.
+    pub fn measure_text_width(&mut self, text: &str, is_bold: bool) -> f32 {
+        self.atlas.measure_text_width(&self.queue, text, is_bold)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_text_line(
         &mut self,
@@ -961,24 +1043,25 @@ impl TermRenderer {
     ) {
         let cell_w = self.atlas.cell_width;
         let baseline = self.atlas.baseline_offset;
+        let y_snapped = y.round();
         let mut cur_x = x;
         for c in text.chars() {
-            let cw = unicode_width::UnicodeWidthChar::width(c)
-                .unwrap_or(1)
-                .max(1) as f32
-                * cell_w;
-            if cur_x + cw > x + max_w {
+            let glyph_info = self
+                .atlas
+                .get_or_insert_glyph(&self.queue, c, is_bold, false);
+            let adv = glyph_info
+                .map(|g| g.advance)
+                .unwrap_or_else(|| char_display_cells(c) as f32 * cell_w)
+                .max(0.0);
+            if cur_x - x + adv > max_w + 1e-3 {
                 break;
             }
-            if let Some(glyph_info) = self
-                .atlas
-                .get_or_insert_glyph(&self.queue, c, is_bold, false)
-            {
+            if let Some(glyph_info) = glyph_info {
                 if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
                     glyph_instances.push(GlyphInstance {
                         rect: [
-                            cur_x + glyph_info.offset[0],
-                            y + baseline - glyph_info.offset[1] - glyph_info.size[1],
+                            cur_x.round() + glyph_info.offset[0],
+                            y_snapped + baseline - glyph_info.offset[1] - glyph_info.size[1],
                             glyph_info.size[0],
                             glyph_info.size[1],
                         ],
@@ -992,8 +1075,59 @@ impl TermRenderer {
                     });
                 }
             }
-            cur_x += cw;
+            cur_x += adv;
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_line_ellipsized(
+        &mut self,
+        glyph_instances: &mut Vec<GlyphInstance>,
+        text: &str,
+        x: f32,
+        y: f32,
+        max_w: f32,
+        color: [f32; 4],
+        is_bold: bool,
+    ) {
+        let cell_w = self.atlas.cell_width;
+        let baseline = self.atlas.baseline_offset;
+        let y_snapped = y.round();
+        let atlas = &mut self.atlas;
+        let queue = &self.queue;
+        for_each_ellipsized_glyph(
+            text,
+            x,
+            max_w,
+            |c| {
+                let info = atlas.get_or_insert_glyph(queue, c, is_bold, false);
+                let adv = info
+                    .map(|g| g.advance)
+                    .unwrap_or_else(|| char_display_cells(c) as f32 * cell_w);
+                (adv, info)
+            },
+            |_c, cur_x, glyph_info| {
+                if let Some(glyph_info) = glyph_info {
+                    if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
+                        glyph_instances.push(GlyphInstance {
+                            rect: [
+                                cur_x.round() + glyph_info.offset[0],
+                                y_snapped + baseline - glyph_info.offset[1] - glyph_info.size[1],
+                                glyph_info.size[0],
+                                glyph_info.size[1],
+                            ],
+                            uv: [
+                                glyph_info.uv_min[0],
+                                glyph_info.uv_min[1],
+                                glyph_info.uv_max[0],
+                                glyph_info.uv_max[1],
+                            ],
+                            color,
+                        });
+                    }
+                }
+            },
+        );
     }
 
     /// Draws the right-aligned `[AI]` and `[⚙]` action buttons (either embedded in
@@ -1197,7 +1331,6 @@ impl TermRenderer {
         state: &AgentPanelState<'_>,
     ) {
         let scale = layout.scale;
-        let cell_w = self.atlas.cell_width;
         let cell_h = self.atlas.cell_height;
         let panel = layout.panel;
         let accent = [0.039, 0.518, 1.00, 1.0];
@@ -1265,10 +1398,11 @@ impl TermRenderer {
             rect: close.as_array(),
             color: [0.14, 0.16, 0.21, 0.9],
         });
+        let close_label_w = self.measure_text_width("×", false);
         self.draw_text_line(
             glyphs,
             "×",
-            close.x + (close.w - cell_w) / 2.0,
+            close.x + (close.w - close_label_w) / 2.0,
             close.y + (close.h - cell_h) / 2.0,
             close.w,
             [0.72, 0.76, 0.85, 0.95],
@@ -1282,7 +1416,7 @@ impl TermRenderer {
         } else {
             "Global · all tabs".to_string()
         };
-        self.draw_text_line(
+        self.draw_text_line_ellipsized(
             glyphs,
             &scope,
             panel.x + 12.0 * scale,
@@ -1298,10 +1432,11 @@ impl TermRenderer {
             color: [0.10, 0.36, 0.72, 0.9],
         });
         let new_label = "+ New";
+        let new_label_w = self.measure_text_width(new_label, true);
         self.draw_text_line(
             glyphs,
             new_label,
-            new_btn.x + (new_btn.w - new_label.chars().count() as f32 * cell_w) / 2.0,
+            new_btn.x + (new_btn.w - new_label_w) / 2.0,
             new_btn.y + (new_btn.h - cell_h) / 2.0,
             new_btn.w,
             [0.98, 0.98, 1.0, 1.0],
@@ -1388,7 +1523,7 @@ impl TermRenderer {
 
             // Location pill ("Tab 2 · #3"): says which tab owns this agent, so a
             // listing spanning several tabs is self-explanatory.
-            let pill_text_w = item.location_label.chars().count() as f32 * cell_w;
+            let pill_text_w = self.measure_text_width(&item.location_label, false);
             let pill_w = pill_text_w + 10.0 * scale;
             let pill_h = cell_h + 4.0 * scale;
             let pill_x = card.right() - pill_w - 8.0 * scale;
@@ -1406,7 +1541,7 @@ impl TermRenderer {
                 &item.location_label,
                 pill_x + 5.0 * scale,
                 pill_y + (pill_h - cell_h) / 2.0,
-                pill_text_w,
+                pill_text_w + 1.0,
                 [0.68, 0.78, 0.94, 1.0],
                 false,
             );
@@ -1428,7 +1563,7 @@ impl TermRenderer {
 
             // Line 1: task name (or agent name when unnamed)
             let text_x = dot_x + dot_size + 6.0 * scale;
-            self.draw_text_line(
+            self.draw_text_line_ellipsized(
                 glyphs,
                 top_title,
                 text_x,
@@ -1438,7 +1573,7 @@ impl TermRenderer {
                 true,
             );
             // Line 2: project / directory
-            self.draw_text_line(
+            self.draw_text_line_ellipsized(
                 glyphs,
                 &format!("▸ {}", item.project_name),
                 card.x + 10.0 * scale,
@@ -1455,7 +1590,7 @@ impl TermRenderer {
             } else {
                 [0.58, 0.63, 0.72, 0.88]
             };
-            self.draw_text_line(
+            self.draw_text_line_ellipsized(
                 glyphs,
                 &bottom_subtitle,
                 card.x + 10.0 * scale,
@@ -1701,7 +1836,7 @@ impl TermRenderer {
                     }
                 }
 
-                // Tab Title Text (Centered vertically)
+                // Tab Title Text (Centered vertically, CJK wide-character aware + ellipsis)
                 let text_start_x = tab_x + 10.0 * scale;
                 let max_text_w = close_x - text_start_x - 4.0 * scale;
                 let text_y = (tab_bar_h - cell_h) / 2.0;
@@ -1711,31 +1846,15 @@ impl TermRenderer {
                     [0.62, 0.65, 0.73, 1.0]
                 };
 
-                for (ch_idx, c) in tab.title.chars().enumerate() {
-                    let gx = text_start_x + (ch_idx as f32 * cell_w);
-                    if gx + cell_w > text_start_x + max_text_w {
-                        break;
-                    }
-                    if let Some(glyph_info) =
-                        self.atlas.get_or_insert_glyph(&self.queue, c, false, false)
-                    {
-                        if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
-                            let draw_x = gx + glyph_info.offset[0];
-                            let draw_y =
-                                text_y + baseline - glyph_info.offset[1] - glyph_info.size[1];
-                            glyph_instances.push(GlyphInstance {
-                                rect: [draw_x, draw_y, glyph_info.size[0], glyph_info.size[1]],
-                                uv: [
-                                    glyph_info.uv_min[0],
-                                    glyph_info.uv_min[1],
-                                    glyph_info.uv_max[0],
-                                    glyph_info.uv_max[1],
-                                ],
-                                color: text_color,
-                            });
-                        }
-                    }
-                }
+                self.draw_text_line_ellipsized(
+                    &mut glyph_instances,
+                    &tab.title,
+                    text_start_x,
+                    text_y,
+                    max_text_w,
+                    text_color,
+                    false,
+                );
             }
 
             // 2.3 New Tab "+" Button
@@ -1782,10 +1901,11 @@ impl TermRenderer {
                 rect: [chevron_x, plus_btn_y, chevron_w, 1.0],
                 color: [0.22, 0.25, 0.33, 0.6],
             });
+            let chevron_label_w = self.measure_text_width("v", false);
             self.draw_text_line(
                 &mut glyph_instances,
                 "v",
-                chevron_x + (chevron_w - cell_w) / 2.0,
+                chevron_x + (chevron_w - chevron_label_w) / 2.0,
                 plus_btn_y + (plus_btn_w - cell_h) / 2.0,
                 chevron_w,
                 [0.7, 0.75, 0.85, 1.0],
@@ -2231,7 +2351,9 @@ impl TermRenderer {
                                 is_italic,
                             ) {
                                 if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
-                                    let glyph_x = x + glyph_info.offset[0];
+                                    let wide_pad_x =
+                                        wide_cell_center_offset(cell.c, glyph_info.advance, cell_w);
+                                    let glyph_x = x + wide_pad_x + glyph_info.offset[0];
                                     let glyph_y =
                                         y + baseline - glyph_info.offset[1] - glyph_info.size[1];
 
@@ -2298,7 +2420,12 @@ impl TermRenderer {
                                         ) {
                                             if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0
                                             {
-                                                let glyph_x = x + glyph_info.offset[0];
+                                                let wide_pad_x = wide_cell_center_offset(
+                                                    c,
+                                                    glyph_info.advance,
+                                                    cell_w,
+                                                );
+                                                let glyph_x = x + wide_pad_x + glyph_info.offset[0];
                                                 let glyph_y = y + baseline
                                                     - glyph_info.offset[1]
                                                     - glyph_info.size[1];
@@ -2476,7 +2603,7 @@ impl TermRenderer {
                     Some(preedit) => format!("Find: {}[{}]▏  ({})", query, preedit, count_str),
                     None => format!("Find: {}▏  ({})", query, count_str),
                 };
-                let bar_w = ((text_display_cells(&label) as f32 * cell_w) + 24.0 * scale)
+                let bar_w = (self.measure_text_width(&label, false) + 24.0 * scale)
                     .clamp(220.0 * scale, (pw - 24.0 * scale).max(120.0));
                 let bar_h = cell_h + 12.0 * scale;
                 let bar_x = (px + pw - bar_w - 12.0 * scale).max(px + 4.0);
@@ -2596,18 +2723,26 @@ impl TermRenderer {
                         [0.90, 0.92, 0.96, 1.0]
                     };
 
-                    self.draw_text_line(
+                    let sc_info = item
+                        .shortcut
+                        .as_deref()
+                        .map(|sc| (sc, self.measure_text_width(sc, false)));
+                    let label_max_w = match sc_info {
+                        Some((_, sc_w)) => (menu.width - 28.0 * scale - sc_w).max(20.0),
+                        None => (menu.width - 20.0 * scale).max(20.0),
+                    };
+
+                    self.draw_text_line_ellipsized(
                         &mut glyph_instances,
                         &item.label,
                         menu.x + 10.0 * scale,
                         cur_y + (row_h - cell_h) / 2.0,
-                        menu.width - 20.0 * scale,
+                        label_max_w,
                         text_color,
                         is_hovered,
                     );
 
-                    if let Some(ref sc) = item.shortcut {
-                        let sc_w = text_display_cells(sc) as f32 * cell_w;
+                    if let Some((sc, sc_w)) = sc_info {
                         self.draw_text_line(
                             &mut glyph_instances,
                             sc,

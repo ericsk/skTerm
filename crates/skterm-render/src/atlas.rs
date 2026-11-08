@@ -236,13 +236,14 @@ pub struct GlyphKey {
     pub is_italic: bool,
 }
 
-/// Metadata and UV bounds of an allocated glyph in the atlas.
+/// Metadata, UV bounds, and typographic advance width of an allocated glyph in the atlas.
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphInfo {
     pub uv_min: [f32; 2],
     pub uv_max: [f32; 2],
     pub size: [f32; 2],
     pub offset: [f32; 2],
+    pub advance: f32,
 }
 
 /// 2D dynamic texture atlas for font glyph caching with user-configured font chains & CJK fallback.
@@ -621,6 +622,11 @@ impl GlyphAtlas {
 
         let glyph_w = metrics.width as u32;
         let glyph_h = metrics.height as u32;
+        let advance = if metrics.advance_width > 0.0 {
+            metrics.advance_width
+        } else {
+            unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as f32 * self.cell_width
+        };
 
         if glyph_w == 0 || glyph_h == 0 {
             let info = GlyphInfo {
@@ -628,6 +634,7 @@ impl GlyphAtlas {
                 uv_max: [0.0, 0.0],
                 size: [0.0, 0.0],
                 offset: [0.0, 0.0],
+                advance,
             };
             self.cache.insert(key, info);
             return Some(info);
@@ -693,10 +700,30 @@ impl GlyphAtlas {
             uv_max,
             size: [glyph_w as f32, glyph_h as f32],
             offset: [metrics.xmin as f32, metrics.ymin as f32],
+            advance,
         };
 
         self.cache.insert(key, info);
         Some(info)
+    }
+
+    /// Typographic advance width in physical pixels for `c` when rendered in UI text.
+    pub fn glyph_advance(&mut self, queue: &Queue, c: char, is_bold: bool, is_italic: bool) -> f32 {
+        self.get_or_insert_glyph(queue, c, is_bold, is_italic)
+            .map(|g| g.advance)
+            .unwrap_or_else(|| {
+                unicode_width::UnicodeWidthChar::width(c)
+                    .unwrap_or(1)
+                    .max(1) as f32
+                    * self.cell_width
+            })
+    }
+
+    /// Total typographic advance width in physical pixels for `text` when rendered in UI text.
+    pub fn measure_text_width(&mut self, queue: &Queue, text: &str, is_bold: bool) -> f32 {
+        text.chars()
+            .map(|c| self.glyph_advance(queue, c, is_bold, false))
+            .sum()
     }
 }
 
@@ -797,6 +824,7 @@ pub fn rasterize_fitted_glyph(
         metrics.xmin = ((allocated_width - orig_w) * 0.5).round() as i32;
     }
 
+    metrics.advance_width = allocated_width;
     (metrics, bitmap)
 }
 
@@ -1810,5 +1838,93 @@ mod tests {
                 col += w_cells;
             }
         }
+    }
+
+    #[test]
+    fn test_cjk_mixed_ascii_visual_spacing_and_grid_centering() {
+        let font_size = 32.0_f32;
+        let (primary, _, _, mut fallbacks) = load_configured_font_chain("Menlo", &[]);
+        for path in SYSTEM_CJK_CANDIDATES {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(regular) = FontFace::from_bytes(bytes, FontSettings::default()) {
+                    fallbacks.push(FallbackFont {
+                        regular,
+                        bold: None,
+                    });
+                }
+            }
+        }
+
+        let cell_width = primary
+            .metrics('M', font_size)
+            .advance_width
+            .ceil()
+            .max(1.0);
+        let cell_height = primary
+            .horizontal_line_metrics(font_size)
+            .map(|m| (m.ascent - m.descent + m.line_gap).ceil())
+            .unwrap_or(font_size * 1.3)
+            .max(1.0);
+
+        let resolve_face = |c: char| -> Option<&FontFace> {
+            if primary.lookup_glyph_index(c) != 0 {
+                return Some(&primary);
+            }
+            fallbacks
+                .iter()
+                .map(|fb| &fb.regular)
+                .find(|f| f.lookup_glyph_index(c) != 0)
+        };
+
+        let sample = "16級資優班生活";
+        if sample.chars().any(|c| resolve_face(c).is_none()) {
+            return;
+        }
+
+        // 1. UI typographic advance layout: verify non-overlapping ink and uniform spacing
+        // between ASCII digits ('1','6'), ASCII->CJK ('6'->'級'), and CJK->CJK ('級'->'資'...).
+        let mut pen_x = 0.0_f32;
+        let mut ink_spans: Vec<(char, f32, f32)> = Vec::new();
+        for c in sample.chars() {
+            let face = resolve_face(c).unwrap();
+            let (m, _) = rasterize_fitted_glyph(face, c, font_size, cell_width, cell_height);
+            let gx = pen_x.round() + m.xmin as f32;
+            ink_spans.push((c, gx, gx + m.width as f32));
+            pen_x += m.advance_width;
+        }
+
+        let gap_1_6 = ink_spans[1].1 - ink_spans[0].2;
+        let gap_6_cjk = ink_spans[2].1 - ink_spans[1].2;
+        let cjk_gaps: Vec<f32> = ink_spans[2..].windows(2).map(|w| w[1].1 - w[0].2).collect();
+
+        assert!(gap_1_6 > 0.0 && gap_6_cjk > 0.0);
+        for &g in &cjk_gaps {
+            assert!(
+                g > 0.0 && g <= 8.0,
+                "Expected compact CJK inter-glyph gap (<= 8px at 32px font), got {:.2}px",
+                g
+            );
+            assert!(
+                (g - gap_1_6).abs() <= 4.0,
+                "Expected CJK gap ({:.2}px) to match ASCII digit gap ({:.2}px) within 4px",
+                g,
+                gap_1_6
+            );
+        }
+
+        // 2. Terminal 2-cell grid centering: verify CJK ideograph is horizontally balanced
+        // inside [0, 2 * cell_width] instead of hugging the left edge next to preceding ASCII.
+        let cjk_face = resolve_face('級').unwrap();
+        let (cjk_m, _) = rasterize_fitted_glyph(cjk_face, '級', font_size, cell_width, cell_height);
+        let pad_x = crate::wide_cell_center_offset('級', cjk_m.advance_width, cell_width);
+        let left_margin = pad_x + cjk_m.xmin as f32;
+        let right_margin = (2.0 * cell_width) - (left_margin + cjk_m.width as f32);
+        assert!(left_margin >= 0.0 && right_margin >= 0.0);
+        assert!(
+            (left_margin - right_margin).abs() <= 3.0,
+            "Expected symmetric 2-cell CJK margins, got left={:.1}px right={:.1}px",
+            left_margin,
+            right_margin
+        );
     }
 }

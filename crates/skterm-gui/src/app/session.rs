@@ -506,8 +506,7 @@ impl TerminalSession {
                                     self.search_query, ime_preedit, count_str
                                 )
                             };
-                            let bar_w = ((skterm_render::text_display_cells(&label) as f32
-                                * cell_w)
+                            let bar_w = (self.renderer.measure_text_width(&label, false)
                                 + 24.0 * scale_f32)
                                 .clamp(
                                     220.0 * scale_f32,
