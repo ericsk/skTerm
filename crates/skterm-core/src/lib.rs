@@ -6,7 +6,11 @@ pub mod pty;
 pub mod terminal;
 pub mod vt;
 
-pub use graphics::{GraphicImage, KittyGraphicsParser, SixelDecoder};
+pub use graphics::{
+    kitty_diacritic_index, GraphicImage, KittyControlParams, KittyGraphicsParser,
+    PlaceholderCellMeta, SixelDecoder, StoredImage, VirtualPlacement, KITTY_DIACRITICS,
+    KITTY_PLACEHOLDER_CHAR, PLACEHOLDER_META_TAG,
+};
 pub use grid::{
     Cell, CellFlags, Color, Cursor, CursorShape, NamedColor, Row, ScreenBuffer, ScreenGrid,
     SearchMatch, Selection, SelectionMode,
@@ -25,7 +29,7 @@ pub use vt::{
 
 /// skterm-core library version and basic info
 pub fn core_info() -> &'static str {
-    "skterm-core v0.1.0"
+    concat!("skterm-core v", env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(test)]
@@ -35,7 +39,10 @@ mod tests {
 
     #[test]
     fn test_core_info() {
-        assert_eq!(core_info(), "skterm-core v0.1.0");
+        assert_eq!(
+            core_info(),
+            concat!("skterm-core v", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

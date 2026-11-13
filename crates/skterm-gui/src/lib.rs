@@ -36,7 +36,7 @@ pub use preferences_window::{PreferencesCategory, PreferencesWindow};
 
 /// skterm-gui version and basic info
 pub fn gui_info() -> &'static str {
-    "skterm-gui v0.1.0"
+    concat!("skterm-gui v", env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(test)]
@@ -47,7 +47,10 @@ mod tests {
 
     #[test]
     fn test_gui_info() {
-        assert_eq!(gui_info(), "skterm-gui v0.1.0");
+        assert_eq!(
+            gui_info(),
+            concat!("skterm-gui v", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

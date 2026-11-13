@@ -11,16 +11,16 @@ pub use agent_panel::{AgentPanelHit, AgentPanelLayout, PanelRect};
 pub use atlas::{is_terminal_friendly_font, GlyphAtlas, GlyphInfo, GlyphKey};
 pub use pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
 pub use renderer::{
-    char_display_cells, color_to_rgba_themed, color_to_rgba_with_dynamic_palette,
-    for_each_ellipsized_glyph, text_display_cells, wide_cell_center_offset, AgentPanelState,
-    AgentSidebarItem, AgentStatus, PaneRenderItem, PreeditOverlayLayout, RenderSurfaceOutcome,
-    RenderTheme, ScrollbarMetrics, TabItem, TermRenderer, TopDropdownMenu, TopDropdownMenuItem,
-    TopRightButtons,
+    char_display_cells, clip_image_quad_to_bounds, color_to_rgba_themed,
+    color_to_rgba_with_dynamic_palette, for_each_ellipsized_glyph, text_display_cells,
+    wide_cell_center_offset, AgentPanelState, AgentSidebarItem, AgentStatus, PaneRenderItem,
+    PreeditOverlayLayout, RenderSurfaceOutcome, RenderTheme, ScrollbarMetrics, TabItem,
+    TermRenderer, TopDropdownMenu, TopDropdownMenuItem, TopRightButtons,
 };
 
 /// skterm-render version and basic info
 pub fn render_info() -> &'static str {
-    "skterm-render v0.1.0"
+    concat!("skterm-render v", env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(test)]
@@ -29,7 +29,10 @@ mod tests {
 
     #[test]
     fn test_render_info() {
-        assert_eq!(render_info(), "skterm-render v0.1.0");
+        assert_eq!(
+            render_info(),
+            concat!("skterm-render v", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
@@ -270,5 +273,39 @@ mod tests {
         // True 2:1 CJK monospace font (32px advance inside 2 * 16px = 32px double-cell) needs 0px offset
         assert_eq!(wide_cell_center_offset('級', 32.0, 16.0), 0.0);
         assert_eq!(wide_cell_center_offset('級', 40.0, 20.0), 0.0);
+    }
+
+    #[test]
+    fn test_clip_image_quad_to_bounds() {
+        // Fully inside pane bounds: unchanged
+        let (r, uv) = clip_image_quad_to_bounds(
+            [10.0, 20.0, 40.0, 60.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 200.0, 200.0],
+        )
+        .unwrap();
+        assert_eq!(r, [10.0, 20.0, 40.0, 60.0]);
+        assert_eq!(uv, [0.0, 0.0, 1.0, 1.0]);
+
+        // Scrolled half-way off the top of a pane starting at y=50: top half clipped, UV v0 becomes 0.5
+        let (r, uv) = clip_image_quad_to_bounds(
+            [10.0, 20.0, 40.0, 60.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 50.0, 200.0, 200.0],
+        )
+        .unwrap();
+        assert_eq!(r, [10.0, 50.0, 40.0, 30.0]);
+        assert!((uv[0] - 0.0).abs() < 1e-6);
+        assert!((uv[1] - 0.5).abs() < 1e-6);
+        assert!((uv[2] - 1.0).abs() < 1e-6);
+        assert!((uv[3] - 1.0).abs() < 1e-6);
+
+        // Completely scrolled off-screen: returns None
+        assert!(clip_image_quad_to_bounds(
+            [10.0, -80.0, 40.0, 60.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 200.0, 200.0]
+        )
+        .is_none());
     }
 }

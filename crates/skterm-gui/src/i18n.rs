@@ -751,7 +751,8 @@ pub const ES: I18nStrings = I18nStrings {
     ctx_clear_scrollback: "🧹 Limpiar pantalla",
 
     pref_language_label: "Idioma de la interfaz",
-    pref_language_subtitle: "Idioma de la barra de menús y menús contextuales (aplicación inmediata)",
+    pref_language_subtitle:
+        "Idioma de la barra de menús y menús contextuales (aplicación inmediata)",
     pref_language_auto: "Automático (Sistema)",
     pref_language_zh_tw: "繁體中文",
     pref_language_zh_cn: "简体中文",

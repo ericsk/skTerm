@@ -11,6 +11,6 @@ fn main() {
         }
     }
     let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba);
-    print!("\x1b_Ga=t,f=32,s=8,v=8,m=0;{}\x1b\\", b64);
+    print!("\x1b_Ga=T,f=32,s=8,v=8,m=0;{}\x1b\\", b64);
     println!("Kitty Graphics Output Displayed Successfully!");
 }

@@ -1179,7 +1179,8 @@ impl Workspace {
                     let avail_h = (rect.height - pad_y * 2.0).max(cell_h);
                     let cols = (avail_w / cell_w).floor() as usize;
                     let rows = (avail_h / cell_h).floor() as usize;
-                    let _ = terminal.resize(rows.max(1), cols.max(1));
+                    let _ =
+                        terminal.resize_with_cell_size(rows.max(1), cols.max(1), cell_w, cell_h);
                 }
             }
         }

@@ -2340,6 +2340,7 @@ dependencies = [
  "base64",
  "bitflags 2.13.1",
  "crossbeam-channel",
+ "flate2",
  "image",
  "libc",
  "portable-pty",

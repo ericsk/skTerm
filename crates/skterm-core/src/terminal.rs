@@ -5,6 +5,20 @@ use crate::pty::{PtyEvent, PtyProcess, PtySpawnOptions};
 use crate::vt::TerminalState;
 use vte::Parser;
 
+/// Maximum bytes buffered for a single APC (`ESC _ ... ST`) sequence (64 MiB).
+const MAX_APC_BYTES: usize = 64 * 1024 * 1024;
+
+/// Streaming pre-parser state for intercepting Application Program Command (`ESC _ ... ST`)
+/// sequences before `vte::Parser` discards them in `SosPmApcString`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ApcState {
+    #[default]
+    Normal,
+    SawEsc,
+    InApc,
+    InApcEsc,
+}
+
 /// The complete terminal instance combining terminal state, parser, and child PTY process.
 pub struct Terminal {
     pub state: TerminalState,
@@ -14,6 +28,12 @@ pub struct Terminal {
     pub custom_label: Option<String>,
     /// Reused across `poll_pty` calls so steady-state reading allocates nothing.
     read_buf: Vec<u8>,
+    /// Streaming APC (`\x1b_...\x1b\\`) state machine for Kitty Graphics Protocol.
+    apc_state: ApcState,
+    apc_buf: Vec<u8>,
+    apc_overflowed: bool,
+    /// Last `(pixel_width, pixel_height)` reported to the kernel PTY via `TIOCSWINSZ`.
+    last_pty_pixels: (u16, u16),
     /// Set once `PtyEvent::Exit` has been observed. `Some(None)` means the child exited
     /// but no status could be retrieved.
     exit_code: Option<Option<u32>>,
@@ -59,6 +79,10 @@ impl Terminal {
             last_output_time: std::time::Instant::now(),
             custom_label: None,
             read_buf: Vec::new(),
+            apc_state: ApcState::Normal,
+            apc_buf: Vec::new(),
+            apc_overflowed: false,
+            last_pty_pixels: (0, 0),
             exit_code: None,
             has_exited: false,
         })
@@ -73,14 +97,149 @@ impl Terminal {
             last_output_time: std::time::Instant::now(),
             custom_label: None,
             read_buf: Vec::new(),
+            apc_state: ApcState::Normal,
+            apc_buf: Vec::new(),
+            apc_overflowed: false,
+            last_pty_pixels: (0, 0),
             exit_code: None,
             has_exited: false,
         }
     }
 
-    /// Feed byte stream (from PTY or test) into the VTE parser to update state.
+    /// Feed byte stream (from PTY or test) into the APC + VTE parser pipeline to update state.
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.state, bytes);
+        // Zero-overhead fast path when not mid-APC and no ESC byte is present in `bytes`.
+        if self.apc_state == ApcState::Normal && !bytes.contains(&0x1B) {
+            self.parser.advance(&mut self.state, bytes);
+            return;
+        }
+
+        let mut i = 0;
+        while i < bytes.len() {
+            match self.apc_state {
+                ApcState::Normal => {
+                    if let Some(rel) = bytes[i..].iter().position(|&b| b == 0x1B) {
+                        if rel > 0 {
+                            self.parser.advance(&mut self.state, &bytes[i..i + rel]);
+                        }
+                        i += rel + 1;
+                        self.apc_state = ApcState::SawEsc;
+                    } else {
+                        self.parser.advance(&mut self.state, &bytes[i..]);
+                        break;
+                    }
+                }
+                ApcState::SawEsc => {
+                    let b = bytes[i];
+                    if b == b'_' {
+                        i += 1;
+                        self.parser.advance(&mut self.state, b"\x1b_");
+                        self.apc_buf.clear();
+                        self.apc_overflowed = false;
+                        self.apc_state = ApcState::InApc;
+                    } else if b == 0x1B {
+                        self.parser.advance(&mut self.state, b"\x1b");
+                        i += 1;
+                    } else {
+                        self.parser.advance(&mut self.state, b"\x1b");
+                        self.apc_state = ApcState::Normal;
+                    }
+                }
+                ApcState::InApc => {
+                    let slice = &bytes[i..];
+                    let delim_pos = slice
+                        .iter()
+                        .position(|&b| matches!(b, 0x1B | 0x07 | 0x18 | 0x1A));
+                    match delim_pos {
+                        None => {
+                            self.push_apc_slice(slice);
+                            break;
+                        }
+                        Some(rel) => {
+                            if rel > 0 {
+                                self.push_apc_slice(&slice[..rel]);
+                            }
+                            let delim = slice[rel];
+                            i += rel + 1;
+                            match delim {
+                                0x1B => {
+                                    self.apc_state = ApcState::InApcEsc;
+                                }
+                                0x07 => {
+                                    self.parser.advance(&mut self.state, b"\x1b\\");
+                                    self.finish_apc();
+                                }
+                                _ => {
+                                    // CAN (0x18) or SUB (0x1A) aborts the control string.
+                                    self.parser.advance(&mut self.state, &[delim]);
+                                    self.apc_buf.clear();
+                                    self.apc_overflowed = false;
+                                    self.apc_state = ApcState::Normal;
+                                }
+                            }
+                        }
+                    }
+                }
+                ApcState::InApcEsc => {
+                    let b = bytes[i];
+                    if b == b'\\' {
+                        i += 1;
+                        self.parser.advance(&mut self.state, b"\x1b\\");
+                        self.finish_apc();
+                    } else if b == b'_' {
+                        // Interrupted APC immediately followed by a new APC (`ESC _`).
+                        i += 1;
+                        self.parser.advance(&mut self.state, b"\x1b_");
+                        self.apc_buf.clear();
+                        self.apc_overflowed = false;
+                        self.apc_state = ApcState::InApc;
+                    } else {
+                        // Interrupted APC followed by another ESC sequence (e.g. `ESC [`):
+                        // transition `vte` into `Escape` and let `Normal` feed `b` onward.
+                        self.apc_buf.clear();
+                        self.apc_overflowed = false;
+                        self.parser.advance(&mut self.state, b"\x1b");
+                        self.apc_state = ApcState::Normal;
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn push_apc_slice(&mut self, slice: &[u8]) {
+        if self.apc_overflowed {
+            return;
+        }
+        if self.apc_buf.len().saturating_add(slice.len()) > MAX_APC_BYTES {
+            let header_keep = (256usize).saturating_sub(self.apc_buf.len());
+            if header_keep > 0 {
+                let take = header_keep.min(slice.len());
+                self.apc_buf.extend_from_slice(&slice[..take]);
+            }
+            self.apc_overflowed = true;
+        } else {
+            self.apc_buf.extend_from_slice(slice);
+        }
+    }
+
+    fn finish_apc(&mut self) {
+        let payload = std::mem::take(&mut self.apc_buf);
+        let overflowed = self.apc_overflowed;
+        self.apc_overflowed = false;
+        self.apc_state = ApcState::Normal;
+
+        if overflowed {
+            self.state.handle_apc_overflow(&payload);
+        } else {
+            self.state.handle_apc(&payload);
+        }
+        // Retain allocation capacity up to 64 KiB so normal chunks avoid reallocating,
+        // without holding multi-megabyte buffers indefinitely after a large image upload.
+        if payload.capacity() <= 65536 {
+            self.apc_buf = payload;
+            self.apc_buf.clear();
+        }
     }
 
     /// Drain available output from the PTY process and update terminal state.
@@ -116,7 +275,7 @@ impl Terminal {
         let had_data = !buf.is_empty();
         if had_data {
             self.last_output_time = std::time::Instant::now();
-            self.parser.advance(&mut self.state, &buf);
+            self.feed_bytes(&buf);
             if !self.state.pending_responses.is_empty() {
                 let responses = std::mem::take(&mut self.state.pending_responses);
                 if let Some(pty) = &self.pty {
@@ -179,14 +338,42 @@ impl Terminal {
     /// `pty.resize` is a `TIOCSWINSZ` ioctl that sends `SIGWINCH` to the child --
     /// spamming it at mouse-move rate makes vim/htop redraw continuously.
     pub fn resize(&mut self, rows: usize, cols: usize) -> anyhow::Result<()> {
+        let cell_w = self.state.grid.cell_width_px;
+        let cell_h = self.state.grid.cell_height_px;
+        self.resize_with_cell_size(rows, cols, cell_w, cell_h)
+    }
+
+    /// Notify PTY and Grid of window resize along with exact cell physical pixel dimensions
+    /// (`cell_w`, `cell_h`) so `TIOCGWINSZ`, `CSI 14 t`, `CSI 16 t`, Sixel, and Kitty Graphics
+    /// placements all compute exact pixel/cell ratios.
+    pub fn resize_with_cell_size(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        cell_w: f32,
+        cell_h: f32,
+    ) -> anyhow::Result<()> {
+        let cell_w = if cell_w > 0.0 { cell_w } else { 9.0 };
+        let cell_h = if cell_h > 0.0 { cell_h } else { 18.0 };
+        self.state.grid.set_cell_pixel_size(cell_w, cell_h);
+
+        let pixel_w = (cols as f32 * cell_w).round().clamp(0.0, u16::MAX as f32) as u16;
+        let pixel_h = (rows as f32 * cell_h).round().clamp(0.0, u16::MAX as f32) as u16;
+
         let active = self.state.grid.active();
-        if active.rows == rows && active.cols == cols {
+        let grid_changed = active.rows != rows || active.cols != cols;
+        let pixels_changed = self.last_pty_pixels != (pixel_w, pixel_h);
+
+        if !grid_changed && !pixels_changed {
             return Ok(());
         }
 
-        self.state.grid.resize(rows, cols);
+        if grid_changed {
+            self.state.grid.resize(rows, cols);
+        }
         if let Some(pty) = &self.pty {
-            pty.resize(rows as u16, cols as u16)?;
+            pty.resize_with_pixels(rows as u16, cols as u16, pixel_w, pixel_h)?;
+            self.last_pty_pixels = (pixel_w, pixel_h);
         }
         Ok(())
     }

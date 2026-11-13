@@ -116,21 +116,13 @@ pub fn apply_window_icon(window: &Window) {
                     #[cfg(target_pointer_width = "64")]
                     #[link(name = "user32")]
                     extern "system" {
-                        fn SetClassLongPtrW(
-                            hWnd: isize,
-                            nIndex: i32,
-                            dwNewLong: usize,
-                        ) -> usize;
+                        fn SetClassLongPtrW(hWnd: isize, nIndex: i32, dwNewLong: usize) -> usize;
                     }
                     #[cfg(target_pointer_width = "32")]
                     #[link(name = "user32")]
                     extern "system" {
                         #[link_name = "SetClassLongW"]
-                        fn SetClassLongPtrW(
-                            hWnd: isize,
-                            nIndex: i32,
-                            dwNewLong: usize,
-                        ) -> usize;
+                        fn SetClassLongPtrW(hWnd: isize, nIndex: i32, dwNewLong: usize) -> usize;
                     }
 
                     #[link(name = "user32")]
@@ -178,8 +170,14 @@ pub fn apply_window_icon(window: &Window) {
                     );
                     let sm_w = GetSystemMetrics(SM_CXSMICON).max(16);
                     let sm_h = GetSystemMetrics(SM_CYSMICON).max(16);
-                    let hicon_small =
-                        LoadImageW(hinstance, 1 as *const u16, IMAGE_ICON, sm_w, sm_h, LR_SHARED);
+                    let hicon_small = LoadImageW(
+                        hinstance,
+                        1 as *const u16,
+                        IMAGE_ICON,
+                        sm_w,
+                        sm_h,
+                        LR_SHARED,
+                    );
 
                     if hicon_big != 0 {
                         SetClassLongPtrW(hwnd, GCLP_HICON, hicon_big as usize);

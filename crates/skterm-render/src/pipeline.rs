@@ -85,6 +85,7 @@ impl GlyphInstance {
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct ImageInstance {
     pub rect: [f32; 4],
+    pub uv: [f32; 4],
 }
 
 impl ImageInstance {
@@ -92,11 +93,18 @@ impl ImageInstance {
         VertexBufferLayout {
             array_stride: std::mem::size_of::<ImageInstance>() as wgpu::BufferAddress,
             step_mode: VertexStepMode::Instance,
-            attributes: &[wgpu::VertexAttribute {
-                offset: 0,
-                shader_location: 0,
-                format: wgpu::VertexFormat::Float32x4,
-            }],
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
         }
     }
 }
@@ -113,14 +121,14 @@ pub struct TerminalPipeline {
     pub bind_group_layout: BindGroupLayout,
     pub image_bind_group_layout: BindGroupLayout,
     pub max_instances: usize,
+    pub max_image_instances: usize,
 }
 
 impl TerminalPipeline {
     pub const INITIAL_MAX_INSTANCES: usize = 32768;
 
-    /// Capacity of `image_instance_buffer`, in `ImageInstance`s. Callers must not
-    /// submit more image draws than this in a single frame.
-    pub const MAX_IMAGE_INSTANCES: usize = 1024;
+    /// Initial capacity of `image_instance_buffer`, dynamically grown by [`Self::ensure_image_capacity`].
+    pub const MAX_IMAGE_INSTANCES: usize = 4096;
 
     pub fn new(
         device: &Device,
@@ -362,6 +370,7 @@ impl TerminalPipeline {
             bind_group_layout,
             image_bind_group_layout,
             max_instances: Self::INITIAL_MAX_INSTANCES,
+            max_image_instances: Self::MAX_IMAGE_INSTANCES,
         })
     }
 
@@ -388,6 +397,18 @@ impl TerminalPipeline {
             self.glyph_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("skterm_glyph_instance_buffer"),
                 size: (self.max_instances * std::mem::size_of::<GlyphInstance>()) as u64,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+    }
+
+    pub fn ensure_image_capacity(&mut self, device: &Device, required: usize) {
+        if required > self.max_image_instances {
+            self.max_image_instances = (required * 2).max(Self::MAX_IMAGE_INSTANCES);
+            self.image_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("skterm_image_instance_buffer"),
+                size: (self.max_image_instances * std::mem::size_of::<ImageInstance>()) as u64,
                 usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });

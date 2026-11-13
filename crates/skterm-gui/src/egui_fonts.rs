@@ -63,7 +63,10 @@ pub fn setup_egui_cjk_fonts(ctx: &Context) {
 
     for path in korean_candidates {
         if let Ok(font_data) = fs::read(path) {
-            info!("Loaded Korean fallback font into egui preferences: {}", path);
+            info!(
+                "Loaded Korean fallback font into egui preferences: {}",
+                path
+            );
             fonts.font_data.insert(
                 "korean_font".to_owned(),
                 std::sync::Arc::new(egui::FontData::from_owned(font_data)),

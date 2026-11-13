@@ -4,7 +4,10 @@ use crate::agent_panel::AgentPanelLayout;
 use crate::atlas::GlyphAtlas;
 use crate::box_drawing::draw_custom_block_or_box_char;
 use crate::pipeline::{color_to_rgba, BgInstance, GlyphInstance, ImageInstance, TerminalPipeline};
-use skterm_core::{CellFlags, Color, CursorShape, ScreenGrid};
+use skterm_core::{
+    CellFlags, Color, CursorShape, NamedColor, PlaceholderCellMeta, ScreenGrid,
+    KITTY_PLACEHOLDER_CHAR,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
@@ -635,6 +638,88 @@ impl TopDropdownMenu {
     }
 }
 
+/// Maximum GPU texture memory retained in [`TermRenderer::image_cache`] before LRU eviction (256 MiB).
+const MAX_GPU_IMAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+pub struct CachedGpuImage {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    pub bind_group: wgpu::BindGroup,
+    pub byte_size: usize,
+    pub last_used_frame: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ImageDrawCall {
+    texture_id: u32,
+    z_index: i32,
+    order: u32,
+    instance: ImageInstance,
+}
+
+/// Extract a 24-bit or 8-bit Kitty image/placement ID encoded in an SGR cell color
+/// (`38;2;r;g;b`, `38;5;idx`, `58;2;r;g;b`, `58;5;idx`).
+#[inline]
+fn color_to_kitty_id(color: Color) -> u32 {
+    match color {
+        Color::Rgb(r, g, b) => ((r as u32) << 16) | ((g as u32) << 8) | (b as u32),
+        Color::Indexed(idx) => idx as u32,
+        Color::Named(named) => match named {
+            NamedColor::Black => 0,
+            NamedColor::Red => 1,
+            NamedColor::Green => 2,
+            NamedColor::Yellow => 3,
+            NamedColor::Blue => 4,
+            NamedColor::Magenta => 5,
+            NamedColor::Cyan => 6,
+            NamedColor::White => 7,
+            NamedColor::BrightBlack => 8,
+            NamedColor::BrightRed => 9,
+            NamedColor::BrightGreen => 10,
+            NamedColor::BrightYellow => 11,
+            NamedColor::BrightBlue => 12,
+            NamedColor::BrightMagenta => 13,
+            NamedColor::BrightCyan => 14,
+            NamedColor::BrightWhite => 15,
+        },
+        Color::DefaultFg | Color::DefaultBg => 0,
+    }
+}
+
+/// Intersect an image quad `rect = [x, y, w, h]` (with texture coordinates `uv = [u0, v0, u1, v1]`)
+/// against pane bounds `bounds = [bx, by, bw, bh]`, proportionally clipping UVs so images scroll
+/// and clip smoothly at pane edges without stretching or bleeding into adjacent panes.
+#[inline]
+pub fn clip_image_quad_to_bounds(
+    rect: [f32; 4],
+    uv: [f32; 4],
+    bounds: [f32; 4],
+) -> Option<([f32; 4], [f32; 4])> {
+    let [x, y, w, h] = rect;
+    let [bx, by, bw, bh] = bounds;
+    if w <= 0.0 || h <= 0.0 || bw <= 0.0 || bh <= 0.0 {
+        return None;
+    }
+
+    let x0 = x.max(bx);
+    let y0 = y.max(by);
+    let x1 = (x + w).min(bx + bw);
+    let y1 = (y + h).min(by + bh);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+
+    let [u0, v0, u1, v1] = uv;
+    let du = u1 - u0;
+    let dv = v1 - v0;
+    let cu0 = u0 + du * ((x0 - x) / w);
+    let cv0 = v0 + dv * ((y0 - y) / h);
+    let cu1 = u0 + du * ((x1 - x) / w);
+    let cv1 = v0 + dv * ((y1 - y) / h);
+
+    Some(([x0, y0, x1 - x0, y1 - y0], [cu0, cv0, cu1, cv1]))
+}
+
 pub struct TermRenderer {
     pub window: Arc<Window>,
     pub surface: Surface<'static>,
@@ -653,7 +738,9 @@ pub struct TermRenderer {
     pub fallback_families: Vec<String>,
     pub opacity: f32,
     pub image_sampler: wgpu::Sampler,
-    pub image_cache: HashMap<u32, (wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
+    pub image_cache: HashMap<u32, CachedGpuImage>,
+    pub image_cache_bytes: usize,
+    frame_counter: u64,
 
     // Per-frame instance scratch buffers.
     //
@@ -668,7 +755,7 @@ pub struct TermRenderer {
     // that building them doesn't hold a borrow on `self`.
     bg_instances: Vec<BgInstance>,
     glyph_instances: Vec<GlyphInstance>,
-    image_draw_calls: Vec<(u32, ImageInstance)>,
+    image_draw_calls: Vec<ImageDrawCall>,
     image_instances: Vec<ImageInstance>,
 
     perf: FrameProfiler,
@@ -929,6 +1016,8 @@ impl TermRenderer {
             opacity: 1.0,
             image_sampler,
             image_cache: HashMap::new(),
+            image_cache_bytes: 0,
+            frame_counter: 0,
             // Pre-sized for a dense ~200x50 pane so even the first frames avoid
             // the realloc chain. These only ever grow to the high-water mark.
             bg_instances: Vec::with_capacity(4096),
@@ -937,6 +1026,115 @@ impl TermRenderer {
             image_instances: Vec::new(),
             perf: FrameProfiler::from_env(),
         })
+    }
+
+    fn ensure_image_texture_uploaded(
+        &mut self,
+        tex_id: u32,
+        width_px: u32,
+        height_px: u32,
+        rgba_data: &[u8],
+    ) -> bool {
+        if width_px == 0 || height_px == 0 {
+            return false;
+        }
+        let expected_bytes = (width_px as usize)
+            .saturating_mul(height_px as usize)
+            .saturating_mul(4);
+        if rgba_data.len() < expected_bytes {
+            return false;
+        }
+
+        if let Some(entry) = self.image_cache.get_mut(&tex_id) {
+            entry.last_used_frame = self.frame_counter;
+            return true;
+        }
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("skterm_image_{tex_id}")),
+            size: Extent3d {
+                width: width_px,
+                height: height_px,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        self.queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            &rgba_data[..expected_bytes],
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width_px * 4),
+                rows_per_image: Some(height_px),
+            },
+            Extent3d {
+                width: width_px,
+                height: height_px,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("skterm_image_bg_{tex_id}")),
+            layout: &self.pipeline.image_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.image_sampler),
+                },
+            ],
+        });
+
+        self.image_cache_bytes = self.image_cache_bytes.saturating_add(expected_bytes);
+        self.image_cache.insert(
+            tex_id,
+            CachedGpuImage {
+                texture,
+                view,
+                bind_group,
+                byte_size: expected_bytes,
+                last_used_frame: self.frame_counter,
+            },
+        );
+        true
+    }
+
+    fn evict_stale_gpu_images(&mut self) {
+        if self.image_cache_bytes <= MAX_GPU_IMAGE_CACHE_BYTES {
+            return;
+        }
+        let cur_frame = self.frame_counter;
+        let mut stale: Vec<(u64, u32)> = self
+            .image_cache
+            .iter()
+            .filter(|(_, entry)| entry.last_used_frame < cur_frame)
+            .map(|(&id, entry)| (entry.last_used_frame, id))
+            .collect();
+        stale.sort_unstable_by_key(|&(f, _)| f);
+        for (_, victim_id) in stale {
+            if self.image_cache_bytes <= MAX_GPU_IMAGE_CACHE_BYTES {
+                break;
+            }
+            if let Some(removed) = self.image_cache.remove(&victim_id) {
+                self.image_cache_bytes = self.image_cache_bytes.saturating_sub(removed.byte_size);
+            }
+        }
     }
 
     pub fn update_padding(&mut self, pad_x: f32, pad_y: f32) {
@@ -1696,6 +1894,8 @@ impl TermRenderer {
         // for the compositor to hand back a free swapchain image.
         let acquire_ns = self.perf.since(frame_start);
 
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+
         // Borrow the persistent scratch buffers for the duration of this frame.
         // `take` leaves empty Vecs behind (no allocation) and we hand the buffers
         // back at the end, so the capacity built up by previous frames is reused.
@@ -1705,6 +1905,7 @@ impl TermRenderer {
         bg_instances.clear();
         glyph_instances.clear();
         image_draw_calls.clear();
+        let mut next_image_order: u32 = 0;
 
         // Everything from here to the "Upload instances to GPU buffers" marker is the
         // CPU-side instance build -- the only part dirty tracking could skip.
@@ -1994,77 +2195,38 @@ impl TermRenderer {
             }
 
             let active_buf = pane.grid.active();
+            let pane_bounds = [px, py, pw, ph];
 
-            // Sixel / Kitty Images in this pane
+            // Sixel / Kitty Images in this pane (scrolled with `scroll_offset` and UV-clipped to pane)
             for img in &active_buf.images {
-                if !self.image_cache.contains_key(&img.id) && img.width_px > 0 && img.height_px > 0
-                {
-                    let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some(&format!("skterm_image_{}", img.id)),
-                        size: Extent3d {
-                            width: img.width_px,
-                            height: img.height_px,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: TextureDimension::D2,
-                        format: TextureFormat::Rgba8Unorm,
-                        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                        view_formats: &[],
-                    });
+                let display_row = img.row + (active_buf.scroll_offset as isize);
+                let [off_x, off_y, disp_w, disp_h] = img.compute_display_box(cell_w, cell_h);
+                let ix = px + self.padding_x + (img.col as f32 * cell_w) + off_x;
+                let iy = py + self.padding_y + (display_row as f32 * cell_h) + off_y;
 
-                    self.queue.write_texture(
-                        TexelCopyTextureInfo {
-                            texture: &texture,
-                            mip_level: 0,
-                            origin: Origin3d::ZERO,
-                            aspect: TextureAspect::All,
-                        },
-                        &img.rgba_data,
-                        TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(img.width_px * 4),
-                            rows_per_image: Some(img.height_px),
-                        },
-                        Extent3d {
-                            width: img.width_px,
-                            height: img.height_px,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-
-                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("skterm_image_bg_{}", img.id)),
-                        layout: &self.pipeline.image_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&self.image_sampler),
-                            },
-                        ],
-                    });
-
-                    self.image_cache.insert(img.id, (texture, view, bind_group));
-                }
-
-                let ix = px + self.padding_x + (img.col as f32 * cell_w);
-                let iy = py + self.padding_y + (img.row as f32 * cell_h);
-                let iw = (img.width_cells as f32 * cell_w).min(pw);
-                let ih = (img.height_cells as f32 * cell_h).min(ph);
-
-                if ix < px + pw && iy < py + ph {
-                    image_draw_calls.push((
+                if let Some((clipped_rect, clipped_uv)) = clip_image_quad_to_bounds(
+                    [ix, iy, disp_w, disp_h],
+                    img.uv_bounds(),
+                    pane_bounds,
+                ) {
+                    if self.ensure_image_texture_uploaded(
                         img.id,
-                        ImageInstance {
-                            rect: [ix, iy, iw, ih],
-                        },
-                    ));
+                        img.width_px,
+                        img.height_px,
+                        &img.rgba_data,
+                    ) {
+                        let order = next_image_order;
+                        next_image_order = next_image_order.wrapping_add(1);
+                        image_draw_calls.push(ImageDrawCall {
+                            texture_id: img.id,
+                            z_index: img.z_index,
+                            order,
+                            instance: ImageInstance {
+                                rect: clipped_rect,
+                                uv: clipped_uv,
+                            },
+                        });
+                    }
                 }
             }
 
@@ -2113,6 +2275,9 @@ impl TermRenderer {
                         .partition_point(|m| m.global_row == global_row)
                         + row_match_start;
                     let row_matches = &pane.search_matches[row_match_start..row_match_end];
+                    // Tracks `(col_idx, image_id, placement_id, tile_row, tile_col)` of the
+                    // preceding `U+10EEEE` cell on this row for Kitty's omitted-diacritic continuation.
+                    let mut prev_placeholder: Option<(usize, u32, u32, u16, u16)> = None;
 
                     for (c_idx, cell) in row.cells.iter().enumerate() {
                         if let Some((preedit_row, start_col, end_col)) = preedit_grid_span {
@@ -2320,6 +2485,185 @@ impl TermRenderer {
                                     color: fg_rgba,
                                 });
                             }
+                        }
+
+                        if cell.c == KITTY_PLACEHOLDER_CHAR {
+                            if !cell.flags.contains(CellFlags::HIDDEN) {
+                                let meta = cell
+                                    .hyperlink_id
+                                    .and_then(PlaceholderCellMeta::unpack)
+                                    .unwrap_or_else(PlaceholderCellMeta::empty);
+                                let low_id = color_to_kitty_id(cell.fg);
+                                let image_id = low_id | ((meta.id_msb as u32) << 24);
+                                let placement_id = cell
+                                    .underline_color_id
+                                    .and_then(|uid| pane.grid.get_underline_color(uid))
+                                    .map(color_to_kitty_id)
+                                    .unwrap_or(0);
+
+                                let (tile_row, tile_col) = match meta.diacritic_count {
+                                    0 => match prev_placeholder {
+                                        Some((prev_c, pid_img, pid_pl, pr, pc))
+                                            if prev_c + 1 == c_idx
+                                                && pid_img == image_id
+                                                && pid_pl == placement_id =>
+                                        {
+                                            (pr, pc.saturating_add(1))
+                                        }
+                                        _ => (0, 0),
+                                    },
+                                    1 => match prev_placeholder {
+                                        Some((prev_c, pid_img, pid_pl, pr, pc))
+                                            if prev_c + 1 == c_idx
+                                                && pid_img == image_id
+                                                && pid_pl == placement_id
+                                                && pr == meta.row_idx =>
+                                        {
+                                            (meta.row_idx, pc.saturating_add(1))
+                                        }
+                                        _ => (meta.row_idx, 0),
+                                    },
+                                    _ => (meta.row_idx, meta.col_idx),
+                                };
+                                prev_placeholder =
+                                    Some((c_idx, image_id, placement_id, tile_row, tile_col));
+
+                                if let Some(stored) = pane.grid.kitty_images.get(&image_id) {
+                                    let vp =
+                                        pane.grid.lookup_virtual_placement(image_id, placement_id);
+                                    let [sx, sy, sw, sh] = vp.map(|v| v.src_rect).unwrap_or([
+                                        0,
+                                        0,
+                                        stored.width_px,
+                                        stored.height_px,
+                                    ]);
+                                    let cols_opt = vp.and_then(|v| v.cols);
+                                    let rows_opt = vp.and_then(|v| v.rows);
+
+                                    let src_wf = sw.max(1) as f32;
+                                    let src_hf = sh.max(1) as f32;
+                                    let (box_x, box_y, disp_w, disp_h) = match (cols_opt, rows_opt)
+                                    {
+                                        (None, None) => (0.0, 0.0, src_wf, src_hf),
+                                        (Some(c), None) => {
+                                            let w = c.max(1) as f32 * cell_w;
+                                            (0.0, 0.0, w, src_hf * (w / src_wf))
+                                        }
+                                        (None, Some(r)) => {
+                                            let h = r.max(1) as f32 * cell_h;
+                                            (0.0, 0.0, src_wf * (h / src_hf), h)
+                                        }
+                                        (Some(c), Some(r)) => {
+                                            let bw = c.max(1) as f32 * cell_w;
+                                            let bh = r.max(1) as f32 * cell_h;
+                                            let s = (bw / src_wf).min(bh / src_hf);
+                                            let dw = src_wf * s;
+                                            let dh = src_hf * s;
+                                            ((bw - dw) * 0.5, (bh - dh) * 0.5, dw, dh)
+                                        }
+                                    };
+
+                                    let tile_vx0 = tile_col as f32 * cell_w;
+                                    let tile_vy0 = tile_row as f32 * cell_h;
+                                    let tile_vx1 = tile_vx0 + cell_w;
+                                    let tile_vy1 = tile_vy0 + cell_h;
+
+                                    let ix0 = tile_vx0.max(box_x);
+                                    let iy0 = tile_vy0.max(box_y);
+                                    let ix1 = tile_vx1.min(box_x + disp_w);
+                                    let iy1 = tile_vy1.min(box_y + disp_h);
+
+                                    if ix1 > ix0 && iy1 > iy0 && disp_w > 0.0 && disp_h > 0.0 {
+                                        let tw = stored.width_px.max(1) as f32;
+                                        let th = stored.height_px.max(1) as f32;
+                                        let base_u0 = sx as f32 / tw;
+                                        let base_v0 = sy as f32 / th;
+                                        let base_du = sw as f32 / tw;
+                                        let base_dv = sh as f32 / th;
+
+                                        let u0 = base_u0 + base_du * ((ix0 - box_x) / disp_w);
+                                        let v0 = base_v0 + base_dv * ((iy0 - box_y) / disp_h);
+                                        let u1 = base_u0 + base_du * ((ix1 - box_x) / disp_w);
+                                        let v1 = base_v0 + base_dv * ((iy1 - box_y) / disp_h);
+
+                                        let screen_rect = [
+                                            x + (ix0 - tile_vx0),
+                                            y + (iy0 - tile_vy0),
+                                            ix1 - ix0,
+                                            iy1 - iy0,
+                                        ];
+
+                                        if let Some((clipped_rect, clipped_uv)) =
+                                            clip_image_quad_to_bounds(
+                                                screen_rect,
+                                                [u0, v0, u1, v1],
+                                                pane_bounds,
+                                            )
+                                        {
+                                            if self.ensure_image_texture_uploaded(
+                                                stored.texture_id,
+                                                stored.width_px,
+                                                stored.height_px,
+                                                &stored.rgba_data,
+                                            ) {
+                                                // Coalesce horizontally adjacent placeholder tiles of the
+                                                // same row & image to avoid subpixel seams and cut draw calls.
+                                                let merged = if let Some(last) =
+                                                    image_draw_calls.last_mut()
+                                                {
+                                                    if last.texture_id == stored.texture_id
+                                                        && last.z_index == 0
+                                                        && (last.instance.rect[1] - clipped_rect[1])
+                                                            .abs()
+                                                            < 1e-3
+                                                        && (last.instance.rect[3] - clipped_rect[3])
+                                                            .abs()
+                                                            < 1e-3
+                                                        && ((last.instance.rect[0]
+                                                            + last.instance.rect[2])
+                                                            - clipped_rect[0])
+                                                            .abs()
+                                                            < 1e-2
+                                                        && (last.instance.uv[1] - clipped_uv[1])
+                                                            .abs()
+                                                            < 1e-4
+                                                        && (last.instance.uv[3] - clipped_uv[3])
+                                                            .abs()
+                                                            < 1e-4
+                                                        && (last.instance.uv[2] - clipped_uv[0])
+                                                            .abs()
+                                                            < 1e-3
+                                                    {
+                                                        last.instance.rect[2] += clipped_rect[2];
+                                                        last.instance.uv[2] = clipped_uv[2];
+                                                        true
+                                                    } else {
+                                                        false
+                                                    }
+                                                } else {
+                                                    false
+                                                };
+
+                                                if !merged {
+                                                    let order = next_image_order;
+                                                    next_image_order =
+                                                        next_image_order.wrapping_add(1);
+                                                    image_draw_calls.push(ImageDrawCall {
+                                                        texture_id: stored.texture_id,
+                                                        z_index: 0,
+                                                        order,
+                                                        instance: ImageInstance {
+                                                            rect: clipped_rect,
+                                                            uv: clipped_uv,
+                                                        },
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
                         }
 
                         if cell.c != ' '
@@ -2795,14 +3139,18 @@ impl TermRenderer {
         // leave only the last write visible, and every image would be drawn at the last
         // image's rect. Instead we upload the whole array once and select per draw via
         // the instance index.
-        image_draw_calls.retain(|(id, _)| self.image_cache.contains_key(id));
-        image_draw_calls.truncate(TerminalPipeline::MAX_IMAGE_INSTANCES);
+        image_draw_calls.retain(|c| self.image_cache.contains_key(&c.texture_id));
+        image_draw_calls.sort_unstable_by_key(|c| (c.z_index, c.order));
+        let neg_z_end = image_draw_calls.partition_point(|c| c.z_index < 0);
+
         if !image_draw_calls.is_empty() {
+            self.pipeline
+                .ensure_image_capacity(&self.device, image_draw_calls.len());
             // De-interleave into a reused buffer rather than `collect()`ing a fresh
             // Vec, which allocated once per frame whenever any image was on screen.
             let mut img_instances = std::mem::take(&mut self.image_instances);
             img_instances.clear();
-            img_instances.extend(image_draw_calls.iter().map(|(_, inst)| *inst));
+            img_instances.extend(image_draw_calls.iter().map(|c| c.instance));
             self.queue.write_buffer(
                 &self.pipeline.image_instance_buffer,
                 0,
@@ -2849,16 +3197,13 @@ impl TermRenderer {
                 render_pass.draw(0..6, 0..normal_bg_len as u32);
             }
 
-            // 2. Draw Graphic Images (Sixel / Kitty)
-            // Each image owns its own bind group, so we still need one draw per image,
-            // but the pipeline and vertex buffer are bound once and each draw selects
-            // its instance by index into the array uploaded above.
-            if !image_draw_calls.is_empty() {
+            // 2a. Draw Background-Layer Graphic Images (`z < 0`, behind terminal text)
+            if neg_z_end > 0 {
                 render_pass.set_pipeline(&self.pipeline.image_pipeline);
                 render_pass.set_vertex_buffer(0, self.pipeline.image_instance_buffer.slice(..));
-                for (idx, (id, _)) in image_draw_calls.iter().enumerate() {
-                    if let Some((_, _, img_bg)) = self.image_cache.get(id) {
-                        render_pass.set_bind_group(1, img_bg, &[]);
+                for (idx, call) in image_draw_calls[..neg_z_end].iter().enumerate() {
+                    if let Some(entry) = self.image_cache.get(&call.texture_id) {
+                        render_pass.set_bind_group(1, &entry.bind_group, &[]);
                         let idx = idx as u32;
                         render_pass.draw(0..6, idx..idx + 1);
                     }
@@ -2872,9 +3217,22 @@ impl TermRenderer {
                 render_pass.draw(0..6, 0..normal_glyph_len as u32);
             }
 
-            // 4. Floating Top Dropdown Menu Overlay
+            // 2b. Draw Foreground-Layer Graphic Images (`z >= 0` & Unicode Placeholders, above text)
+            if neg_z_end < image_draw_calls.len() {
+                render_pass.set_pipeline(&self.pipeline.image_pipeline);
+                render_pass.set_vertex_buffer(0, self.pipeline.image_instance_buffer.slice(..));
+                for (offset, call) in image_draw_calls[neg_z_end..].iter().enumerate() {
+                    if let Some(entry) = self.image_cache.get(&call.texture_id) {
+                        render_pass.set_bind_group(1, &entry.bind_group, &[]);
+                        let idx = (neg_z_end + offset) as u32;
+                        render_pass.draw(0..6, idx..idx + 1);
+                    }
+                }
+            }
+
+            // 4. Floating Top Dropdown Menu & Find Bar Overlays
             // Drawn strictly AFTER all base backgrounds, images, and text glyphs so that
-            // terminal characters behind the menu can never show through or occlude the menu.
+            // terminal characters and images behind the menu never bleed through.
             if bg_instances.len() > normal_bg_len {
                 render_pass.set_pipeline(&self.pipeline.bg_pipeline);
                 render_pass.set_vertex_buffer(0, self.pipeline.bg_instance_buffer.slice(..));
@@ -2888,6 +3246,7 @@ impl TermRenderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        self.evict_stale_gpu_images();
 
         if let Some(overlay) = overlay_fn {
             overlay(&self.device, &self.queue, &view, &self.config);

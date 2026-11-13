@@ -1,6 +1,10 @@
 //! VT100, xterm, 24-bit TrueColor ANSI, Sixel, and Kitty Graphics escape sequence handler.
 
-use crate::graphics::{GraphicImage, KittyGraphicsParser, SixelDecoder};
+use crate::graphics::{
+    composite_rgba_patch, decode_kitty_pixels, load_transmission_payload, AnimationFrame,
+    GraphicImage, KittyControlParams, KittyGraphicsParser, KittyParseStep, SixelDecoder,
+    VirtualPlacement,
+};
 use crate::grid::{CellFlags, Color, CursorShape, NamedColor, SavedCursor, ScreenGrid};
 use std::collections::HashMap;
 use std::num::{NonZeroU16, NonZeroU32};
@@ -687,26 +691,32 @@ impl Perform for TerminalState {
             DcsMode::Sixel => {
                 let mut decoder = SixelDecoder::new();
                 if let Some((w_px, h_px, rgba)) = decoder.decode(&self.sixel_buffer) {
-                    let cell_w = 9.0;
-                    let cell_h = 18.0;
+                    let cell_w = self.grid.cell_width_px.max(1.0);
+                    let cell_h = self.grid.cell_height_px.max(1.0);
                     let w_cells = ((w_px as f32 / cell_w).ceil() as usize).max(1);
                     let h_cells = ((h_px as f32 / cell_h).ceil() as usize).max(1);
 
-                    let id = self.grid.next_image_id;
-                    self.grid.next_image_id += 1;
+                    let id = self.grid.alloc_texture_id();
 
                     let cur_row = self.grid.active().cursor.row;
                     let cur_col = self.grid.active().cursor.col;
 
                     let img = GraphicImage {
                         id,
-                        row: cur_row,
+                        image_id: 0,
+                        image_number: 0,
+                        placement_id: 0,
+                        row: cur_row as isize,
                         col: cur_col,
                         width_px: w_px,
                         height_px: h_px,
+                        src_rect: [0, 0, w_px, h_px],
+                        cell_offset: [0, 0],
+                        display_cols: None,
+                        display_rows: None,
                         width_cells: w_cells,
                         height_cells: h_cells,
-                        rgba_data: rgba,
+                        rgba_data: Arc::new(rgba),
                         z_index: 0,
                     };
 
@@ -716,8 +726,12 @@ impl Perform for TerminalState {
                     );
                     self.grid.active_mut().add_image(img);
 
-                    // Advance cursor down below the image
-                    self.grid.active_mut().move_down(h_cells);
+                    // Advance cursor down across the image rows (scrolling if needed)
+                    let bg = self.bg;
+                    for _ in 0..h_cells {
+                        self.grid.active_mut().linefeed_with_bg(bg);
+                    }
+                    self.grid.active_mut().cursor.col = 0;
                 }
                 self.sixel_buffer.clear();
             }
@@ -917,52 +931,20 @@ impl Perform for TerminalState {
                 }
             }
             _ => {
-                // Check Kitty Graphics via OSC or APC
-                if let Ok(cmd) = std::str::from_utf8(params[0]) {
-                    if let Some(cmd_args) = cmd.strip_prefix('G') {
-                        let header = cmd_args.split(';').next().unwrap_or("");
-                        let is_query = header.split(',').any(|kv| kv == "a=q");
-                        if is_query {
-                            let quiet = header
-                                .split(',')
-                                .find_map(|kv| kv.strip_prefix("q="))
-                                .unwrap_or("0");
-                            if quiet != "2" {
-                                if let Some(id_val) =
-                                    header.split(',').find_map(|kv| kv.strip_prefix("i="))
-                                {
-                                    let resp = format!("\x1b_Gi={id_val};OK\x1b\\");
-                                    self.pending_responses.extend_from_slice(resp.as_bytes());
-                                } else {
-                                    self.pending_responses.extend_from_slice(b"\x1b_G;OK\x1b\\");
-                                }
-                            }
-                        } else if let Some((w, h, rgba, z)) =
-                            self.kitty_parser.parse_command(cmd_args)
-                        {
-                            let id = self.grid.next_image_id;
-                            self.grid.next_image_id += 1;
-
-                            let cur_row = self.grid.active().cursor.row;
-                            let cur_col = self.grid.active().cursor.col;
-
-                            let w_cells = ((w as f32 / 9.0).ceil() as usize).max(1);
-                            let h_cells = ((h as f32 / 18.0).ceil() as usize).max(1);
-
-                            let img = GraphicImage {
-                                id,
-                                row: cur_row,
-                                col: cur_col,
-                                width_px: w,
-                                height_px: h,
-                                width_cells: w_cells,
-                                height_cells: h_cells,
-                                rgba_data: rgba,
-                                z_index: z,
-                            };
-                            info!("Decoded Kitty Graphics image: {}x{} px", w, h);
-                            self.grid.active_mut().add_image(img);
+                // Fallback support for Kitty Graphics sent via OSC (`\x1b]G<keys>;<payload>\x1b\\`).
+                // Note that `vte` splits OSC parameters on `;`, so rejoin `params` before parsing.
+                if let Some(first_rest) = params[0].strip_prefix(b"G") {
+                    if params.len() == 1 {
+                        self.handle_kitty_graphics(first_rest);
+                    } else {
+                        let extra_len: usize = params[1..].iter().map(|p| 1 + p.len()).sum();
+                        let mut joined = Vec::with_capacity(first_rest.len() + extra_len);
+                        joined.extend_from_slice(first_rest);
+                        for seg in &params[1..] {
+                            joined.push(b';');
+                            joined.extend_from_slice(seg);
                         }
+                        self.handle_kitty_graphics(&joined);
                     }
                 }
             }
@@ -1436,10 +1418,11 @@ impl Perform for TerminalState {
                 _ => {}
             },
             'q' if intermediates == b">" => {
-                // XTVERSION: CSI > q / CSI > 0 q -> DCS > | skTerm(0.1.0) ST
+                // XTVERSION: CSI > q / CSI > 0 q -> DCS > | skTerm(<version>) ST
                 if first_param == 0 {
-                    self.pending_responses
-                        .extend_from_slice(b"\x1bP>|skTerm(0.1.0)\x1b\\");
+                    self.pending_responses.extend_from_slice(
+                        concat!("\x1bP>|skTerm(", env!("CARGO_PKG_VERSION"), ")\x1b\\").as_bytes(),
+                    );
                 }
             }
             't' if intermediates.is_empty() => {
@@ -1448,11 +1431,16 @@ impl Perform for TerminalState {
                     14 => {
                         let rows = self.grid.active().rows;
                         let cols = self.grid.active().cols;
-                        let resp = format!("\x1b[4;{};{}t", rows * 18, cols * 9);
+                        let ch = (self.grid.cell_height_px.round() as usize).max(1);
+                        let cw = (self.grid.cell_width_px.round() as usize).max(1);
+                        let resp = format!("\x1b[4;{};{}t", rows * ch, cols * cw);
                         self.pending_responses.extend_from_slice(resp.as_bytes());
                     }
                     16 => {
-                        self.pending_responses.extend_from_slice(b"\x1b[6;18;9t");
+                        let ch = (self.grid.cell_height_px.round() as usize).max(1);
+                        let cw = (self.grid.cell_width_px.round() as usize).max(1);
+                        let resp = format!("\x1b[6;{ch};{cw}t");
+                        self.pending_responses.extend_from_slice(resp.as_bytes());
                     }
                     18 => {
                         let rows = self.grid.active().rows;
@@ -1659,6 +1647,883 @@ impl TerminalState {
             }
         }
         None
+    }
+
+    /// Dispatch an Application Program Command (`ESC _ <apc_bytes> ST`).
+    pub fn handle_apc(&mut self, apc_bytes: &[u8]) {
+        if let Some(cmd_bytes) = apc_bytes.strip_prefix(b"G") {
+            self.handle_kitty_graphics(cmd_bytes);
+        }
+    }
+
+    /// Report an `ENOMEM` error when a single APC sequence exceeded `MAX_APC_BYTES`.
+    pub fn handle_apc_overflow(&mut self, apc_prefix: &[u8]) {
+        self.kitty_parser.reset();
+        if let Some(cmd_prefix) = apc_prefix.strip_prefix(b"G") {
+            let header_bytes = cmd_prefix.split(|&b| b == b';').next().unwrap_or(&[]);
+            if let Ok(header) = std::str::from_utf8(header_bytes) {
+                let mut params = KittyControlParams::default();
+                params.apply_header(header);
+                if let Some(resp) =
+                    params.format_response(None, false, "ENOMEM:APC payload exceeds size limit")
+                {
+                    self.pending_responses.extend_from_slice(&resp);
+                }
+            }
+        }
+    }
+
+    /// Parse and execute a Kitty Graphics Protocol command body (`<control>;<payload>`).
+    pub fn handle_kitty_graphics(&mut self, cmd_bytes: &[u8]) {
+        match self.kitty_parser.feed_chunk(cmd_bytes) {
+            KittyParseStep::NeedMoreChunks => {}
+            KittyParseStep::Error {
+                params,
+                code,
+                message,
+            } => {
+                let err_msg = format!("{code}:{message}");
+                if let Some(resp) = params.format_response(None, false, &err_msg) {
+                    self.pending_responses.extend_from_slice(&resp);
+                }
+            }
+            KittyParseStep::Complete { params, payload } => match params.action {
+                'q' => {
+                    let check_res = if payload.is_empty()
+                        && params.medium == 'd'
+                        && params.data_width == 0
+                        && params.data_height == 0
+                    {
+                        Ok(())
+                    } else {
+                        load_transmission_payload(&params, payload)
+                            .and_then(|raw| decode_kitty_pixels(&params, raw).map(|_| ()))
+                    };
+                    match check_res {
+                        Ok(()) => {
+                            if let Some(resp) = params.format_response(None, true, "OK") {
+                                self.pending_responses.extend_from_slice(&resp);
+                            }
+                        }
+                        Err((code, msg)) => {
+                            let err_msg = format!("{code}:{msg}");
+                            if let Some(resp) = params.format_response(None, false, &err_msg) {
+                                self.pending_responses.extend_from_slice(&resp);
+                            }
+                        }
+                    }
+                }
+                't' | 'T' => {
+                    let res = load_transmission_payload(&params, payload)
+                        .and_then(|raw| decode_kitty_pixels(&params, raw));
+                    match res {
+                        Ok((w, h, rgba)) => {
+                            let image_id = if params.image_id != 0 {
+                                params.image_id
+                            } else {
+                                self.grid.alloc_internal_kitty_id()
+                            };
+                            self.grid
+                                .store_kitty_image(image_id, params.image_number, w, h, rgba);
+                            if params.action == 'T' {
+                                if let Err((code, msg)) = self.execute_kitty_put(&params, image_id)
+                                {
+                                    let err_msg = format!("{code}:{msg}");
+                                    if let Some(resp) =
+                                        params.format_response(Some(image_id), false, &err_msg)
+                                    {
+                                        self.pending_responses.extend_from_slice(&resp);
+                                    }
+                                    return;
+                                }
+                            }
+                            if let Some(resp) = params.format_response(Some(image_id), true, "OK") {
+                                self.pending_responses.extend_from_slice(&resp);
+                            }
+                        }
+                        Err((code, msg)) => {
+                            let err_msg = format!("{code}:{msg}");
+                            if let Some(resp) = params.format_response(None, false, &err_msg) {
+                                self.pending_responses.extend_from_slice(&resp);
+                            }
+                        }
+                    }
+                }
+                'p' => {
+                    let resolved_id = if params.image_id != 0 {
+                        Some(params.image_id)
+                    } else if params.image_number != 0 {
+                        self.grid
+                            .kitty_number_to_id
+                            .get(&params.image_number)
+                            .copied()
+                    } else {
+                        None
+                    };
+                    let Some(image_id) = resolved_id else {
+                        let err = if params.image_id == 0 && params.image_number == 0 {
+                            "EINVAL:Put command requires image ID or number"
+                        } else {
+                            "ENOENT:Put command refers to non-existent image number"
+                        };
+                        if let Some(resp) = params.format_response(None, false, err) {
+                            self.pending_responses.extend_from_slice(&resp);
+                        }
+                        return;
+                    };
+
+                    match self.execute_kitty_put(&params, image_id) {
+                        Ok(()) => {
+                            if let Some(resp) = params.format_response(Some(image_id), true, "OK") {
+                                self.pending_responses.extend_from_slice(&resp);
+                            }
+                        }
+                        Err((code, msg)) => {
+                            let err_msg = format!("{code}:{msg}");
+                            if let Some(resp) =
+                                params.format_response(Some(image_id), false, &err_msg)
+                            {
+                                self.pending_responses.extend_from_slice(&resp);
+                            }
+                        }
+                    }
+                }
+                'd' => {
+                    self.execute_kitty_delete(&params);
+                }
+                'f' => match self.execute_kitty_frame(&params, payload) {
+                    Ok(image_id) => {
+                        if let Some(resp) = params.format_response(Some(image_id), true, "OK") {
+                            self.pending_responses.extend_from_slice(&resp);
+                        }
+                    }
+                    Err((code, msg)) => {
+                        let err_msg = format!("{code}:{msg}");
+                        if let Some(resp) = params.format_response(None, false, &err_msg) {
+                            self.pending_responses.extend_from_slice(&resp);
+                        }
+                    }
+                },
+                'c' => match self.execute_kitty_compose(&params) {
+                    Ok(image_id) => {
+                        if let Some(resp) = params.format_response(Some(image_id), true, "OK") {
+                            self.pending_responses.extend_from_slice(&resp);
+                        }
+                    }
+                    Err((code, msg)) => {
+                        let err_msg = format!("{code}:{msg}");
+                        if let Some(resp) = params.format_response(None, false, &err_msg) {
+                            self.pending_responses.extend_from_slice(&resp);
+                        }
+                    }
+                },
+                'a' => match self.execute_kitty_animate(&params) {
+                    Ok(image_id) => {
+                        if let Some(resp) = params.format_response(Some(image_id), true, "OK") {
+                            self.pending_responses.extend_from_slice(&resp);
+                        }
+                    }
+                    Err((code, msg)) => {
+                        let err_msg = format!("{code}:{msg}");
+                        if let Some(resp) = params.format_response(None, false, &err_msg) {
+                            self.pending_responses.extend_from_slice(&resp);
+                        }
+                    }
+                },
+                _ => {
+                    if let Some(resp) =
+                        params.format_response(None, false, "EINVAL:Unsupported Kitty action")
+                    {
+                        self.pending_responses.extend_from_slice(&resp);
+                    }
+                }
+            },
+        }
+    }
+
+    fn execute_kitty_put(
+        &mut self,
+        params: &KittyControlParams,
+        image_id: u32,
+    ) -> Result<(), (&'static str, &'static str)> {
+        let Some(stored) = self.grid.kitty_images.get(&image_id).cloned() else {
+            return Err(("ENOENT", "Put command refers to non-existent image"));
+        };
+
+        let sx = params.x.min(stored.width_px.saturating_sub(1));
+        let sy = params.y.min(stored.height_px.saturating_sub(1));
+        let sw = if params.w == 0 {
+            stored.width_px.saturating_sub(sx)
+        } else {
+            params.w.min(stored.width_px.saturating_sub(sx))
+        }
+        .max(1);
+        let sh = if params.h == 0 {
+            stored.height_px.saturating_sub(sy)
+        } else {
+            params.h.min(stored.height_px.saturating_sub(sy))
+        }
+        .max(1);
+
+        let display_cols = (params.cols > 0).then_some(params.cols);
+        let display_rows = (params.rows > 0).then_some(params.rows);
+
+        if params.unicode_placeholder {
+            let vp = VirtualPlacement {
+                image_id,
+                placement_id: params.placement_id,
+                cols: display_cols,
+                rows: display_rows,
+                src_rect: [sx, sy, sw, sh],
+            };
+            self.grid
+                .virtual_placements
+                .insert((image_id, params.placement_id), vp);
+            self.grid.active_mut().images_dirty = true;
+            return Ok(());
+        }
+
+        // Flush pending auto-wrap if placing directly at the cursor with cursor movement enabled.
+        if params.parent_id == 0
+            && params.cursor_policy == 0
+            && self.grid.active().cursor.pending_wrap
+        {
+            if self.auto_wrap {
+                let bg = self.bg;
+                let active = self.grid.active_mut();
+                let r = active.cursor.row;
+                active.grid[r].is_wrapped = true;
+                active.newline_with_bg(bg);
+            } else {
+                self.grid.active_mut().cursor.pending_wrap = false;
+            }
+        }
+
+        let (anchor_row, anchor_col) = if params.parent_id != 0 {
+            let parent = self
+                .grid
+                .active()
+                .images
+                .iter()
+                .rev()
+                .find(|p| {
+                    p.image_id == params.parent_id
+                        && (params.parent_placement_id == 0
+                            || p.placement_id == params.parent_placement_id)
+                })
+                .ok_or(("ENOENT", "Parent placement not found"))?;
+            let max_col = self.grid.active().cols.saturating_sub(1) as isize;
+            let r = parent.row + params.parent_offset_v as isize;
+            let c =
+                (parent.col as isize + params.parent_offset_h as isize).clamp(0, max_col) as usize;
+            (r, c)
+        } else {
+            let cur = &self.grid.active().cursor;
+            (cur.row as isize, cur.col)
+        };
+
+        let cell_w = self.grid.cell_width_px.max(1.0);
+        let cell_h = self.grid.cell_height_px.max(1.0);
+
+        let mut img = GraphicImage {
+            id: stored.texture_id,
+            image_id,
+            image_number: stored.image_number,
+            placement_id: params.placement_id,
+            row: anchor_row,
+            col: anchor_col,
+            width_px: stored.width_px,
+            height_px: stored.height_px,
+            src_rect: [sx, sy, sw, sh],
+            cell_offset: [params.cell_x_offset, params.cell_y_offset],
+            display_cols,
+            display_rows,
+            width_cells: 1,
+            height_cells: 1,
+            rgba_data: stored.rgba_data,
+            z_index: params.z_index,
+        };
+
+        let [off_x, off_y, disp_w, disp_h] = img.compute_display_box(cell_w, cell_h);
+        img.width_cells = display_cols
+            .map(|c| c as usize)
+            .unwrap_or_else(|| (((off_x + disp_w) / cell_w).ceil() as usize).max(1));
+        img.height_cells = display_rows
+            .map(|r| r as usize)
+            .unwrap_or_else(|| (((off_y + disp_h) / cell_h).ceil() as usize).max(1));
+
+        let width_cells = img.width_cells;
+        let height_cells = img.height_cells;
+
+        if params.placement_id != 0 {
+            self.grid
+                .active_mut()
+                .images
+                .retain(|p| !(p.image_id == image_id && p.placement_id == params.placement_id));
+        }
+
+        info!(
+            "Placed Kitty Graphics image id={} ({}x{} px, {}x{} cells) at ({}, {})",
+            image_id,
+            img.width_px,
+            img.height_px,
+            width_cells,
+            height_cells,
+            anchor_row,
+            anchor_col
+        );
+        self.grid.active_mut().add_image(img);
+
+        if params.cursor_policy == 0 && params.parent_id == 0 {
+            let bg = self.bg;
+            let auto_wrap = self.auto_wrap;
+            let active = self.grid.active_mut();
+            for _ in 0..height_cells.saturating_sub(1) {
+                active.linefeed_with_bg(bg);
+            }
+            let end_col = anchor_col + width_cells;
+            if end_col < active.cols {
+                active.cursor.col = end_col;
+                active.cursor.pending_wrap = false;
+            } else {
+                active.cursor.col = active.cols.saturating_sub(1);
+                active.cursor.pending_wrap = auto_wrap;
+            }
+            active.last_placeholder_pos = None;
+        }
+
+        Ok(())
+    }
+
+    fn execute_kitty_delete(&mut self, params: &KittyControlParams) {
+        let sel = params.delete_target;
+        let free_data = sel.is_ascii_uppercase();
+        let kind = sel.to_ascii_lowercase();
+
+        let cur_row = self.grid.active().cursor.row as isize;
+        let cur_col = self.grid.active().cursor.col;
+
+        let mut candidate_ids: Vec<u32> = Vec::new();
+        let changed: bool;
+
+        match kind {
+            'a' => {
+                // Delete all visible placements on the active screen.
+                let active = self.grid.active_mut();
+                let before = active.images.len();
+                active.images.retain(|p| {
+                    let visible = p.row + (p.height_cells.max(1) as isize) > 0
+                        && p.row < active.rows as isize;
+                    if visible {
+                        if p.image_id != 0 {
+                            candidate_ids.push(p.image_id);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if active.images.len() != before {
+                    active.images_dirty = true;
+                }
+                if free_data {
+                    let all_ids: Vec<u32> = self.grid.kitty_images.keys().copied().collect();
+                    self.grid.virtual_placements.clear();
+                    for id in all_ids {
+                        if !self.grid.is_kitty_image_referenced(id) {
+                            self.grid.remove_stored_kitty_image(id);
+                        }
+                    }
+                }
+                return;
+            }
+            'i' => {
+                let target_id = params.image_id;
+                if target_id == 0 {
+                    return;
+                }
+                candidate_ids.push(target_id);
+                let active = self.grid.active_mut();
+                let before = active.images.len();
+                active.images.retain(|p| {
+                    !(p.image_id == target_id
+                        && (params.placement_id == 0 || p.placement_id == params.placement_id))
+                });
+                changed = active.images.len() != before;
+                if params.placement_id == 0 {
+                    self.grid
+                        .virtual_placements
+                        .retain(|&(iid, _), _| iid != target_id);
+                } else {
+                    self.grid
+                        .virtual_placements
+                        .remove(&(target_id, params.placement_id));
+                }
+            }
+            'n' => {
+                let Some(&target_id) = self.grid.kitty_number_to_id.get(&params.image_number)
+                else {
+                    return;
+                };
+                candidate_ids.push(target_id);
+                let active = self.grid.active_mut();
+                let before = active.images.len();
+                active.images.retain(|p| {
+                    !(p.image_id == target_id
+                        && (params.placement_id == 0 || p.placement_id == params.placement_id))
+                });
+                changed = active.images.len() != before;
+                if params.placement_id == 0 {
+                    self.grid
+                        .virtual_placements
+                        .retain(|&(iid, _), _| iid != target_id);
+                } else {
+                    self.grid
+                        .virtual_placements
+                        .remove(&(target_id, params.placement_id));
+                }
+            }
+            'c' => {
+                let active = self.grid.active_mut();
+                let before = active.images.len();
+                active.images.retain(|p| {
+                    if p.intersects_cell(cur_row, cur_col) {
+                        if p.image_id != 0 {
+                            candidate_ids.push(p.image_id);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+                changed = active.images.len() != before;
+            }
+            'p' | 'q' => {
+                // 1-based cell coordinates `(y, x)`, plus `z_index` match for `q`.
+                if params.x == 0 || params.y == 0 {
+                    return;
+                }
+                let target_row = (params.y - 1) as isize;
+                let target_col = (params.x - 1) as usize;
+                let active = self.grid.active_mut();
+                let before = active.images.len();
+                active.images.retain(|p| {
+                    let hit = p.intersects_cell(target_row, target_col)
+                        && (kind != 'q' || p.z_index == params.z_index);
+                    if hit {
+                        if p.image_id != 0 {
+                            candidate_ids.push(p.image_id);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+                changed = active.images.len() != before;
+            }
+            'r' => {
+                let lo = params.x;
+                let hi = params.y;
+                if lo == 0 || hi < lo {
+                    return;
+                }
+                let active = self.grid.active_mut();
+                let before = active.images.len();
+                active.images.retain(|p| {
+                    if p.image_id >= lo && p.image_id <= hi {
+                        candidate_ids.push(p.image_id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                changed = active.images.len() != before;
+                for &id in self.grid.kitty_images.keys() {
+                    if id >= lo && id <= hi {
+                        candidate_ids.push(id);
+                    }
+                }
+                self.grid
+                    .virtual_placements
+                    .retain(|&(iid, _), _| !(iid >= lo && iid <= hi));
+            }
+            'x' => {
+                if params.x == 0 {
+                    return;
+                }
+                let target_col = (params.x - 1) as usize;
+                let active = self.grid.active_mut();
+                let before = active.images.len();
+                active.images.retain(|p| {
+                    let hit = p.row + (p.height_cells.max(1) as isize) > 0
+                        && p.row < active.rows as isize
+                        && target_col >= p.col
+                        && target_col < p.col + p.width_cells.max(1);
+                    if hit {
+                        if p.image_id != 0 {
+                            candidate_ids.push(p.image_id);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+                changed = active.images.len() != before;
+            }
+            'y' => {
+                if params.y == 0 {
+                    return;
+                }
+                let target_row = (params.y - 1) as isize;
+                let active = self.grid.active_mut();
+                let before = active.images.len();
+                active.images.retain(|p| {
+                    let hit = target_row >= p.row
+                        && target_row < p.row + (p.height_cells.max(1) as isize);
+                    if hit {
+                        if p.image_id != 0 {
+                            candidate_ids.push(p.image_id);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+                changed = active.images.len() != before;
+            }
+            'z' => {
+                let active = self.grid.active_mut();
+                let before = active.images.len();
+                active.images.retain(|p| {
+                    let visible = p.row + (p.height_cells.max(1) as isize) > 0
+                        && p.row < active.rows as isize;
+                    if visible && p.z_index == params.z_index {
+                        if p.image_id != 0 {
+                            candidate_ids.push(p.image_id);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+                changed = active.images.len() != before;
+            }
+            'f' => {
+                let target_id = if params.image_id != 0 {
+                    Some(params.image_id)
+                } else if params.image_number != 0 {
+                    self.grid
+                        .kitty_number_to_id
+                        .get(&params.image_number)
+                        .copied()
+                } else {
+                    None
+                };
+                if let Some(id) = target_id {
+                    if let Some(stored) = self.grid.kitty_images.get_mut(&id) {
+                        if stored.frames.len() > 1 {
+                            stored.frames.truncate(1);
+                            stored.active_frame = 0;
+                            stored.rgba_data = Arc::clone(&stored.frames[0].rgba_data);
+                        }
+                    }
+                }
+                return;
+            }
+            _ => return,
+        }
+
+        if changed {
+            self.grid.active_mut().images_dirty = true;
+        }
+
+        if free_data {
+            candidate_ids.sort_unstable();
+            candidate_ids.dedup();
+            for id in candidate_ids {
+                if !self.grid.is_kitty_image_referenced(id) {
+                    self.grid.remove_stored_kitty_image(id);
+                }
+            }
+        }
+    }
+
+    fn resolve_target_kitty_id(
+        &self,
+        params: &KittyControlParams,
+    ) -> Result<u32, (&'static str, &'static str)> {
+        if params.image_id != 0 {
+            if self.grid.kitty_images.contains_key(&params.image_id) {
+                Ok(params.image_id)
+            } else {
+                Err(("ENOENT", "Image ID not found"))
+            }
+        } else if params.image_number != 0 {
+            self.grid
+                .kitty_number_to_id
+                .get(&params.image_number)
+                .copied()
+                .ok_or(("ENOENT", "Image number not found"))
+        } else {
+            Err(("EINVAL", "Image ID or number is required"))
+        }
+    }
+
+    fn refresh_kitty_texture_bindings(&mut self, image_id: u32) {
+        let new_tex_id = self.grid.alloc_texture_id();
+        let Some(stored) = self.grid.kitty_images.get_mut(&image_id) else {
+            return;
+        };
+        stored.texture_id = new_tex_id;
+        let rgba_arc = Arc::clone(&stored.rgba_data);
+
+        for buf in [&mut self.grid.primary, &mut self.grid.alternate] {
+            let mut touched = false;
+            for p in &mut buf.images {
+                if p.image_id == image_id {
+                    p.id = new_tex_id;
+                    p.rgba_data = Arc::clone(&rgba_arc);
+                    touched = true;
+                }
+            }
+            if touched {
+                buf.images_dirty = true;
+            }
+        }
+        self.grid.active_mut().images_dirty = true;
+    }
+
+    fn execute_kitty_frame(
+        &mut self,
+        params: &KittyControlParams,
+        payload: Vec<u8>,
+    ) -> Result<u32, (&'static str, &'static str)> {
+        let image_id = self.resolve_target_kitty_id(params)?;
+        let (img_w, img_h) = {
+            let stored = self
+                .grid
+                .kitty_images
+                .get(&image_id)
+                .ok_or(("ENOENT", "Image not found"))?;
+            (stored.width_px, stored.height_px)
+        };
+
+        let mut frame_params = params.clone();
+        if frame_params.data_width == 0 {
+            frame_params.data_width = img_w;
+        }
+        if frame_params.data_height == 0 {
+            frame_params.data_height = img_h;
+        }
+
+        let (patch_w, patch_h, patch_rgba) = if payload.is_empty() && frame_params.medium == 'd' {
+            (0, 0, Vec::new())
+        } else {
+            let raw = load_transmission_payload(&frame_params, payload)?;
+            decode_kitty_pixels(&frame_params, raw)?
+        };
+
+        let overwrite = params.cell_x_offset == 1;
+        let gap_ms = params.z_index.max(0) as u32;
+        let fill = params.cell_y_offset.to_be_bytes();
+
+        {
+            let stored = self
+                .grid
+                .kitty_images
+                .get_mut(&image_id)
+                .ok_or(("ENOENT", "Image not found"))?;
+
+            let edit_idx = if params.cols > 0 {
+                let idx = (params.cols - 1) as usize;
+                if idx < stored.frames.len() {
+                    Some(idx)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(idx) = edit_idx {
+                let mut canvas = (*stored.frames[idx].rgba_data).clone();
+                if patch_w > 0 && patch_h > 0 {
+                    composite_rgba_patch(
+                        &mut canvas,
+                        img_w,
+                        img_h,
+                        &patch_rgba,
+                        patch_w,
+                        patch_h,
+                        params.x,
+                        params.y,
+                        overwrite,
+                    );
+                }
+                let arc = Arc::new(canvas);
+                stored.frames[idx].rgba_data = Arc::clone(&arc);
+                if gap_ms > 0 {
+                    stored.frames[idx].gap_ms = gap_ms;
+                }
+                if stored.active_frame == idx {
+                    stored.rgba_data = arc;
+                }
+            } else {
+                let mut canvas = if params.rows > 0 {
+                    let base_idx = (params.rows - 1) as usize;
+                    if let Some(base) = stored.frames.get(base_idx) {
+                        (*base.rgba_data).clone()
+                    } else {
+                        fill.repeat((img_w as usize) * (img_h as usize))
+                    }
+                } else {
+                    fill.repeat((img_w as usize) * (img_h as usize))
+                };
+
+                if patch_w > 0 && patch_h > 0 {
+                    composite_rgba_patch(
+                        &mut canvas,
+                        img_w,
+                        img_h,
+                        &patch_rgba,
+                        patch_w,
+                        patch_h,
+                        params.x,
+                        params.y,
+                        overwrite,
+                    );
+                }
+                let frame_num = (stored.frames.len() + 1) as u32;
+                let arc = Arc::new(canvas);
+                stored.frames.push(AnimationFrame {
+                    frame_number: frame_num,
+                    rgba_data: arc,
+                    gap_ms: if gap_ms > 0 { gap_ms } else { 40 },
+                });
+            }
+        }
+
+        self.refresh_kitty_texture_bindings(image_id);
+        Ok(image_id)
+    }
+
+    fn execute_kitty_compose(
+        &mut self,
+        params: &KittyControlParams,
+    ) -> Result<u32, (&'static str, &'static str)> {
+        let image_id = self.resolve_target_kitty_id(params)?;
+        let overwrite = params.cursor_policy == 1;
+
+        {
+            let stored = self
+                .grid
+                .kitty_images
+                .get_mut(&image_id)
+                .ok_or(("ENOENT", "Image not found"))?;
+
+            let src_idx = params.rows.saturating_sub(1) as usize;
+            let dst_idx = params.cols.saturating_sub(1) as usize;
+            if src_idx >= stored.frames.len() || dst_idx >= stored.frames.len() {
+                return Err(("ENOENT", "Animation frame index out of range"));
+            }
+
+            let img_w = stored.width_px;
+            let img_h = stored.height_px;
+            let sx = params.x.min(img_w);
+            let sy = params.y.min(img_h);
+            let copy_w = if params.w == 0 {
+                img_w.saturating_sub(sx)
+            } else {
+                params.w.min(img_w.saturating_sub(sx))
+            };
+            let copy_h = if params.h == 0 {
+                img_h.saturating_sub(sy)
+            } else {
+                params.h.min(img_h.saturating_sub(sy))
+            };
+
+            if copy_w > 0 && copy_h > 0 {
+                let src_buf = &stored.frames[src_idx].rgba_data;
+                let stride = img_w as usize * 4;
+                let mut rect_bytes = Vec::with_capacity((copy_w * copy_h * 4) as usize);
+                for r in 0..copy_h as usize {
+                    let start = (sy as usize + r) * stride + (sx as usize) * 4;
+                    rect_bytes.extend_from_slice(&src_buf[start..start + (copy_w as usize) * 4]);
+                }
+
+                let mut dst_canvas = (*stored.frames[dst_idx].rgba_data).clone();
+                composite_rgba_patch(
+                    &mut dst_canvas,
+                    img_w,
+                    img_h,
+                    &rect_bytes,
+                    copy_w,
+                    copy_h,
+                    params.cell_x_offset,
+                    params.cell_y_offset,
+                    overwrite,
+                );
+                let arc = Arc::new(dst_canvas);
+                stored.frames[dst_idx].rgba_data = Arc::clone(&arc);
+                if stored.active_frame == dst_idx {
+                    stored.rgba_data = arc;
+                }
+            }
+        }
+
+        self.refresh_kitty_texture_bindings(image_id);
+        Ok(image_id)
+    }
+
+    fn execute_kitty_animate(
+        &mut self,
+        params: &KittyControlParams,
+    ) -> Result<u32, (&'static str, &'static str)> {
+        let image_id = self.resolve_target_kitty_id(params)?;
+        let switched = {
+            let stored = self
+                .grid
+                .kitty_images
+                .get_mut(&image_id)
+                .ok_or(("ENOENT", "Image not found"))?;
+
+            if params.rows > 0 {
+                let idx = (params.rows - 1) as usize;
+                if let Some(frame) = stored.frames.get_mut(idx) {
+                    if params.z_index >= 0 {
+                        frame.gap_ms = params.z_index as u32;
+                    }
+                }
+            }
+
+            if params.cols > 0 {
+                let idx = (params.cols - 1) as usize;
+                if let Some(frame) = stored.frames.get(idx) {
+                    stored.active_frame = idx;
+                    stored.rgba_data = Arc::clone(&frame.rgba_data);
+                    true
+                } else {
+                    false
+                }
+            } else if params.data_width == 3 && !stored.frames.is_empty() {
+                // `s=3` starts playback: advance to the latest available frame if still on frame 1.
+                let last_idx = stored.frames.len() - 1;
+                if stored.active_frame != last_idx {
+                    stored.active_frame = last_idx;
+                    stored.rgba_data = Arc::clone(&stored.frames[last_idx].rgba_data);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        if switched {
+            self.refresh_kitty_texture_bindings(image_id);
+        }
+        Ok(image_id)
     }
 }
 

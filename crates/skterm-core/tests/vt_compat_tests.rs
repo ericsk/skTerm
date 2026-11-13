@@ -797,7 +797,10 @@ fn test_vt_decstr_xtversion_and_xtwinops() {
 
     // XTVERSION (CSI > q)
     term.feed_bytes(b"\x1b[>q");
-    assert_eq!(term.take_pending_responses(), b"\x1bP>|skTerm(0.1.0)\x1b\\");
+    assert_eq!(
+        term.take_pending_responses(),
+        concat!("\x1bP>|skTerm(", env!("CARGO_PKG_VERSION"), ")\x1b\\").as_bytes()
+    );
 
     // XTWINOPS: report text area size in chars (CSI 18 t) and cell size (CSI 16 t)
     term.feed_bytes(b"\x1b[18t\x1b[16t");
@@ -820,4 +823,311 @@ fn test_vt_decstr_xtversion_and_xtwinops() {
     assert!(!term.state.insert_mode);
     assert_eq!(term.grid().active().scroll_region, (0, 23));
     assert!(!term.state.flags.contains(skterm_core::CellFlags::BOLD));
+}
+
+#[test]
+fn test_kitty_graphics_apc_streaming_chunking_zlib_and_formats() {
+    use base64::Engine;
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let mut term = Terminal::new_headless(24, 80, 100);
+
+    // 1. Standard APC query (`\x1b_G...a=q...\x1b\\`) fed byte-by-byte across stream boundaries
+    let query = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
+    for &b in query {
+        term.feed_bytes(&[b]);
+    }
+    assert_eq!(term.take_pending_responses(), b"\x1b_Gi=31;OK\x1b\\");
+    assert!(term.grid().active().images.is_empty());
+    assert!(term.grid().kitty_images.is_empty());
+
+    // 2. Interrupted APC followed immediately by CSI SGR must recover without swallowing text
+    term.feed_bytes(b"\x1b_Ga=T,f=32,s=1,v=1;AAAA\x1b[32mOK\x1b[0m\r\n");
+    assert_eq!(term.grid().active().grid[0].cells[0].c, 'O');
+    assert_eq!(term.grid().active().grid[0].cells[1].c, 'K');
+
+    // 3. Multi-chunk (`m=1` -> `m=0`, split at non-multiple-of-4 boundary) + zlib (`o=z`) RGBA upload (`a=t`)
+    let rgba_2x2: Vec<u8> = vec![
+        255, 0, 0, 255, // red
+        0, 255, 0, 255, // green
+        0, 0, 255, 255, // blue
+        255, 255, 0, 128, // semi-transparent yellow
+    ];
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(&rgba_2x2).unwrap();
+    let compressed = enc.finish().unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
+    let (part1, part2) = b64.split_at(5); // intentionally not divisible by 4!
+
+    let cmd1 = format!("\x1b_Ga=t,i=7,f=32,s=2,v=2,o=z,m=1;{part1}\x1b\\");
+    let cmd2 = format!("\x1b_Gm=0;{part2}\x1b\\");
+    term.feed_bytes(cmd1.as_bytes());
+    assert!(term.take_pending_responses().is_empty()); // No response until m=0
+    term.feed_bytes(cmd2.as_bytes());
+    assert_eq!(term.take_pending_responses(), b"\x1b_Gi=7;OK\x1b\\");
+
+    // `a=t` stores image 7 without placing it on screen
+    assert!(term.grid().kitty_images.contains_key(&7));
+    assert_eq!(&*term.grid().kitty_images[&7].rgba_data, &rgba_2x2);
+    assert!(term.grid().active().images.is_empty());
+
+    // 4. `f=100` real PNG image via `a=T` (transmit & display) with `C=1` (fixed cursor) and `z=-1`
+    let mut png_bytes: Vec<u8> = Vec::new();
+    {
+        let img_buf = image::RgbaImage::from_raw(2, 2, rgba_2x2.clone()).unwrap();
+        img_buf
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+    }
+    let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+    term.feed_bytes(b"\x1b[5;10H"); // row 4, col 9 (0-based)
+    let png_cmd = format!("\x1b_Ga=T,i=9,p=3,f=100,c=4,r=2,C=1,z=-1;{png_b64}\x1b\\");
+    term.feed_bytes(png_cmd.as_bytes());
+    assert_eq!(term.take_pending_responses(), b"\x1b_Gi=9,p=3;OK\x1b\\");
+    // Cursor did not move because C=1
+    assert_eq!(term.grid().active().cursor.row, 4);
+    assert_eq!(term.grid().active().cursor.col, 9);
+    assert_eq!(term.grid().active().images.len(), 1);
+    let placed = &term.grid().active().images[0];
+    assert_eq!(placed.image_id, 9);
+    assert_eq!(placed.placement_id, 3);
+    assert_eq!((placed.row, placed.col), (4, 9));
+    assert_eq!((placed.width_cells, placed.height_cells), (4, 2));
+    assert_eq!(placed.z_index, -1);
+}
+
+#[test]
+fn test_kitty_graphics_put_delete_scroll_and_animation() {
+    use base64::Engine;
+
+    let mut term = Terminal::new_headless(10, 20, 5);
+    let rgb_2x2: Vec<u8> = vec![
+        255, 0, 0, // (0,0)
+        0, 255, 0, // (1,0)
+        0, 0, 255, // (0,1)
+        255, 255, 255, // (1,1)
+    ];
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&rgb_2x2);
+
+    // Upload by image number `I=55` (`a=t`)
+    let upload = format!("\x1b_Ga=t,I=55,f=24,s=2,v=2;{b64}\x1b\\");
+    term.feed_bytes(upload.as_bytes());
+    let resp = String::from_utf8(term.take_pending_responses()).unwrap();
+    assert!(resp.contains(",I=55;OK\x1b\\"), "unexpected resp: {resp}");
+
+    // Place using `I=55,p=1` at (0, 0) with `c=3,r=2` (`C=0` advances cursor down 1 row, right 3 cols)
+    term.feed_bytes(b"\x1b[1;1H\x1b_Ga=p,I=55,p=1,c=3,r=2\x1b\\");
+    let _ = term.take_pending_responses();
+    assert_eq!(term.grid().active().images.len(), 1);
+    assert_eq!(term.grid().active().cursor.row, 1);
+    assert_eq!(term.grid().active().cursor.col, 3);
+
+    // Re-putting the same `(I=55, p=1)` moves/replaces the placement rather than duplicating it
+    term.feed_bytes(b"\x1b[4;6H\x1b_Ga=p,I=55,p=1,c=2,r=2,C=1\x1b\\");
+    let _ = term.take_pending_responses();
+    assert_eq!(term.grid().active().images.len(), 1);
+    assert_eq!(term.grid().active().images[0].row, 3);
+    assert_eq!(term.grid().active().images[0].col, 5);
+
+    // Relative placement (`P=<id>,Q=1,H=2,V=1`)
+    let stored_id = term.grid().active().images[0].image_id;
+    let rel_cmd = format!("\x1b_Ga=p,i={stored_id},p=2,P={stored_id},Q=1,H=2,V=1,c=1,r=1\x1b\\");
+    term.feed_bytes(rel_cmd.as_bytes());
+    let _ = term.take_pending_responses();
+    assert_eq!(term.grid().active().images.len(), 2);
+    assert_eq!(term.grid().active().images[1].row, 4);
+    assert_eq!(term.grid().active().images[1].col, 7);
+
+    // Animation frame (`a=f` + `a=a,c=2`) updates texture binding & RGBA pixels
+    let green_frame =
+        base64::engine::general_purpose::STANDARD.encode([0u8, 200, 0, 255].repeat(4));
+    let old_tex_id = term.grid().kitty_images[&stored_id].texture_id;
+    let frame_cmd = format!("\x1b_Ga=f,i={stored_id},f=32,s=2,v=2,X=1;{green_frame}\x1b\\");
+    let anim_cmd = format!("\x1b_Ga=a,i={stored_id},c=2\x1b\\");
+    term.feed_bytes(frame_cmd.as_bytes());
+    term.feed_bytes(anim_cmd.as_bytes());
+    let _ = term.take_pending_responses();
+    assert_ne!(term.grid().kitty_images[&stored_id].texture_id, old_tex_id);
+    assert_eq!(
+        &term.grid().active().images[0].rgba_data[..4],
+        &[0, 200, 0, 255]
+    );
+
+    // Lowercase `d=p` (1-based x=8, y=5 -> 0-based col=7, row=4) removes placement 2 only, keeping StoredImage
+    term.feed_bytes(b"\x1b_Ga=d,d=p,x=8,y=5\x1b\\");
+    assert_eq!(term.grid().active().images.len(), 1);
+    assert!(term.grid().kitty_images.contains_key(&stored_id));
+
+    // Scroll placement 1 (at row 3, height 2) up by 5 lines -> row becomes -2 (in scrollback, NOT stuck at 0!)
+    term.grid_mut().active_mut().scroll_up(5);
+    assert_eq!(term.grid().active().images.len(), 1);
+    assert_eq!(term.grid().active().images[0].row, -2);
+
+    // Scroll 6 more lines past `max_scrollback = 5` -> image is evicted from scrollback automatically
+    term.grid_mut().active_mut().scroll_up(6);
+    assert!(term.grid().active().images.is_empty());
+
+    // Uppercase `d=I` frees the stored image from memory
+    let del_cmd = format!("\x1b_Ga=d,d=I,i={stored_id}\x1b\\");
+    term.feed_bytes(del_cmd.as_bytes());
+    assert!(!term.grid().kitty_images.contains_key(&stored_id));
+}
+
+#[test]
+fn test_kitty_graphics_file_temp_and_shm_mediums() {
+    use base64::Engine;
+
+    let mut term = Terminal::new_headless(10, 20, 100);
+    let pixels: Vec<u8> = vec![10, 20, 30, 255, 40, 50, 60, 255];
+
+    // 1. Safe `t=t` temporary file containing `tty-graphics-protocol` in system temp_dir IS deleted after read
+    let safe_tmp = std::env::temp_dir().join(format!(
+        "skterm-tty-graphics-protocol-{}.raw",
+        std::process::id()
+    ));
+    std::fs::write(&safe_tmp, &pixels).unwrap();
+    let safe_b64 =
+        base64::engine::general_purpose::STANDARD.encode(safe_tmp.to_string_lossy().as_bytes());
+    let cmd_t = format!("\x1b_Ga=t,i=101,t=t,f=32,s=2,v=1;{safe_b64}\x1b\\");
+    term.feed_bytes(cmd_t.as_bytes());
+    assert_eq!(term.take_pending_responses(), b"\x1b_Gi=101;OK\x1b\\");
+    assert!(
+        !safe_tmp.exists(),
+        "tty-graphics-protocol temp file must be removed"
+    );
+    assert_eq!(&*term.grid().kitty_images[&101].rgba_data, &pixels);
+
+    // 2. Security guard: `t=t` file WITHOUT `tty-graphics-protocol` in its name is read, NOT deleted!
+    let unsafe_tmp =
+        std::env::temp_dir().join(format!("skterm-keep-me-{}.raw", std::process::id()));
+    let mut padded = vec![99u8; 4];
+    padded.extend_from_slice(&pixels);
+    std::fs::write(&unsafe_tmp, &padded).unwrap();
+    let unsafe_b64 =
+        base64::engine::general_purpose::STANDARD.encode(unsafe_tmp.to_string_lossy().as_bytes());
+    // Also exercise `O=4,S=8` offset/length slicing!
+    let cmd_keep = format!("\x1b_Ga=t,i=102,t=t,f=32,s=2,v=1,O=4,S=8;{unsafe_b64}\x1b\\");
+    term.feed_bytes(cmd_keep.as_bytes());
+    assert_eq!(term.take_pending_responses(), b"\x1b_Gi=102;OK\x1b\\");
+    assert!(
+        unsafe_tmp.exists(),
+        "file without tty-graphics-protocol marker must NOT be deleted"
+    );
+    let _ = std::fs::remove_file(&unsafe_tmp);
+    assert_eq!(&*term.grid().kitty_images[&102].rgba_data, &pixels);
+
+    // 3. POSIX Shared Memory (`t=s`) on Unix (using POSIX `mmap`, required on macOS XNU)
+    #[cfg(unix)]
+    {
+        let shm_name = format!("/skterm_{}", std::process::id());
+        let c_name = std::ffi::CString::new(shm_name.clone()).unwrap();
+        unsafe {
+            let _ = libc::shm_unlink(c_name.as_ptr());
+        }
+        let fd = unsafe {
+            libc::shm_open(
+                c_name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            unsafe {
+                let _ = libc::ftruncate(fd, pixels.len() as libc::off_t);
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    pixels.len(),
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                assert_ne!(ptr, libc::MAP_FAILED);
+                std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr as *mut u8, pixels.len());
+                let _ = libc::munmap(ptr, pixels.len());
+                let _ = libc::close(fd);
+            }
+            let shm_b64 = base64::engine::general_purpose::STANDARD.encode(shm_name.as_bytes());
+            let cmd_s = format!("\x1b_Ga=t,i=103,t=s,f=32,s=2,v=1;{shm_b64}\x1b\\");
+            term.feed_bytes(cmd_s.as_bytes());
+            assert_eq!(term.take_pending_responses(), b"\x1b_Gi=103;OK\x1b\\");
+            assert_eq!(&*term.grid().kitty_images[&103].rgba_data, &pixels);
+
+            // Verify the SHM object was unlinked by the terminal
+            let reopen = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0) };
+            assert!(
+                reopen < 0,
+                "POSIX SHM object must be unlinked after t=s read"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_kitty_unicode_placeholders_and_diacritics() {
+    use base64::Engine;
+    use skterm_core::{
+        kitty_diacritic_index, PlaceholderCellMeta, Selection, SelectionMode, KITTY_DIACRITICS,
+        KITTY_PLACEHOLDER_CHAR,
+    };
+
+    // Verify canonical 297 diacritics table invariants
+    assert_eq!(KITTY_DIACRITICS.len(), 297);
+    assert_eq!(KITTY_DIACRITICS[0], 0x0305);
+    assert_eq!(KITTY_DIACRITICS[296], 0x1D244);
+    for pair in KITTY_DIACRITICS.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "KITTY_DIACRITICS must be strictly sorted"
+        );
+    }
+    assert_eq!(kitty_diacritic_index('\u{0305}'), Some(0));
+    assert_eq!(kitty_diacritic_index('\u{1D244}'), Some(296));
+
+    let mut term = Terminal::new_headless(6, 20, 50);
+    let b64 = base64::engine::general_purpose::STANDARD.encode([255u8, 128, 0, 255].repeat(4));
+    // Upload image `i=0x05010203` (requires 3rd diacritic MSB = 5!) and register `U=1` virtual placement `p=7`
+    let id_full: u32 = 0x0501_0203;
+    let upload = format!("\x1b_Ga=t,i={id_full},f=32,s=2,v=2,q=2;{b64}\x1b\\");
+    let virt = format!("\x1b_Ga=p,U=1,i={id_full},p=7,c=3,r=2,q=2\x1b\\");
+    term.feed_bytes(upload.as_bytes());
+    term.feed_bytes(virt.as_bytes());
+    assert!(term.grid().active().images.is_empty());
+    assert!(term.grid().lookup_virtual_placement(id_full, 7).is_some());
+
+    // Emit SGR fg `38;2;1;2;3` + underline color `58;2;0;0;7`, then placeholder at (0,0) with
+    // row=1 (0x030D), col=2 (0x030E), id_msb=5 (0x033D), followed by an abbreviated bare placeholder!
+    let d_row1 = char::from_u32(KITTY_DIACRITICS[1]).unwrap();
+    let d_col2 = char::from_u32(KITTY_DIACRITICS[2]).unwrap();
+    let d_msb5 = char::from_u32(KITTY_DIACRITICS[5]).unwrap();
+    let text = format!(
+        "\x1b[38;2;1;2;3;58:2::0:0:7m{p}{d_row1}{d_col2}{d_msb5}{p}\x1b[0mHi",
+        p = KITTY_PLACEHOLDER_CHAR
+    );
+    term.feed_bytes(text.as_bytes());
+
+    let row0 = &term.grid().active().grid[0];
+    assert_eq!(row0.cells[0].c, KITTY_PLACEHOLDER_CHAR);
+    let meta0 = PlaceholderCellMeta::unpack(row0.cells[0].hyperlink_id.unwrap()).unwrap();
+    assert_eq!(meta0.diacritic_count, 3);
+    assert_eq!((meta0.row_idx, meta0.col_idx, meta0.id_msb), (1, 2, 5));
+    // Placeholder metadata must never masquerade as an OSC 8 URL
+    assert!(term.url_at(0, 0).is_none());
+
+    // Second cell has 0 diacritics (omitted-diacritic run-length continuation)
+    assert_eq!(row0.cells[1].c, KITTY_PLACEHOLDER_CHAR);
+    let meta1 = PlaceholderCellMeta::unpack(row0.cells[1].hyperlink_id.unwrap()).unwrap();
+    assert_eq!(meta1.diacritic_count, 0);
+    assert_eq!(row0.cells[2].c, 'H');
+    assert_eq!(row0.cells[3].c, 'i');
+
+    // Selecting across placeholder cells substitutes spaces instead of leaking PUA codepoints
+    term.grid_mut().active_mut().selection =
+        Some(Selection::new((0, 0), (0, 3), SelectionMode::Simple));
+    assert_eq!(term.grid().active().extract_selected_text(), "  Hi");
 }

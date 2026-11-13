@@ -123,6 +123,7 @@ var image_sampler: sampler;
 
 struct ImageInstance {
     @location(0) rect: vec4<f32>, // [x, y, w, h] in screen pixels
+    @location(1) uv: vec4<f32>,   // [u_min, v_min, u_max, v_max]
 };
 
 struct ImageVertexOutput {
@@ -143,13 +144,18 @@ fn vs_image(
     let x1 = instance.rect.x + instance.rect.z;
     let y1 = instance.rect.y + instance.rect.w;
 
+    let u0 = instance.uv.x;
+    let v0 = instance.uv.y;
+    let u1 = instance.uv.z;
+    let v1 = instance.uv.w;
+
     switch (vertex_index) {
-        case 0u: { pos = vec2<f32>(x0, y0); uv = vec2<f32>(0.0, 0.0); }
-        case 1u: { pos = vec2<f32>(x0, y1); uv = vec2<f32>(0.0, 1.0); }
-        case 2u: { pos = vec2<f32>(x1, y0); uv = vec2<f32>(1.0, 0.0); }
-        case 3u: { pos = vec2<f32>(x1, y1); uv = vec2<f32>(1.0, 1.0); }
-        case 4u: { pos = vec2<f32>(x0, y1); uv = vec2<f32>(0.0, 1.0); }
-        case 5u: { pos = vec2<f32>(x1, y0); uv = vec2<f32>(1.0, 0.0); }
+        case 0u: { pos = vec2<f32>(x0, y0); uv = vec2<f32>(u0, v0); }
+        case 1u: { pos = vec2<f32>(x0, y1); uv = vec2<f32>(u0, v1); }
+        case 2u: { pos = vec2<f32>(x1, y0); uv = vec2<f32>(u1, v0); }
+        case 3u: { pos = vec2<f32>(x1, y1); uv = vec2<f32>(u1, v1); }
+        case 4u: { pos = vec2<f32>(x0, y1); uv = vec2<f32>(u0, v1); }
+        case 5u: { pos = vec2<f32>(x1, y0); uv = vec2<f32>(u1, v0); }
         default: {}
     }
 

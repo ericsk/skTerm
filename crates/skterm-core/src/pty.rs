@@ -293,13 +293,25 @@ impl PtyProcess {
         self.event_rx.try_recv().ok()
     }
 
-    /// Resize the master PTY window size.
+    /// Resize the master PTY window size (character grid only, pixel size = 0).
     pub fn resize(&self, rows: u16, cols: u16) -> anyhow::Result<()> {
+        self.resize_with_pixels(rows, cols, 0, 0)
+    }
+
+    /// Resize the master PTY window size including physical pixel dimensions (`ws_xpixel`, `ws_ypixel`)
+    /// so graphics-capable CLI tools (`icat`, `yazi`, `chafa`, `viu`) can query `TIOCGWINSZ`.
+    pub fn resize_with_pixels(
+        &self,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> anyhow::Result<()> {
         self.master.resize(PtySize {
             rows,
             cols,
-            pixel_width: 0,
-            pixel_height: 0,
+            pixel_width,
+            pixel_height,
         })?;
         Ok(())
     }

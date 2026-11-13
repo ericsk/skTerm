@@ -1,6 +1,9 @@
 //! Screen Buffer, Character Grid, Damage Tracking, Dual Buffer, Selection, and Terminal Graphics.
 
-use crate::graphics::GraphicImage;
+use crate::graphics::{
+    kitty_diacritic_index, AnimationFrame, GraphicImage, PlaceholderCellMeta, StoredImage,
+    VirtualPlacement, KITTY_PLACEHOLDER_CHAR, MAX_IMAGE_STORAGE_BYTES, PLACEHOLDER_META_TAG,
+};
 use bitflags::bitflags;
 use std::collections::{HashMap, VecDeque};
 use std::num::{NonZeroU16, NonZeroU32};
@@ -321,6 +324,8 @@ pub struct ScreenBuffer {
     pub selection: Option<Selection>,
     pub scroll_offset: usize,
     pub images: Vec<GraphicImage>,
+    pub images_dirty: bool,
+    pub last_placeholder_pos: Option<(usize, usize)>,
     pub tab_stops: Vec<bool>,
 }
 
@@ -340,6 +345,8 @@ impl ScreenBuffer {
             selection: None,
             scroll_offset: 0,
             images: Vec::new(),
+            images_dirty: false,
+            last_placeholder_pos: None,
             tab_stops,
         }
     }
@@ -401,12 +408,14 @@ impl ScreenBuffer {
 
     pub fn add_image(&mut self, img: GraphicImage) {
         self.images.push(img);
+        self.images_dirty = true;
     }
 
     pub fn resize(&mut self, new_rows: usize, new_cols: usize) {
         if new_rows == 0 || new_cols == 0 {
             return;
         }
+        self.last_placeholder_pos = None;
 
         if new_cols != self.cols {
             self.reflow(new_rows, new_cols);
@@ -417,11 +426,15 @@ impl ScreenBuffer {
 
     /// Resize when only the number of rows changes (cols remains the same).
     pub fn resize_height_only(&mut self, new_rows: usize) {
+        let mut pulled_from_scrollback: isize = 0;
+        let mut pushed_to_scrollback: isize = 0;
+
         if new_rows > self.rows {
             let diff = new_rows - self.rows;
             for _ in 0..diff {
                 if let Some(old_row) = self.scrollback.pop_back() {
                     self.grid.push_front(old_row);
+                    pulled_from_scrollback += 1;
                 } else {
                     self.grid.push_back(Row::new(self.cols));
                 }
@@ -432,6 +445,7 @@ impl ScreenBuffer {
                 let Some(removed) = self.grid.pop_front() else {
                     break;
                 };
+                pushed_to_scrollback += 1;
                 if self.max_scrollback > 0 {
                     if self.scrollback.len() >= self.max_scrollback {
                         self.scrollback.pop_front();
@@ -441,11 +455,23 @@ impl ScreenBuffer {
             }
         }
 
+        let delta = pulled_from_scrollback - pushed_to_scrollback;
+        if delta != 0 && !self.images.is_empty() {
+            for img in &mut self.images {
+                img.row += delta;
+            }
+            let min_row = -(self.scrollback.len() as isize);
+            self.images
+                .retain(|img| img.row + (img.height_cells.max(1) as isize) > min_row);
+            self.images_dirty = true;
+        }
+
         self.rows = new_rows;
         self.scroll_region = (0, new_rows.saturating_sub(1));
         self.cursor.row = self.cursor.row.min(new_rows.saturating_sub(1));
         self.cursor.col = self.cursor.col.min(self.cols.saturating_sub(1));
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
         self.selection = None;
     }
 
@@ -459,12 +485,16 @@ impl ScreenBuffer {
             row.resize(new_cols);
         }
 
+        let mut pulled_from_scrollback: isize = 0;
+        let mut pushed_to_scrollback: isize = 0;
+
         if new_rows > self.rows {
             let diff = new_rows - self.rows;
             for _ in 0..diff {
                 if let Some(mut old_row) = self.scrollback.pop_back() {
                     old_row.resize(new_cols);
                     self.grid.push_front(old_row);
+                    pulled_from_scrollback += 1;
                 } else {
                     self.grid.push_back(Row::new(new_cols));
                 }
@@ -475,6 +505,7 @@ impl ScreenBuffer {
                 let Some(removed) = self.grid.pop_front() else {
                     break;
                 };
+                pushed_to_scrollback += 1;
                 if self.max_scrollback > 0 {
                     if self.scrollback.len() >= self.max_scrollback {
                         self.scrollback.pop_front();
@@ -484,6 +515,17 @@ impl ScreenBuffer {
             }
         }
 
+        let delta = pulled_from_scrollback - pushed_to_scrollback;
+        if delta != 0 && !self.images.is_empty() {
+            for img in &mut self.images {
+                img.row += delta;
+            }
+            let min_row = -(self.scrollback.len() as isize);
+            self.images
+                .retain(|img| img.row + (img.height_cells.max(1) as isize) > min_row);
+            self.images_dirty = true;
+        }
+
         self.resize_tab_stops(new_cols);
         self.rows = new_rows;
         self.cols = new_cols;
@@ -491,6 +533,7 @@ impl ScreenBuffer {
         self.cursor.row = self.cursor.row.min(new_rows.saturating_sub(1));
         self.cursor.col = self.cursor.col.min(new_cols.saturating_sub(1));
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
         self.selection = None;
     }
 
@@ -938,7 +981,11 @@ impl ScreenBuffer {
                         .flags
                         .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::WRAP_SPACER)
                     {
-                        line_str.push(prev.c);
+                        line_str.push(if prev.c == KITTY_PLACEHOLDER_CHAR {
+                            ' '
+                        } else {
+                            prev.c
+                        });
                     }
                 }
 
@@ -948,7 +995,11 @@ impl ScreenBuffer {
                             .flags
                             .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::WRAP_SPACER)
                         {
-                            line_str.push(cell.c);
+                            line_str.push(if cell.c == KITTY_PLACEHOLDER_CHAR {
+                                ' '
+                            } else {
+                                cell.c
+                            });
                         }
                     }
                 }
@@ -973,6 +1024,7 @@ impl ScreenBuffer {
         self.cursor.row = row.min(self.rows.saturating_sub(1));
         self.cursor.col = col.min(self.cols.saturating_sub(1));
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
     }
 
     pub fn move_up(&mut self, n: usize) {
@@ -983,6 +1035,7 @@ impl ScreenBuffer {
             self.cursor.row = self.cursor.row.saturating_sub(n);
         }
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
     }
 
     pub fn move_down(&mut self, n: usize) {
@@ -993,16 +1046,19 @@ impl ScreenBuffer {
             self.cursor.row = (self.cursor.row + n).min(self.rows.saturating_sub(1));
         }
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
     }
 
     pub fn move_forward(&mut self, n: usize) {
         self.cursor.col = (self.cursor.col + n).min(self.cols.saturating_sub(1));
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
     }
 
     pub fn move_backward(&mut self, n: usize) {
         self.cursor.col = self.cursor.col.saturating_sub(n);
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
     }
 
     pub fn linefeed(&mut self) {
@@ -1017,6 +1073,7 @@ impl ScreenBuffer {
             self.cursor.row += 1;
         }
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
     }
 
     pub fn newline(&mut self) {
@@ -1027,6 +1084,7 @@ impl ScreenBuffer {
         self.linefeed_with_bg(bg);
         self.cursor.col = 0;
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
     }
 
     pub fn scroll_up(&mut self, n: usize) {
@@ -1037,6 +1095,7 @@ impl ScreenBuffer {
         let (top, bottom) = self.scroll_region;
         let full_screen = top == 0 && bottom == self.rows.saturating_sub(1);
         let cols = self.cols;
+        let mut actual_scrolled: isize = 0;
 
         for _ in 0..n {
             if full_screen {
@@ -1062,19 +1121,40 @@ impl ScreenBuffer {
                 };
                 blank.reuse_as_blank(cols, bg);
                 self.grid.push_back(blank);
+                actual_scrolled += 1;
             } else {
                 let Some(mut row) = self.grid.remove(top) else {
                     break;
                 };
                 row.reuse_as_blank(cols, bg);
                 self.grid.insert(bottom, row);
+                actual_scrolled += 1;
             }
         }
 
-        for img in &mut self.images {
-            img.row = img.row.saturating_sub(n);
+        if actual_scrolled > 0 && !self.images.is_empty() {
+            if full_screen {
+                for img in &mut self.images {
+                    img.row -= actual_scrolled;
+                }
+                let min_row = -(self.scrollback.len() as isize);
+                self.images
+                    .retain(|img| img.row + (img.height_cells.max(1) as isize) > min_row);
+            } else {
+                let top_i = top as isize;
+                let bottom_i = bottom as isize;
+                self.images.retain_mut(|img| {
+                    if img.row >= top_i && img.row <= bottom_i {
+                        img.row -= actual_scrolled;
+                        img.row + (img.height_cells.max(1) as isize) > top_i
+                    } else {
+                        true
+                    }
+                });
+            }
+            self.images_dirty = true;
         }
-        self.images.retain(|img| img.row < self.rows + 100);
+        self.last_placeholder_pos = None;
     }
 
     pub fn scroll_down(&mut self, n: usize) {
@@ -1084,17 +1164,30 @@ impl ScreenBuffer {
     pub fn scroll_down_with_bg(&mut self, n: usize, bg: Color) {
         let (top, bottom) = self.scroll_region;
         let cols = self.cols;
+        let mut actual_scrolled: isize = 0;
         for _ in 0..n {
             let Some(mut row) = self.grid.remove(bottom) else {
                 break;
             };
             row.reuse_as_blank(cols, bg);
             self.grid.insert(top, row);
+            actual_scrolled += 1;
         }
 
-        for img in &mut self.images {
-            img.row = img.row.saturating_add(n);
+        if actual_scrolled > 0 && !self.images.is_empty() {
+            let top_i = top as isize;
+            let bottom_i = bottom as isize;
+            self.images.retain_mut(|img| {
+                if img.row >= top_i && img.row <= bottom_i {
+                    img.row += actual_scrolled;
+                    img.row <= bottom_i
+                } else {
+                    true
+                }
+            });
+            self.images_dirty = true;
         }
+        self.last_placeholder_pos = None;
     }
 
     /// Clean up any wide characters that would be split across the boundaries of `[start_col, end_col)`.
@@ -1173,8 +1266,29 @@ impl ScreenBuffer {
         hyperlink_id: Option<NonZeroU32>,
         auto_wrap: bool,
     ) {
-        let char_width = UnicodeWidthChar::width(c).unwrap_or(1);
+        let char_width = if c == KITTY_PLACEHOLDER_CHAR {
+            1
+        } else {
+            UnicodeWidthChar::width(c).unwrap_or(1)
+        };
         if char_width == 0 {
+            if let Some((pr, pc)) = self.last_placeholder_pos {
+                if let Some(diacritic_idx) = kitty_diacritic_index(c) {
+                    if let Some(row) = self.grid.get_mut(pr) {
+                        if let Some(cell) = row.cells.get_mut(pc) {
+                            if cell.c == KITTY_PLACEHOLDER_CHAR {
+                                let mut meta = cell
+                                    .hyperlink_id
+                                    .and_then(PlaceholderCellMeta::unpack)
+                                    .unwrap_or_else(PlaceholderCellMeta::empty);
+                                meta.push_diacritic(diacritic_idx);
+                                cell.hyperlink_id = Some(meta.pack());
+                                row.is_dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
             return;
         }
 
@@ -1211,6 +1325,12 @@ impl ScreenBuffer {
             actual_flags.insert(CellFlags::WIDE_CHAR);
         }
 
+        let cell_link_or_placeholder = if c == KITTY_PLACEHOLDER_CHAR {
+            Some(PlaceholderCellMeta::empty().pack())
+        } else {
+            hyperlink_id
+        };
+
         // Resolve the row once: this runs per printed character, and every
         // `self.grid[..]` is an index computation on the deque.
         let row = &mut self.grid[cur_row];
@@ -1220,8 +1340,14 @@ impl ScreenBuffer {
         cell.bg = bg;
         cell.flags = actual_flags;
         cell.underline_color_id = underline_color_id;
-        cell.hyperlink_id = hyperlink_id;
+        cell.hyperlink_id = cell_link_or_placeholder;
         row.is_dirty = true;
+
+        if c == KITTY_PLACEHOLDER_CHAR {
+            self.last_placeholder_pos = Some((cur_row, cur_col));
+        } else {
+            self.last_placeholder_pos = None;
+        }
 
         if char_width == 2 && cur_col + 1 < cols {
             let spacer_cell = &mut row.cells[cur_col + 1];
@@ -1372,11 +1498,22 @@ impl ScreenBuffer {
                 for r in 0..self.rows {
                     self.grid[r].clear(bg);
                 }
-                if mode == 3 {
+                if mode == 2 {
+                    let prev_len = self.images.len();
+                    self.images
+                        .retain(|img| img.row + (img.height_cells.max(1) as isize) <= 0);
+                    if self.images.len() != prev_len {
+                        self.images_dirty = true;
+                    }
+                } else {
                     self.scrollback.clear();
-                    self.images.clear();
+                    if !self.images.is_empty() {
+                        self.images.clear();
+                        self.images_dirty = true;
+                    }
                 }
                 self.cursor.pending_wrap = false;
+                self.last_placeholder_pos = None;
             }
             _ => {}
         }
@@ -1412,9 +1549,13 @@ impl ScreenBuffer {
     /// Clear both visible screen rows and scrollback history (`Cmd+K` behavior).
     pub fn clear_scrollback_and_screen(&mut self) {
         self.scrollback.clear();
-        self.images.clear();
+        if !self.images.is_empty() {
+            self.images.clear();
+            self.images_dirty = true;
+        }
         self.scroll_offset = 0;
         self.selection = None;
+        self.last_placeholder_pos = None;
         for r in 0..self.rows {
             self.grid[r].clear(Color::DefaultBg);
         }
@@ -1784,6 +1925,14 @@ pub struct ScreenGrid {
     pub underline_colors: Vec<Color>,
     pub underline_color_map: HashMap<Color, NonZeroU16>,
     pub next_image_id: u32,
+    pub cell_width_px: f32,
+    pub cell_height_px: f32,
+    pub kitty_images: HashMap<u32, StoredImage>,
+    pub kitty_number_to_id: HashMap<u32, u32>,
+    pub virtual_placements: HashMap<(u32, u32), VirtualPlacement>,
+    pub kitty_storage_bytes: usize,
+    pub kitty_seq: u64,
+    pub next_internal_kitty_id: u32,
 }
 
 impl ScreenGrid {
@@ -1798,7 +1947,166 @@ impl ScreenGrid {
             underline_colors: Vec::new(),
             underline_color_map: HashMap::new(),
             next_image_id: 1,
+            cell_width_px: 9.0,
+            cell_height_px: 18.0,
+            kitty_images: HashMap::new(),
+            kitty_number_to_id: HashMap::new(),
+            virtual_placements: HashMap::new(),
+            kitty_storage_bytes: 0,
+            kitty_seq: 0,
+            next_internal_kitty_id: 0x8000_0001,
         }
+    }
+
+    pub fn alloc_texture_id(&mut self) -> u32 {
+        let id = self.next_image_id;
+        self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+        id
+    }
+
+    pub fn alloc_internal_kitty_id(&mut self) -> u32 {
+        loop {
+            let id = self.next_internal_kitty_id;
+            self.next_internal_kitty_id = self
+                .next_internal_kitty_id
+                .checked_add(1)
+                .unwrap_or(0x8000_0001);
+            if id != 0 && !self.kitty_images.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    pub fn is_kitty_image_referenced(&self, image_id: u32) -> bool {
+        self.primary.images.iter().any(|p| p.image_id == image_id)
+            || self.alternate.images.iter().any(|p| p.image_id == image_id)
+            || self
+                .virtual_placements
+                .keys()
+                .any(|&(iid, _)| iid == image_id)
+    }
+
+    pub fn remove_stored_kitty_image(&mut self, image_id: u32) {
+        if let Some(removed) = self.kitty_images.remove(&image_id) {
+            self.kitty_storage_bytes = self.kitty_storage_bytes.saturating_sub(removed.byte_len());
+            if removed.image_number != 0
+                && self.kitty_number_to_id.get(&removed.image_number) == Some(&image_id)
+            {
+                self.kitty_number_to_id.remove(&removed.image_number);
+            }
+        }
+        self.virtual_placements
+            .retain(|&(iid, _), _| iid != image_id);
+    }
+
+    pub fn store_kitty_image(
+        &mut self,
+        image_id: u32,
+        image_number: u32,
+        width_px: u32,
+        height_px: u32,
+        rgba: Vec<u8>,
+    ) -> u32 {
+        if let Some(old) = self.kitty_images.remove(&image_id) {
+            self.kitty_storage_bytes = self.kitty_storage_bytes.saturating_sub(old.byte_len());
+        }
+
+        let texture_id = self.alloc_texture_id();
+        self.kitty_seq = self.kitty_seq.wrapping_add(1);
+        let rgba_arc = Arc::new(rgba);
+        let frame0 = AnimationFrame {
+            frame_number: 1,
+            rgba_data: Arc::clone(&rgba_arc),
+            gap_ms: 40,
+        };
+        let stored = StoredImage {
+            image_id,
+            image_number,
+            texture_id,
+            width_px,
+            height_px,
+            rgba_data: Arc::clone(&rgba_arc),
+            frames: vec![frame0],
+            active_frame: 0,
+            seq: self.kitty_seq,
+        };
+        let added_bytes = stored.byte_len();
+        self.kitty_storage_bytes = self.kitty_storage_bytes.saturating_add(added_bytes);
+        if image_number != 0 {
+            self.kitty_number_to_id.insert(image_number, image_id);
+        }
+        self.kitty_images.insert(image_id, stored);
+
+        // Refresh any live placements already referencing `image_id` so in-place image updates
+        // immediately upload the new texture to the GPU.
+        for buf in [&mut self.primary, &mut self.alternate] {
+            let mut updated = false;
+            for p in &mut buf.images {
+                if p.image_id == image_id {
+                    p.id = texture_id;
+                    p.width_px = width_px;
+                    p.height_px = height_px;
+                    p.src_rect = [0, 0, width_px, height_px];
+                    p.rgba_data = Arc::clone(&rgba_arc);
+                    updated = true;
+                }
+            }
+            if updated {
+                buf.images_dirty = true;
+            }
+        }
+
+        self.enforce_kitty_storage_quota(image_id);
+        texture_id
+    }
+
+    pub fn enforce_kitty_storage_quota(&mut self, protected_id: u32) {
+        if self.kitty_storage_bytes <= MAX_IMAGE_STORAGE_BYTES {
+            return;
+        }
+
+        // Evict oldest unreferenced images first, then oldest overall (excluding `protected_id`).
+        for pass in 0..2 {
+            if self.kitty_storage_bytes <= MAX_IMAGE_STORAGE_BYTES {
+                break;
+            }
+            let mut candidates: Vec<(u64, u32)> = self
+                .kitty_images
+                .values()
+                .filter(|img| {
+                    img.image_id != protected_id
+                        && (pass == 1 || !self.is_kitty_image_referenced(img.image_id))
+                })
+                .map(|img| (img.seq, img.image_id))
+                .collect();
+            candidates.sort_unstable_by_key(|&(seq, _)| seq);
+
+            for (_, victim_id) in candidates {
+                if self.kitty_storage_bytes <= MAX_IMAGE_STORAGE_BYTES {
+                    break;
+                }
+                self.primary.images.retain(|p| p.image_id != victim_id);
+                self.alternate.images.retain(|p| p.image_id != victim_id);
+                self.remove_stored_kitty_image(victim_id);
+            }
+        }
+    }
+
+    pub fn lookup_virtual_placement(
+        &self,
+        image_id: u32,
+        placement_id: u32,
+    ) -> Option<VirtualPlacement> {
+        self.virtual_placements
+            .get(&(image_id, placement_id))
+            .or_else(|| {
+                if placement_id != 0 {
+                    self.virtual_placements.get(&(image_id, 0))
+                } else {
+                    None
+                }
+            })
+            .copied()
     }
 
     pub fn register_underline_color(&mut self, color: Color) -> Option<NonZeroU16> {
@@ -1820,16 +2128,18 @@ impl ScreenGrid {
 
     pub fn register_hyperlink(&mut self, uri: &str) -> NonZeroU32 {
         let id = self.next_hyperlink_id;
-        // Saturate rather than wrap. Wrapping would eventually hand out 0, which is
-        // reserved as the `None` niche in `Cell::hyperlink_id`. Note that ids are not
-        // interned today, so a shell emitting the same URI repeatedly grows this table;
-        // saturating merely makes the degenerate case safe, not cheap.
-        self.next_hyperlink_id = self.next_hyperlink_id.checked_add(1).unwrap_or(id);
+        // Saturate below `PLACEHOLDER_META_TAG` (bit 31, reserved for Kitty Unicode placeholder
+        // tile metadata) rather than wrapping into 0 or colliding with placeholder tags.
+        let next_raw = (id.get() + 1).clamp(1, PLACEHOLDER_META_TAG - 1);
+        self.next_hyperlink_id = NonZeroU32::new(next_raw).unwrap_or(id);
         self.hyperlinks.insert(id, Arc::new(uri.to_string()));
         id
     }
 
     pub fn get_hyperlink(&self, id: NonZeroU32) -> Option<&str> {
+        if (id.get() & PLACEHOLDER_META_TAG) != 0 {
+            return None;
+        }
         self.hyperlinks.get(&id).map(|s| s.as_str())
     }
 
@@ -1858,17 +2168,27 @@ impl ScreenGrid {
         self.alternate.cursor.shape = shape;
     }
 
+    pub fn set_cell_pixel_size(&mut self, cell_w: f32, cell_h: f32) {
+        if cell_w > 0.0 && cell_h > 0.0 {
+            self.cell_width_px = cell_w;
+            self.cell_height_px = cell_h;
+        }
+    }
+
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.primary.resize(rows, cols);
         self.alternate.resize_no_reflow(rows, cols);
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.active().grid.iter().any(|r| r.is_dirty)
+        let active = self.active();
+        active.images_dirty || active.grid.iter().any(|r| r.is_dirty)
     }
 
     pub fn clear_dirty(&mut self) {
-        for row in &mut self.active_mut().grid {
+        let active = self.active_mut();
+        active.images_dirty = false;
+        for row in &mut active.grid {
             row.is_dirty = false;
         }
     }
