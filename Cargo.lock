@@ -2321,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "skterm-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2334,7 +2334,7 @@ dependencies = [
 
 [[package]]
 name = "skterm-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "skterm-gui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2374,7 +2374,7 @@ dependencies = [
 
 [[package]]
 name = "skterm-render"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ab_glyph",
  "anyhow",
