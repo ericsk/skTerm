@@ -193,6 +193,22 @@ impl App {
             }
         }
 
+        if let Some(pref) = &mut self.preferences_window {
+            if let Some(due) = pref.next_repaint_at {
+                if now >= due {
+                    pref.next_repaint_at = None;
+                    pref.is_occluded = false;
+                    pref.needs_redraw = true;
+                } else {
+                    arm(due);
+                }
+            }
+            if pref.needs_redraw && !pref.is_occluded {
+                pref.window.request_redraw();
+                arm(now);
+            }
+        }
+
         // 3. Debounced config auto-save. This is the only place that writes
         // config.toml while running, which is what keeps the file consistent.
         if self.pending_config_save {

@@ -166,7 +166,9 @@ impl App {
     }
 
     pub fn open_preferences_window(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(pref) = &self.preferences_window {
+        if let Some(pref) = &mut self.preferences_window {
+            pref.is_occluded = false;
+            pref.needs_redraw = true;
             pref.window.focus_window();
             pref.window.request_redraw();
             return;
@@ -176,8 +178,12 @@ impl App {
             event_loop,
             &self.config_manager.current_config,
         )) {
-            Ok(pref) => {
+            Ok(mut pref) => {
                 info!("Opened dedicated Preferences Window (ID: {:?})", pref.id());
+                pref.window.focus_window();
+                pref.egui_state.egui_input_mut().focused = pref.window.has_focus();
+                pref.needs_redraw = true;
+                pref.window.request_redraw();
                 self.preferences_window = Some(pref);
             }
             Err(e) => {
@@ -328,7 +334,8 @@ impl ApplicationHandler<AppEvent> for App {
                 self.execute_native_menu_action(event_loop, action);
             }
             AppEvent::UpdateStateChanged => {
-                if let Some(pref) = &self.preferences_window {
+                if let Some(pref) = &mut self.preferences_window {
+                    pref.needs_redraw = true;
                     pref.window.request_redraw();
                 }
             }
@@ -372,7 +379,24 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     WindowEvent::Resized(new_size) => {
                         pref.resize(new_size);
+                        pref.needs_redraw = true;
                         pref.window.request_redraw();
+                        return;
+                    }
+                    WindowEvent::ScaleFactorChanged { .. } => {
+                        let _ = pref.egui_state.on_window_event(&pref.window, &event);
+                        pref.resize(pref.window.inner_size());
+                        pref.needs_redraw = true;
+                        pref.window.request_redraw();
+                        return;
+                    }
+                    WindowEvent::Occluded(occluded) => {
+                        pref.is_occluded = occluded;
+                        if !occluded {
+                            pref.next_repaint_at = None;
+                            pref.needs_redraw = true;
+                            pref.window.request_redraw();
+                        }
                         return;
                     }
                     WindowEvent::RedrawRequested => {
@@ -393,6 +417,7 @@ impl ApplicationHandler<AppEvent> for App {
                     _ => {
                         let res = pref.egui_state.on_window_event(&pref.window, &event);
                         if res.repaint {
+                            pref.needs_redraw = true;
                             pref.window.request_redraw();
                         }
                         // No `check_changed` here on purpose. egui is immediate-mode:

@@ -175,7 +175,12 @@ impl App {
         crate::i18n::set_locale(new_locale);
         #[cfg(target_os = "macos")]
         crate::macos_menu::install_or_update_macos_menu(new_locale);
-        if let Some(pref_win) = &self.preferences_window {
+        if let Some(pref_win) = &mut self.preferences_window {
+            // If config was reloaded from disk (not from the prefs UI itself), sync the open form.
+            if !persist {
+                pref_win.load_from_config(new_cfg);
+            }
+            pref_win.needs_redraw = true;
             pref_win.window.request_redraw();
         }
 

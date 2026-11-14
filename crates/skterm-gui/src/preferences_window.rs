@@ -474,6 +474,11 @@ pub struct PreferencesWindow {
     pub active_category: PreferencesCategory,
     pub detected_fonts: Vec<String>,
     pub should_close: bool,
+    pub needs_redraw: bool,
+    pub is_occluded: bool,
+    pub has_presented_first_frame: bool,
+    pub initial_occlusion_retries: u8,
+    pub next_repaint_at: Option<std::time::Instant>,
     pub show_all_fonts: bool,
     pub show_manual_font_input: bool,
     pub show_ansi_palette: bool,
@@ -556,6 +561,29 @@ impl PreferencesWindow {
         let window = Arc::new(event_loop.create_window(window_attrs)?);
         crate::icon::apply_window_icon(&window);
 
+        #[cfg(target_os = "macos")]
+        {
+            use objc2::msg_send;
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = window.window_handle() {
+                if let RawWindowHandle::AppKit(appkit) = handle.as_raw() {
+                    let view_ptr = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
+                    if !view_ptr.is_null() {
+                        unsafe {
+                            let win_ptr: *mut objc2::runtime::AnyObject =
+                                msg_send![view_ptr, window];
+                            if !win_ptr.is_null() {
+                                // NSWindowTabbingModeDisallowed = 2: keep Preferences as a
+                                // standalone dialog even when macOS is set to "Always prefer tabs".
+                                let _: () = msg_send![win_ptr, setTabbingMode: 2isize];
+                                let _: () = msg_send![win_ptr, center];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window.clone())?;
 
@@ -583,11 +611,12 @@ impl PreferencesWindow {
         let height = size.height.max(1);
 
         let surface_caps = surface.get_capabilities(&adapter);
+        // egui-wgpu prefers non-sRGB (gamma-space) formats such as Bgra8Unorm / Rgba8Unorm.
         let surface_format = surface_caps
             .formats
             .iter()
             .copied()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
         let config = SurfaceConfiguration {
@@ -608,14 +637,16 @@ impl PreferencesWindow {
         Self::apply_macos_hig_theme(&egui_ctx);
 
         let scale = window.scale_factor() as f32;
-        let egui_state = egui_winit::State::new(
+        let max_texture_side = device.limits().max_texture_dimension_2d as usize;
+        let mut egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::viewport::ViewportId::ROOT,
             &window,
             Some(scale),
             None,
-            None,
+            Some(max_texture_side),
         );
+        egui_state.egui_input_mut().focused = window.has_focus();
 
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
@@ -637,6 +668,11 @@ impl PreferencesWindow {
             active_category: PreferencesCategory::Appearance,
             detected_fonts,
             should_close: false,
+            needs_redraw: true,
+            is_occluded: false,
+            has_presented_first_frame: false,
+            initial_occlusion_retries: 0,
+            next_repaint_at: None,
             show_all_fonts: false,
             show_manual_font_input: false,
             show_ansi_palette: false,
@@ -886,6 +922,58 @@ impl PreferencesWindow {
             self.window.set_title(expected_title);
         }
 
+        let cur_size = self.window.inner_size();
+        if cur_size.width == 0 || cur_size.height == 0 {
+            self.needs_redraw = false;
+            return self.check_changed(config_manager);
+        }
+        if cur_size.width != self.config.width || cur_size.height != self.config.height {
+            self.resize(cur_size);
+        }
+
+        // IMPORTANT: Acquire the GPU surface texture BEFORE calling `take_egui_input` / `run_ui`.
+        //
+        // On macOS with wgpu 30+, a newly created NSWindow reports `CurrentSurfaceTexture::Occluded`
+        // on its initial `drawRect:` before WindowServer finishes compositing it onscreen.
+        // Running `egui_ctx.run_ui` before acquiring the surface drains `Fonts::font_image_delta()`
+        // (`TextureId::Managed(0)`), and returning early on `Occluded` drops that initial
+        // `TexturesDelta` forever — causing `egui_wgpu` to skip 100% of draw calls ("Missing texture:
+        // Managed(0)") and leaving the Preferences window completely blank on all subsequent frames.
+        let (output, suboptimal) = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => (t, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => (t, true),
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                self.resize(self.window.inner_size());
+                self.needs_redraw = true;
+                self.window.request_redraw();
+                return self.check_changed(config_manager);
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.needs_redraw = false;
+                self.next_repaint_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(16));
+                return self.check_changed(config_manager);
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                self.is_occluded = true;
+                self.needs_redraw = false;
+                if !self.has_presented_first_frame && self.initial_occlusion_retries < 60 {
+                    self.initial_occlusion_retries += 1;
+                    self.next_repaint_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(16));
+                }
+                return self.check_changed(config_manager);
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                info!("Surface validation error in preferences window");
+                self.needs_redraw = false;
+                return self.check_changed(config_manager);
+            }
+        };
+
+        self.is_occluded = false;
+        self.needs_redraw = false;
+
         let raw_input = self.egui_state.take_egui_input(&self.window);
 
         let egui_ctx = self.egui_ctx.clone();
@@ -1072,18 +1160,23 @@ impl PreferencesWindow {
                 });
         });
 
+        if let Some(vp_out) = full_output
+            .viewport_output
+            .get(&egui::viewport::ViewportId::ROOT)
+        {
+            if vp_out.repaint_delay.is_zero() {
+                self.needs_redraw = true;
+                self.next_repaint_at = None;
+                self.window.request_redraw();
+            } else if vp_out.repaint_delay < std::time::Duration::from_secs(3600) {
+                self.next_repaint_at = std::time::Instant::now().checked_add(vp_out.repaint_delay);
+            } else {
+                self.next_repaint_at = None;
+            }
+        }
+
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
-
-        // Render to GPU surface
-        let output = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            other => {
-                info!("Surface status in preferences window: {:?}", other);
-                return self.check_changed(config_manager);
-            }
-        };
 
         let view = output
             .texture
@@ -1095,22 +1188,23 @@ impl PreferencesWindow {
             });
 
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [self.config.width, self.config.height],
-            pixels_per_point: self.window.scale_factor() as f32,
+            size_in_pixels: [output.texture.width(), output.texture.height()],
+            pixels_per_point: full_output.pixels_per_point,
         };
 
         let clipped_primitives = self
             .egui_ctx
             .tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
 
-        for (&id, deltas) in &full_output.textures_delta.set {
-            for delta in deltas {
+        let mut textures_delta = full_output.textures_delta;
+        for (id, deltas) in textures_delta.set.drain() {
+            for delta in &deltas {
                 self.egui_renderer
                     .update_texture(&self.device, &self.queue, id, delta);
             }
         }
 
-        self.egui_renderer.update_buffers(
+        let user_cmd_bufs = self.egui_renderer.update_buffers(
             &self.device,
             &self.queue,
             &mut encoder,
@@ -1128,9 +1222,9 @@ impl PreferencesWindow {
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.11,
-                                g: 0.11,
-                                b: 0.15,
+                                r: 28.0 / 255.0,
+                                g: 29.0 / 255.0,
+                                b: 38.0 / 255.0,
                                 a: 1.0,
                             }),
                             store: wgpu::StoreOp::Store,
@@ -1147,12 +1241,25 @@ impl PreferencesWindow {
                 .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
         }
 
-        for id in &full_output.textures_delta.free {
-            self.egui_renderer.free_texture(id);
+        for id in textures_delta.free.drain() {
+            self.egui_renderer.free_texture(&id);
         }
 
-        self.queue.submit(Some(encoder.finish()));
+        self.queue.submit(
+            user_cmd_bufs
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
         self.queue.present(output);
+
+        self.has_presented_first_frame = true;
+        self.initial_occlusion_retries = 0;
+
+        if suboptimal {
+            self.resize(self.window.inner_size());
+            self.needs_redraw = true;
+            self.window.request_redraw();
+        }
 
         self.check_changed(config_manager)
     }
@@ -5159,5 +5266,204 @@ fn translate_extra<'a>(
             ),
             _ => (en, en, en, en, en),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferences_wgpu_render_produces_visible_ui_after_initial_occlusion() {
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })) else {
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&DeviceDescriptor::default()))
+        else {
+            return;
+        };
+
+        let egui_ctx = Context::default();
+        crate::egui_fonts::setup_egui_cjk_fonts(&egui_ctx);
+        PreferencesWindow::apply_macos_hig_theme(&egui_ctx);
+
+        let format = wgpu::TextureFormat::Bgra8Unorm;
+        let mut egui_renderer =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+
+        // Frame 1: surface is `Occluded` BEFORE `run_ui`, so `run_ui` must not run yet.
+        // Frame 2: surface becomes visible (`Success`), `run_ui` runs and uploads `Managed(0)`.
+        let mut raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(820.0, 600.0),
+            )),
+            focused: true,
+            ..Default::default()
+        };
+        raw_input
+            .viewports
+            .entry(egui::viewport::ViewportId::ROOT)
+            .or_default()
+            .native_pixels_per_point = Some(2.0);
+
+        let full_output = egui_ctx.run_ui(raw_input, |ui| {
+            egui::Panel::left("pref_sidebar")
+                .exact_size(195.0)
+                .frame(
+                    Frame::new()
+                        .fill(Color32::from_rgb(22, 23, 30))
+                        .inner_margin(Margin::symmetric(14, 18)),
+                )
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("skTerm 偏好設定")
+                            .size(15.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                });
+
+            egui::CentralPanel::default()
+                .frame(
+                    Frame::new()
+                        .fill(Color32::from_rgb(28, 29, 38))
+                        .inner_margin(Margin::symmetric(26, 22)),
+                )
+                .show(ui, |ui| {
+                    let mut toggle = true;
+                    render_inset_card(ui, "外觀與字型", |b| {
+                        b.row("自動檢查更新", Some("啟動時檢查新版"), |ui| {
+                            render_macos_toggle_switch(ui, &mut toggle);
+                        });
+                    });
+                });
+        });
+
+        assert!(
+            full_output
+                .textures_delta
+                .set
+                .contains_key(&egui::TextureId::Managed(0)),
+            "Expected initial font/UI atlas delta on first visible frame"
+        );
+
+        let width = 1640u32;
+        let height = 1200u32;
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pref_test_target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [width, height],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+        let clipped = egui_ctx.tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
+
+        let mut textures_delta = full_output.textures_delta;
+        for (id, deltas) in textures_delta.set.drain() {
+            for delta in &deltas {
+                egui_renderer.update_texture(&device, &queue, id, delta);
+            }
+        }
+        egui_renderer.update_buffers(&device, &queue, &mut encoder, &clipped, &screen_descriptor);
+        {
+            let mut rpass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 1.0,
+                                b: 0.0,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            egui_renderer.render(&mut rpass, &clipped, &screen_descriptor);
+        }
+        for id in textures_delta.free.drain() {
+            egui_renderer.free_texture(&id);
+        }
+
+        let bytes_per_row = (width * 4).div_ceil(256) * 256;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (bytes_per_row * height) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range().unwrap();
+        let mut distinct_colors = std::collections::HashSet::new();
+        for y in (0..height as usize).step_by(4) {
+            let row =
+                &data[y * bytes_per_row as usize..y * bytes_per_row as usize + width as usize * 4];
+            for x in (0..width as usize).step_by(4) {
+                let off = x * 4;
+                distinct_colors.insert([row[off], row[off + 1], row[off + 2]]);
+            }
+        }
+        // Sidebar, central panel, card background, toggle switch green, white text -> many colors
+        assert!(
+            distinct_colors.len() >= 5,
+            "Expected rich rendered Preferences UI colors, got only {:?}",
+            distinct_colors
+        );
     }
 }

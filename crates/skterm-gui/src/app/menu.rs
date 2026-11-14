@@ -720,6 +720,7 @@ impl App {
                     if let Some(pref) = &mut self.preferences_window {
                         pref.egui_ctx
                             .input_mut(|i| i.events.push(egui::Event::Copy));
+                        pref.needs_redraw = true;
                         pref.window.request_redraw();
                     }
                     return;
@@ -732,6 +733,7 @@ impl App {
                     if let (Some(pref), Some(text)) = (&mut self.preferences_window, pasted) {
                         pref.egui_ctx
                             .input_mut(|i| i.events.push(egui::Event::Paste(text)));
+                        pref.needs_redraw = true;
                         pref.window.request_redraw();
                     }
                     return;
@@ -747,6 +749,7 @@ impl App {
                                 modifiers: egui::Modifiers::COMMAND,
                             });
                         });
+                        pref.needs_redraw = true;
                         pref.window.request_redraw();
                     }
                     return;
