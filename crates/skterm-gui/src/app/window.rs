@@ -126,6 +126,12 @@ impl App {
         let est_h = (init_rows * font_size_pt * line_height + pad_y * 2.0).ceil() as f64;
 
         let mut window_attrs = WindowAttributes::default().with_title("skTerm");
+        #[cfg(target_os = "windows")]
+        {
+            // Keep the Win32 window hidden until the GPU renderer, final
+            // geometry, and initial themed frame are ready.
+            window_attrs = window_attrs.with_visible(false);
+        }
         if let Some((phys_size, _, _)) = existing_geometry {
             window_attrs = window_attrs.with_inner_size(phys_size);
         } else {
@@ -251,6 +257,7 @@ impl App {
             center_window_on_screen(&window, event_loop);
         }
 
+        #[cfg(not(target_os = "windows"))]
         if existing_geometry.is_none() {
             match self
                 .config_manager
@@ -343,6 +350,39 @@ impl App {
         self.sessions.insert(window_id, session);
         self.session_order.push(window_id);
         self.active_session_id = Some(window_id);
+
+        #[cfg(target_os = "windows")]
+        {
+            // Sync pane sizes using the active session's real tab bar height and
+            // present an initial themed frame before revealing the Win32 window so
+            // DWM never flashes an unpainted background or intermediate size.
+            let actual_tab_bar_h = self.get_tab_bar_height();
+            if let Some(session) = self.sessions.get_mut(&window_id) {
+                session.sync_all_pane_sizes(actual_tab_bar_h);
+            }
+            self.handle_redraw_requested(window_id, actual_tab_bar_h);
+            if let Some(session) = self.sessions.get_mut(&window_id) {
+                session.is_occluded = false;
+                session.window.set_visible(true);
+                if existing_geometry.is_none() {
+                    match self
+                        .config_manager
+                        .current_config
+                        .window
+                        .startup_mode
+                        .as_str()
+                    {
+                        "maximized" => session.window.set_maximized(true),
+                        "fullscreen" => session
+                            .window
+                            .set_fullscreen(Some(Fullscreen::Borderless(None))),
+                        _ => {}
+                    }
+                }
+                session.window.request_redraw();
+            }
+        }
+
         if existing_geometry.is_none() {
             self.record_session_window_position(window_id);
         }

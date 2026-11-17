@@ -29,9 +29,43 @@ pub fn open_url_in_browser(url: &str) -> anyhow::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn()?;
+        if url.contains('\0') {
+            anyhow::bail!("URL contains invalid NUL byte");
+        }
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: isize,
+                lpOperation: *const u16,
+                lpFile: *const u16,
+                lpParameters: *const u16,
+                lpDirectory: *const u16,
+                nShowCmd: i32,
+            ) -> isize;
+        }
+        const SW_SHOWNORMAL: i32 = 1;
+        let op: Vec<u16> = std::ffi::OsStr::new("open")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let target: Vec<u16> = std::ffi::OsStr::new(url)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let ret = unsafe {
+            ShellExecuteW(
+                0,
+                op.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if ret <= 32 {
+            anyhow::bail!("ShellExecuteW failed to open URL (code {})", ret);
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

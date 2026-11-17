@@ -348,12 +348,13 @@ impl ApplicationHandler<AppEvent> for App {
 
         if self.sessions.is_empty() {
             crate::updater::cleanup_old_executable_on_startup();
-            if self.config_manager.current_config.window.auto_check_updates {
-                crate::updater::trigger_check_for_updates(false);
-            }
             if let Err(e) = self.create_terminal_session(event_loop) {
                 error!("Failed to create initial terminal window: {:?}", e);
                 event_loop.exit();
+                return;
+            }
+            if self.config_manager.current_config.window.auto_check_updates {
+                crate::updater::trigger_check_for_updates(false);
             }
         }
     }

@@ -9,7 +9,7 @@ use crate::app::AppEvent;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use tracing::{error, info, warn};
 use winit::event_loop::EventLoopProxy;
@@ -786,8 +786,21 @@ pub fn replace_macos_app_bundle_in_place(
 // Network & Archive Execution Helpers
 // ============================================================================
 
+/// Build a `Command` that executes silently without spawning a console window on Windows.
+fn background_command(program: &str) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 fn fetch_url_text(url: &str) -> Result<String, String> {
-    let output = Command::new("curl")
+    let output = background_command("curl")
         .args([
             "-fsSL",
             "--max-time",
@@ -814,9 +827,9 @@ fn fetch_url_text(url: &str) -> Result<String, String> {
 }
 
 fn download_url_to_file(url: &str, dest: &Path) -> Result<(), String> {
-    let status = Command::new("curl")
+    let status = background_command("curl")
         .args([
-            "-fL",
+            "-fsSL",
             "--max-time",
             "180",
             "-H",
@@ -825,6 +838,9 @@ fn download_url_to_file(url: &str, dest: &Path) -> Result<(), String> {
         ])
         .arg(dest)
         .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map_err(|e| format!("無法執行 curl 下載更新檔: {}", e))?;
 
@@ -1075,11 +1091,14 @@ fn install_downloaded_archive(
     }
 
     if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip") {
-        let status = Command::new("tar")
+        let status = background_command("tar")
             .arg("-xf")
             .arg(archive_path)
             .arg("-C")
             .arg(&extract_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map_err(|e| format!("無法執行 tar 解壓縮: {}", e))?;
         if !status.success() {
