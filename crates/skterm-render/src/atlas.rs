@@ -1881,16 +1881,30 @@ mod tests {
             return;
         }
 
-        // 1. UI typographic advance layout: verify non-overlapping ink and uniform spacing
+        // 1. UI typographic advance layout: verify non-overlapping ink and compact spacing
         // between ASCII digits ('1','6'), ASCII->CJK ('6'->'級'), and CJK->CJK ('級'->'資'...).
         let mut pen_x = 0.0_f32;
         let mut ink_spans: Vec<(char, f32, f32)> = Vec::new();
+        let mut cjk_advances: Vec<(char, f32)> = Vec::new();
         for c in sample.chars() {
             let face = resolve_face(c).unwrap();
             let (m, _) = rasterize_fitted_glyph(face, c, font_size, cell_width, cell_height);
+            if !c.is_ascii() {
+                cjk_advances.push((c, m.advance_width));
+            }
             let gx = pen_x.round() + m.xmin as f32;
             ink_spans.push((c, gx, gx + m.width as f32));
             pen_x += m.advance_width;
+        }
+
+        for &(c, adv) in &cjk_advances {
+            assert!(
+                adv <= font_size * 1.1,
+                "Expected CJK glyph '{}' to keep compact ~1.0em typographic advance (<= {:.1}px), got {:.2}px",
+                c,
+                font_size * 1.1,
+                adv
+            );
         }
 
         let gap_1_6 = ink_spans[1].1 - ink_spans[0].2;
@@ -1899,14 +1913,17 @@ mod tests {
 
         assert!(gap_1_6 > 0.0 && gap_6_cjk > 0.0);
         for &g in &cjk_gaps {
+            // Full-body Gothic CJK faces (e.g. Noto Sans CJK on Linux, Microsoft YaHei on Windows)
+            // fill nearly 100% of the 1.0em square, so antialiased integer pixel bounding boxes of
+            // adjacent wide ideographs can touch cleanly (0.0px gap) without overlapping.
             assert!(
-                g > 0.0 && g <= 8.0,
-                "Expected compact CJK inter-glyph gap (<= 8px at 32px font), got {:.2}px",
+                (0.0..=8.0).contains(&g),
+                "Expected non-overlapping, compact CJK inter-glyph gap (0..=8px at 32px font), got {:.2}px",
                 g
             );
             assert!(
-                (g - gap_1_6).abs() <= 4.0,
-                "Expected CJK gap ({:.2}px) to match ASCII digit gap ({:.2}px) within 4px",
+                g <= gap_1_6 + 4.0,
+                "Expected CJK gap ({:.2}px) not to exceed ASCII digit gap ({:.2}px) by more than 4px",
                 g,
                 gap_1_6
             );

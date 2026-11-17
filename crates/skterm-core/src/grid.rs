@@ -1478,15 +1478,15 @@ impl ScreenBuffer {
                 let row = &mut self.grid[cur_row];
                 row.cells[cur_col..].fill(Cell::blank(bg));
                 row.is_dirty = true;
-                for r in (cur_row + 1)..self.rows {
-                    self.grid[r].clear(bg);
+                for row in self.grid.iter_mut().skip(cur_row + 1) {
+                    row.clear(bg);
                 }
             }
             1 => {
                 let cur_row = self.cursor.row;
                 let cur_col = self.cursor.col;
-                for r in 0..cur_row {
-                    self.grid[r].clear(bg);
+                for row in self.grid.iter_mut().take(cur_row) {
+                    row.clear(bg);
                 }
                 let end = cur_col.min(self.cols.saturating_sub(1));
                 self.clear_split_wide_chars(cur_row, 0, end + 1);
@@ -1495,8 +1495,8 @@ impl ScreenBuffer {
                 row.is_dirty = true;
             }
             2 | 3 => {
-                for r in 0..self.rows {
-                    self.grid[r].clear(bg);
+                for row in &mut self.grid {
+                    row.clear(bg);
                 }
                 if mode == 2 {
                     let prev_len = self.images.len();
@@ -1556,8 +1556,8 @@ impl ScreenBuffer {
         self.scroll_offset = 0;
         self.selection = None;
         self.last_placeholder_pos = None;
-        for r in 0..self.rows {
-            self.grid[r].clear(Color::DefaultBg);
+        for row in &mut self.grid {
+            row.clear(Color::DefaultBg);
         }
         self.cursor.row = 0;
         self.cursor.col = 0;

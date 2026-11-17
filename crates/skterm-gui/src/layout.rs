@@ -1570,8 +1570,9 @@ impl ProcessTreeCache {
         self.cwd_cache.clear();
 
         // On Linux, `find_agent_descendant` walks `/proc/<pid>/task/*/children` directly
-        // in microseconds without spawning `ps` or touching unrelated system processes.
-        #[cfg(target_os = "linux")]
+        // in microseconds without spawning `ps` or touching unrelated system processes;
+        // on Windows, `is_first_refresh` is unused as well.
+        #[cfg(not(all(unix, not(target_os = "linux"))))]
         {
             let _ = is_first_refresh;
         }

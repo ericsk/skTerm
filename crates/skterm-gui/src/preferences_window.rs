@@ -794,8 +794,8 @@ impl PreferencesWindow {
         self.cursor_override = config.colors.cursor.clone().unwrap_or_default();
         self.selection_override = config.colors.selection.clone().unwrap_or_default();
         if let Some(pal) = &config.colors.palette {
-            for idx in 0..16 {
-                self.palette_overrides[idx] = pal
+            for (idx, slot) in self.palette_overrides.iter_mut().enumerate() {
+                *slot = pal
                     .get_index(idx)
                     .map(|s| s.to_string())
                     .unwrap_or_default();

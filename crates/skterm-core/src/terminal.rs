@@ -422,21 +422,24 @@ impl Terminal {
             }
         }
 
-        let candidates = [self.foreground_process_group_id(), self.process_id()];
-        for pid in candidates.into_iter().flatten() {
-            #[cfg(target_os = "macos")]
-            {
-                if let Some(path) = crate::pty::process_cwd(pid as libc::pid_t) {
-                    if std::path::Path::new(&path).exists() {
-                        return Some(path);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let candidates = [self.foreground_process_group_id(), self.process_id()];
+            for pid in candidates.into_iter().flatten() {
+                #[cfg(target_os = "macos")]
+                {
+                    if let Some(path) = crate::pty::process_cwd(pid as libc::pid_t) {
+                        if std::path::Path::new(&path).exists() {
+                            return Some(path);
+                        }
                     }
                 }
-            }
-            #[cfg(target_os = "linux")]
-            {
-                if let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", pid)) {
-                    if path.exists() {
-                        return Some(path.to_string_lossy().into_owned());
+                #[cfg(target_os = "linux")]
+                {
+                    if let Ok(path) = std::fs::read_link(format!("/proc/{}/cwd", pid)) {
+                        if path.exists() {
+                            return Some(path.to_string_lossy().into_owned());
+                        }
                     }
                 }
             }
