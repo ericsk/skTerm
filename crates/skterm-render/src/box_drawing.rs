@@ -24,11 +24,7 @@ pub fn draw_custom_block_or_box_char(
         return true;
     }
 
-    if (0x2500..=0x257F).contains(&code) && draw_box_drawing(code, x, y, w, h, color, instances) {
-        return true;
-    }
-
-    false
+    (0x2500..=0x257F).contains(&code) && draw_box_drawing(code, x, y, w, h, color, instances)
 }
 
 fn push_rect(instances: &mut Vec<BgInstance>, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
