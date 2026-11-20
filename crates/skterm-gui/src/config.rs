@@ -180,6 +180,12 @@ pub struct TerminalConfig {
     pub bell: String,
     #[serde(default = "default_right_click_action")]
     pub right_click_action: String,
+    #[serde(default = "default_osc52")]
+    pub osc52: String,
+    #[serde(default = "default_shell_integration")]
+    pub shell_integration: bool,
+    #[serde(default = "default_semantic_prompt_marks")]
+    pub semantic_prompt_marks: bool,
 }
 
 fn default_term() -> String {
@@ -197,6 +203,15 @@ fn default_bell() -> String {
 fn default_right_click_action() -> String {
     "menu".to_string()
 }
+fn default_osc52() -> String {
+    "write-only".to_string()
+}
+fn default_shell_integration() -> bool {
+    true
+}
+fn default_semantic_prompt_marks() -> bool {
+    true
+}
 
 impl Default for TerminalConfig {
     fn default() -> Self {
@@ -209,6 +224,9 @@ impl Default for TerminalConfig {
             option_as_alt: default_option_as_alt(),
             bell: default_bell(),
             right_click_action: default_right_click_action(),
+            osc52: default_osc52(),
+            shell_integration: default_shell_integration(),
+            semantic_prompt_marks: default_semantic_prompt_marks(),
         }
     }
 }
@@ -893,6 +911,15 @@ bell = "visual"
 # 滑鼠右鍵行為 ("menu": 開啟快捷選單 [Shift+右鍵貼上], "paste": 直接貼上 [Shift+右鍵開選單])
 right_click_action = "menu"
 
+# OSC 52 剪貼簿權限 ("write-only": 允許寫入與清空但禁止讀取, "read-write": 允許讀寫, "disabled": 停用)
+osc52 = "write-only"
+
+# 自動注入 zsh / bash / fish Shell 語意整合 (OSC 133 提示符跳轉與 OSC 7 目錄同步)
+shell_integration = true
+
+# 在左側邊距顯示提示符狀態細標記 (成功淡色 / 非零退出碼紅色)
+semantic_prompt_marks = true
+
 
 [colors]
 # 內建色彩主題名稱
@@ -1024,6 +1051,15 @@ bell = "visual"
 
 # 滑鼠右鍵行為 ("menu": 開啟快捷選單 [Shift+右鍵貼上], "paste": 直接貼上 [Shift+右鍵開選單])
 right_click_action = "menu"
+
+# OSC 52 剪貼簿權限 ("write-only": 允許寫入與清空但禁止讀取, "read-write": 允許讀寫, "disabled": 停用)
+osc52 = "write-only"
+
+# 自動注入 zsh / bash / fish Shell 語意整合 (OSC 133 提示符跳轉與 OSC 7 目錄同步)
+shell_integration = true
+
+# 在左側邊距顯示提示符狀態細標記 (成功淡色 / 非零退出碼紅色)
+semantic_prompt_marks = true
 
 
 [colors]

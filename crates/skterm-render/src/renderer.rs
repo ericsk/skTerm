@@ -349,12 +349,17 @@ pub struct PaneRenderItem<'a> {
     pub dynamic_fg: Option<(u8, u8, u8)>,
     pub dynamic_bg: Option<(u8, u8, u8)>,
     pub dynamic_cursor: Option<(u8, u8, u8)>,
+    pub dynamic_selection_bg: Option<(u8, u8, u8)>,
+    pub dynamic_selection_fg: Option<(u8, u8, u8)>,
+    pub progress: Option<skterm_core::TerminalProgress>,
+    pub show_prompt_marks: bool,
 }
 
 /// Render descriptor for a tab item in the tab bar
 pub struct TabItem {
     pub title: String,
     pub is_active: bool,
+    pub progress: Option<skterm_core::TerminalProgress>,
 }
 
 /// Lifecycle status of an AI Agent displayed in the global agents sidebar.
@@ -503,6 +508,8 @@ pub struct AgentPanelState<'a> {
     pub ai_btn_hovered: bool,
     /// Whether the pointer is hovering over the `[⚙]` preferences button.
     pub prefs_btn_hovered: bool,
+    /// Optional active `(title, body)` notification toast banner (`OSC 9` / `99` / `777`).
+    pub toast: Option<(&'a str, &'a str)>,
 }
 
 impl AgentPanelState<'_> {
@@ -516,6 +523,7 @@ impl AgentPanelState<'_> {
             show_floating_top_right: false,
             ai_btn_hovered: false,
             prefs_btn_hovered: false,
+            toast: None,
         }
     }
 }
@@ -718,6 +726,27 @@ pub fn clip_image_quad_to_bounds(
     let cv1 = v0 + dv * ((y1 - y) / h);
 
     Some(([x0, y0, x1 - x0, y1 - y0], [cu0, cv0, cu1, cv1]))
+}
+
+/// Compute `(seg_x, seg_w, rgba_color)` for an `OSC 9;4` progress bar inside `[x, x + avail_w]`.
+#[inline]
+pub fn progress_bar_segment(
+    prog: skterm_core::TerminalProgress,
+    x: f32,
+    avail_w: f32,
+) -> (f32, f32, [f32; 4]) {
+    use skterm_core::ProgressState;
+    let frac = (prog.percent.min(100) as f32) / 100.0;
+    match prog.state {
+        ProgressState::Normal => (x, (avail_w * frac).max(2.0), [0.25, 0.62, 1.0, 0.95]),
+        ProgressState::Error => (x, (avail_w * frac).max(2.0), [0.95, 0.28, 0.30, 0.95]),
+        ProgressState::Paused => (x, (avail_w * frac).max(2.0), [0.96, 0.72, 0.18, 0.95]),
+        ProgressState::Indeterminate => (
+            x + avail_w * 0.32,
+            (avail_w * 0.36).max(4.0),
+            [0.35, 0.68, 1.0, 0.92],
+        ),
+    }
 }
 
 pub struct TermRenderer {
@@ -2056,6 +2085,25 @@ impl TermRenderer {
                     text_color,
                     false,
                 );
+
+                // Tab-level `OSC 9;4` progress underline along bottom of capsule
+                if let Some(prog) = tab.progress {
+                    let bar_h = (2.0 * scale).max(1.0);
+                    let bar_x = tab_x + 3.0 * scale;
+                    let bar_y = tab_y + tab_h - bar_h;
+                    let bar_avail = (tab_w - 6.0 * scale).max(2.0);
+                    bg_instances.push(BgInstance {
+                        rect: [bar_x, bar_y, bar_avail, bar_h],
+                        color: [1.0, 1.0, 1.0, 0.10],
+                    });
+                    let (seg_x, seg_w, seg_color) = progress_bar_segment(prog, bar_x, bar_avail);
+                    if seg_w > 0.0 {
+                        bg_instances.push(BgInstance {
+                            rect: [seg_x, bar_y, seg_w, bar_h],
+                            color: seg_color,
+                        });
+                    }
+                }
             }
 
             // 2.3 New Tab "+" Button
@@ -2163,6 +2211,19 @@ impl TermRenderer {
                     self.theme.cursor_color[3],
                 ];
             }
+            if let Some((r, g, b)) = pane.dynamic_selection_bg {
+                let sel_alpha = if pane.dynamic_selection_fg.is_some() {
+                    0.92
+                } else {
+                    0.72
+                };
+                pane_theme.selection_color = [
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                    sel_alpha,
+                ];
+            }
 
             bg_instances.push(BgInstance {
                 rect: [px, py, pw, ph],
@@ -2259,6 +2320,29 @@ impl TermRenderer {
                     break;
                 }
                 let global_row = top_global_row + r_idx;
+
+                // Subtle left-margin semantic prompt mark (`OSC 133` / `OSC 633`)
+                if pane.show_prompt_marks && !pane.grid.is_alternate && self.padding_x >= 3.0 {
+                    if let Some(mark) = active_buf.prompt_mark_at_visible_row(r_idx) {
+                        let mark_w = (2.0 * scale).max(1.0);
+                        let mark_x = px + (2.0 * scale).min((self.padding_x - mark_w).max(0.5));
+                        let mark_pad_y = (2.0 * scale).min(cell_h * 0.2);
+                        let mark_color = match mark.exit_code {
+                            Some(code) if code != 0 => [0.95, 0.30, 0.32, 0.88],
+                            Some(0) => [0.30, 0.80, 0.52, 0.55],
+                            _ => [0.48, 0.56, 0.72, 0.45],
+                        };
+                        bg_instances.push(BgInstance {
+                            rect: [
+                                mark_x,
+                                y + mark_pad_y,
+                                mark_w,
+                                (cell_h - mark_pad_y * 2.0).max(2.0),
+                            ],
+                            color: mark_color,
+                        });
+                    }
+                }
 
                 if let Some(row) = active_buf.get_visible_row(r_idx) {
                     // `ScreenBuffer::search` emits matches in ascending `global_row`
@@ -2404,6 +2488,10 @@ impl TermRenderer {
                                 rect: [x, y, cell_w, cell_h],
                                 color: pane_theme.selection_color,
                             });
+                            if let Some((sr, sg, sb)) = pane.dynamic_selection_fg {
+                                fg_rgba =
+                                    [sr as f32 / 255.0, sg as f32 / 255.0, sb as f32 / 255.0, 1.0];
+                            }
                         }
 
                         if !cell.flags.contains(CellFlags::HIDDEN) {
@@ -2919,6 +3007,22 @@ impl TermRenderer {
                     }
                 }
             }
+
+            // Per-pane `OSC 9;4` top progress bar (2px sleek strip along pane top edge)
+            if let Some(prog) = pane.progress {
+                let bar_h = (2.0 * scale).max(1.0);
+                bg_instances.push(BgInstance {
+                    rect: [px, py, pw, bar_h],
+                    color: [1.0, 1.0, 1.0, 0.10],
+                });
+                let (seg_x, seg_w, seg_color) = progress_bar_segment(prog, px, pw);
+                if seg_w > 0.0 {
+                    bg_instances.push(BgInstance {
+                        rect: [seg_x, py, seg_w, bar_h],
+                        color: seg_color,
+                    });
+                }
+            }
         }
 
         let normal_bg_len = bg_instances.len();
@@ -2971,6 +3075,72 @@ impl TermRenderer {
                     bar_y + 6.0 * scale,
                     bar_w - 16.0 * scale,
                     [0.96, 0.97, 1.0, 1.0],
+                    false,
+                );
+            }
+        }
+
+        // Floating Notification Toast Overlay (`OSC 9` / `OSC 99` / `OSC 777`)
+        if let Some((toast_title, toast_body)) = panel_state.toast {
+            let main_w = if sidebar_open {
+                (screen_w - panel_state.width_px).max(120.0)
+            } else {
+                screen_w
+            };
+            let title_w = self.measure_text_width(toast_title, true);
+            let body_w = self.measure_text_width(toast_body, false);
+            let desired_w = title_w.max(body_w) + 28.0 * scale;
+            let toast_w = desired_w.clamp(
+                220.0 * scale,
+                (main_w - 28.0 * scale).clamp(160.0, 380.0 * scale),
+            );
+            let has_body = !toast_body.is_empty();
+            let toast_h = if has_body {
+                cell_h * 2.0 + 18.0 * scale
+            } else {
+                cell_h + 14.0 * scale
+            };
+            let toast_x = (main_w - toast_w - 14.0 * scale).max(6.0 * scale);
+            let toast_y = tab_bar_h + 10.0 * scale;
+
+            // Drop shadow + dark glass body + left accent bar
+            bg_instances.push(BgInstance {
+                rect: [
+                    toast_x - 2.0 * scale,
+                    toast_y + 2.0 * scale,
+                    toast_w + 4.0 * scale,
+                    toast_h + 2.0 * scale,
+                ],
+                color: [0.0, 0.0, 0.0, 0.42],
+            });
+            bg_instances.push(BgInstance {
+                rect: [toast_x, toast_y, toast_w, toast_h],
+                color: [0.11, 0.13, 0.19, 0.96],
+            });
+            bg_instances.push(BgInstance {
+                rect: [toast_x, toast_y, (3.0 * scale).max(2.0), toast_h],
+                color: [0.25, 0.62, 1.0, 0.98],
+            });
+
+            let text_x = toast_x + 12.0 * scale;
+            let max_text_w = (toast_w - 20.0 * scale).max(40.0);
+            self.draw_text_line_ellipsized(
+                &mut glyph_instances,
+                toast_title,
+                text_x,
+                toast_y + 6.0 * scale,
+                max_text_w,
+                [0.97, 0.98, 1.0, 1.0],
+                true,
+            );
+            if has_body {
+                self.draw_text_line_ellipsized(
+                    &mut glyph_instances,
+                    toast_body,
+                    text_x,
+                    toast_y + cell_h + 10.0 * scale,
+                    max_text_w,
+                    [0.76, 0.80, 0.88, 1.0],
                     false,
                 );
             }

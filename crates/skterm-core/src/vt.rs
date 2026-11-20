@@ -1,11 +1,14 @@
-//! VT100, xterm, 24-bit TrueColor ANSI, Sixel, and Kitty Graphics escape sequence handler.
+//! VT100, xterm, 24-bit TrueColor ANSI, Sixel, Kitty Graphics, and OSC 1337 escape sequence handler.
 
 use crate::graphics::{
-    composite_rgba_patch, decode_kitty_pixels, load_transmission_payload, AnimationFrame,
-    GraphicImage, KittyControlParams, KittyGraphicsParser, KittyParseStep, SixelDecoder,
-    VirtualPlacement,
+    composite_rgba_patch, decode_b64_flexible, decode_kitty_pixels, load_transmission_payload,
+    AnimationFrame, GraphicImage, KittyControlParams, KittyGraphicsParser, KittyParseStep,
+    Osc1337Action, Osc1337FileParams, Osc1337Parser, SixelDecoder, VirtualPlacement,
 };
-use crate::grid::{CellFlags, Color, CursorShape, NamedColor, SavedCursor, ScreenGrid};
+use crate::grid::{
+    CellFlags, Color, CursorShape, NamedColor, PointerShape, ProgressState, SavedCursor,
+    ScreenGrid, SemanticZone, TerminalProgress,
+};
 use std::collections::HashMap;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::Arc;
@@ -154,6 +157,44 @@ pub struct ProgramStatusRecord {
     pub seq: u64,
 }
 
+/// Clipboard operation requested by `OSC 52` or `OSC 1337;Copy=...`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardRequest {
+    /// Set clipboard contents to decoded UTF-8 string.
+    Write(String),
+    /// Clear clipboard contents (`OSC 52 ; c ; `).
+    Clear,
+    /// Query current clipboard contents (`OSC 52 ; <selection> ; ?`).
+    Query {
+        selection: String,
+        bell_terminated: bool,
+    },
+}
+
+/// Desktop / Toast notification emitted via `OSC 9`, `OSC 99`, or `OSC 777`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalNotification {
+    pub id: Option<String>,
+    pub title: String,
+    pub body: String,
+    /// `true` when `OSC 99` explicitly specifies `o=always` (display even when focused).
+    pub force_when_focused: bool,
+    /// `true` when `OSC 99` specifies `o=invisible` (display only when occluded or background tab).
+    pub only_when_invisible: bool,
+    /// `true` when urgency is critical (`u=2`).
+    pub urgent: bool,
+}
+
+/// In-flight multi-chunk `OSC 99` (`d=0`) notification draft.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Osc99Draft {
+    pub title: String,
+    pub body: String,
+    pub force_when_focused: bool,
+    pub only_when_invisible: bool,
+    pub urgent: bool,
+}
+
 /// Terminal state engine combining ScreenGrid and VTE event handlers.
 #[derive(Debug, Clone)]
 pub struct TerminalState {
@@ -167,6 +208,9 @@ pub struct TerminalState {
     pub current_hyperlink_id: Option<NonZeroU32>,
     pub title: String,
     pub title_stack: Vec<String>,
+    /// Explicit tab / icon title set via `OSC 1;<title>` (`None` when unset or cleared).
+    pub icon_title: Option<String>,
+    pub icon_title_stack: Vec<Option<String>>,
     pub application_cursor_keys: bool,
     pub bracketed_paste: bool,
     pub auto_wrap: bool,
@@ -180,6 +224,11 @@ pub struct TerminalState {
     pub dynamic_fg: Option<(u8, u8, u8)>,
     pub dynamic_bg: Option<(u8, u8, u8)>,
     pub dynamic_cursor: Option<(u8, u8, u8)>,
+    pub dynamic_selection_bg: Option<(u8, u8, u8)>,
+    pub dynamic_selection_fg: Option<(u8, u8, u8)>,
+    pub pointer_shape: PointerShape,
+    pub pointer_shape_stack: Vec<PointerShape>,
+    pub progress: Option<TerminalProgress>,
     pub mouse_protocol: MouseProtocol,
     pub mouse_format: MouseFormat,
     pub in_sixel: bool,
@@ -187,9 +236,15 @@ pub struct TerminalState {
     pub dcs_mode: DcsMode,
     pub dcs_buffer: Vec<u8>,
     pub kitty_parser: KittyGraphicsParser,
+    pub osc1337_parser: Osc1337Parser,
     pub insert_mode: bool,
     pub current_working_directory: Option<String>,
+    pub current_document_url: Option<String>,
     pub pending_clipboard: Option<String>,
+    pub pending_clipboard_requests: Vec<ClipboardRequest>,
+    pub pending_notifications: Vec<TerminalNotification>,
+    pub pending_user_attention: Option<bool>,
+    pub osc99_drafts: HashMap<String, Osc99Draft>,
     pub pending_responses: Vec<u8>,
     pub last_printed_char: Option<char>,
     pub g0_charset: Charset,
@@ -213,6 +268,8 @@ impl TerminalState {
             current_hyperlink_id: None,
             title: String::from("skTerm"),
             title_stack: Vec::new(),
+            icon_title: None,
+            icon_title_stack: Vec::new(),
             application_cursor_keys: false,
             bracketed_paste: false,
             auto_wrap: true,
@@ -226,6 +283,11 @@ impl TerminalState {
             dynamic_fg: None,
             dynamic_bg: None,
             dynamic_cursor: None,
+            dynamic_selection_bg: None,
+            dynamic_selection_fg: None,
+            pointer_shape: PointerShape::Default,
+            pointer_shape_stack: Vec::new(),
+            progress: None,
             mouse_protocol: MouseProtocol::None,
             mouse_format: MouseFormat::X10,
             in_sixel: false,
@@ -233,9 +295,15 @@ impl TerminalState {
             dcs_mode: DcsMode::None,
             dcs_buffer: Vec::new(),
             kitty_parser: KittyGraphicsParser::new(),
+            osc1337_parser: Osc1337Parser::new(),
             insert_mode: false,
             current_working_directory: None,
+            current_document_url: None,
             pending_clipboard: None,
+            pending_clipboard_requests: Vec::new(),
+            pending_notifications: Vec::new(),
+            pending_user_attention: None,
+            osc99_drafts: HashMap::new(),
             pending_responses: Vec::new(),
             last_printed_char: None,
             g0_charset: Charset::Ascii,
@@ -245,6 +313,14 @@ impl TerminalState {
             program_status_seq: 0,
             program_status_dirty: false,
         }
+    }
+
+    /// Return the currently active mouse pointer shape (`OSC 22`).
+    pub fn active_pointer_shape(&self) -> PointerShape {
+        self.pointer_shape_stack
+            .last()
+            .copied()
+            .unwrap_or(self.pointer_shape)
     }
 
     /// Return the highest-priority active OSC 7501 program status record in this terminal.
@@ -274,6 +350,9 @@ impl TerminalState {
         self.insert_mode = false;
         self.synchronized_output = false;
         self.synchronized_output_since = None;
+        self.pointer_shape = PointerShape::Default;
+        self.pointer_shape_stack.clear();
+        self.progress = None;
         self.g0_charset = Charset::Ascii;
         self.g1_charset = Charset::Ascii;
         self.active_charset = 0;
@@ -714,6 +793,7 @@ impl Perform for TerminalState {
                         cell_offset: [0, 0],
                         display_cols: None,
                         display_rows: None,
+                        custom_display_cells: None,
                         width_cells: w_cells,
                         height_cells: h_cells,
                         rgba_data: Arc::new(rgba),
@@ -796,9 +876,36 @@ impl Perform for TerminalState {
         let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
         match params[0] {
-            b"0" | b"2" => {
+            b"0" => {
                 if params.len() > 1 {
-                    if let Ok(title) = std::str::from_utf8(params[1]) {
+                    let joined = params[1..].join(&b';');
+                    if let Ok(title) = std::str::from_utf8(&joined) {
+                        self.title = title.to_string();
+                        if title.trim().is_empty() {
+                            self.icon_title = None;
+                        }
+                    }
+                }
+            }
+            b"1" => {
+                if params.len() > 1 {
+                    let joined = params[1..].join(&b';');
+                    if let Ok(icon) = std::str::from_utf8(&joined) {
+                        let trimmed = icon.trim();
+                        self.icon_title = if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        };
+                    }
+                } else {
+                    self.icon_title = None;
+                }
+            }
+            b"2" => {
+                if params.len() > 1 {
+                    let joined = params[1..].join(&b';');
+                    if let Ok(title) = std::str::from_utf8(&joined) {
                         self.title = title.to_string();
                     }
                 }
@@ -832,10 +939,42 @@ impl Perform for TerminalState {
                     }
                 }
             }
+            b"6" => {
+                // macOS Terminal.app Document URI (`OSC 6 ; file://host/path`)
+                if params.len() > 1 {
+                    if let Ok(uri) = std::str::from_utf8(params[1]) {
+                        let uri = uri.trim();
+                        if uri.is_empty() {
+                            self.current_document_url = None;
+                        } else if let Some(path) = parse_osc7_uri(uri) {
+                            if self.current_working_directory.is_none() {
+                                let derived_cwd = if path.ends_with('/') {
+                                    Some(path.clone())
+                                } else {
+                                    std::path::Path::new(&path)
+                                        .parent()
+                                        .and_then(|p| p.to_str())
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                };
+                                if let Some(cwd) = derived_cwd {
+                                    self.current_working_directory = Some(cwd);
+                                }
+                            }
+                            self.current_document_url = Some(path);
+                        }
+                    }
+                } else {
+                    self.current_document_url = None;
+                }
+            }
             b"7" => {
                 if params.len() > 1 {
                     if let Ok(uri) = std::str::from_utf8(params[1]) {
-                        if let Some(path) = parse_osc7_uri(uri) {
+                        let uri = uri.trim();
+                        if uri.is_empty() {
+                            self.current_working_directory = None;
+                        } else if let Some(path) = parse_osc7_uri(uri) {
                             self.current_working_directory = Some(path);
                         }
                     }
@@ -845,7 +984,10 @@ impl Perform for TerminalState {
                 if params.len() >= 3 {
                     if let Ok(uri) = std::str::from_utf8(params[2]) {
                         if !uri.is_empty() {
-                            let hid = self.grid.register_hyperlink(uri);
+                            let explicit_id = std::str::from_utf8(params[1])
+                                .ok()
+                                .and_then(extract_osc8_id);
+                            let hid = self.grid.register_hyperlink_with_id(explicit_id, uri);
                             self.current_hyperlink_id = Some(hid);
                             self.current_hyperlink = Some(Arc::new(uri.to_string()));
                         } else {
@@ -855,29 +997,24 @@ impl Perform for TerminalState {
                     }
                 }
             }
-            b"10" | b"11" | b"12" => {
-                // Dynamic color query or set (used by neovim, fish, zsh, lipgloss/termenv)
-                if let Some(&arg) = params.get(1) {
-                    let code = std::str::from_utf8(params[0]).unwrap_or("10");
-                    if arg == b"?" {
-                        let (r, g, b) = match params[0] {
-                            b"10" => self.dynamic_fg.unwrap_or((0xf5, 0xf5, 0xf7)),
-                            b"11" => self.dynamic_bg.unwrap_or((0x1a, 0x1b, 0x1e)),
-                            _ => self.dynamic_cursor.unwrap_or((0xf5, 0xf5, 0xf7)),
-                        };
-                        let rgb_str = format_osc_rgb(r, g, b);
-                        let resp = format!("\x1b]{code};{rgb_str}{terminator}");
-                        self.pending_responses.extend_from_slice(resp.as_bytes());
-                    } else if let Ok(spec) = std::str::from_utf8(arg) {
-                        if let Some(rgb) = parse_osc_color_spec(spec) {
-                            match params[0] {
-                                b"10" => self.dynamic_fg = Some(rgb),
-                                b"11" => self.dynamic_bg = Some(rgb),
-                                _ => self.dynamic_cursor = Some(rgb),
-                            }
-                        }
-                    }
+            b"9" => {
+                self.handle_osc_9(&params[1..]);
+            }
+            b"10" | b"11" | b"12" | b"17" | b"19" => {
+                // Dynamic color query or set (`10` fg, `11` bg, `12` cursor, `17` selection bg, `19` selection fg).
+                // Supports xterm chained parameters (`OSC 10 ; spec1 ; spec2 ...`).
+                if let Ok(start_code) = std::str::from_utf8(params[0]).unwrap_or("10").parse::<u8>()
+                {
+                    self.handle_osc_dynamic_color_series(start_code, &params[1..], terminator);
                 }
+            }
+            b"21" => {
+                // Kitty Color Control Protocol (`OSC 21 ; key=val ; ...`)
+                self.handle_osc_21(&params[1..], terminator);
+            }
+            b"22" => {
+                // Mouse Pointer Cursor Shape Protocol (`OSC 22 ; <op>`)
+                self.handle_osc_22(&params[1..], terminator);
             }
             b"104" => {
                 // Reset dynamic palette colors (specific indices or all if none specified)
@@ -896,19 +1033,28 @@ impl Perform for TerminalState {
             b"110" => self.dynamic_fg = None,
             b"111" => self.dynamic_bg = None,
             b"112" => self.dynamic_cursor = None,
+            b"117" => self.dynamic_selection_bg = None,
+            b"119" => self.dynamic_selection_fg = None,
             b"52" => {
-                if params.len() >= 3 && params[2] != b"?" {
-                    use base64::Engine;
-                    let cleaned: Vec<u8> = params[2]
-                        .iter()
-                        .copied()
-                        .filter(|b| !b.is_ascii_whitespace())
-                        .collect();
-                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&cleaned)
-                    {
-                        if let Ok(text) = String::from_utf8(decoded) {
-                            self.pending_clipboard = Some(text);
-                        }
+                self.handle_osc_52(&params[1..], bell_terminated);
+            }
+            b"99" => {
+                self.handle_osc_99(&params[1..]);
+            }
+            b"133" | b"633" => {
+                let is_633 = params[0] == b"633";
+                self.handle_osc_semantic_prompt(&params[1..], is_633);
+            }
+            b"777" => {
+                self.handle_osc_777(&params[1..]);
+            }
+            b"1337" => {
+                if params.len() > 1 {
+                    if params.len() == 2 {
+                        self.handle_osc_1337(params[1], bell_terminated);
+                    } else {
+                        let body = params[1..].join(&b';');
+                        self.handle_osc_1337(&body, bell_terminated);
                     }
                 }
             }
@@ -1384,12 +1530,16 @@ impl Perform for TerminalState {
                                     self.grid.set_alternate(false);
                                     self.kitty_keyboard_stack.clear();
                                     self.modify_other_keys = 0;
+                                    self.pointer_shape = PointerShape::Default;
+                                    self.pointer_shape_stack.clear();
                                 }
                                 1049 => {
                                     self.grid.set_alternate(false);
                                     self.restore_cursor();
                                     self.kitty_keyboard_stack.clear();
                                     self.modify_other_keys = 0;
+                                    self.pointer_shape = PointerShape::Default;
+                                    self.pointer_shape_stack.clear();
                                 }
                                 2004 => self.bracketed_paste = false,
                                 2026 => {
@@ -1455,6 +1605,12 @@ impl Perform for TerminalState {
                             .and_then(|p| p.first())
                             .copied()
                             .unwrap_or(0);
+                        if sub == 0 || sub == 1 {
+                            if self.icon_title_stack.len() >= 16 {
+                                self.icon_title_stack.remove(0);
+                            }
+                            self.icon_title_stack.push(self.icon_title.clone());
+                        }
                         if sub == 0 || sub == 2 {
                             if self.title_stack.len() >= 16 {
                                 self.title_stack.remove(0);
@@ -1469,6 +1625,11 @@ impl Perform for TerminalState {
                             .and_then(|p| p.first())
                             .copied()
                             .unwrap_or(0);
+                        if sub == 0 || sub == 1 {
+                            if let Some(prev_icon) = self.icon_title_stack.pop() {
+                                self.icon_title = prev_icon;
+                            }
+                        }
                         if sub == 0 || sub == 2 {
                             if let Some(prev) = self.title_stack.pop() {
                                 self.title = prev;
@@ -1647,6 +1808,678 @@ impl TerminalState {
             }
         }
         None
+    }
+
+    /// Dispatch an Operating System Command (`ESC ] <osc_bytes> BEL/ST`) without `vte`'s
+    /// 1024-byte `ArrayVec` truncation limit.
+    pub fn handle_osc_raw(&mut self, osc_bytes: &[u8], bell_terminated: bool) {
+        if let Some(body) = osc_bytes.strip_prefix(b"1337;") {
+            self.handle_osc_1337(body, bell_terminated);
+            return;
+        }
+        if let Some(cmd_bytes) = osc_bytes.strip_prefix(b"G") {
+            self.handle_kitty_graphics(cmd_bytes);
+            return;
+        }
+        let params: Vec<&[u8]> = osc_bytes.split(|&b| b == b';').collect();
+        self.osc_dispatch(&params, bell_terminated);
+    }
+
+    /// Clean up state when a single OSC sequence exceeded `MAX_APC_BYTES`.
+    pub fn handle_osc_overflow(&mut self, osc_prefix: &[u8]) {
+        if osc_prefix.starts_with(b"1337;") {
+            self.osc1337_parser.reset();
+        } else if let Some(cmd_prefix) = osc_prefix.strip_prefix(b"G") {
+            self.kitty_parser.reset();
+            let header_bytes = cmd_prefix.split(|&b| b == b';').next().unwrap_or(&[]);
+            if let Ok(header) = std::str::from_utf8(header_bytes) {
+                let mut params = KittyControlParams::default();
+                params.apply_header(header);
+                if let Some(resp) =
+                    params.format_response(None, false, "ENOMEM:OSC payload exceeds size limit")
+                {
+                    self.pending_responses.extend_from_slice(&resp);
+                }
+            }
+        }
+    }
+
+    /// Parse and execute an iTerm2 `OSC 1337 ; <body>` sequence.
+    pub fn handle_osc_1337(&mut self, body: &[u8], bell_terminated: bool) {
+        match self.osc1337_parser.handle_command(body) {
+            Osc1337Action::Ignored | Osc1337Action::NeedMoreParts => {}
+            Osc1337Action::DisplayImage {
+                params,
+                width_px,
+                height_px,
+                rgba,
+            } => {
+                self.place_osc1337_image(&params, width_px, height_px, rgba);
+            }
+            Osc1337Action::SetCursorShape(code) => {
+                let shape = match code {
+                    1 => CursorShape::Beam,
+                    2 => CursorShape::Underline,
+                    _ => CursorShape::Block,
+                };
+                self.grid.set_cursor_shape(shape);
+            }
+            Osc1337Action::SetCurrentDir(dir) => {
+                self.current_working_directory = Some(dir);
+            }
+            Osc1337Action::ReportCellSize => {
+                let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
+                let ch = self.grid.cell_height_px.max(1.0);
+                let cw = self.grid.cell_width_px.max(1.0);
+                let resp = format!("\x1b]1337;ReportCellSize={ch:.1};{cw:.1}{terminator}");
+                self.pending_responses.extend_from_slice(resp.as_bytes());
+            }
+            Osc1337Action::ClearScrollback => {
+                let active = self.grid.active_mut();
+                active.scrollback.clear();
+                active.scroll_offset = 0;
+                active.prompt_marks.retain(|m| m.row >= 0);
+                let before = active.images.len();
+                active
+                    .images
+                    .retain(|img| img.row + (img.height_cells.max(1) as isize) > 0);
+                if active.images.len() != before {
+                    active.images_dirty = true;
+                }
+            }
+            Osc1337Action::SetMark => {
+                let active = self.grid.active_mut();
+                active.record_prompt_mark();
+                active.semantic_zone = SemanticZone::Prompt;
+                self.progress = None;
+            }
+            Osc1337Action::CopyText(text) => {
+                self.pending_clipboard = Some(text.clone());
+                self.push_clipboard_request(ClipboardRequest::Write(text));
+            }
+            Osc1337Action::RequestAttention(active) => {
+                self.pending_user_attention = Some(active);
+            }
+        }
+    }
+
+    fn push_clipboard_request(&mut self, req: ClipboardRequest) {
+        if self.pending_clipboard_requests.len() >= 32 {
+            self.pending_clipboard_requests.remove(0);
+        }
+        self.pending_clipboard_requests.push(req);
+    }
+
+    fn push_notification(&mut self, notif: TerminalNotification) {
+        if notif.title.is_empty() && notif.body.is_empty() {
+            return;
+        }
+        if self.pending_notifications.len() >= 16 {
+            self.pending_notifications.remove(0);
+        }
+        self.pending_notifications.push(notif);
+    }
+
+    /// Handle `OSC 9`: disambiguates ConEmu `OSC 9 ; 4 ; <state> [; <pct>]` progress bar
+    /// from iTerm2 `OSC 9 ; <message>` desktop notification.
+    fn handle_osc_9(&mut self, args: &[&[u8]]) {
+        if args.is_empty() {
+            return;
+        }
+        if args.len() >= 2 && trim_ascii_bytes(args[0]) == b"4" {
+            let state_code = std::str::from_utf8(trim_ascii_bytes(args[1]))
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(0);
+            let pct_opt = args
+                .get(2)
+                .and_then(|b| std::str::from_utf8(trim_ascii_bytes(b)).ok())
+                .and_then(|s| s.parse::<u16>().ok())
+                .map(|v| v.min(100) as u8);
+
+            self.progress = match state_code {
+                0 => None,
+                1 => Some(TerminalProgress {
+                    state: ProgressState::Normal,
+                    percent: pct_opt.unwrap_or(0),
+                }),
+                2 => Some(TerminalProgress {
+                    state: ProgressState::Error,
+                    percent: pct_opt.unwrap_or(100),
+                }),
+                3 => Some(TerminalProgress {
+                    state: ProgressState::Indeterminate,
+                    percent: 0,
+                }),
+                4 => Some(TerminalProgress {
+                    state: ProgressState::Paused,
+                    percent: pct_opt.unwrap_or(100),
+                }),
+                _ => self.progress,
+            };
+            return;
+        }
+
+        let joined = args.join(&b';');
+        if let Ok(msg) = std::str::from_utf8(trim_ascii_bytes(&joined)) {
+            if !msg.is_empty() {
+                self.push_notification(TerminalNotification {
+                    id: None,
+                    title: String::from("skTerm"),
+                    body: msg.to_string(),
+                    force_when_focused: false,
+                    only_when_invisible: false,
+                    urgent: false,
+                });
+            }
+        }
+    }
+
+    /// Handle xterm dynamic color series (`OSC 10` fg, `11` bg, `12` cursor, `17` sel bg, `19` sel fg).
+    fn handle_osc_dynamic_color_series(
+        &mut self,
+        start_code: u8,
+        args: &[&[u8]],
+        terminator: &str,
+    ) {
+        let mut code = start_code;
+        for &arg in args {
+            let arg = trim_ascii_bytes(arg);
+            if arg == b"?" {
+                let rgb_opt = match code {
+                    10 => Some(self.dynamic_fg.unwrap_or((0xf5, 0xf5, 0xf7))),
+                    11 => Some(self.dynamic_bg.unwrap_or((0x1a, 0x1b, 0x1e))),
+                    12 => Some(self.dynamic_cursor.unwrap_or((0xf5, 0xf5, 0xf7))),
+                    17 => Some(self.dynamic_selection_bg.unwrap_or((0x48, 0x52, 0x70))),
+                    19 => Some(self.dynamic_selection_fg.unwrap_or((0xf5, 0xf5, 0xf7))),
+                    _ => None,
+                };
+                if let Some((r, g, b)) = rgb_opt {
+                    let rgb_str = format_osc_rgb(r, g, b);
+                    let resp = format!("\x1b]{code};{rgb_str}{terminator}");
+                    self.pending_responses.extend_from_slice(resp.as_bytes());
+                }
+            } else if let Ok(spec) = std::str::from_utf8(arg) {
+                if !spec.is_empty() {
+                    if let Some(rgb) = parse_osc_color_spec(spec) {
+                        match code {
+                            10 => self.dynamic_fg = Some(rgb),
+                            11 => self.dynamic_bg = Some(rgb),
+                            12 => self.dynamic_cursor = Some(rgb),
+                            17 => self.dynamic_selection_bg = Some(rgb),
+                            19 => self.dynamic_selection_fg = Some(rgb),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            code = code.saturating_add(1);
+        }
+    }
+
+    /// Handle Kitty Color Control Protocol (`OSC 21 ; key=value ; ...`).
+    fn handle_osc_21(&mut self, args: &[&[u8]], terminator: &str) {
+        let mut resp_parts: Vec<String> = Vec::new();
+        for &raw in args {
+            let Ok(entry) = std::str::from_utf8(trim_ascii_bytes(raw)) else {
+                continue;
+            };
+            if entry.is_empty() {
+                continue;
+            }
+            let Some((raw_key, raw_val)) = entry.split_once('=') else {
+                continue;
+            };
+            let key = raw_key.trim();
+            let val = raw_val.trim();
+
+            enum ColorSlot {
+                Fg,
+                Bg,
+                Cursor,
+                SelBg,
+                SelFg,
+                Palette(u8),
+            }
+
+            let slot = match key {
+                "foreground" | "fg" => Some(ColorSlot::Fg),
+                "background" | "bg" => Some(ColorSlot::Bg),
+                "cursor" => Some(ColorSlot::Cursor),
+                "selection_background" | "selection_bg" => Some(ColorSlot::SelBg),
+                "selection_foreground" | "selection_fg" => Some(ColorSlot::SelFg),
+                _ => key
+                    .strip_prefix("color")
+                    .unwrap_or(key)
+                    .parse::<u8>()
+                    .ok()
+                    .map(ColorSlot::Palette),
+            };
+
+            let Some(slot) = slot else {
+                continue;
+            };
+
+            if val == "?" {
+                let (r, g, b) = match slot {
+                    ColorSlot::Fg => self.dynamic_fg.unwrap_or((0xf5, 0xf5, 0xf7)),
+                    ColorSlot::Bg => self.dynamic_bg.unwrap_or((0x1a, 0x1b, 0x1e)),
+                    ColorSlot::Cursor => self.dynamic_cursor.unwrap_or((0xf5, 0xf5, 0xf7)),
+                    ColorSlot::SelBg => self.dynamic_selection_bg.unwrap_or((0x48, 0x52, 0x70)),
+                    ColorSlot::SelFg => self.dynamic_selection_fg.unwrap_or((0xf5, 0xf5, 0xf7)),
+                    ColorSlot::Palette(idx) => self
+                        .dynamic_palette
+                        .get(&idx)
+                        .copied()
+                        .unwrap_or_else(|| default_indexed_rgb(idx)),
+                };
+                resp_parts.push(format!("{key}=rgb:{r:02x}/{g:02x}/{b:02x}"));
+            } else if val.is_empty() {
+                match slot {
+                    ColorSlot::Fg => self.dynamic_fg = None,
+                    ColorSlot::Bg => self.dynamic_bg = None,
+                    ColorSlot::Cursor => self.dynamic_cursor = None,
+                    ColorSlot::SelBg => self.dynamic_selection_bg = None,
+                    ColorSlot::SelFg => self.dynamic_selection_fg = None,
+                    ColorSlot::Palette(idx) => {
+                        self.dynamic_palette.remove(&idx);
+                    }
+                }
+            } else if let Some(rgb) = parse_osc_color_spec(val) {
+                match slot {
+                    ColorSlot::Fg => self.dynamic_fg = Some(rgb),
+                    ColorSlot::Bg => self.dynamic_bg = Some(rgb),
+                    ColorSlot::Cursor => self.dynamic_cursor = Some(rgb),
+                    ColorSlot::SelBg => self.dynamic_selection_bg = Some(rgb),
+                    ColorSlot::SelFg => self.dynamic_selection_fg = Some(rgb),
+                    ColorSlot::Palette(idx) => {
+                        self.dynamic_palette.insert(idx, rgb);
+                    }
+                }
+            }
+        }
+        if !resp_parts.is_empty() {
+            let resp = format!("\x1b]21;{}{terminator}", resp_parts.join(";"));
+            self.pending_responses.extend_from_slice(resp.as_bytes());
+        }
+    }
+
+    /// Handle `OSC 22` Mouse Pointer Cursor Shape set / stack push (`>`) / pop (`<`) / query (`?`).
+    fn handle_osc_22(&mut self, args: &[&[u8]], terminator: &str) {
+        if args.is_empty() {
+            self.pointer_shape = PointerShape::Default;
+            if let Some(top) = self.pointer_shape_stack.last_mut() {
+                *top = PointerShape::Default;
+            }
+            return;
+        }
+        let joined = args.join(&b';');
+        let Ok(spec) = std::str::from_utf8(trim_ascii_bytes(&joined)) else {
+            return;
+        };
+        if spec.is_empty() {
+            self.pointer_shape = PointerShape::Default;
+            if let Some(top) = self.pointer_shape_stack.last_mut() {
+                *top = PointerShape::Default;
+            }
+            return;
+        }
+        if spec == "<" {
+            if let Some(popped) = self.pointer_shape_stack.pop() {
+                if self.pointer_shape_stack.is_empty() {
+                    let _ = popped;
+                }
+            } else {
+                self.pointer_shape = PointerShape::Default;
+            }
+            return;
+        }
+        if let Some(query_rest) = spec.strip_prefix('?') {
+            let q = query_rest.trim();
+            if q.is_empty() || q == "__current__" {
+                let name = self.active_pointer_shape().as_css_name();
+                let resp = format!("\x1b]22;{name}{terminator}");
+                self.pending_responses.extend_from_slice(resp.as_bytes());
+            } else {
+                let flags: Vec<&str> = q
+                    .split(',')
+                    .map(|n| {
+                        if PointerShape::from_css_name(n).is_some() {
+                            "1"
+                        } else {
+                            "0"
+                        }
+                    })
+                    .collect();
+                let resp = format!("\x1b]22;{}{terminator}", flags.join(","));
+                self.pending_responses.extend_from_slice(resp.as_bytes());
+            }
+            return;
+        }
+
+        let (is_push, names_str) = if let Some(rest) = spec.strip_prefix('>') {
+            (true, rest)
+        } else if let Some(rest) = spec.strip_prefix('=') {
+            (false, rest)
+        } else {
+            (false, spec)
+        };
+
+        let resolved = names_str
+            .split(',')
+            .find_map(PointerShape::from_css_name)
+            .unwrap_or(PointerShape::Default);
+
+        if is_push {
+            if self.pointer_shape_stack.len() >= 16 {
+                self.pointer_shape_stack.remove(0);
+            }
+            self.pointer_shape_stack.push(resolved);
+        } else if let Some(top) = self.pointer_shape_stack.last_mut() {
+            *top = resolved;
+        } else {
+            self.pointer_shape = resolved;
+        }
+    }
+
+    /// Handle `OSC 52 ; <selection> ; <payload|?|empty>` clipboard write, clear, and query.
+    fn handle_osc_52(&mut self, args: &[&[u8]], bell_terminated: bool) {
+        if args.len() < 2 {
+            return;
+        }
+        let sel_raw = std::str::from_utf8(trim_ascii_bytes(args[0])).unwrap_or("c");
+        let selection = if sel_raw.is_empty() {
+            String::from("c")
+        } else {
+            sel_raw.to_string()
+        };
+        let payload = trim_ascii_bytes(args[1]);
+
+        if payload == b"?" {
+            self.push_clipboard_request(ClipboardRequest::Query {
+                selection,
+                bell_terminated,
+            });
+        } else if payload.is_empty() {
+            self.pending_clipboard = None;
+            self.push_clipboard_request(ClipboardRequest::Clear);
+        } else if let Ok(decoded) = decode_b64_flexible(payload) {
+            if let Ok(text) = String::from_utf8(decoded) {
+                self.pending_clipboard = Some(text.clone());
+                self.push_clipboard_request(ClipboardRequest::Write(text));
+            }
+        }
+    }
+
+    /// Handle Kitty Desktop Notification Protocol (`OSC 99 ; <metadata> ; <payload>`).
+    fn handle_osc_99(&mut self, args: &[&[u8]]) {
+        if args.is_empty() {
+            return;
+        }
+        let meta_str = std::str::from_utf8(trim_ascii_bytes(args[0])).unwrap_or("");
+        let payload_bytes: std::borrow::Cow<'_, [u8]> = if args.len() <= 1 {
+            std::borrow::Cow::Borrowed(b"")
+        } else if args.len() == 2 {
+            std::borrow::Cow::Borrowed(args[1])
+        } else {
+            std::borrow::Cow::Owned(args[1..].join(&b';'))
+        };
+
+        let mut id = String::new();
+        let mut done = true;
+        let mut part = "title";
+        let mut base64_encoded = false;
+        let mut occasion: Option<&str> = None;
+        let mut urgency: Option<u8> = None;
+
+        for kv in meta_str.split(':') {
+            let Some((k, v)) = kv.split_once('=') else {
+                continue;
+            };
+            match k.trim() {
+                "i" => id = v.trim().to_string(),
+                "d" => done = v.trim() != "0",
+                "p" => part = v.trim(),
+                "e" => base64_encoded = v.trim() == "1",
+                "o" => occasion = Some(v.trim()),
+                "u" => urgency = v.trim().parse::<u8>().ok(),
+                _ => {}
+            }
+        }
+
+        if part == "?" {
+            let id_prefix = if id.is_empty() {
+                String::new()
+            } else {
+                format!("i={id}:")
+            };
+            let resp = format!(
+                "\x1b]99;{id_prefix}p=?;title,body,close:o=always,unfocused,invisible:u=0,1,2\x1b\\"
+            );
+            self.pending_responses.extend_from_slice(resp.as_bytes());
+            return;
+        }
+        if part == "close" || part == "alive" {
+            if !id.is_empty() {
+                self.osc99_drafts.remove(&id);
+            }
+            return;
+        }
+
+        let decoded_text = if base64_encoded {
+            decode_b64_flexible(&payload_bytes)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_default()
+        } else {
+            String::from_utf8_lossy(&payload_bytes).into_owned()
+        };
+
+        let draft_key = id.clone();
+        if self.osc99_drafts.len() >= 16 && !self.osc99_drafts.contains_key(&draft_key) {
+            self.osc99_drafts.clear();
+        }
+        let draft = self.osc99_drafts.entry(draft_key.clone()).or_default();
+        if let Some(occ) = occasion {
+            draft.force_when_focused = occ == "always";
+            draft.only_when_invisible = occ == "invisible";
+        }
+        if let Some(u) = urgency {
+            draft.urgent = u >= 2;
+        }
+        match part {
+            "body" => draft.body.push_str(&decoded_text),
+            _ => draft.title.push_str(&decoded_text),
+        }
+
+        if done {
+            if let Some(fin) = self.osc99_drafts.remove(&draft_key) {
+                let (title, body) = if fin.body.is_empty() {
+                    (String::from("skTerm"), fin.title)
+                } else if fin.title.is_empty() {
+                    (String::from("skTerm"), fin.body)
+                } else {
+                    (fin.title, fin.body)
+                };
+                self.push_notification(TerminalNotification {
+                    id: (!id.is_empty()).then_some(id),
+                    title,
+                    body,
+                    force_when_focused: fin.force_when_focused,
+                    only_when_invisible: fin.only_when_invisible,
+                    urgent: fin.urgent,
+                });
+            }
+        }
+    }
+
+    /// Handle rxvt / VTE / Ghostty Desktop Notification (`OSC 777 ; notify ; <title> ; <body>`).
+    fn handle_osc_777(&mut self, args: &[&[u8]]) {
+        if args.len() < 2 {
+            return;
+        }
+        let subcmd = std::str::from_utf8(trim_ascii_bytes(args[0])).unwrap_or("");
+        if !subcmd.eq_ignore_ascii_case("notify") {
+            return;
+        }
+        let title_str = std::str::from_utf8(trim_ascii_bytes(args[1])).unwrap_or("skTerm");
+        let body_str = if args.len() >= 3 {
+            let joined = args[2..].join(&b';');
+            String::from_utf8_lossy(trim_ascii_bytes(&joined)).into_owned()
+        } else {
+            String::new()
+        };
+        let (title, body) = if body_str.is_empty() {
+            (String::from("skTerm"), title_str.to_string())
+        } else {
+            (
+                if title_str.is_empty() {
+                    String::from("skTerm")
+                } else {
+                    title_str.to_string()
+                },
+                body_str,
+            )
+        };
+        self.push_notification(TerminalNotification {
+            id: None,
+            title,
+            body,
+            force_when_focused: false,
+            only_when_invisible: false,
+            urgent: false,
+        });
+    }
+
+    /// Handle FinalTerm `OSC 133` and VS Code `OSC 633` semantic shell integration sequences.
+    fn handle_osc_semantic_prompt(&mut self, args: &[&[u8]], is_633: bool) {
+        if args.is_empty() {
+            return;
+        }
+        let kind = trim_ascii_bytes(args[0]);
+        match kind {
+            b"A" => {
+                let active = self.grid.active_mut();
+                active.record_prompt_mark();
+                active.semantic_zone = SemanticZone::Prompt;
+                self.progress = None;
+            }
+            b"B" => {
+                self.grid.active_mut().semantic_zone = SemanticZone::CommandInput;
+            }
+            b"C" => {
+                self.grid.active_mut().semantic_zone = SemanticZone::CommandOutput;
+            }
+            b"D" => {
+                let exit_code = args
+                    .get(1)
+                    .and_then(|b| std::str::from_utf8(trim_ascii_bytes(b)).ok())
+                    .and_then(|s| s.parse::<i32>().ok());
+                let active = self.grid.active_mut();
+                active.complete_last_prompt_mark(exit_code);
+                active.semantic_zone = SemanticZone::Idle;
+                self.progress = None;
+            }
+            b"P" if is_633 => {
+                for &prop in &args[1..] {
+                    if let Ok(s) = std::str::from_utf8(trim_ascii_bytes(prop)) {
+                        if let Some(cwd_raw) = s.strip_prefix("Cwd=") {
+                            let unescaped = unescape_osc633_value(cwd_raw);
+                            if !unescaped.is_empty() {
+                                self.current_working_directory = Some(unescaped);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn place_osc1337_image(
+        &mut self,
+        params: &Osc1337FileParams,
+        width_px: u32,
+        height_px: u32,
+        rgba: Vec<u8>,
+    ) {
+        if !params.do_not_move_cursor && self.grid.active().cursor.pending_wrap {
+            if self.auto_wrap {
+                let bg = self.bg;
+                let active = self.grid.active_mut();
+                let r = active.cursor.row;
+                active.grid[r].is_wrapped = true;
+                active.newline_with_bg(bg);
+            } else {
+                self.grid.active_mut().cursor.pending_wrap = false;
+            }
+        }
+
+        let (anchor_row, anchor_col, pane_rows, pane_cols) = {
+            let active = self.grid.active();
+            (
+                active.cursor.row as isize,
+                active.cursor.col,
+                active.rows,
+                active.cols,
+            )
+        };
+        let cell_w = self.grid.cell_width_px.max(1.0);
+        let cell_h = self.grid.cell_height_px.max(1.0);
+        let layout = params.compute_layout(
+            width_px, height_px, cell_w, cell_h, pane_cols, pane_rows, anchor_col,
+        );
+
+        let id = self.grid.alloc_texture_id();
+        let img = GraphicImage {
+            id,
+            image_id: 0,
+            image_number: 0,
+            placement_id: 0,
+            row: anchor_row,
+            col: anchor_col,
+            width_px,
+            height_px,
+            src_rect: [0, 0, width_px, height_px],
+            cell_offset: [0, 0],
+            display_cols: None,
+            display_rows: None,
+            custom_display_cells: Some(layout.custom_display_cells),
+            width_cells: layout.width_cells,
+            height_cells: layout.height_cells,
+            rgba_data: Arc::new(rgba),
+            z_index: 0,
+        };
+
+        info!(
+            "Placed OSC 1337 inline image id={} ({}x{} px, {}x{} cells) at ({}, {})",
+            id,
+            width_px,
+            height_px,
+            layout.width_cells,
+            layout.height_cells,
+            anchor_row,
+            anchor_col
+        );
+        self.grid.active_mut().add_image(img);
+
+        if !params.do_not_move_cursor {
+            let bg = self.bg;
+            let auto_wrap = self.auto_wrap;
+            let active = self.grid.active_mut();
+            for _ in 0..layout.height_cells.saturating_sub(1) {
+                active.linefeed_with_bg(bg);
+            }
+            let end_col = anchor_col + layout.width_cells;
+            if end_col < active.cols {
+                active.cursor.col = end_col;
+                active.cursor.pending_wrap = false;
+            } else {
+                active.cursor.col = active.cols.saturating_sub(1);
+                active.cursor.pending_wrap = auto_wrap;
+            }
+            active.last_placeholder_pos = None;
+        }
     }
 
     /// Dispatch an Application Program Command (`ESC _ <apc_bytes> ST`).
@@ -1938,6 +2771,7 @@ impl TerminalState {
             cell_offset: [params.cell_x_offset, params.cell_y_offset],
             display_cols,
             display_rows,
+            custom_display_cells: None,
             width_cells: 1,
             height_cells: 1,
             rgba_data: stored.rgba_data,
@@ -2834,6 +3668,45 @@ fn map_dec_special_graphics(c: char) -> char {
         '~' => '·',
         _ => c,
     }
+}
+
+/// Extract explicit `id=<value>` from an `OSC 8 ; <params> ; <uri>` colon-separated parameter list.
+fn extract_osc8_id(params_str: &str) -> Option<&str> {
+    for kv in params_str.split(':') {
+        if let Some(id) = kv.strip_prefix("id=") {
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Unescape VS Code `OSC 633 ; P ; Cwd=...` values (`\xNN` hex escapes and `\\`).
+fn unescape_osc633_value(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'x' && i + 3 < bytes.len() {
+                if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 2..i + 4]) {
+                    if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                        out.push(val);
+                        i += 4;
+                        continue;
+                    }
+                }
+            } else if bytes[i + 1] == b'\\' {
+                out.push(b'\\');
+                i += 2;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Parse an OSC 7 file URI (e.g., `file://hostname/Users/name/path%20with%20spaces`)

@@ -1,4 +1,4 @@
-//! `skterm-core`: VT100/xterm State Machine, ScreenGrid, PTY Abstraction, Sixel, and Kitty Graphics.
+//! `skterm-core`: VT100/xterm State Machine, ScreenGrid, PTY Abstraction, Sixel, Kitty, and OSC 1337 Graphics.
 
 pub mod graphics;
 pub mod grid;
@@ -7,24 +7,27 @@ pub mod terminal;
 pub mod vt;
 
 pub use graphics::{
-    kitty_diacritic_index, GraphicImage, KittyControlParams, KittyGraphicsParser,
-    PlaceholderCellMeta, SixelDecoder, StoredImage, VirtualPlacement, KITTY_DIACRITICS,
-    KITTY_PLACEHOLDER_CHAR, PLACEHOLDER_META_TAG,
+    encode_base64_standard, kitty_diacritic_index, GraphicImage, KittyControlParams,
+    KittyGraphicsParser, Osc1337Action, Osc1337Dimension, Osc1337FileParams, Osc1337Layout,
+    Osc1337Parser, PlaceholderCellMeta, SixelDecoder, StoredImage, VirtualPlacement,
+    KITTY_DIACRITICS, KITTY_PLACEHOLDER_CHAR, PLACEHOLDER_META_TAG,
 };
 pub use grid::{
-    Cell, CellFlags, Color, Cursor, CursorShape, NamedColor, Row, ScreenBuffer, ScreenGrid,
-    SearchMatch, Selection, SelectionMode,
+    Cell, CellFlags, Color, Cursor, CursorShape, NamedColor, PointerShape, ProgressState,
+    PromptMark, Row, ScreenBuffer, ScreenGrid, SearchMatch, Selection, SelectionMode, SemanticZone,
+    TerminalProgress,
 };
 #[cfg(target_os = "macos")]
 pub use pty::process_cwd;
 pub use pty::{
-    available_shell_presets, find_cmd, find_git_bash_path, find_pwsh_path, find_windows_powershell,
-    PtyEvent, PtyProcess, PtySpawnOptions, ShellPresetInfo,
+    available_shell_presets, ensure_shell_integration_files, find_cmd, find_git_bash_path,
+    find_pwsh_path, find_windows_powershell, PtyEvent, PtyProcess, PtySpawnOptions,
+    ShellPresetInfo,
 };
 pub use terminal::Terminal;
 pub use vt::{
-    Charset, MouseFormat, MouseProtocol, ProgramStatusKind, ProgramStatusRecord,
-    ProgramStatusState, TerminalState,
+    Charset, ClipboardRequest, MouseFormat, MouseProtocol, ProgramStatusKind, ProgramStatusRecord,
+    ProgramStatusState, TerminalNotification, TerminalState,
 };
 
 /// skterm-core library version and basic info

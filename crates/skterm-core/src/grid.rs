@@ -211,6 +211,155 @@ pub enum CursorShape {
     Underline,
 }
 
+/// Mouse pointer cursor shape controlled via `OSC 22` (CSS / X11 cursor names).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PointerShape {
+    #[default]
+    Default,
+    Text,
+    VerticalText,
+    Pointer,
+    Crosshair,
+    Wait,
+    Progress,
+    Help,
+    Grab,
+    Grabbing,
+    NotAllowed,
+    NoDrop,
+    ContextMenu,
+    Cell,
+    Move,
+    Alias,
+    Copy,
+    ZoomIn,
+    ZoomOut,
+    EwResize,
+    NsResize,
+    NeswResize,
+    NwseResize,
+    ColResize,
+    RowResize,
+    AllScroll,
+    None,
+}
+
+impl PointerShape {
+    /// Parse a single CSS / XCursor pointer name into [`PointerShape`].
+    pub fn from_css_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "default" | "arrow" | "left_ptr" | "top_left_arrow" => Some(Self::Default),
+            "text" | "ibeam" | "xterm" => Some(Self::Text),
+            "vertical-text" => Some(Self::VerticalText),
+            "pointer" | "hand" | "hand1" | "hand2" | "pointing_hand" => Some(Self::Pointer),
+            "crosshair" | "cross" | "tcross" => Some(Self::Crosshair),
+            "wait" | "watch" => Some(Self::Wait),
+            "progress" | "left_ptr_watch" | "half-busy" => Some(Self::Progress),
+            "help" | "question_arrow" | "whats_this" => Some(Self::Help),
+            "grab" | "openhand" => Some(Self::Grab),
+            "grabbing" | "closedhand" | "dnd-move" => Some(Self::Grabbing),
+            "not-allowed" | "crossed_circle" | "forbidden" => Some(Self::NotAllowed),
+            "no-drop" | "dnd-no-drop" => Some(Self::NoDrop),
+            "context-menu" => Some(Self::ContextMenu),
+            "cell" | "plus" => Some(Self::Cell),
+            "move" | "fleur" | "size_all" => Some(Self::Move),
+            "alias" | "dnd-link" | "link" => Some(Self::Alias),
+            "copy" | "dnd-copy" => Some(Self::Copy),
+            "zoom-in" => Some(Self::ZoomIn),
+            "zoom-out" => Some(Self::ZoomOut),
+            "ew-resize" | "e-resize" | "w-resize" | "sb_h_double_arrow" | "size_hor" => {
+                Some(Self::EwResize)
+            }
+            "ns-resize" | "n-resize" | "s-resize" | "sb_v_double_arrow" | "size_ver" => {
+                Some(Self::NsResize)
+            }
+            "nesw-resize" | "ne-resize" | "sw-resize" | "size_bdiag" => Some(Self::NeswResize),
+            "nwse-resize" | "nw-resize" | "se-resize" | "size_fdiag" => Some(Self::NwseResize),
+            "col-resize" | "split_h" => Some(Self::ColResize),
+            "row-resize" | "split_v" => Some(Self::RowResize),
+            "all-scroll" => Some(Self::AllScroll),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Canonical CSS cursor name reported by `OSC 22 ; ?`.
+    pub fn as_css_name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Text => "text",
+            Self::VerticalText => "vertical-text",
+            Self::Pointer => "pointer",
+            Self::Crosshair => "crosshair",
+            Self::Wait => "wait",
+            Self::Progress => "progress",
+            Self::Help => "help",
+            Self::Grab => "grab",
+            Self::Grabbing => "grabbing",
+            Self::NotAllowed => "not-allowed",
+            Self::NoDrop => "no-drop",
+            Self::ContextMenu => "context-menu",
+            Self::Cell => "cell",
+            Self::Move => "move",
+            Self::Alias => "alias",
+            Self::Copy => "copy",
+            Self::ZoomIn => "zoom-in",
+            Self::ZoomOut => "zoom-out",
+            Self::EwResize => "ew-resize",
+            Self::NsResize => "ns-resize",
+            Self::NeswResize => "nesw-resize",
+            Self::NwseResize => "nwse-resize",
+            Self::ColResize => "col-resize",
+            Self::RowResize => "row-resize",
+            Self::AllScroll => "all-scroll",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Progress indicator state reported via `OSC 9 ; 4 ; <state> ; <percent>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressState {
+    /// Normal active progress (`state = 1`).
+    Normal,
+    /// Error progress (`state = 2`).
+    Error,
+    /// Indeterminate / busy activity (`state = 3`).
+    Indeterminate,
+    /// Paused / warning progress (`state = 4`).
+    Paused,
+}
+
+/// Active `OSC 9 ; 4` progress bar state for a terminal pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalProgress {
+    pub state: ProgressState,
+    /// Percentage clamped to `0..=100`.
+    pub percent: u8,
+}
+
+/// Current semantic shell zone (`OSC 133` / `OSC 633`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SemanticZone {
+    #[default]
+    Idle,
+    /// Between `133;A` (prompt start) and `133;B`.
+    Prompt,
+    /// Between `133;B` (command input start) and `133;C`.
+    CommandInput,
+    /// Between `133;C` (command execution start) and `133;D`.
+    CommandOutput,
+}
+
+/// A semantic prompt marker (`OSC 133;A` / `OSC 633;A` / `OSC 1337;SetMark`) anchored to a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptMark {
+    /// Row index (`>= 0` indexes live `grid[row]`; `< 0` indexes `-row` lines into `scrollback` from newest).
+    pub row: isize,
+    /// Exit status reported by `OSC 133;D;<exit>` / `OSC 633;D;<exit>` when the command completed.
+    pub exit_code: Option<i32>,
+}
+
 /// Terminal cursor state
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cursor {
@@ -327,6 +476,8 @@ pub struct ScreenBuffer {
     pub images_dirty: bool,
     pub last_placeholder_pos: Option<(usize, usize)>,
     pub tab_stops: Vec<bool>,
+    pub prompt_marks: VecDeque<PromptMark>,
+    pub semantic_zone: SemanticZone,
 }
 
 impl ScreenBuffer {
@@ -348,6 +499,8 @@ impl ScreenBuffer {
             images_dirty: false,
             last_placeholder_pos: None,
             tab_stops,
+            prompt_marks: VecDeque::new(),
+            semantic_zone: SemanticZone::Idle,
         }
     }
 
@@ -407,8 +560,31 @@ impl ScreenBuffer {
     }
 
     pub fn add_image(&mut self, img: GraphicImage) {
+        let is_standalone = img.image_id == 0;
         self.images.push(img);
         self.images_dirty = true;
+
+        // Enforce `MAX_IMAGE_STORAGE_BYTES` across standalone (`image_id == 0`, Sixel / OSC 1337)
+        // placements so repeated inline image dumps never grow heap memory without bound.
+        if is_standalone && self.images.len() > 1 {
+            let mut standalone_bytes: usize = self
+                .images
+                .iter()
+                .filter(|p| p.image_id == 0)
+                .map(|p| p.rgba_data.len())
+                .fold(0usize, usize::saturating_add);
+            while standalone_bytes > MAX_IMAGE_STORAGE_BYTES {
+                // Keep at least the newest placement at `self.images.len() - 1`.
+                let last_idx = self.images.len() - 1;
+                if let Some(pos) = self.images[..last_idx].iter().position(|p| p.image_id == 0) {
+                    standalone_bytes =
+                        standalone_bytes.saturating_sub(self.images[pos].rgba_data.len());
+                    self.images.remove(pos);
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     pub fn resize(&mut self, new_rows: usize, new_cols: usize) {
@@ -464,6 +640,14 @@ impl ScreenBuffer {
             self.images
                 .retain(|img| img.row + (img.height_cells.max(1) as isize) > min_row);
             self.images_dirty = true;
+        }
+        if delta != 0 && !self.prompt_marks.is_empty() {
+            for mark in &mut self.prompt_marks {
+                mark.row += delta;
+            }
+            let min_row = -(self.scrollback.len() as isize);
+            self.prompt_marks
+                .retain(|m| m.row >= min_row && m.row < new_rows as isize);
         }
 
         self.rows = new_rows;
@@ -524,6 +708,14 @@ impl ScreenBuffer {
             self.images
                 .retain(|img| img.row + (img.height_cells.max(1) as isize) > min_row);
             self.images_dirty = true;
+        }
+        if delta != 0 && !self.prompt_marks.is_empty() {
+            for mark in &mut self.prompt_marks {
+                mark.row += delta;
+            }
+            let min_row = -(self.scrollback.len() as isize);
+            self.prompt_marks
+                .retain(|m| m.row >= min_row && m.row < new_rows as isize);
         }
 
         self.resize_tab_stops(new_cols);
@@ -1154,6 +1346,26 @@ impl ScreenBuffer {
             }
             self.images_dirty = true;
         }
+        if actual_scrolled > 0 && !self.prompt_marks.is_empty() {
+            if full_screen {
+                for mark in &mut self.prompt_marks {
+                    mark.row -= actual_scrolled;
+                }
+                let min_row = -(self.scrollback.len() as isize);
+                self.prompt_marks.retain(|m| m.row >= min_row);
+            } else {
+                let top_i = top as isize;
+                let bottom_i = bottom as isize;
+                self.prompt_marks.retain_mut(|m| {
+                    if m.row >= top_i && m.row <= bottom_i {
+                        m.row -= actual_scrolled;
+                        m.row >= top_i
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
         self.last_placeholder_pos = None;
     }
 
@@ -1186,6 +1398,18 @@ impl ScreenBuffer {
                 }
             });
             self.images_dirty = true;
+        }
+        if actual_scrolled > 0 && !self.prompt_marks.is_empty() {
+            let top_i = top as isize;
+            let bottom_i = bottom as isize;
+            self.prompt_marks.retain_mut(|m| {
+                if m.row >= top_i && m.row <= bottom_i {
+                    m.row += actual_scrolled;
+                    m.row <= bottom_i
+                } else {
+                    true
+                }
+            });
         }
         self.last_placeholder_pos = None;
     }
@@ -1505,12 +1729,14 @@ impl ScreenBuffer {
                     if self.images.len() != prev_len {
                         self.images_dirty = true;
                     }
+                    self.prompt_marks.retain(|m| m.row < 0);
                 } else {
                     self.scrollback.clear();
                     if !self.images.is_empty() {
                         self.images.clear();
                         self.images_dirty = true;
                     }
+                    self.prompt_marks.clear();
                 }
                 self.cursor.pending_wrap = false;
                 self.last_placeholder_pos = None;
@@ -1549,6 +1775,7 @@ impl ScreenBuffer {
     /// Clear both visible screen rows and scrollback history (`Cmd+K` behavior).
     pub fn clear_scrollback_and_screen(&mut self) {
         self.scrollback.clear();
+        self.prompt_marks.clear();
         if !self.images.is_empty() {
             self.images.clear();
             self.images_dirty = true;
@@ -1904,6 +2131,113 @@ impl ScreenBuffer {
             .min(total_scrollback);
         self.scroll_offset = new_offset;
     }
+
+    /// Record a semantic prompt mark (`OSC 133;A` / `OSC 633;A` / `OSC 1337;SetMark`) at the
+    /// current cursor row, deduplicating consecutive marks on the same row.
+    pub fn record_prompt_mark(&mut self) {
+        let cur_row = self.cursor.row as isize;
+        if let Some(last) = self.prompt_marks.back_mut() {
+            if last.row == cur_row {
+                last.exit_code = None;
+                return;
+            }
+        }
+        // Keep `prompt_marks` sorted by `row` if the cursor jumped upward before emitting `133;A`.
+        if let Some(pos) = self.prompt_marks.iter().position(|m| m.row == cur_row) {
+            self.prompt_marks[pos].exit_code = None;
+            return;
+        }
+        let max_marks = self
+            .max_scrollback
+            .saturating_add(self.rows)
+            .saturating_add(64);
+        if self.prompt_marks.len() >= max_marks {
+            self.prompt_marks.pop_front();
+        }
+        let insert_idx = self.prompt_marks.partition_point(|m| m.row < cur_row);
+        self.prompt_marks.insert(
+            insert_idx,
+            PromptMark {
+                row: cur_row,
+                exit_code: None,
+            },
+        );
+    }
+
+    /// Attach a command exit code (`OSC 133;D;<exit>` / `OSC 633;D;<exit>`) to the most recent
+    /// prompt mark at or above the current cursor row.
+    pub fn complete_last_prompt_mark(&mut self, exit_code: Option<i32>) {
+        let cur_row = self.cursor.row as isize;
+        if let Some(mark) = self
+            .prompt_marks
+            .iter_mut()
+            .rev()
+            .find(|m| m.row <= cur_row)
+        {
+            mark.exit_code = exit_code;
+        } else if let Some(mark) = self.prompt_marks.back_mut() {
+            mark.exit_code = exit_code;
+        }
+    }
+
+    /// Return the [`PromptMark`] at visible viewport row `visible_row` (`0..self.rows`), if any.
+    pub fn prompt_mark_at_visible_row(&self, visible_row: usize) -> Option<PromptMark> {
+        if self.prompt_marks.is_empty() {
+            return None;
+        }
+        let target_row = (visible_row as isize) - (self.scroll_offset as isize);
+        let idx = self.prompt_marks.partition_point(|m| m.row < target_row);
+        self.prompt_marks
+            .get(idx)
+            .copied()
+            .filter(|m| m.row == target_row)
+    }
+
+    /// Scroll upward in history to the nearest semantic prompt above the current viewport top.
+    /// Returns `true` if `scroll_offset` changed.
+    pub fn scroll_to_prev_prompt(&mut self) -> bool {
+        let max_scroll = self.scrollback.len();
+        if max_scroll == 0 || self.prompt_marks.is_empty() {
+            return false;
+        }
+        let mut best: Option<usize> = None;
+        for mark in &self.prompt_marks {
+            let desired = (-mark.row).clamp(0, max_scroll as isize) as usize;
+            if desired > self.scroll_offset {
+                best = Some(match best {
+                    Some(cur) => cur.min(desired),
+                    None => desired,
+                });
+            }
+        }
+        if let Some(target) = best {
+            self.scroll_offset = target;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Scroll downward toward live output to the next semantic prompt (or `0` at the bottom).
+    /// Returns `true` if `scroll_offset` changed.
+    pub fn scroll_to_next_prompt(&mut self) -> bool {
+        if self.scroll_offset == 0 {
+            return false;
+        }
+        let max_scroll = self.scrollback.len();
+        let mut best: Option<usize> = None;
+        for mark in &self.prompt_marks {
+            let desired = (-mark.row).clamp(0, max_scroll as isize) as usize;
+            if desired < self.scroll_offset {
+                best = Some(match best {
+                    Some(cur) => cur.max(desired),
+                    None => desired,
+                });
+            }
+        }
+        self.scroll_offset = best.unwrap_or(0);
+        true
+    }
 }
 
 /// A search match location in scrollback or active grid.
@@ -1922,6 +2256,8 @@ pub struct ScreenGrid {
     pub is_alternate: bool,
     pub next_hyperlink_id: NonZeroU32,
     pub hyperlinks: HashMap<NonZeroU32, Arc<String>>,
+    /// Maps explicit `OSC 8 ; id=<key> ; <uri>` pairs to a shared `NonZeroU32` hyperlink ID.
+    pub named_hyperlinks: HashMap<(String, String), NonZeroU32>,
     pub underline_colors: Vec<Color>,
     pub underline_color_map: HashMap<Color, NonZeroU16>,
     pub next_image_id: u32,
@@ -1944,6 +2280,7 @@ impl ScreenGrid {
             // Starts at 1: zero is reserved as the `None` niche in `Cell::hyperlink_id`.
             next_hyperlink_id: NonZeroU32::new(1).unwrap(),
             hyperlinks: HashMap::new(),
+            named_hyperlinks: HashMap::new(),
             underline_colors: Vec::new(),
             underline_color_map: HashMap::new(),
             next_image_id: 1,
@@ -2127,6 +2464,30 @@ impl ScreenGrid {
     }
 
     pub fn register_hyperlink(&mut self, uri: &str) -> NonZeroU32 {
+        self.register_hyperlink_with_id(None, uri)
+    }
+
+    pub fn register_hyperlink_with_id(
+        &mut self,
+        explicit_id: Option<&str>,
+        uri: &str,
+    ) -> NonZeroU32 {
+        if let Some(eid) = explicit_id.filter(|s| !s.is_empty()) {
+            let key = (eid.to_string(), uri.to_string());
+            if let Some(&existing) = self.named_hyperlinks.get(&key) {
+                return existing;
+            }
+            let id = self.alloc_hyperlink_slot(uri);
+            if self.named_hyperlinks.len() >= 8192 {
+                self.named_hyperlinks.clear();
+            }
+            self.named_hyperlinks.insert(key, id);
+            return id;
+        }
+        self.alloc_hyperlink_slot(uri)
+    }
+
+    fn alloc_hyperlink_slot(&mut self, uri: &str) -> NonZeroU32 {
         let id = self.next_hyperlink_id;
         // Saturate below `PLACEHOLDER_META_TAG` (bit 31, reserved for Kitty Unicode placeholder
         // tile metadata) rather than wrapping into 0 or colliding with placeholder tags.

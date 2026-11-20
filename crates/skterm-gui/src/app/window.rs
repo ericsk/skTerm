@@ -343,6 +343,9 @@ impl App {
             is_occluded: false,
             is_window_focused: true,
             focused_pane_target: None,
+            active_toast: None,
+            last_os_notification: None,
+            panes_with_running_prog: std::collections::HashSet::new(),
         };
         session.sync_focus_events();
         session.update_ime_position(tab_bar_h, "");
@@ -547,12 +550,41 @@ impl App {
         #[cfg(not(target_os = "macos"))]
         let is_link_modifier = self.modifiers.control_key();
 
+        let sessions_len = self.sessions.len();
+        let tab_bar_style = self
+            .config_manager
+            .current_config
+            .window
+            .tab_bar_style
+            .as_str();
         if let Some(session) = self.sessions.get_mut(&window_id) {
             if session.dragging_splitter.is_none() {
                 if is_link_modifier && session.hovered_url.is_some() {
+                    session.window.set_cursor_visible(true);
                     session.window.set_cursor(CursorIcon::Pointer);
                 } else {
-                    session.window.set_cursor(CursorIcon::Default);
+                    let tab_bar_h = if (sessions_len <= 1
+                        && session.workspace.tabs.len() <= 1
+                        && tab_bar_style == "auto")
+                        || tab_bar_style == "never"
+                    {
+                        0.0
+                    } else {
+                        36.0 * session.renderer.scale_factor
+                    };
+                    let (mx, my) = session.mouse_pos;
+                    let pane_pointer = session
+                        .get_pane_and_cell_at(mx, my, tab_bar_h)
+                        .and_then(|(pid, _, _)| {
+                            session
+                                .workspace
+                                .active_tab()?
+                                .root
+                                .find_terminal(pid)
+                                .map(|t| t.state.active_pointer_shape())
+                        })
+                        .unwrap_or(skterm_core::PointerShape::Default);
+                    super::input_mouse::apply_pointer_shape(&session.window, pane_pointer);
                 }
             }
         }

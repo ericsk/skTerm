@@ -59,7 +59,8 @@ impl App {
                             }
                         }
                         if pty_updated {
-                            session.flush_osc52_clipboard(self.clipboard.as_ref());
+                            let osc52_policy = &self.config_manager.current_config.terminal.osc52;
+                            session.flush_osc52_clipboard(self.clipboard.as_ref(), osc52_policy);
                         }
                         if status_changed {
                             session.last_tab_label_refresh = None;
@@ -393,6 +394,36 @@ impl App {
                         session.sync_all_pane_sizes(tab_bar_h);
                         session.window.request_redraw();
                         return;
+                    }
+                }
+                Key::Named(NamedKey::ArrowUp) if !self.modifiers.alt_key() && !is_alt_variant => {
+                    if let Some(session) = self.sessions.get_mut(&window_id) {
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            if let Some(term) = tab.active_terminal_mut() {
+                                if !term.grid().is_alternate {
+                                    if term.grid_mut().active_mut().scroll_to_prev_prompt() {
+                                        session.last_scroll_time = Some(Instant::now());
+                                        session.window.request_redraw();
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                Key::Named(NamedKey::ArrowDown) if !self.modifiers.alt_key() && !is_alt_variant => {
+                    if let Some(session) = self.sessions.get_mut(&window_id) {
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            if let Some(term) = tab.active_terminal_mut() {
+                                if !term.grid().is_alternate {
+                                    if term.grid_mut().active_mut().scroll_to_next_prompt() {
+                                        session.last_scroll_time = Some(Instant::now());
+                                        session.window.request_redraw();
+                                    }
+                                    return;
+                                }
+                            }
+                        }
                     }
                 }
                 Key::Named(NamedKey::PageUp) => {
@@ -956,7 +987,8 @@ impl App {
                 }
             }
             if pty_updated {
-                session.flush_osc52_clipboard(self.clipboard.as_ref());
+                let osc52_policy = &self.config_manager.current_config.terminal.osc52;
+                session.flush_osc52_clipboard(self.clipboard.as_ref(), osc52_policy);
             }
             if status_changed {
                 session.last_tab_label_refresh = None;

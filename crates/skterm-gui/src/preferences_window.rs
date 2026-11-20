@@ -526,6 +526,9 @@ pub struct PreferencesWindow {
     pub option_as_alt: String,
     pub bell: String,
     pub right_click_action: String,
+    pub osc52: String,
+    pub shell_integration: bool,
+    pub semantic_prompt_marks: bool,
 
     pub cursor_shape: String,
     pub cursor_blink: bool,
@@ -713,6 +716,9 @@ impl PreferencesWindow {
             option_as_alt: "both".to_string(),
             bell: "visual".to_string(),
             right_click_action: "menu".to_string(),
+            osc52: "write-only".to_string(),
+            shell_integration: true,
+            semantic_prompt_marks: true,
 
             cursor_shape: "block".to_string(),
             cursor_blink: true,
@@ -825,6 +831,9 @@ impl PreferencesWindow {
         self.option_as_alt = config.terminal.option_as_alt.clone();
         self.bell = config.terminal.bell.clone();
         self.right_click_action = config.terminal.right_click_action.clone();
+        self.osc52 = config.terminal.osc52.clone();
+        self.shell_integration = config.terminal.shell_integration;
+        self.semantic_prompt_marks = config.terminal.semantic_prompt_marks;
 
         self.cursor_shape = config.cursor.shape.clone();
         self.cursor_blink = config.cursor.blink;
@@ -903,6 +912,9 @@ impl PreferencesWindow {
         cfg.terminal.option_as_alt = self.option_as_alt.clone();
         cfg.terminal.bell = self.bell.clone();
         cfg.terminal.right_click_action = self.right_click_action.clone();
+        cfg.terminal.osc52 = self.osc52.clone();
+        cfg.terminal.shell_integration = self.shell_integration;
+        cfg.terminal.semantic_prompt_marks = self.semantic_prompt_marks;
 
         cfg.cursor.shape = self.cursor_shape.clone();
         cfg.cursor.blink = self.cursor_blink;
@@ -3226,6 +3238,65 @@ impl PreferencesWindow {
                         if render_macos_segmented_control(ui, &mut cur, &opts) {
                             self.right_click_action = cur.to_string();
                         }
+                    },
+                );
+
+                b.row(
+                    l(
+                        "OSC 52 剪貼簿權限 (OSC 52 Clipboard)",
+                        "OSC 52 剪贴板权限 (OSC 52 Clipboard)",
+                        "OSC 52 Clipboard Access",
+                    ),
+                    Some(l(
+                        "控制遠端 SSH 或 TUI 程式讀寫系統剪貼簿的權限",
+                        "控制远程 SSH 或 TUI 程序读写系统剪贴板的权限",
+                        "Control terminal programs reading or writing the system clipboard",
+                    )),
+                    |ui| {
+                        let mut cur = self.osc52.as_str();
+                        let opts = [
+                            (
+                                "write-only",
+                                l("僅允許寫入 (預設)", "仅允许写入 (默认)", "Write Only"),
+                            ),
+                            ("read-write", l("允許讀寫", "允许读写", "Read & Write")),
+                            ("disabled", l("停用", "禁用", "Disabled")),
+                        ];
+                        if render_macos_segmented_control(ui, &mut cur, &opts) {
+                            self.osc52 = cur.to_string();
+                        }
+                    },
+                );
+
+                b.row(
+                    l(
+                        "自動 Shell 整合 (Shell Integration)",
+                        "自动 Shell 整合 (Shell Integration)",
+                        "Shell Integration (OSC 133 / OSC 7)",
+                    ),
+                    Some(l(
+                        "為 zsh / bash / fish 自動注入提示符跳轉與目錄同步鉤子",
+                        "为 zsh / bash / fish 自动注入提示符跳转与目录同步钩子",
+                        "Auto-inject prompt navigation and CWD hooks for new shells",
+                    )),
+                    |ui| {
+                        render_macos_toggle_switch(ui, &mut self.shell_integration);
+                    },
+                );
+
+                b.row(
+                    l(
+                        "提示符狀態標記 (Prompt Gutter Marks)",
+                        "提示符状态标记 (Prompt Gutter Marks)",
+                        "Semantic Prompt Gutter Marks",
+                    ),
+                    Some(l(
+                        "在左側邊距顯示指令執行狀態細線（成功淡綠 / 失敗紅色）",
+                        "在左侧边距显示命令执行状态细线（成功淡绿 / 失败红色）",
+                        "Show command exit status indicators in the left margin",
+                    )),
+                    |ui| {
+                        render_macos_toggle_switch(ui, &mut self.semantic_prompt_marks);
                     },
                 );
 

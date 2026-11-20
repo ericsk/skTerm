@@ -307,28 +307,33 @@ impl App {
                 }
 
                 if !is_over_splitter {
-                    // Check hyperlink under cursor
-                    let detected_url = if let Some((pane_id, row, col)) =
+                    // Check hyperlink and OSC 22 pointer shape under cursor
+                    let (detected_url, pane_pointer) = if let Some((pane_id, row, col)) =
                         session.get_pane_and_cell_at(mx, my, tab_bar_h)
                     {
                         if let Some(tab) = session.workspace.active_tab() {
-                            tab.root
-                                .find_terminal(pane_id)
-                                .and_then(|t| t.url_at(row, col))
+                            if let Some(t) = tab.root.find_terminal(pane_id) {
+                                (t.url_at(row, col), t.state.active_pointer_shape())
+                            } else {
+                                (None, skterm_core::PointerShape::Default)
+                            }
                         } else {
-                            None
+                            (None, skterm_core::PointerShape::Default)
                         }
                     } else {
-                        None
+                        (None, skterm_core::PointerShape::Default)
                     };
 
                     session.hovered_url = detected_url;
 
                     if is_link_modifier && session.hovered_url.is_some() {
+                        session.window.set_cursor_visible(true);
                         session.window.set_cursor(CursorIcon::Pointer);
                     } else {
-                        session.window.set_cursor(CursorIcon::Default);
+                        apply_pointer_shape(&session.window, pane_pointer);
                     }
+                } else {
+                    session.window.set_cursor_visible(true);
                 }
             }
         }
@@ -1179,4 +1184,47 @@ impl App {
             }
         }
     }
+}
+
+/// Apply an `OSC 22` [`skterm_core::PointerShape`] onto a `winit` [`winit::window::Window`].
+pub(crate) fn apply_pointer_shape(
+    window: &winit::window::Window,
+    shape: skterm_core::PointerShape,
+) {
+    use skterm_core::PointerShape;
+    if shape == PointerShape::None {
+        window.set_cursor_visible(false);
+        return;
+    }
+    window.set_cursor_visible(true);
+    let icon = match shape {
+        PointerShape::Default => CursorIcon::Default,
+        PointerShape::Text => CursorIcon::Text,
+        PointerShape::VerticalText => CursorIcon::VerticalText,
+        PointerShape::Pointer => CursorIcon::Pointer,
+        PointerShape::Crosshair => CursorIcon::Crosshair,
+        PointerShape::Wait => CursorIcon::Wait,
+        PointerShape::Progress => CursorIcon::Progress,
+        PointerShape::Help => CursorIcon::Help,
+        PointerShape::Grab => CursorIcon::Grab,
+        PointerShape::Grabbing => CursorIcon::Grabbing,
+        PointerShape::NotAllowed => CursorIcon::NotAllowed,
+        PointerShape::NoDrop => CursorIcon::NoDrop,
+        PointerShape::ContextMenu => CursorIcon::ContextMenu,
+        PointerShape::Cell => CursorIcon::Cell,
+        PointerShape::Move => CursorIcon::Move,
+        PointerShape::Alias => CursorIcon::Alias,
+        PointerShape::Copy => CursorIcon::Copy,
+        PointerShape::ZoomIn => CursorIcon::ZoomIn,
+        PointerShape::ZoomOut => CursorIcon::ZoomOut,
+        PointerShape::EwResize => CursorIcon::EwResize,
+        PointerShape::NsResize => CursorIcon::NsResize,
+        PointerShape::NeswResize => CursorIcon::NeswResize,
+        PointerShape::NwseResize => CursorIcon::NwseResize,
+        PointerShape::ColResize => CursorIcon::ColResize,
+        PointerShape::RowResize => CursorIcon::RowResize,
+        PointerShape::AllScroll => CursorIcon::AllScroll,
+        PointerShape::None => CursorIcon::Default,
+    };
+    window.set_cursor(icon);
 }

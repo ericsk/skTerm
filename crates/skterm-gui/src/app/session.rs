@@ -87,6 +87,15 @@ pub struct TerminalSession {
     /// The `(tab_id, pane_id)` that currently holds terminal focus in this window
     /// for DEC Mode `?1004` (`focus_events`) reporting.
     pub focused_pane_target: Option<(u32, u32)>,
+    /// Active in-window notification toast `(title, body, expires_at)`.
+    pub active_toast: Option<(String, String, Instant)>,
+    /// Rate-limiter for native OS desktop notifications (`OSC 9` / `99` / `777`).
+    pub last_os_notification: Option<Instant>,
+    /// Tracks `(tab_id, pane_id)` pairs that were running a non-shell foreground child
+    /// on the previous title refresh, so stale `OSC 1` / `OSC 9;4` state left behind
+    /// by an exited program is cleared on return to the shell without wiping out
+    /// `OSC 1` titles set directly at an idle shell prompt.
+    pub panes_with_running_prog: std::collections::HashSet<(u32, u32)>,
 }
 
 /// Refresh period of the monitor `window` currently sits on.
@@ -283,8 +292,11 @@ impl TerminalSession {
         let mut any_tab_changed = false;
 
         let process_cache = &self.process_cache;
+        let panes_with_running_prog = &mut self.panes_with_running_prog;
 
         for (idx, tab) in self.workspace.tabs.iter_mut().enumerate() {
+            let tab_id = tab.id;
+            let active_pane_id = tab.active_pane_id;
             let computed = if let Some(terminal) = tab.active_terminal_mut() {
                 let process = terminal.foreground_process_name();
                 let cmdline = terminal.foreground_process_cmdline();
@@ -310,8 +322,8 @@ impl TerminalSession {
                     })
                     .or(osc7501_agent_brand.as_deref());
 
-                // Clear stale OSC titles left behind by an exited foreground program
-                // once the terminal returns to an idle shell prompt with a known CWD.
+                // Clear stale OSC titles and progress bars left behind by an exited foreground
+                // program once the terminal transitions back to an idle shell prompt.
                 let running_prog = crate::tab_title::resolve_program_name(
                     process.as_deref(),
                     cmdline.as_deref(),
@@ -319,12 +331,21 @@ impl TerminalSession {
                     &terminal.state.title,
                     configured_shell,
                 );
-                if running_prog.is_none()
-                    && osc7501_status.is_none()
-                    && cwd.is_some()
-                    && terminal.state.title != "skTerm"
-                {
-                    terminal.state.title = "skTerm".to_string();
+                let pane_key = (tab_id, active_pane_id);
+                let was_running_prog = if running_prog.is_some() {
+                    panes_with_running_prog.insert(pane_key);
+                    false
+                } else {
+                    panes_with_running_prog.remove(&pane_key)
+                };
+                if running_prog.is_none() && osc7501_status.is_none() && cwd.is_some() {
+                    if terminal.state.title != "skTerm" {
+                        terminal.state.title = "skTerm".to_string();
+                    }
+                    if was_running_prog {
+                        terminal.state.icon_title = None;
+                        terminal.state.progress = None;
+                    }
                 }
 
                 let effective_osc_title = osc7501_status
@@ -334,8 +355,9 @@ impl TerminalSession {
                     .unwrap_or(&terminal.state.title);
 
                 let fallback = format!("Tab {}", idx + 1);
-                let label = crate::tab_title::build_tab_label(
+                let label = crate::tab_title::build_tab_label_with_icon(
                     terminal.custom_label.as_deref(),
+                    terminal.state.icon_title.as_deref(),
                     process.as_deref(),
                     cmdline.as_deref(),
                     descendant_agent,
@@ -585,20 +607,120 @@ impl TerminalSession {
         }
     }
 
-    pub fn flush_osc52_clipboard(&mut self, clipboard: Option<&Arc<Mutex<Clipboard>>>) {
-        for tab in &mut self.workspace.tabs {
+    pub fn flush_osc52_clipboard(
+        &mut self,
+        clipboard: Option<&Arc<Mutex<Clipboard>>>,
+        osc52_policy: &str,
+    ) {
+        use skterm_core::{encode_base64_standard, ClipboardRequest};
+        use winit::window::UserAttentionType;
+
+        let policy = osc52_policy.trim().to_ascii_lowercase();
+        let allow_write = policy != "disabled";
+        let allow_read = policy == "read-write";
+
+        let active_tab_idx = self.workspace.active_tab_idx;
+        let is_window_focused = self.is_window_focused;
+        let is_occluded = self.is_occluded;
+        let mut toast_to_show: Option<(String, String)> = None;
+        let mut attention_to_request: Option<Option<UserAttentionType>> = None;
+
+        for (tab_idx, tab) in self.workspace.tabs.iter_mut().enumerate() {
+            let is_active_tab = tab_idx == active_tab_idx;
             for id in tab.root.all_leaf_ids() {
-                if let Some(terminal) = tab.root.find_terminal_mut(id) {
-                    if let Some(text) = terminal.take_pending_clipboard() {
-                        if let Some(cb) = clipboard {
-                            if let Ok(mut clip) = cb.lock() {
-                                let _ = clip.set_text(text);
-                                info!("Copied OSC 52 text to system clipboard");
+                let Some(terminal) = tab.root.find_terminal_mut(id) else {
+                    continue;
+                };
+
+                // 1. OSC 52 / OSC 1337 Clipboard requests
+                let reqs = terminal.take_pending_clipboard_requests();
+                for req in reqs {
+                    match req {
+                        ClipboardRequest::Write(text) if allow_write => {
+                            if let Some(cb) = clipboard {
+                                if let Ok(mut clip) = cb.lock() {
+                                    let _ = clip.set_text(text);
+                                    info!("Copied OSC 52 text to system clipboard");
+                                }
                             }
                         }
+                        ClipboardRequest::Clear if allow_write => {
+                            if let Some(cb) = clipboard {
+                                if let Ok(mut clip) = cb.lock() {
+                                    let _ = clip.set_text(String::new());
+                                    info!("Cleared system clipboard via OSC 52");
+                                }
+                            }
+                        }
+                        ClipboardRequest::Query {
+                            selection,
+                            bell_terminated,
+                        } if allow_read => {
+                            if let Some(cb) = clipboard {
+                                if let Ok(mut clip) = cb.lock() {
+                                    let text = clip.get_text().unwrap_or_default();
+                                    let b64 = encode_base64_standard(text.as_bytes());
+                                    let term = if bell_terminated { "\x07" } else { "\x1b\\" };
+                                    let resp = format!("\x1b]52;{selection};{b64}{term}");
+                                    let _ = terminal.write_to_pty(resp.as_bytes());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // 2. OSC 1337 RequestAttention
+                if let Some(attn) = terminal.take_pending_user_attention() {
+                    attention_to_request = Some(if attn {
+                        Some(UserAttentionType::Informational)
+                    } else {
+                        None
+                    });
+                }
+
+                // 3. Desktop Notifications (`OSC 9` / `OSC 99` / `OSC 777`)
+                let notifs = terminal.take_pending_notifications();
+                for notif in notifs {
+                    let is_currently_viewed = is_window_focused && !is_occluded && is_active_tab;
+                    let is_invisible = is_occluded || !is_active_tab;
+
+                    let should_deliver = if notif.force_when_focused {
+                        true
+                    } else if notif.only_when_invisible {
+                        is_invisible
+                    } else {
+                        !is_currently_viewed
+                    };
+
+                    if should_deliver {
+                        if !is_window_focused {
+                            let kind = if notif.urgent {
+                                UserAttentionType::Critical
+                            } else {
+                                UserAttentionType::Informational
+                            };
+                            attention_to_request = Some(Some(kind));
+                        }
+                        if self
+                            .last_os_notification
+                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+                        {
+                            self.last_os_notification = Some(Instant::now());
+                            dispatch_os_notification(notif.title.clone(), notif.body.clone());
+                        }
+                        toast_to_show = Some((notif.title, notif.body));
                     }
                 }
             }
+        }
+
+        if let Some(attn) = attention_to_request {
+            self.window.request_user_attention(attn);
+        }
+        if let Some((title, body)) = toast_to_show {
+            self.active_toast = Some((title, body, Instant::now() + Duration::from_secs(4)));
+            self.request_redraw();
         }
     }
 
@@ -824,4 +946,45 @@ impl TerminalSession {
         let max_x = self.renderer.config.width as f32 - menu_w - 4.0 * scale;
         (btn_x + btn_w / 2.0 - menu_w / 2.0).clamp(4.0 * scale, max_x.max(4.0 * scale))
     }
+}
+
+/// Deliver a non-blocking native OS desktop notification using safe positional argv passing
+/// (immune to AppleScript / shell injection).
+fn dispatch_os_notification(title: String, body: String) {
+    let _ = std::thread::Builder::new()
+        .name("skterm-notify".to_string())
+        .spawn(move || {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("/usr/bin/osascript")
+                    .args([
+                        "-e",
+                        "on run argv",
+                        "-e",
+                        "display notification (item 2 of argv) with title (item 1 of argv)",
+                        "-e",
+                        "end run",
+                        "--",
+                        &title,
+                        &body,
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("notify-send")
+                    .args(["-a", "skTerm", "--", &title, &body])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                let _ = (title, body);
+            }
+        });
 }

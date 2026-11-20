@@ -33,12 +33,14 @@
 - 🤖 **AI Agents Sidebar & `OSC 7501` Protocol**:
   - Global floating AI Agents panel (`Cmd+Shift+A` / `Ctrl+Shift+A`) tracking running AI CLI sessions across all tabs and windows.
   - Inline task label renaming (`Cmd+Shift+R` / `Ctrl+Shift+R`) and live lifecycle status integration via the `OSC 7501` protocol.
-- 🖼️ **Advanced Terminal Graphics Protocols (Kitty & DEC Sixel)**:
-  - **Kitty Graphics Protocol**: Direct GPU texture pipeline rendering for 32-bit RGBA, 24-bit RGB, and PNG images.
+- 🖼️ **Advanced Terminal Graphics Protocols (Kitty, iTerm2 `OSC 1337` & DEC Sixel)**:
+  - **Kitty Graphics Protocol**: Direct GPU texture pipeline rendering for 32-bit RGBA, 24-bit RGB, and PNG/JPEG/BMP/TIFF/ICO images.
+  - **iTerm2 Inline Images (`OSC 1337`)**: Full `File=` and `MultipartFile` / `FilePart` / `FileEnd` inline image rendering (`imgcat` compatible) with `auto` / cell / `px` / `%` sizing, `preserveAspectRatio`, and `doNotMoveCursor`.
   - **DEC Sixel**: Full bitmap raster decoding and palette support.
-- 🔗 **Clickable Hyperlinks & URL Auto-Detection**:
-  - Supports standard **OSC 8** escape sequence hyperlinks alongside real-time plain-text URL auto-detection (`https://`, `http://`, `www.`, etc.).
-  - Hold `Cmd` (macOS) or `Ctrl` (Linux/Windows) while hovering to display a pointer cursor, and click to open links directly in your default browser.
+- 🔗 **Modern OSC Ecosystem & Shell Integration**:
+  - **Semantic Shell Prompts (`OSC 133` & `OSC 633`)**: Auto-injected `zsh` / `bash` / `fish` hooks, `Cmd+↑/↓` (`Ctrl+Shift+↑/↓`) prompt jumping, and subtle left-margin command exit status indicators.
+  - **Progress Bars (`OSC 9;4`) & Desktop Notifications (`OSC 9`, `OSC 99`, `OSC 777`)**: Dual-layer per-pane and per-tab progress indicators, unfocused OS notifications, Dock attention bounce, and in-window Toast banners.
+  - **Hyperlinks (`OSC 8` with `id=` grouping)**, **Pointer Cursor Shapes (`OSC 22`)**, **Clipboard Control (`OSC 52` with configurable `write-only` / `read-write` / `disabled` security)**, **Document & CWD URIs (`OSC 6` / `OSC 7`)**, **Tab vs Window Titles (`OSC 0` / `1` / `2`)**, and **Dynamic Colors (`OSC 4` / `10`–`19` / `21` / `104` / `110`–`119`)**.
 - ⚙️ **Preferences GUI, Hot Reload, i18n & OTA Updates**:
   - Native GPU-rendered Preferences window (`egui 0.37`, `Cmd+,` / `Ctrl+,`) plus native macOS menu bar integration.
   - Built-in themes (`pure-black`, `catppuccin-mocha`, `tokyo-night`, `dracula`, `solarized-dark`, `nord`, `default-dark`) and automatic TOML configuration hot-reloading.
@@ -70,6 +72,7 @@
 | `Cmd + ]` / `Cmd + [` | `Alt + ]` / `Alt + [` | **Focus Next / Previous Pane** |
 | `Cmd + Shift + ]` / `[` | `Ctrl + Shift + ]` / `[` (or `Ctrl + Tab` / `Ctrl + Shift + Tab`) | **Switch to Next / Previous Tab** |
 | `Cmd + 1` ~ `9` | `Ctrl + 1` ~ `9` | **Switch Directly to Tab 1 ~ 9** |
+| `Cmd + ↑` / `Cmd + ↓` | `Ctrl + Shift + ↑` / `↓` | **Jump to Previous / Next Prompt (`OSC 133` / `633`)** |
 | `Cmd + F` | `Ctrl + Shift + F` | **Find in Scrollback** |
 | `Cmd + K` | `Ctrl + Shift + K` | **Clear Scrollback & Screen** |
 | `Cmd + C` / `Cmd + V` | `Ctrl + Shift + C` / `Ctrl + Shift + V` | **Copy / Paste (Supports Bracketed Paste)** |
@@ -169,6 +172,12 @@ option_as_alt = "both"
 bell = "visual"
 # Right-click mouse behavior ("menu" or "paste")
 right_click_action = "menu"
+# OSC 52 clipboard access ("write-only", "read-write", "disabled")
+osc52 = "write-only"
+# Auto-inject zsh/bash/fish OSC 133 & OSC 7 shell integration hooks
+shell_integration = true
+# Draw subtle left-margin command exit status indicators
+semantic_prompt_marks = true
 
 [colors]
 # Built-in themes: "pure-black", "catppuccin-mocha", "tokyo-night", "dracula", "solarized-dark", "nord", "default-dark"
@@ -194,10 +203,10 @@ blink_interval_ms = 500
 
 ```
 skTerm Workspace
-├── crates/skterm-core    # VT100 state machine, character grid, PTY management, OSC 7501, Sixel & Kitty graphics decoding
-├── crates/skterm-render  # wgpu 30.0 pipeline, 2D glyph texture atlas, AI agents panel & Sixel/Kitty GPU rendering
+├── crates/skterm-core    # VT100 state machine, character grid, PTY management, OSC 7501, Sixel, Kitty & OSC 1337 graphics decoding
+├── crates/skterm-render  # wgpu 30.0 pipeline, 2D glyph texture atlas, AI agents panel & Sixel/Kitty/OSC 1337 GPU rendering
 ├── crates/skterm-gui     # winit event loop, BSP split panes, inline IME, i18n, OTA updater & egui 0.37 preferences UI
-└── crates/skterm-app     # Application binary entry point & examples (benchmark, kitty_image, sixel_image)
+└── crates/skterm-app     # Application binary entry point & examples (benchmark, kitty_image, osc1337_image, sixel_image)
 ```
 
 ---

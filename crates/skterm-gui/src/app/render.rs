@@ -112,6 +112,12 @@ impl App {
                 }
             }
 
+            let show_prompt_marks = self
+                .config_manager
+                .current_config
+                .terminal
+                .semantic_prompt_marks;
+
             let tabs: Vec<TabItem> = session
                 .workspace
                 .tabs
@@ -123,9 +129,19 @@ impl App {
                     } else {
                         tab.title.clone()
                     };
+                    let tab_progress = tab
+                        .active_terminal()
+                        .and_then(|t| t.state.progress)
+                        .or_else(|| {
+                            tab.root
+                                .all_leaf_ids()
+                                .into_iter()
+                                .find_map(|pid| tab.root.find_terminal(pid)?.state.progress)
+                        });
                     TabItem {
                         title,
                         is_active: idx == session.workspace.active_tab_idx,
+                        progress: tab_progress,
                     }
                 })
                 .collect();
@@ -193,10 +209,19 @@ impl App {
                             dynamic_fg: t.state.dynamic_fg,
                             dynamic_bg: t.state.dynamic_bg,
                             dynamic_cursor: t.state.dynamic_cursor,
+                            dynamic_selection_bg: t.state.dynamic_selection_bg,
+                            dynamic_selection_fg: t.state.dynamic_selection_fg,
+                            progress: t.state.progress,
+                            show_prompt_marks,
                         });
                     }
                 }
             }
+
+            let toast_pair = session
+                .active_toast
+                .as_ref()
+                .map(|(title, body, _)| (title.as_str(), body.as_str()));
 
             let panel_state = AgentPanelState {
                 open: session.workspace.sidebar_open,
@@ -211,6 +236,7 @@ impl App {
                     || (session.menu_open && !session.menu_is_context),
                 ai_btn_hovered: session.ai_btn_hovered,
                 prefs_btn_hovered: session.prefs_btn_hovered,
+                toast: toast_pair,
             };
 
             let (top_menu, _actions) = if session.menu_open {

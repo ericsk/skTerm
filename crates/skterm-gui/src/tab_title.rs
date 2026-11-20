@@ -271,8 +271,42 @@ pub fn build_tab_label(
     osc_title: &str,
     fallback_title: &str,
 ) -> String {
+    build_tab_label_with_icon(
+        custom_label,
+        None,
+        foreground_process,
+        foreground_cmdline,
+        descendant_agent,
+        cwd,
+        home,
+        configured_shell,
+        osc_title,
+        fallback_title,
+    )
+}
+
+/// Build the compact text for a tab capsule and macOS native tab, giving explicit
+/// `OSC 1 ; <icon_title>` precedence over `{program} · {dir_basename}` (while
+/// keeping user `custom_label` from `Cmd+Shift+R` at highest priority and leaving
+/// generic `OSC 0/2` titles filtered by the smart `{program} · {dir}` rules).
+#[allow(clippy::too_many_arguments)]
+pub fn build_tab_label_with_icon(
+    custom_label: Option<&str>,
+    osc_icon_title: Option<&str>,
+    foreground_process: Option<&str>,
+    foreground_cmdline: Option<&str>,
+    descendant_agent: Option<&str>,
+    cwd: Option<&str>,
+    home: Option<&str>,
+    configured_shell: Option<&str>,
+    osc_title: &str,
+    fallback_title: &str,
+) -> String {
     if let Some(custom) = custom_label.map(str::trim).filter(|s| !s.is_empty()) {
         return custom.to_string();
+    }
+    if let Some(icon) = osc_icon_title.map(str::trim).filter(|s| !s.is_empty()) {
+        return icon.to_string();
     }
 
     let dir_name = cwd.map(|c| dir_basename(c, home));
@@ -606,6 +640,42 @@ mod tests {
         assert_eq!(
             build_window_title(None, None, None, None, None, HOME, None, ""),
             "skTerm"
+        );
+    }
+
+    #[test]
+    fn explicit_osc1_icon_title_beats_smart_dir_but_yields_to_custom_label() {
+        // Explicit OSC 1 overrides `{program} · {dir}`
+        assert_eq!(
+            build_tab_label_with_icon(
+                None,
+                Some("API Server"),
+                Some("cargo"),
+                Some("cargo run"),
+                None,
+                Some("/Users/eric/Projects/skTerm"),
+                HOME,
+                Some("/bin/zsh"),
+                "eric@macbook: ~/Projects/skTerm",
+                "Tab 1",
+            ),
+            "API Server"
+        );
+        // User manual rename (`Cmd+Shift+R`) still wins over OSC 1
+        assert_eq!(
+            build_tab_label_with_icon(
+                Some("Pinned Name"),
+                Some("API Server"),
+                Some("cargo"),
+                None,
+                None,
+                Some("/Users/eric/Projects/skTerm"),
+                HOME,
+                Some("/bin/zsh"),
+                "",
+                "Tab 1",
+            ),
+            "Pinned Name"
         );
     }
 }

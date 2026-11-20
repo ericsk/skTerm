@@ -1,4 +1,4 @@
-# 06. 終端圖像協定規格 (Graphics Protocol: Sixel & Kitty)
+# 06. 終端圖像協定規格 (Graphics Protocol: Sixel, Kitty & OSC 1337)
 
 ## 1. 協定範疇與支援
 - **Sixel Graphics Protocol**：
@@ -7,13 +7,18 @@
 - **Kitty Graphics Protocol**：
   - 完整攔截標準 **APC (`ESC _ G ... ST`)** 與相容 **OSC (`ESC ] G ... ST`)** 控制序列（支援跨讀取緩衝區串流切分）。
   - **傳輸媒介與壓縮**：支援直傳 (`t=d`)、本機一般檔案 (`t=f`)、安全暫存檔 (`t=t`，嚴格驗證暫存目錄與 `tty-graphics-protocol` 命名)、POSIX 共享記憶體 (`t=s`)、分塊重組 (`m=1`/`m=0`)、偏移量與長度讀取 (`O=`/`S=`) 及 Zlib 解壓縮 (`o=z`)。
-  - **像素格式**：支援 32-bit RGBA (`f=32`)、24-bit RGB (`f=24`) 與 PNG/JPEG (`f=100`)。
+  - **像素格式**：支援 32-bit RGBA (`f=32`)、24-bit RGB (`f=24`) 與 PNG/JPEG/BMP/ICO/TIFF/PNM/TGA (`f=100`)。
   - **指令動作**：
     - `a=q`：能力探測與錯誤回報（遵循 `q=0`/`q=1`/`q=2` 靜音旗標）。
     - `a=t` / `a=T` / `a=p`：分離圖像儲存庫（`StoredImage`，具備 320 MiB LRU 配額）與畫面擺放實例（`GraphicImage`），支援 ID (`i=`)、編號 (`I=`)、Placement ID (`p=`)、裁切區域 (`x,y,w,h`)、子格偏移 (`X,Y`)、欄列等比縮放 (`c,r`)、游標策略 (`C=0`/`C=1`) 及相對父圖定位 (`P,Q,H,V`)。
     - `a=d`：支援 `a/A`、`i/I`、`n/N`、`c/C`、`p/P`、`q/Q`、`r/R`、`x/X`、`y/Y`、`z/Z`、`f/F` 等小寫（僅移除畫面位置）與大寫（連同釋放未引用紋理）刪除選擇器。
     - `a=f` / `a=c` / `a=a`：支援動畫影格建立、Alpha 合成/覆寫與目標影格切換。
     - **Unicode Placeholders (`U=1`, `U+10EEEE`)**：支援 297 個標準組合變音符號（`KITTY_DIACRITICS`）編碼之列/欄/MSB 瓦片座標與省略延續模式，相容 `tmux`、`yazi`、`snacks.nvim` 等 TUI 工具。
+- **iTerm2 Inline Images Protocol (`OSC 1337`)**：
+  - 透過前置串流狀態機攔截 **OSC (`ESC ] 1337 ; ... BEL/ST`)**，突破 `vte` 1024-byte `ArrayVec` 限制，支援最大 64 MiB 單筆串流與折行 Base64 載荷。
+  - **傳輸模式**：支援單筆 `File=[args]:<base64>` 以及分段傳輸 `MultipartFile=[args]`、`FilePart=<chunk>`、`FileEnd`（相容 `imgcat`、`chafa -f iterm`、`timg -pi`、`wezterm imgcat`）。
+  - **尺寸與排版參數**：支援 `inline=1`（預設 `inline=0` 不繪製）、`width=` / `height=`（`auto`、字元格數 `N`、像素 `Npx`、視窗百分比 `N%`）、`preserveAspectRatio=0|1`（等比置中縮放與強制拉伸）及 `doNotMoveCursor=1`（TUI 原地預覽模式）。
+  - **輔助子指令**：支援 `CursorShape=0|1|2`、`CurrentDir=`、`ReportCellSize` 與 `ClearScrollback`。
 
 ---
 

@@ -1,4 +1,4 @@
-//! Terminal Graphics Protocols: DEC Sixel and Kitty Graphics Protocol Decoders.
+//! Terminal Graphics Protocols: DEC Sixel, Kitty Graphics Protocol, and iTerm2 OSC 1337 Decoders.
 
 use base64::engine::general_purpose::{
     STANDARD as BASE64_STANDARD, STANDARD_NO_PAD as BASE64_NO_PAD,
@@ -157,6 +157,10 @@ pub struct GraphicImage {
     pub display_cols: Option<u32>,
     /// Explicit target display height in rows (`r=`), if specified.
     pub display_rows: Option<u32>,
+    /// Optional explicit display box in cell units `[offset_x_cells, offset_y_cells, width_cells_f32, height_cells_f32]`.
+    /// Used by protocols with pixel/percentage/stretch sizing (such as iTerm2 `OSC 1337`) so exact
+    /// sub-cell pixel geometry is preserved while still scaling cleanly on font zoom.
+    pub custom_display_cells: Option<[f32; 4]>,
     /// Occupied width in grid cells.
     pub width_cells: usize,
     /// Occupied height in grid cells.
@@ -169,11 +173,18 @@ pub struct GraphicImage {
 
 impl GraphicImage {
     /// Compute the rendered `[offset_x, offset_y, display_w_px, display_h_px]` relative to the
-    /// anchor cell's top-left corner `(col * cell_w, row * cell_h)`, preserving aspect ratio
-    /// per the Kitty Graphics Protocol specification.
+    /// anchor cell's top-left corner `(col * cell_w, row * cell_h)`.
     pub fn compute_display_box(&self, cell_w: f32, cell_h: f32) -> [f32; 4] {
         let cell_w = cell_w.max(1.0);
         let cell_h = cell_h.max(1.0);
+        if let Some([ox_c, oy_c, w_c, h_c]) = self.custom_display_cells {
+            return [
+                ox_c * cell_w,
+                oy_c * cell_h,
+                (w_c * cell_w).max(1.0),
+                (h_c * cell_h).max(1.0),
+            ];
+        }
         let src_w = self.src_rect[2].max(1) as f32;
         let src_h = self.src_rect[3].max(1) as f32;
         let off_x = (self.cell_offset[0] as f32).min(cell_w - 1.0).max(0.0);
@@ -1370,6 +1381,29 @@ fn decompress_zlib_bounded(compressed: &[u8]) -> Result<Vec<u8>, (&'static str, 
     Ok(out)
 }
 
+/// Inspect encoded image dimensions before full decode (decompression-bomb guard) and decode
+/// PNG / JPEG / BMP / ICO / TIFF / PNM / TGA bytes into `(width_px, height_px, rgba_bytes)`.
+pub fn decode_encoded_image_rgba(
+    data: &[u8],
+) -> Result<(u32, u32, Vec<u8>), (&'static str, &'static str)> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|_| ("EINVAL", "Failed to inspect encoded image header"))?;
+    let (w, h) = reader
+        .into_dimensions()
+        .map_err(|_| ("EINVAL", "Failed to read encoded image dimensions"))?;
+    validate_kitty_dimensions(w, h)?;
+
+    let img = image::load_from_memory(data).map_err(|_| {
+        warn!("Failed to decode compressed image from memory");
+        ("EINVAL", "Failed to decode encoded image")
+    })?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    validate_kitty_dimensions(w, h)?;
+    Ok((w, h, rgba.into_raw()))
+}
+
 /// Decode raw pixel or PNG/JPEG bytes into `(width_px, height_px, rgba_bytes)`.
 pub fn decode_kitty_pixels(
     params: &KittyControlParams,
@@ -1380,23 +1414,9 @@ pub fn decode_kitty_pixels(
 
     match params.format {
         100 => {
-            let reader = image::ImageReader::new(std::io::Cursor::new(&data))
-                .with_guessed_format()
-                .map_err(|_| ("EINVAL", "Failed to inspect encoded image header"))?;
-            let (w, h) = reader
-                .into_dimensions()
-                .map_err(|_| ("EINVAL", "Failed to read encoded image dimensions"))?;
-            validate_kitty_dimensions(w, h)?;
-
-            let img = image::load_from_memory(&data).map_err(|_| {
-                warn!("Failed to decode Kitty PNG/compressed image from memory");
-                ("EINVAL", "Failed to decode PNG image")
-            })?;
-            let rgba = img.to_rgba8();
-            let (w, h) = rgba.dimensions();
-            validate_kitty_dimensions(w, h)?;
-            info!("Decoded Kitty PNG image: {}x{} px", w, h);
-            Ok((w, h, rgba.into_raw()))
+            let (w, h, rgba) = decode_encoded_image_rgba(&data)?;
+            info!("Decoded Kitty encoded image: {}x{} px", w, h);
+            Ok((w, h, rgba))
         }
         24 => {
             validate_kitty_dimensions(width, height)?;
@@ -1511,6 +1531,631 @@ pub fn composite_rgba_patch(
                 }
             }
         }
+    }
+}
+
+// =========================================================================
+// iTerm2 Inline Images Protocol (`OSC 1337`)
+// =========================================================================
+
+/// Dimension specification for iTerm2 `OSC 1337` `width=` and `height=` arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Osc1337Dimension {
+    /// Automatic intrinsic sizing (`auto`).
+    #[default]
+    Auto,
+    /// Dimension in character cells (`N`, columns for `width`, rows for `height`).
+    Cells(f32),
+    /// Dimension in pixels (`Npx`).
+    Pixels(f32),
+    /// Dimension as a percentage of the active terminal viewport (`N%`).
+    Percent(f32),
+}
+
+impl Osc1337Dimension {
+    pub fn parse(raw: &str) -> Self {
+        let s = raw.trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+            return Self::Auto;
+        }
+        if s.len() > 2 && s[s.len() - 2..].eq_ignore_ascii_case("px") {
+            if let Ok(v) = s[..s.len() - 2].trim().parse::<f32>() {
+                if v.is_finite() && v > 0.0 {
+                    return Self::Pixels(v);
+                }
+            }
+            return Self::Auto;
+        }
+        if let Some(num_str) = s.strip_suffix('%') {
+            if let Ok(v) = num_str.trim().parse::<f32>() {
+                if v.is_finite() && v > 0.0 {
+                    return Self::Percent(v);
+                }
+            }
+            return Self::Auto;
+        }
+        if let Ok(v) = s.parse::<f32>() {
+            if v.is_finite() && v > 0.0 {
+                return Self::Cells(v);
+            }
+        }
+        Self::Auto
+    }
+}
+
+/// Resolved cell-space placement geometry for an `OSC 1337` inline image.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Osc1337Layout {
+    /// `[offset_x_cells, offset_y_cells, width_cells_f32, height_cells_f32]` stored on [`GraphicImage`].
+    pub custom_display_cells: [f32; 4],
+    /// Occupied integer grid columns.
+    pub width_cells: usize,
+    /// Occupied integer grid rows.
+    pub height_cells: usize,
+}
+
+/// Parsed arguments for `OSC 1337 ; File=<args>:<b64>` or `MultipartFile=<args>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Osc1337FileParams {
+    /// Optional decoded UTF-8 filename (from Base64 `name=`).
+    pub name: Option<String>,
+    /// Optional declared raw byte size (`size=`).
+    pub declared_size: Option<usize>,
+    /// Target width (`width=`, default `Auto`).
+    pub width: Osc1337Dimension,
+    /// Target height (`height=`, default `Auto`).
+    pub height: Osc1337Dimension,
+    /// Preserve aspect ratio when scaling (`preserveAspectRatio=`, default `true`).
+    pub preserve_aspect_ratio: bool,
+    /// Render inline in the terminal grid (`inline=1`, default `false`).
+    pub inline: bool,
+    /// Keep cursor at its starting cell without scrolling (`doNotMoveCursor=1`, default `false`).
+    pub do_not_move_cursor: bool,
+}
+
+impl Default for Osc1337FileParams {
+    fn default() -> Self {
+        Self {
+            name: None,
+            declared_size: None,
+            width: Osc1337Dimension::Auto,
+            height: Osc1337Dimension::Auto,
+            preserve_aspect_ratio: true,
+            inline: false,
+            do_not_move_cursor: false,
+        }
+    }
+}
+
+impl Osc1337FileParams {
+    pub fn parse_args(args_str: &str) -> Self {
+        let mut params = Self::default();
+        for part in args_str.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let Some((k, v)) = part.split_once('=') else {
+                continue;
+            };
+            let k = k.trim();
+            let v = v.trim();
+            match k {
+                "name" => {
+                    if let Ok(bytes) = decode_b64_flexible(v.as_bytes()) {
+                        if let Ok(s) = String::from_utf8(bytes) {
+                            if !s.is_empty() {
+                                params.name = Some(s);
+                            }
+                        }
+                    }
+                }
+                "size" => {
+                    if let Ok(sz) = v.parse::<usize>() {
+                        params.declared_size = Some(sz);
+                    }
+                }
+                "width" => {
+                    params.width = Osc1337Dimension::parse(v);
+                }
+                "height" => {
+                    params.height = Osc1337Dimension::parse(v);
+                }
+                "preserveAspectRatio" => {
+                    params.preserve_aspect_ratio = !(v == "0"
+                        || v.eq_ignore_ascii_case("false")
+                        || v.eq_ignore_ascii_case("no"));
+                }
+                "inline" => {
+                    params.inline =
+                        v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes");
+                }
+                "doNotMoveCursor" => {
+                    params.do_not_move_cursor =
+                        v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes");
+                }
+                _ => {}
+            }
+        }
+        params
+    }
+
+    /// Compute the rendered box and cell footprint for an `OSC 1337` inline image.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_layout(
+        &self,
+        img_w_px: u32,
+        img_h_px: u32,
+        cell_w: f32,
+        cell_h: f32,
+        pane_cols: usize,
+        pane_rows: usize,
+        cursor_col: usize,
+    ) -> Osc1337Layout {
+        let cell_w = cell_w.max(1.0);
+        let cell_h = cell_h.max(1.0);
+        let img_w = img_w_px.max(1) as f32;
+        let img_h = img_h_px.max(1) as f32;
+        let pane_w_px = pane_cols.max(1) as f32 * cell_w;
+        let pane_h_px = pane_rows.max(1) as f32 * cell_h;
+
+        let req_w_px = match self.width {
+            Osc1337Dimension::Auto => None,
+            Osc1337Dimension::Cells(c) => Some((c * cell_w).max(1.0)),
+            Osc1337Dimension::Pixels(px) => Some(px.max(1.0)),
+            Osc1337Dimension::Percent(pct) => Some(((pct / 100.0) * pane_w_px).max(1.0)),
+        };
+        let req_h_px = match self.height {
+            Osc1337Dimension::Auto => None,
+            Osc1337Dimension::Cells(r) => Some((r * cell_h).max(1.0)),
+            Osc1337Dimension::Pixels(px) => Some(px.max(1.0)),
+            Osc1337Dimension::Percent(pct) => Some(((pct / 100.0) * pane_h_px).max(1.0)),
+        };
+
+        let (pad_x, pad_y, disp_w, disp_h, box_w, box_h) = match (req_w_px, req_h_px) {
+            (None, None) => {
+                // In `auto` x `auto` mode, display 1:1 in native pixels unless wider than the
+                // remaining pane width, in which case scale down to fit the viewport width.
+                let avail_w_px = pane_cols.saturating_sub(cursor_col).max(1) as f32 * cell_w;
+                if img_w > avail_w_px {
+                    let w = avail_w_px;
+                    let h = if self.preserve_aspect_ratio {
+                        (img_h * (w / img_w)).max(1.0)
+                    } else {
+                        img_h
+                    };
+                    (0.0, 0.0, w, h, w, h)
+                } else {
+                    (0.0, 0.0, img_w, img_h, img_w, img_h)
+                }
+            }
+            (Some(w), None) => {
+                let h = if self.preserve_aspect_ratio {
+                    (img_h * (w / img_w)).max(1.0)
+                } else {
+                    img_h
+                };
+                (0.0, 0.0, w, h, w, h)
+            }
+            (None, Some(h)) => {
+                let w = if self.preserve_aspect_ratio {
+                    (img_w * (h / img_h)).max(1.0)
+                } else {
+                    img_w
+                };
+                (0.0, 0.0, w, h, w, h)
+            }
+            (Some(w), Some(h)) => {
+                if self.preserve_aspect_ratio {
+                    let scale = (w / img_w).min(h / img_h);
+                    let dw = (img_w * scale).max(1.0);
+                    let dh = (img_h * scale).max(1.0);
+                    let px = ((w - dw) * 0.5).max(0.0);
+                    let py = ((h - dh) * 0.5).max(0.0);
+                    (px, py, dw, dh, w, h)
+                } else {
+                    (0.0, 0.0, w, h, w, h)
+                }
+            }
+        };
+
+        let width_cells = (((box_w / cell_w) - 1e-4).ceil().max(1.0)) as usize;
+        let height_cells = (((box_h / cell_h) - 1e-4).ceil().max(1.0)) as usize;
+
+        Osc1337Layout {
+            custom_display_cells: [
+                pad_x / cell_w,
+                pad_y / cell_h,
+                disp_w / cell_w,
+                disp_h / cell_h,
+            ],
+            width_cells,
+            height_cells,
+        }
+    }
+}
+
+/// Parsed outcome of a single `OSC 1337 ; ...` sequence.
+#[derive(Debug)]
+pub enum Osc1337Action {
+    /// Unknown, non-inline (`inline=0`), or invalid sequence safely ignored.
+    Ignored,
+    /// Multipart transfer in progress (`MultipartFile` / `FilePart` buffered).
+    NeedMoreParts,
+    /// Decoded inline image ready to be placed on the terminal grid.
+    DisplayImage {
+        params: Osc1337FileParams,
+        width_px: u32,
+        height_px: u32,
+        rgba: Vec<u8>,
+    },
+    /// `OSC 1337 ; CursorShape=<0|1|2>` (`0` = Block, `1` = Beam, `2` = Underline).
+    SetCursorShape(u8),
+    /// `OSC 1337 ; CurrentDir=<path>`.
+    SetCurrentDir(String),
+    /// `OSC 1337 ; ReportCellSize`.
+    ReportCellSize,
+    /// `OSC 1337 ; ClearScrollback`.
+    ClearScrollback,
+    /// `OSC 1337 ; SetMark` (marks current line as a semantic prompt/jump mark).
+    SetMark,
+    /// `OSC 1337 ; Copy=[target]:<base64>` (copies UTF-8 text to clipboard).
+    CopyText(String),
+    /// `OSC 1337 ; RequestAttention=<yes|1|fireworks|once|no|0>`.
+    RequestAttention(bool),
+}
+
+/// Encode raw bytes as standard RFC 4648 Base64 (used for `OSC 52` clipboard query responses).
+pub fn encode_base64_standard(bytes: &[u8]) -> String {
+    BASE64_STANDARD.encode(bytes)
+}
+
+/// Decode a Base64 slice tolerating ASCII whitespace and optional `=` padding.
+pub(crate) fn decode_b64_flexible(b64_bytes: &[u8]) -> Result<Vec<u8>, ()> {
+    let has_ws = b64_bytes.iter().any(|b| b.is_ascii_whitespace());
+    let clean_cow: std::borrow::Cow<'_, [u8]> = if has_ws {
+        std::borrow::Cow::Owned(
+            b64_bytes
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(b64_bytes)
+    };
+    let clean = clean_cow.as_ref();
+    if clean.is_empty() {
+        return Ok(Vec::new());
+    }
+    if (clean.len() / 4).saturating_mul(3) > MAX_KITTY_RAW_BYTES {
+        return Err(());
+    }
+    BASE64_STANDARD
+        .decode(clean)
+        .or_else(|_| {
+            let stripped: Vec<u8> = clean.iter().copied().take_while(|&b| b != b'=').collect();
+            BASE64_NO_PAD.decode(&stripped)
+        })
+        .map_err(|_| ())
+}
+
+/// Stateful parser for iTerm2 `OSC 1337` sequences, supporting both single-shot `File=`
+/// inline images and chunked `MultipartFile` / `FilePart` / `FileEnd` transfers.
+#[derive(Debug, Clone, Default)]
+pub struct Osc1337Parser {
+    in_multipart: bool,
+    overflowed: bool,
+    multipart_params: Osc1337FileParams,
+    chunk_buffer: Vec<u8>,
+    b64_rem: [u8; 4],
+    b64_rem_len: usize,
+}
+
+impl Osc1337Parser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        self.in_multipart = false;
+        self.overflowed = false;
+        self.multipart_params = Osc1337FileParams::default();
+        self.chunk_buffer = Vec::new();
+        self.b64_rem = [0; 4];
+        self.b64_rem_len = 0;
+    }
+
+    /// Process the body of an `OSC 1337 ; <body>` sequence (with leading `1337;` stripped).
+    pub fn handle_command(&mut self, body: &[u8]) -> Osc1337Action {
+        let trimmed = trim_osc_bytes(body);
+        if trimmed.is_empty() {
+            return Osc1337Action::Ignored;
+        }
+
+        // 1. Single-shot `File=[args]:<base64>` or `File:<base64>`
+        if let Some(rest) = strip_ascii_case_prefix(trimmed, b"File") {
+            if matches!(rest.first(), Some(b'=' | b':')) {
+                self.reset();
+                let after_kw = if rest[0] == b'=' { &rest[1..] } else { rest };
+                let Some(colon_pos) = after_kw.iter().position(|&b| b == b':') else {
+                    return Osc1337Action::Ignored;
+                };
+                let args_bytes = &after_kw[..colon_pos];
+                let b64_bytes = &after_kw[colon_pos + 1..];
+                let Ok(args_str) = std::str::from_utf8(args_bytes) else {
+                    return Osc1337Action::Ignored;
+                };
+                let params = Osc1337FileParams::parse_args(args_str);
+                if !params.inline
+                    || params
+                        .declared_size
+                        .is_some_and(|sz| sz > MAX_KITTY_RAW_BYTES)
+                {
+                    return Osc1337Action::Ignored;
+                }
+                let Ok(raw) = decode_b64_flexible(b64_bytes) else {
+                    warn!("OSC 1337 File: invalid or oversized base64 payload");
+                    return Osc1337Action::Ignored;
+                };
+                if raw.is_empty() || raw.len() > MAX_KITTY_RAW_BYTES {
+                    return Osc1337Action::Ignored;
+                }
+                return match decode_encoded_image_rgba(&raw) {
+                    Ok((width_px, height_px, rgba)) => {
+                        info!(
+                            "Decoded OSC 1337 inline image: {}x{} px",
+                            width_px, height_px
+                        );
+                        Osc1337Action::DisplayImage {
+                            params,
+                            width_px,
+                            height_px,
+                            rgba,
+                        }
+                    }
+                    Err(_) => Osc1337Action::Ignored,
+                };
+            }
+        }
+
+        // 2. Chunked `MultipartFile=[args]`
+        if let Some(rest) = strip_ascii_case_prefix(trimmed, b"MultipartFile") {
+            if rest.is_empty() || matches!(rest.first(), Some(b'=' | b':')) {
+                self.reset();
+                let after_kw = if rest.first() == Some(&b'=') {
+                    &rest[1..]
+                } else {
+                    rest
+                };
+                let (args_bytes, initial_b64) = match after_kw.iter().position(|&b| b == b':') {
+                    Some(pos) => (&after_kw[..pos], Some(&after_kw[pos + 1..])),
+                    None => (after_kw, None),
+                };
+                let Ok(args_str) = std::str::from_utf8(args_bytes) else {
+                    return Osc1337Action::Ignored;
+                };
+                let params = Osc1337FileParams::parse_args(args_str);
+                if !params.inline
+                    || params
+                        .declared_size
+                        .is_some_and(|sz| sz > MAX_KITTY_RAW_BYTES)
+                {
+                    return Osc1337Action::Ignored;
+                }
+                let cap = params.declared_size.unwrap_or(0).min(1024 * 1024);
+                self.in_multipart = true;
+                self.overflowed = false;
+                self.multipart_params = params;
+                self.chunk_buffer = Vec::with_capacity(cap);
+                if let Some(b64) = initial_b64 {
+                    if !b64.is_empty() && self.push_multipart_b64(b64, false).is_err() {
+                        self.reset();
+                        return Osc1337Action::Ignored;
+                    }
+                }
+                return Osc1337Action::NeedMoreParts;
+            }
+        }
+
+        // 3. Chunked `FilePart=<b64>`
+        if let Some(rest) = strip_ascii_case_prefix(trimmed, b"FilePart") {
+            if let Some(&sep) = rest.first() {
+                if sep == b'=' || sep == b':' {
+                    if !self.in_multipart {
+                        return Osc1337Action::Ignored;
+                    }
+                    if self.push_multipart_b64(&rest[1..], false).is_err() {
+                        self.reset();
+                        return Osc1337Action::Ignored;
+                    }
+                    return Osc1337Action::NeedMoreParts;
+                }
+            }
+        }
+
+        // 4. Chunked `FileEnd`
+        if let Some(rest) = strip_ascii_case_prefix(trimmed, b"FileEnd") {
+            let rest = trim_osc_bytes(rest);
+            if rest.is_empty() || rest == b";" {
+                if !self.in_multipart {
+                    return Osc1337Action::Ignored;
+                }
+                let ok_final = self.push_multipart_b64(&[], true).is_ok();
+                let overflowed = self.overflowed;
+                let params = std::mem::take(&mut self.multipart_params);
+                let raw = std::mem::take(&mut self.chunk_buffer);
+                self.reset();
+                if !ok_final || overflowed || !params.inline || raw.is_empty() {
+                    return Osc1337Action::Ignored;
+                }
+                return match decode_encoded_image_rgba(&raw) {
+                    Ok((width_px, height_px, rgba)) => {
+                        info!(
+                            "Decoded OSC 1337 multipart inline image: {}x{} px",
+                            width_px, height_px
+                        );
+                        Osc1337Action::DisplayImage {
+                            params,
+                            width_px,
+                            height_px,
+                            rgba,
+                        }
+                    }
+                    Err(_) => Osc1337Action::Ignored,
+                };
+            }
+        }
+
+        // 5. Auxiliary iTerm2 `OSC 1337` subcommands
+        if let Some(rest) = strip_ascii_case_prefix(trimmed, b"CursorShape=") {
+            let val_bytes = rest.split(|&b| b == b';').next().unwrap_or(rest);
+            if let Ok(s) = std::str::from_utf8(trim_osc_bytes(val_bytes)) {
+                if let Ok(code) = s.parse::<u8>() {
+                    if code <= 2 {
+                        return Osc1337Action::SetCursorShape(code);
+                    }
+                }
+            }
+            return Osc1337Action::Ignored;
+        }
+
+        if let Some(rest) = strip_ascii_case_prefix(trimmed, b"CurrentDir=") {
+            let dir_bytes = rest.split(|&b| b == b';').next().unwrap_or(rest);
+            if let Ok(dir) = std::str::from_utf8(trim_osc_bytes(dir_bytes)) {
+                if !dir.is_empty() {
+                    return Osc1337Action::SetCurrentDir(dir.to_string());
+                }
+            }
+            return Osc1337Action::Ignored;
+        }
+
+        if let Some(rest) = strip_ascii_case_prefix(trimmed, b"ReportCellSize") {
+            let rest = trim_osc_bytes(rest);
+            if rest.is_empty() || rest == b";" {
+                return Osc1337Action::ReportCellSize;
+            }
+        }
+
+        if let Some(rest) = strip_ascii_case_prefix(trimmed, b"ClearScrollback") {
+            let rest = trim_osc_bytes(rest);
+            if rest.is_empty() || rest == b";" {
+                return Osc1337Action::ClearScrollback;
+            }
+        }
+
+        if let Some(rest) = strip_ascii_case_prefix(trimmed, b"SetMark") {
+            let rest = trim_osc_bytes(rest);
+            if rest.is_empty() || rest == b";" {
+                return Osc1337Action::SetMark;
+            }
+        }
+
+        if let Some(rest) = strip_ascii_case_prefix(trimmed, b"Copy=") {
+            if let Some(colon_pos) = rest.iter().position(|&b| b == b':') {
+                if let Ok(decoded) = decode_b64_flexible(&rest[colon_pos + 1..]) {
+                    if let Ok(text) = String::from_utf8(decoded) {
+                        return Osc1337Action::CopyText(text);
+                    }
+                }
+            }
+            return Osc1337Action::Ignored;
+        }
+
+        if let Some(rest) = strip_ascii_case_prefix(trimmed, b"RequestAttention=") {
+            let val_bytes = rest.split(|&b| b == b';').next().unwrap_or(rest);
+            if let Ok(val) = std::str::from_utf8(trim_osc_bytes(val_bytes)) {
+                let active = matches!(
+                    val.to_ascii_lowercase().as_str(),
+                    "1" | "yes" | "true" | "fireworks" | "once"
+                );
+                return Osc1337Action::RequestAttention(active);
+            }
+            return Osc1337Action::Ignored;
+        }
+
+        Osc1337Action::Ignored
+    }
+
+    fn push_multipart_b64(&mut self, b64_bytes: &[u8], is_final: bool) -> Result<(), ()> {
+        if self.overflowed {
+            return Ok(());
+        }
+
+        let mut clean = Vec::with_capacity(self.b64_rem_len + b64_bytes.len());
+        if self.b64_rem_len > 0 {
+            clean.extend_from_slice(&self.b64_rem[..self.b64_rem_len]);
+            self.b64_rem_len = 0;
+        }
+        for &b in b64_bytes {
+            if !b.is_ascii_whitespace() {
+                clean.push(b);
+            }
+        }
+
+        if clean.is_empty() {
+            return Ok(());
+        }
+
+        let to_decode = if is_final {
+            &clean[..]
+        } else {
+            let aligned = clean.len() & !3;
+            let rem = clean.len() - aligned;
+            if rem > 0 {
+                self.b64_rem[..rem].copy_from_slice(&clean[aligned..]);
+                self.b64_rem_len = rem;
+            }
+            &clean[..aligned]
+        };
+
+        if to_decode.is_empty() {
+            return Ok(());
+        }
+
+        let decoded = BASE64_STANDARD
+            .decode(to_decode)
+            .or_else(|_| {
+                let stripped: Vec<u8> = to_decode
+                    .iter()
+                    .copied()
+                    .take_while(|&b| b != b'=')
+                    .collect();
+                BASE64_NO_PAD.decode(&stripped)
+            })
+            .map_err(|_| ())?;
+
+        if self.chunk_buffer.len().saturating_add(decoded.len()) > MAX_KITTY_RAW_BYTES {
+            self.overflowed = true;
+            self.chunk_buffer = Vec::new();
+            return Ok(());
+        }
+
+        self.chunk_buffer.extend_from_slice(&decoded);
+        Ok(())
+    }
+}
+
+#[inline]
+fn trim_osc_bytes(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map(|p| p + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
+}
+
+#[inline]
+fn strip_ascii_case_prefix<'a>(haystack: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    if haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&haystack[prefix.len()..])
+    } else {
+        None
     }
 }
 

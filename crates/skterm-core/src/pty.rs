@@ -24,6 +24,8 @@ pub struct PtySpawnOptions {
     pub cwd: Option<String>,
     pub term: Option<String>,
     pub env: HashMap<String, String>,
+    /// Automatically inject lightweight `OSC 133` + `OSC 7` shell hooks for interactive `zsh`, `bash`, and `fish`.
+    pub shell_integration: bool,
     pub wakeup_cb: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -35,6 +37,7 @@ impl std::fmt::Debug for PtySpawnOptions {
             .field("cwd", &self.cwd)
             .field("term", &self.term)
             .field("env", &self.env)
+            .field("shell_integration", &self.shell_integration)
             .field("has_wakeup_cb", &self.wakeup_cb.is_some())
             .finish()
     }
@@ -90,17 +93,77 @@ impl PtyProcess {
         let shell_path = options.shell.unwrap_or_else(default_shell);
         let mut cmd = CommandBuilder::new(&shell_path);
 
+        let shell_basename = std::path::Path::new(&shell_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&shell_path)
+            .to_ascii_lowercase();
+        let is_non_interactive_cmd = options
+            .args
+            .iter()
+            .any(|a| matches!(a.as_str(), "-c" | "/c" | "/C" | "-Command"));
+
+        let mut bash_rcfile_injected = false;
+        let mut extra_integration_envs: Vec<(String, String)> = Vec::new();
+        if options.shell_integration && !is_non_interactive_cmd {
+            if let Some(int_dir) = ensure_shell_integration_files() {
+                match shell_basename.as_str() {
+                    "zsh" => {
+                        let zsh_dir = int_dir.join("zsh");
+                        if let Ok(orig) = std::env::var("ZDOTDIR") {
+                            if !orig.is_empty() && std::path::Path::new(&orig) != zsh_dir {
+                                extra_integration_envs
+                                    .push(("SKTERM_ORIG_ZDOTDIR".to_string(), orig));
+                            }
+                        }
+                        extra_integration_envs.push((
+                            "ZDOTDIR".to_string(),
+                            zsh_dir.to_string_lossy().into_owned(),
+                        ));
+                    }
+                    "bash" | "bash.exe"
+                        if options.args.is_empty()
+                            || (options.args.len() == 1
+                                && matches!(options.args[0].as_str(), "-l" | "--login")) =>
+                    {
+                        let bash_rc = int_dir.join("bash").join("skterm.bash");
+                        if bash_rc.is_file() {
+                            cmd.arg("--rcfile");
+                            cmd.arg(bash_rc.to_string_lossy().as_ref());
+                            bash_rcfile_injected = true;
+                        }
+                    }
+                    "fish" => {
+                        let fish_data = int_dir.join("fish_data");
+                        let cur_xdg = std::env::var("XDG_DATA_DIRS")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+                        extra_integration_envs.push((
+                            "XDG_DATA_DIRS".to_string(),
+                            format!("{}:{}", fish_data.to_string_lossy(), cur_xdg),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         #[cfg(target_os = "macos")]
         if options.args.is_empty() {
-            cmd.arg("-l");
-        } else {
+            if !bash_rcfile_injected {
+                cmd.arg("-l");
+            }
+        } else if !bash_rcfile_injected {
             for arg in &options.args {
                 cmd.arg(arg);
             }
         }
         #[cfg(not(target_os = "macos"))]
-        for arg in &options.args {
-            cmd.arg(arg);
+        if !bash_rcfile_injected {
+            for arg in &options.args {
+                cmd.arg(arg);
+            }
         }
 
         let target_dir = if let Some(dir) = options.cwd {
@@ -134,6 +197,11 @@ impl PtyProcess {
         let term_name = options.term.unwrap_or_else(|| "xterm-256color".to_string());
         cmd.env("TERM", term_name);
         cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "skTerm");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        for (k, v) in extra_integration_envs {
+            cmd.env(k, v);
+        }
 
         // Ensure UTF-8 locale environment variables are set if missing
         if std::env::var_os("LANG").is_none() {
@@ -963,4 +1031,181 @@ pub fn available_shell_presets() -> Vec<ShellPresetInfo> {
         }
         presets
     }
+}
+
+/// Materialize lightweight `zsh`, `bash`, and `fish` shell-integration bootstrap scripts
+/// (`OSC 133` prompt/command marks + `OSC 7` working directory reporting) into a private
+/// user-owned directory, returning its path on success.
+pub fn ensure_shell_integration_files() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::with_capacity(2);
+    #[cfg(target_os = "windows")]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        if !appdata.is_empty() {
+            candidates.push(
+                std::path::PathBuf::from(appdata)
+                    .join("skTerm")
+                    .join("shell-integration"),
+            );
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            candidates.push(
+                std::path::PathBuf::from(home)
+                    .join(".config")
+                    .join("skterm")
+                    .join("shell-integration"),
+            );
+        }
+    }
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = std::process::id();
+    candidates.push(std::env::temp_dir().join(format!("skterm-shell-integration-{uid}")));
+
+    let root = candidates
+        .into_iter()
+        .find(|dir| prepare_private_dir(dir))?;
+
+    let zsh_dir = root.join("zsh");
+    let bash_dir = root.join("bash");
+    let fish_dir = root.join("fish_data").join("fish").join("vendor_conf.d");
+    if !prepare_private_dir(&zsh_dir)
+        || !prepare_private_dir(&bash_dir)
+        || !prepare_private_dir(&fish_dir)
+    {
+        return None;
+    }
+
+    let zshenv = r#"if [[ -n "$SKTERM_ORIG_ZDOTDIR" ]]; then
+  [[ -f "$SKTERM_ORIG_ZDOTDIR/.zshenv" ]] && builtin source "$SKTERM_ORIG_ZDOTDIR/.zshenv"
+elif [[ -f "$HOME/.zshenv" ]]; then
+  builtin source "$HOME/.zshenv"
+fi
+"#;
+    let zprofile = r#"if [[ -n "$SKTERM_ORIG_ZDOTDIR" ]]; then
+  [[ -f "$SKTERM_ORIG_ZDOTDIR/.zprofile" ]] && builtin source "$SKTERM_ORIG_ZDOTDIR/.zprofile"
+elif [[ -f "$HOME/.zprofile" ]]; then
+  builtin source "$HOME/.zprofile"
+fi
+"#;
+    let zshrc = r#"if [[ -n "$SKTERM_ORIG_ZDOTDIR" ]]; then
+  export ZDOTDIR="$SKTERM_ORIG_ZDOTDIR"
+  unset SKTERM_ORIG_ZDOTDIR
+  [[ -f "$ZDOTDIR/.zshrc" ]] && builtin source "$ZDOTDIR/.zshrc"
+else
+  unset ZDOTDIR
+  [[ -f "$HOME/.zshrc" ]] && builtin source "$HOME/.zshrc"
+fi
+if [[ -o interactive && -z "$__SKTERM_INTEGRATION_LOADED" ]]; then
+  typeset -g __SKTERM_INTEGRATION_LOADED=1
+  typeset -gi __skterm_cmd_running=0
+  __skterm_precmd() {
+    local ret=$?
+    if (( __skterm_cmd_running )); then
+      builtin printf '\e]133;D;%d\a' "$ret"
+      __skterm_cmd_running=0
+    fi
+    builtin printf '\e]7;file://%s%s\a\e]133;A\a' "${HOST:-localhost}" "$PWD"
+  }
+  __skterm_preexec() {
+    __skterm_cmd_running=1
+    builtin printf '\e]133;C\a'
+  }
+  autoload -Uz add-zsh-hook
+  add-zsh-hook precmd __skterm_precmd
+  add-zsh-hook preexec __skterm_preexec
+fi
+"#;
+    let zlogin = r#"if [[ -n "$ZDOTDIR" && -f "$ZDOTDIR/.zlogin" ]]; then
+  builtin source "$ZDOTDIR/.zlogin"
+elif [[ -f "$HOME/.zlogin" ]]; then
+  builtin source "$HOME/.zlogin"
+fi
+"#;
+
+    let bashrc = r#"if [ -f /etc/profile ]; then . /etc/profile; fi
+if [ -f "$HOME/.bash_profile" ]; then
+  . "$HOME/.bash_profile"
+elif [ -f "$HOME/.bash_login" ]; then
+  . "$HOME/.bash_login"
+elif [ -f "$HOME/.profile" ]; then
+  . "$HOME/.profile"
+elif [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+fi
+if [ -z "$__SKTERM_INTEGRATION_LOADED" ]; then
+  __SKTERM_INTEGRATION_LOADED=1
+  __skterm_cmd_running=0
+  __skterm_preexec_trap() {
+    if [ -n "$COMP_LINE" ]; then return; fi
+    if [ "$BASH_COMMAND" = "__skterm_prompt_cmd" ]; then return; fi
+    if [ "$__skterm_cmd_running" = "0" ]; then
+      __skterm_cmd_running=1
+      printf '\033]133;C\007'
+    fi
+  }
+  __skterm_prompt_cmd() {
+    local ret=$?
+    if [ "$__skterm_cmd_running" = "1" ]; then
+      printf '\033]133;D;%d\007' "$ret"
+      __skterm_cmd_running=0
+    fi
+    printf '\033]7;file://%s%s\007\033]133;A\007' "${HOSTNAME:-localhost}" "$PWD"
+  }
+  trap '__skterm_preexec_trap' DEBUG
+  PROMPT_COMMAND="__skterm_prompt_cmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+fi
+"#;
+
+    let fish_conf = r#"if status is-interactive; and not set -q __skterm_integration_loaded
+    set -g __skterm_integration_loaded 1
+    set -g __skterm_cmd_running 0
+    function __skterm_on_prompt --on-event fish_prompt
+        set -l ret $status
+        if test "$__skterm_cmd_running" = "1"
+            printf '\e]133;D;%d\a' $ret
+            set -g __skterm_cmd_running 0
+        end
+        printf '\e]7;file://%s%s\a\e]133;A\a' (hostname) "$PWD"
+    end
+    function __skterm_on_preexec --on-event fish_preexec
+        set -g __skterm_cmd_running 1
+        printf '\e]133;C\a'
+    end
+end
+"#;
+
+    let _ = std::fs::write(zsh_dir.join(".zshenv"), zshenv);
+    let _ = std::fs::write(zsh_dir.join(".zprofile"), zprofile);
+    let _ = std::fs::write(zsh_dir.join(".zshrc"), zshrc);
+    let _ = std::fs::write(zsh_dir.join(".zlogin"), zlogin);
+    let _ = std::fs::write(bash_dir.join("skterm.bash"), bashrc);
+    let _ = std::fs::write(fish_dir.join("skterm.fish"), fish_conf);
+
+    Some(root)
+}
+
+fn prepare_private_dir(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let Ok(sym_meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if sym_meta.file_type().is_symlink() || !sym_meta.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let euid = unsafe { libc::geteuid() };
+        if sym_meta.uid() != euid {
+            return false;
+        }
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    true
 }

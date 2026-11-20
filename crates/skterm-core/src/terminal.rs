@@ -5,11 +5,12 @@ use crate::pty::{PtyEvent, PtyProcess, PtySpawnOptions};
 use crate::vt::TerminalState;
 use vte::Parser;
 
-/// Maximum bytes buffered for a single APC (`ESC _ ... ST`) sequence (64 MiB).
+/// Maximum bytes buffered for a single APC (`ESC _ ... ST`) or OSC (`ESC ] ... BEL/ST`) sequence (64 MiB).
 const MAX_APC_BYTES: usize = 64 * 1024 * 1024;
 
 /// Streaming pre-parser state for intercepting Application Program Command (`ESC _ ... ST`)
-/// sequences before `vte::Parser` discards them in `SosPmApcString`.
+/// and Operating System Command (`ESC ] ... BEL/ST`) sequences before `vte::Parser` discards
+/// APC payloads or truncates OSC payloads at its 1024-byte `ArrayVec` limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ApcState {
     #[default]
@@ -17,6 +18,8 @@ enum ApcState {
     SawEsc,
     InApc,
     InApcEsc,
+    InOsc,
+    InOscEsc,
 }
 
 /// The complete terminal instance combining terminal state, parser, and child PTY process.
@@ -137,6 +140,12 @@ impl Terminal {
                         self.apc_buf.clear();
                         self.apc_overflowed = false;
                         self.apc_state = ApcState::InApc;
+                    } else if b == b']' {
+                        i += 1;
+                        self.parser.advance(&mut self.state, b"\x1b_");
+                        self.apc_buf.clear();
+                        self.apc_overflowed = false;
+                        self.apc_state = ApcState::InOsc;
                     } else if b == 0x1B {
                         self.parser.advance(&mut self.state, b"\x1b");
                         i += 1;
@@ -193,9 +202,88 @@ impl Terminal {
                         self.apc_buf.clear();
                         self.apc_overflowed = false;
                         self.apc_state = ApcState::InApc;
+                    } else if b == b']' {
+                        // Interrupted APC immediately followed by an OSC (`ESC ]`).
+                        i += 1;
+                        self.parser.advance(&mut self.state, b"\x1b_");
+                        self.apc_buf.clear();
+                        self.apc_overflowed = false;
+                        self.apc_state = ApcState::InOsc;
+                    } else if b == 0x1B {
+                        i += 1;
+                        self.apc_buf.clear();
+                        self.apc_overflowed = false;
+                        self.parser.advance(&mut self.state, b"\x1b");
+                        self.apc_state = ApcState::SawEsc;
                     } else {
                         // Interrupted APC followed by another ESC sequence (e.g. `ESC [`):
                         // transition `vte` into `Escape` and let `Normal` feed `b` onward.
+                        self.apc_buf.clear();
+                        self.apc_overflowed = false;
+                        self.parser.advance(&mut self.state, b"\x1b");
+                        self.apc_state = ApcState::Normal;
+                    }
+                }
+                ApcState::InOsc => {
+                    let slice = &bytes[i..];
+                    let delim_pos = slice
+                        .iter()
+                        .position(|&b| matches!(b, 0x1B | 0x07 | 0x18 | 0x1A));
+                    match delim_pos {
+                        None => {
+                            self.push_osc_slice(slice);
+                            break;
+                        }
+                        Some(rel) => {
+                            if rel > 0 {
+                                self.push_osc_slice(&slice[..rel]);
+                            }
+                            let delim = slice[rel];
+                            i += rel + 1;
+                            match delim {
+                                0x1B => {
+                                    self.apc_state = ApcState::InOscEsc;
+                                }
+                                0x07 => {
+                                    self.parser.advance(&mut self.state, b"\x1b\\");
+                                    self.finish_osc(true);
+                                }
+                                _ => {
+                                    // CAN (0x18) or SUB (0x1A) aborts the control string.
+                                    self.parser.advance(&mut self.state, &[delim]);
+                                    self.apc_buf.clear();
+                                    self.apc_overflowed = false;
+                                    self.apc_state = ApcState::Normal;
+                                }
+                            }
+                        }
+                    }
+                }
+                ApcState::InOscEsc => {
+                    let b = bytes[i];
+                    if b == b'\\' {
+                        i += 1;
+                        self.parser.advance(&mut self.state, b"\x1b\\");
+                        self.finish_osc(false);
+                    } else if b == b'_' {
+                        i += 1;
+                        self.parser.advance(&mut self.state, b"\x1b_");
+                        self.apc_buf.clear();
+                        self.apc_overflowed = false;
+                        self.apc_state = ApcState::InApc;
+                    } else if b == b']' {
+                        i += 1;
+                        self.parser.advance(&mut self.state, b"\x1b_");
+                        self.apc_buf.clear();
+                        self.apc_overflowed = false;
+                        self.apc_state = ApcState::InOsc;
+                    } else if b == 0x1B {
+                        i += 1;
+                        self.apc_buf.clear();
+                        self.apc_overflowed = false;
+                        self.parser.advance(&mut self.state, b"\x1b");
+                        self.apc_state = ApcState::SawEsc;
+                    } else {
                         self.apc_buf.clear();
                         self.apc_overflowed = false;
                         self.parser.advance(&mut self.state, b"\x1b");
@@ -223,6 +311,28 @@ impl Terminal {
         }
     }
 
+    #[inline]
+    fn push_osc_slice(&mut self, slice: &[u8]) {
+        if self.apc_overflowed {
+            return;
+        }
+        // Per ECMA-48 / VT500 `osc_string` state, C0 control characters (`< 0x20`, e.g. `\r`/`\n`
+        // inside 76-col wrapped Base64 payloads) are ignored rather than executed or buffered.
+        if !slice.iter().any(|&b| b < 0x20) {
+            self.push_apc_slice(slice);
+            return;
+        }
+        for &b in slice {
+            if b >= 0x20 {
+                if self.apc_buf.len() >= MAX_APC_BYTES {
+                    self.apc_overflowed = true;
+                    break;
+                }
+                self.apc_buf.push(b);
+            }
+        }
+    }
+
     fn finish_apc(&mut self) {
         let payload = std::mem::take(&mut self.apc_buf);
         let overflowed = self.apc_overflowed;
@@ -236,6 +346,23 @@ impl Terminal {
         }
         // Retain allocation capacity up to 64 KiB so normal chunks avoid reallocating,
         // without holding multi-megabyte buffers indefinitely after a large image upload.
+        if payload.capacity() <= 65536 {
+            self.apc_buf = payload;
+            self.apc_buf.clear();
+        }
+    }
+
+    fn finish_osc(&mut self, bell_terminated: bool) {
+        let payload = std::mem::take(&mut self.apc_buf);
+        let overflowed = self.apc_overflowed;
+        self.apc_overflowed = false;
+        self.apc_state = ApcState::Normal;
+
+        if overflowed {
+            self.state.handle_osc_overflow(&payload);
+        } else {
+            self.state.handle_osc_raw(&payload, bell_terminated);
+        }
         if payload.capacity() <= 65536 {
             self.apc_buf = payload;
             self.apc_buf.clear();
@@ -450,6 +577,22 @@ impl Terminal {
     /// Take any pending OSC 52 clipboard text decoded by the VT state machine.
     pub fn take_pending_clipboard(&mut self) -> Option<String> {
         self.state.pending_clipboard.take()
+    }
+
+    /// Take all pending OSC 52 / OSC 1337 clipboard requests (write, clear, query).
+    pub fn take_pending_clipboard_requests(&mut self) -> Vec<crate::vt::ClipboardRequest> {
+        self.state.pending_clipboard = None;
+        std::mem::take(&mut self.state.pending_clipboard_requests)
+    }
+
+    /// Take all pending desktop notifications (`OSC 9`, `OSC 99`, `OSC 777`).
+    pub fn take_pending_notifications(&mut self) -> Vec<crate::vt::TerminalNotification> {
+        std::mem::take(&mut self.state.pending_notifications)
+    }
+
+    /// Take any pending user attention request (`OSC 1337;RequestAttention=...`).
+    pub fn take_pending_user_attention(&mut self) -> Option<bool> {
+        self.state.pending_user_attention.take()
     }
 
     /// Take any pending VT device query responses (DA1, DA2, DSR, CPR, DECRQM, OSC 10/11/12, OSC 7501, Kitty `a=q`).

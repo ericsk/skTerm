@@ -86,6 +86,7 @@ impl App {
             .shell
             .as_ref()
             .map(|s| s.program.as_str());
+        let osc52_policy = self.config_manager.current_config.terminal.osc52.clone();
 
         let mut any_program_status_changed = false;
 
@@ -102,7 +103,7 @@ impl App {
             } else {
                 let outcome = session.workspace.poll_all_ptys();
                 if outcome.any_output {
-                    session.flush_osc52_clipboard(self.clipboard.as_ref());
+                    session.flush_osc52_clipboard(self.clipboard.as_ref(), &osc52_policy);
                 }
                 if outcome.any_output && active_session != Some(*id) {
                     session.mark_unseen_output();
@@ -156,6 +157,15 @@ impl App {
                     session.request_redraw();
                 } else {
                     arm(deadline);
+                }
+            }
+
+            if let Some((_, _, expires_at)) = session.active_toast {
+                if now >= expires_at {
+                    session.active_toast = None;
+                    session.request_redraw();
+                } else {
+                    arm(expires_at);
                 }
             }
         }

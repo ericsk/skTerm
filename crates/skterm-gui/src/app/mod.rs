@@ -232,6 +232,7 @@ impl App {
             cwd,
             term: Some(term_cfg.term.clone()),
             env: term_cfg.env.clone(),
+            shell_integration: term_cfg.shell_integration,
             wakeup_cb,
         }
     }
@@ -298,11 +299,12 @@ impl ApplicationHandler<AppEvent> for App {
                 // will flip the flag again and schedule another wakeup, so nothing is lost.
                 self.pty_wakeup_pending.store(false, Ordering::Release);
                 let active_session = self.active_session_id;
+                let osc52_policy = self.config_manager.current_config.terminal.osc52.clone();
                 let mut any_program_status_changed = false;
                 for (id, session) in self.sessions.iter_mut() {
                     let outcome = session.workspace.poll_all_ptys();
                     if outcome.any_output {
-                        session.flush_osc52_clipboard(self.clipboard.as_ref());
+                        session.flush_osc52_clipboard(self.clipboard.as_ref(), &osc52_policy);
                     }
                     if outcome.any_output && active_session != Some(*id) {
                         session.mark_unseen_output();

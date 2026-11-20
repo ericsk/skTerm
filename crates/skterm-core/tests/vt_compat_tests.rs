@@ -1131,3 +1131,519 @@ fn test_kitty_unicode_placeholders_and_diacritics() {
         Some(Selection::new((0, 0), (0, 3), SelectionMode::Simple));
     assert_eq!(term.grid().active().extract_selected_text(), "  Hi");
 }
+
+#[test]
+fn test_osc1337_inline_image_large_streaming_units_and_aspect_ratio() {
+    use base64::Engine;
+
+    let mut term = Terminal::new_headless(24, 80, 100);
+    term.resize_with_cell_size(24, 80, 9.0, 18.0).unwrap();
+
+    // Generate a 64x32 pseudo-random RGBA PNG whose Base64 encoding exceeds 4 KiB
+    // (well above `vte::Parser`'s 1024-byte `ArrayVec` OSC limit).
+    let (w, h) = (64u32, 32u32);
+    let mut raw_rgba = Vec::with_capacity((w * h * 4) as usize);
+    let mut seed: u32 = 0x9E37_79B9;
+    for y in 0..h {
+        for x in 0..w {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            raw_rgba.push(((seed >> 24) as u8) ^ (x as u8));
+            raw_rgba.push(((seed >> 16) as u8) ^ (y as u8));
+            raw_rgba.push((seed >> 8) as u8);
+            raw_rgba.push(255);
+        }
+    }
+    let mut png_bytes = Vec::new();
+    image::RgbaImage::from_raw(w, h, raw_rgba.clone())
+        .unwrap()
+        .write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let b64_raw = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+    assert!(
+        b64_raw.len() > 2048,
+        "PNG payload should exceed vte's 1024-byte OSC buffer (got {} bytes)",
+        b64_raw.len()
+    );
+
+    // Wrap Base64 with `\r\n` every 76 chars (matching GNU `base64` output) to ensure
+    // embedded C0 newlines inside OSC do not execute linefeeds on the terminal grid.
+    let wrapped_b64: String = b64_raw
+        .as_bytes()
+        .chunks(76)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect::<Vec<_>>()
+        .join("\r\n");
+
+    // 1. `inline=0` (and omitted `inline`) must NOT place an image on the grid
+    let dl_seq = format!(
+        "\x1b]1337;File=size={};inline=0:{wrapped_b64}\x07",
+        png_bytes.len()
+    );
+    term.feed_bytes(dl_seq.as_bytes());
+    assert!(term.grid().active().images.is_empty());
+    assert_eq!(term.grid().active().cursor.row, 0);
+    assert_eq!(term.grid().active().cursor.col, 0);
+
+    // 2. Stream a >2 KiB `inline=1;width=10;height=4;preserveAspectRatio=1` sequence in 37-byte chunks
+    // followed by `\r\nNext` (standard `imgcat` output).
+    let name_b64 = base64::engine::general_purpose::STANDARD.encode("banner.png");
+    let seq = format!(
+        "\x1b]1337;File=name={name_b64};size={};inline=1;width=10;height=4;preserveAspectRatio=1:{wrapped_b64}\x07\r\nNext",
+        png_bytes.len()
+    );
+    for chunk in seq.as_bytes().chunks(37) {
+        term.feed_bytes(chunk);
+    }
+
+    assert_eq!(term.grid().active().images.len(), 1);
+    let img0 = &term.grid().active().images[0];
+    assert_eq!((img0.width_px, img0.height_px), (64, 32));
+    assert_eq!((img0.row, img0.col), (0, 0));
+    assert_eq!((img0.width_cells, img0.height_cells), (10, 4));
+    assert_eq!(&*img0.rgba_data, &raw_rgba);
+
+    // Box is `10*9 = 90px` wide by `4*18 = 72px` tall; a 2:1 image fits at `90x45px`, centered vertically (`pad_y = 13.5px`).
+    let [ox, oy, dw, dh] = img0.compute_display_box(9.0, 18.0);
+    assert!((ox - 0.0).abs() < 1e-3);
+    assert!((oy - 13.5).abs() < 1e-3);
+    assert!((dw - 90.0).abs() < 1e-3);
+    assert!((dh - 45.0).abs() < 1e-3);
+
+    // Trailing `\r\nNext` landed cleanly on row 4 (immediately below the 4-row image), col 4.
+    assert_eq!(term.grid().active().cursor.row, 4);
+    assert_eq!(term.grid().active().cursor.col, 4);
+    let row4: String = term.grid().active().grid[4].cells[0..4]
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(row4, "Next");
+
+    // 3. Pixel dimensions + `preserveAspectRatio=0` stretch + `doNotMoveCursor=1` (`ST` terminator)
+    term.feed_bytes(b"\x1b[7;6H"); // row 6, col 5 (0-based)
+    let stretch_seq = format!(
+        "\x1b]1337;File=inline=1;width=90px;height=54px;preserveAspectRatio=0;doNotMoveCursor=1:{b64_raw}\x1b\\"
+    );
+    term.feed_bytes(stretch_seq.as_bytes());
+    assert_eq!(term.grid().active().images.len(), 2);
+    // Cursor stayed at (6, 5) because `doNotMoveCursor=1`
+    assert_eq!(term.grid().active().cursor.row, 6);
+    assert_eq!(term.grid().active().cursor.col, 5);
+    let img1 = &term.grid().active().images[1];
+    assert_eq!((img1.row, img1.col), (6, 5));
+    assert_eq!((img1.width_cells, img1.height_cells), (10, 3));
+    let [ox1, oy1, dw1, dh1] = img1.compute_display_box(9.0, 18.0);
+    assert!((ox1 - 0.0).abs() < 1e-3 && (oy1 - 0.0).abs() < 1e-3);
+    assert!((dw1 - 90.0).abs() < 1e-3 && (dh1 - 54.0).abs() < 1e-3);
+
+    // 4. Viewport percentage width (`width=50%` of 80 cols = 40 cols = 360px, height auto -> 180px = 10 rows)
+    let pct_seq = format!("\x1b]1337;File=inline=1;width=50%;doNotMoveCursor=1:{b64_raw}\x07");
+    term.feed_bytes(pct_seq.as_bytes());
+    assert_eq!(term.grid().active().images.len(), 3);
+    let img2 = &term.grid().active().images[2];
+    assert_eq!((img2.width_cells, img2.height_cells), (40, 10));
+    let [_, _, dw2, dh2] = img2.compute_display_box(9.0, 18.0);
+    assert!((dw2 - 360.0).abs() < 1e-3 && (dh2 - 180.0).abs() < 1e-3);
+}
+
+#[test]
+fn test_osc1337_multipart_bmp_and_auxiliary_commands() {
+    use base64::Engine;
+    use skterm_core::CursorShape;
+
+    let mut term = Terminal::new_headless(10, 20, 50);
+    term.resize_with_cell_size(10, 20, 9.0, 18.0).unwrap();
+
+    // Encode a 4x2 BMP image to verify both BMP support and MultipartFile/FilePart/FileEnd assembly
+    let rgba_4x2: Vec<u8> = [20u8, 120, 240, 255].repeat(8);
+    let mut bmp_bytes = Vec::new();
+    image::RgbaImage::from_raw(4, 2, rgba_4x2.clone())
+        .unwrap()
+        .write_to(
+            &mut std::io::Cursor::new(&mut bmp_bytes),
+            image::ImageFormat::Bmp,
+        )
+        .unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bmp_bytes);
+    // Split into 3 non-4-byte-aligned chunks
+    let (p1, rest) = b64.split_at(7);
+    let (p2, p3) = rest.split_at(11);
+
+    term.feed_bytes(b"\x1b]1337;MultipartFile=inline=1;width=6;height=2;preserveAspectRatio=0\x07");
+    assert!(term.grid().active().images.is_empty());
+    term.feed_bytes(format!("\x1b]1337;FilePart={p1}\x07").as_bytes());
+    term.feed_bytes(format!("\x1b]1337;FilePart={p2}\x1b\\").as_bytes());
+    term.feed_bytes(format!("\x1b]1337;FilePart={p3}\x07").as_bytes());
+    assert!(term.grid().active().images.is_empty());
+    term.feed_bytes(b"\x1b]1337;FileEnd\x07");
+
+    assert_eq!(term.grid().active().images.len(), 1);
+    let img = &term.grid().active().images[0];
+    assert_eq!((img.width_px, img.height_px), (4, 2));
+    assert_eq!((img.width_cells, img.height_cells), (6, 2));
+    assert_eq!(&*img.rgba_data, &rgba_4x2);
+    assert_eq!(term.grid().active().cursor.row, 1);
+    assert_eq!(term.grid().active().cursor.col, 6);
+
+    // Interrupted OSC followed immediately by CSI must recover cleanly without losing text
+    term.feed_bytes(b"\x1b]1337;File=inline=1:AAAA\x1b[32mOK\x1b[0m");
+    assert_eq!(term.grid().active().grid[1].cells[6].c, 'O');
+    assert_eq!(term.grid().active().grid[1].cells[7].c, 'K');
+
+    // Auxiliary OSC 1337 commands: CursorShape, CurrentDir, ReportCellSize, ClearScrollback
+    term.feed_bytes(b"\x1b]1337;CursorShape=1\x07");
+    assert_eq!(term.grid().active().cursor.shape, CursorShape::Beam);
+    term.feed_bytes(b"\x1b]1337;CursorShape=2\x07");
+    assert_eq!(term.grid().active().cursor.shape, CursorShape::Underline);
+    term.feed_bytes(b"\x1b]1337;CursorShape=0\x07");
+    assert_eq!(term.grid().active().cursor.shape, CursorShape::Block);
+
+    term.feed_bytes(b"\x1b]1337;CurrentDir=/tmp/skterm\x07");
+    assert_eq!(
+        term.state.current_working_directory.as_deref(),
+        Some("/tmp/skterm")
+    );
+
+    term.feed_bytes(b"\x1b]1337;ReportCellSize\x07\x1b]1337;ReportCellSize\x1b\\");
+    assert_eq!(
+        term.take_pending_responses(),
+        b"\x1b]1337;ReportCellSize=18.0;9.0\x07\x1b]1337;ReportCellSize=18.0;9.0\x1b\\"
+    );
+
+    // Scroll image into scrollback, then verify `OSC 1337 ; ClearScrollback` clears scrollback & scrolled-off images
+    term.grid_mut().active_mut().scroll_up(5);
+    assert!(!term.grid().active().scrollback.is_empty());
+    assert_eq!(term.grid().active().images.len(), 1);
+    assert!(term.grid().active().images[0].row < 0);
+    term.feed_bytes(b"\x1b]1337;ClearScrollback\x07");
+    assert!(term.grid().active().scrollback.is_empty());
+    assert!(term.grid().active().images.is_empty());
+}
+
+#[test]
+fn test_osc_1_icon_title_osc_6_doc_url_and_osc_8_id_grouping() {
+    let mut term = Terminal::new_headless(10, 40, 50);
+
+    // 1. OSC 1 sets `icon_title` independently of OSC 2 (`title`), and CSI 22;1t / 23;1t stacks it
+    term.feed_bytes(b"\x1b]2;Main Window\x07\x1b]1;Worker Tab\x07");
+    assert_eq!(term.state.title, "Main Window");
+    assert_eq!(term.state.icon_title.as_deref(), Some("Worker Tab"));
+
+    term.feed_bytes(b"\x1b[22;1t\x1b]1;Subtask\x07");
+    assert_eq!(term.state.icon_title.as_deref(), Some("Subtask"));
+    assert_eq!(term.state.title, "Main Window");
+
+    term.feed_bytes(b"\x1b[23;1t");
+    assert_eq!(term.state.icon_title.as_deref(), Some("Worker Tab"));
+
+    // Empty OSC 1 clears `icon_title`
+    term.feed_bytes(b"\x1b]1;\x07");
+    assert_eq!(term.state.icon_title, None);
+
+    // 2. OSC 6 sets `current_document_url` and populates fallback `current_working_directory`
+    term.feed_bytes(b"\x1b]6;file://localhost/Users/eric/Projects/skTerm/Cargo.toml\x07");
+    assert_eq!(
+        term.state.current_document_url.as_deref(),
+        Some("/Users/eric/Projects/skTerm/Cargo.toml")
+    );
+    assert_eq!(
+        term.state.current_working_directory.as_deref(),
+        Some("/Users/eric/Projects/skTerm")
+    );
+
+    // Explicit OSC 7 overrides CWD without erasing document URL
+    term.feed_bytes(b"\x1b]7;file://localhost/Users/eric/Projects/skTerm/crates\x07");
+    assert_eq!(
+        term.state.current_working_directory.as_deref(),
+        Some("/Users/eric/Projects/skTerm/crates")
+    );
+
+    // 3. OSC 8 `id=` parameter groups discontinuous link spans onto the same `NonZeroU32`
+    term.feed_bytes(
+        b"\x1b]8;id=doc1;https://example.com\x07A\x1b]8;;\x07 \x1b]8;id=doc1;https://example.com\x07B\x1b]8;;\x07 \x1b]8;id=doc2;https://example.com\x07C\x1b]8;;\x07",
+    );
+    let row0 = &term.grid().active().grid[0];
+    let id_a = row0.cells[0].hyperlink_id.unwrap();
+    let id_b = row0.cells[2].hyperlink_id.unwrap();
+    let id_c = row0.cells[4].hyperlink_id.unwrap();
+    assert_eq!(id_a, id_b, "matching OSC 8 id= must share hyperlink_id");
+    assert_ne!(
+        id_a, id_c,
+        "distinct OSC 8 id= must allocate separate hyperlink_id"
+    );
+    assert_eq!(term.url_at(0, 0).as_deref(), Some("https://example.com"));
+    assert_eq!(term.url_at(0, 4).as_deref(), Some("https://example.com"));
+}
+
+#[test]
+fn test_osc_9_notifications_progress_osc_99_and_osc_777() {
+    use base64::Engine;
+    use skterm_core::{ProgressState, TerminalProgress};
+
+    let mut term = Terminal::new_headless(10, 40, 50);
+
+    // 1. ConEmu / Ghostty `OSC 9;4;<state>;<pct>` progress bar states
+    term.feed_bytes(b"\x1b]9;4;1;42\x07");
+    assert_eq!(
+        term.state.progress,
+        Some(TerminalProgress {
+            state: ProgressState::Normal,
+            percent: 42,
+        })
+    );
+    term.feed_bytes(b"\x1b]9;4;2;80\x07");
+    assert_eq!(
+        term.state.progress,
+        Some(TerminalProgress {
+            state: ProgressState::Error,
+            percent: 80,
+        })
+    );
+    term.feed_bytes(b"\x1b]9;4;3\x07");
+    assert_eq!(
+        term.state.progress,
+        Some(TerminalProgress {
+            state: ProgressState::Indeterminate,
+            percent: 0,
+        })
+    );
+    term.feed_bytes(b"\x1b]9;4;4;65\x07");
+    assert_eq!(
+        term.state.progress,
+        Some(TerminalProgress {
+            state: ProgressState::Paused,
+            percent: 65,
+        })
+    );
+    term.feed_bytes(b"\x1b]9;4;0\x07");
+    assert_eq!(term.state.progress, None);
+
+    // 2. iTerm2 `OSC 9;<msg>` and VTE/Ghostty `OSC 777;notify;<title>;<body>`
+    term.feed_bytes(b"\x1b]9;Compilation finished\x07");
+    term.feed_bytes(b"\x1b]777;notify;CI Runner;All 240 tests passed\x1b\\");
+    let notifs = term.take_pending_notifications();
+    assert_eq!(notifs.len(), 2);
+    assert_eq!(notifs[0].title, "skTerm");
+    assert_eq!(notifs[0].body, "Compilation finished");
+    assert!(!notifs[0].force_when_focused);
+    assert_eq!(notifs[1].title, "CI Runner");
+    assert_eq!(notifs[1].body, "All 240 tests passed");
+
+    // 3. Kitty `OSC 99` capability query (`p=?`) and multi-part Base64 notification (`d=0` -> `d=1`)
+    term.feed_bytes(b"\x1b]99;i=q1:p=?;?\x1b\\");
+    let resp = String::from_utf8(term.take_pending_responses()).unwrap();
+    assert_eq!(
+        resp,
+        "\x1b]99;i=q1:p=?;title,body,close:o=always,unfocused,invisible:u=0,1,2\x1b\\"
+    );
+
+    let title_b64 = base64::engine::general_purpose::STANDARD.encode("Deploy Ready");
+    let body_b64 = base64::engine::general_purpose::STANDARD.encode("Production v0.3.0");
+    term.feed_bytes(format!("\x1b]99;i=n7:d=0:p=title:e=1;{title_b64}\x1b\\").as_bytes());
+    assert!(term.take_pending_notifications().is_empty());
+    term.feed_bytes(
+        format!("\x1b]99;i=n7:d=1:p=body:e=1:o=always:u=2;{body_b64}\x1b\\").as_bytes(),
+    );
+    let kitty_notifs = term.take_pending_notifications();
+    assert_eq!(kitty_notifs.len(), 1);
+    assert_eq!(kitty_notifs[0].id.as_deref(), Some("n7"));
+    assert_eq!(kitty_notifs[0].title, "Deploy Ready");
+    assert_eq!(kitty_notifs[0].body, "Production v0.3.0");
+    assert!(kitty_notifs[0].force_when_focused);
+    assert!(kitty_notifs[0].urgent);
+}
+
+#[test]
+fn test_osc_17_19_selection_colors_osc_21_kitty_colors_osc_22_pointer_and_osc_52() {
+    use base64::Engine;
+    use skterm_core::{ClipboardRequest, PointerShape};
+
+    let mut term = Terminal::new_headless(10, 40, 50);
+
+    // 1. OSC 17 / 19 dynamic selection BG / FG set, query, and OSC 117 / 119 reset
+    term.feed_bytes(b"\x1b]17;#334455\x07\x1b]19;#ddeeff\x07\x1b]17;?\x07\x1b]19;?\x1b\\");
+    assert_eq!(term.state.dynamic_selection_bg, Some((0x33, 0x44, 0x55)));
+    assert_eq!(term.state.dynamic_selection_fg, Some((0xdd, 0xee, 0xff)));
+    assert_eq!(
+        term.take_pending_responses(),
+        b"\x1b]17;rgb:3333/4444/5555\x07\x1b]19;rgb:dddd/eeee/ffff\x1b\\"
+    );
+    term.feed_bytes(b"\x1b]117\x07\x1b]119\x07");
+    assert_eq!(term.state.dynamic_selection_bg, None);
+    assert_eq!(term.state.dynamic_selection_fg, None);
+
+    // 2. Kitty OSC 21 set, query (`?`), and reset (empty value)
+    term.feed_bytes(
+        b"\x1b]21;foreground=#123456;selection_background=#654321;color4=#abcdef;foreground=?;4=?\x1b\\",
+    );
+    assert_eq!(term.state.dynamic_fg, Some((0x12, 0x34, 0x56)));
+    assert_eq!(term.state.dynamic_selection_bg, Some((0x65, 0x43, 0x21)));
+    assert_eq!(
+        term.state.dynamic_palette.get(&4),
+        Some(&(0xab, 0xcd, 0xef))
+    );
+    assert_eq!(
+        term.take_pending_responses(),
+        b"\x1b]21;foreground=rgb:12/34/56;4=rgb:ab/cd/ef\x1b\\"
+    );
+    term.feed_bytes(b"\x1b]21;foreground=;4=\x1b\\");
+    assert_eq!(term.state.dynamic_fg, None);
+    assert_eq!(term.state.dynamic_palette.get(&4), None);
+
+    // 3. OSC 22 pointer cursor shape set, stack push (`>`), query (`?`), pop (`<`), and alt-screen reset
+    term.feed_bytes(b"\x1b]22;nonexistent_cursor,pointer\x07");
+    assert_eq!(term.state.active_pointer_shape(), PointerShape::Pointer);
+    term.feed_bytes(b"\x1b]22;>wait\x07\x1b]22;>grabbing\x07\x1b]22;?\x07");
+    assert_eq!(term.state.active_pointer_shape(), PointerShape::Grabbing);
+    assert_eq!(term.take_pending_responses(), b"\x1b]22;grabbing\x07");
+    term.feed_bytes(b"\x1b]22;?pointer,bogus_shape,text\x1b\\");
+    assert_eq!(term.take_pending_responses(), b"\x1b]22;1,0,1\x1b\\");
+    term.feed_bytes(b"\x1b]22;<\x07");
+    assert_eq!(term.state.active_pointer_shape(), PointerShape::Wait);
+    // Leaving alternate screen (`?1049l`) clears pointer stack back to Default
+    term.feed_bytes(b"\x1b[?1049h\x1b]22;crosshair\x07\x1b[?1049l");
+    assert_eq!(term.state.active_pointer_shape(), PointerShape::Default);
+
+    // 4. OSC 52 large (>2 KiB) write, clear, and `?` read query + OSC 1337 Copy
+    let big_clip = "skTerm-OSC52-".repeat(250); // 3250 bytes > 1024-byte vte buffer
+    let big_b64 = base64::engine::general_purpose::STANDARD.encode(big_clip.as_bytes());
+    term.feed_bytes(format!("\x1b]52;c;{big_b64}\x07").as_bytes());
+    term.feed_bytes(b"\x1b]52;c;\x07");
+    term.feed_bytes(b"\x1b]52;p;?\x1b\\");
+    let copy_b64 = base64::engine::general_purpose::STANDARD.encode("iTermCopy");
+    term.feed_bytes(format!("\x1b]1337;Copy=:{copy_b64}\x07").as_bytes());
+
+    let clip_reqs = term.take_pending_clipboard_requests();
+    assert_eq!(
+        clip_reqs,
+        vec![
+            ClipboardRequest::Write(big_clip),
+            ClipboardRequest::Clear,
+            ClipboardRequest::Query {
+                selection: String::from("p"),
+                bell_terminated: false,
+            },
+            ClipboardRequest::Write(String::from("iTermCopy")),
+        ]
+    );
+}
+
+#[test]
+fn test_osc_133_633_semantic_prompts_navigation_and_shell_integration() {
+    use skterm_core::{ensure_shell_integration_files, PtySpawnOptions, SemanticZone};
+
+    let mut term = Terminal::new_headless(5, 40, 100);
+
+    // Emit 3 prompts with outputs so earlier prompts scroll into scrollback (`rows = 5`)
+    // Prompt 1: exit 0
+    term.feed_bytes(b"\x1b]9;4;1;50\x07"); // Stale progress bar before prompt
+    term.feed_bytes(
+        b"\x1b]133;A\x07$ \x1b]133;B\x07echo one\r\n\x1b]133;C\x07one\r\n\x1b]133;D;0\x07",
+    );
+    assert_eq!(
+        term.state.progress, None,
+        "OSC 133;A/D must clear stale progress bar"
+    );
+
+    // Prompt 2: exit 127 (error) + multi-line output
+    term.feed_bytes(
+        b"\x1b]133;A\x07$ \x1b]133;B\x07badcmd\r\n\x1b]133;C\x07err1\r\nerr2\r\nerr3\r\n\x1b]133;D;127\x07",
+    );
+
+    // Prompt 3 (VS Code OSC 633 with hex-escaped CWD): active prompt
+    term.feed_bytes(b"\x1b]633;P;Cwd=/Users/eric/my\\x20project\x07\x1b]633;A\x07$ \x1b]633;B\x07");
+    assert_eq!(
+        term.state.current_working_directory.as_deref(),
+        Some("/Users/eric/my project")
+    );
+    assert_eq!(
+        term.grid().active().semantic_zone,
+        SemanticZone::CommandInput
+    );
+
+    let marks: Vec<_> = term.grid().active().prompt_marks.iter().copied().collect();
+    assert_eq!(marks.len(), 3);
+    assert_eq!(marks[0].exit_code, Some(0));
+    assert_eq!(marks[1].exit_code, Some(127));
+    assert_eq!(marks[2].exit_code, None);
+    assert!(
+        marks[0].row < 0,
+        "oldest prompt should have scrolled into scrollback"
+    );
+
+    // Navigate upward through prompt history (`Cmd+Up`) and back down (`Cmd+Down`)
+    assert_eq!(term.grid().active().scroll_offset, 0);
+    assert!(term.grid_mut().active_mut().scroll_to_prev_prompt());
+    let off1 = term.grid().active().scroll_offset;
+    assert!(off1 > 0);
+    // Top visible row (0) now aligns with a recorded prompt mark!
+    assert!(term.grid().active().prompt_mark_at_visible_row(0).is_some());
+
+    if term.grid_mut().active_mut().scroll_to_prev_prompt() {
+        let off2 = term.grid().active().scroll_offset;
+        assert!(off2 > off1);
+        assert!(term.grid_mut().active_mut().scroll_to_next_prompt());
+        assert_eq!(term.grid().active().scroll_offset, off1);
+    }
+    assert!(term.grid_mut().active_mut().scroll_to_next_prompt());
+    assert_eq!(term.grid().active().scroll_offset, 0);
+
+    // Verify shell integration bootstrap files materialize cleanly
+    let int_dir =
+        ensure_shell_integration_files().expect("shell integration files should materialize");
+    assert!(int_dir.join("zsh").join(".zshrc").is_file());
+    assert!(int_dir.join("bash").join("skterm.bash").is_file());
+    assert!(int_dir
+        .join("fish_data")
+        .join("fish")
+        .join("vendor_conf.d")
+        .join("skterm.fish")
+        .is_file());
+
+    // Verify `PtyProcess::spawn_with_options` exports `TERM_PROGRAM=skTerm`
+    #[cfg(unix)]
+    {
+        let mut live = Terminal::new_with_options(
+            10,
+            60,
+            50,
+            PtySpawnOptions {
+                shell: Some("/bin/sh".to_string()),
+                args: vec![
+                    "-c".to_string(),
+                    "printf '%s:%s\\n' \"$TERM_PROGRAM\" \"$TERM_PROGRAM_VERSION\"".to_string(),
+                ],
+                cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            live.poll_pty();
+            let line0: String = live.grid().active().grid[0]
+                .cells
+                .iter()
+                .map(|c| c.c)
+                .collect();
+            if line0.contains("skTerm:") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let line0: String = live.grid().active().grid[0]
+            .cells
+            .iter()
+            .map(|c| c.c)
+            .collect();
+        assert!(
+            line0
+                .trim()
+                .starts_with(concat!("skTerm:", env!("CARGO_PKG_VERSION"))),
+            "expected TERM_PROGRAM=skTerm, got {:?}",
+            line0.trim()
+        );
+    }
+}
