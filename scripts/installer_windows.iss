@@ -2,7 +2,7 @@
 
 #define MyAppName "skTerm"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.1"
+  #define MyAppVersion "0.3.0"
 #endif
 #define MyAppPublisher "skTerm Developers"
 #define MyAppURL "https://github.com/ericsk/skTerm"
