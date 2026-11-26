@@ -3,7 +3,8 @@
 use ab_glyph::{ScaleFont as _, VariableFont as _};
 use fontdue::{Font, FontSettings};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 use wgpu::{
     Extent3d, Origin3d, Queue, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
@@ -222,13 +223,389 @@ impl FontFace {
     }
 }
 
-/// A fallback font entry holding both its Regular (400) face and an optional Bold (700) face.
+/// Text weight/slant style combination for font face resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FontStyle {
+    Regular,
+    Bold,
+    Italic,
+    BoldItalic,
+}
+
+impl FontStyle {
+    #[inline]
+    pub const fn from_flags(is_bold: bool, is_italic: bool) -> Self {
+        match (is_bold, is_italic) {
+            (false, false) => Self::Regular,
+            (true, false) => Self::Bold,
+            (false, true) => Self::Italic,
+            (true, true) => Self::BoldItalic,
+        }
+    }
+}
+
+/// A fallback font entry holding Regular, Bold, Italic, and Bold+Italic faces.
 pub struct FallbackFont {
     pub regular: FontFace,
     pub bold: Option<FontFace>,
+    pub italic: Option<FontFace>,
+    pub bold_italic: Option<FontFace>,
 }
 
-/// Key identifying a cached glyph in the texture atlas.
+impl FallbackFont {
+    /// Select the best available face for `(is_bold, is_italic)` and report whether the
+    /// returned face is natively italic (so callers know whether synthetic slant is needed).
+    pub fn select_face(&self, is_bold: bool, is_italic: bool) -> (&FontFace, bool) {
+        match FontStyle::from_flags(is_bold, is_italic) {
+            FontStyle::BoldItalic => {
+                if let Some(bi) = self.bold_italic.as_ref() {
+                    (bi, true)
+                } else if let Some(b) = self.bold.as_ref() {
+                    (b, false)
+                } else if let Some(i) = self.italic.as_ref() {
+                    (i, true)
+                } else {
+                    (&self.regular, false)
+                }
+            }
+            FontStyle::Bold => (self.bold.as_ref().unwrap_or(&self.regular), false),
+            FontStyle::Italic => {
+                if let Some(i) = self.italic.as_ref() {
+                    (i, true)
+                } else {
+                    (&self.regular, false)
+                }
+            }
+            FontStyle::Regular => (&self.regular, false),
+        }
+    }
+}
+
+/// Decoded RGBA8 color glyph bitmap ready for upload to the color emoji texture atlas.
+#[derive(Debug, Clone)]
+pub struct DecodedColorGlyph {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Platform color emoji font backed by embedded bitmap strikes (`sbix` / `CBDT` / `EBDT`)
+/// decoded via `ttf-parser` and `image`.
+#[derive(Clone)]
+pub struct ColorEmojiFont {
+    data: Arc<Vec<u8>>,
+    face_index: u32,
+}
+
+const SYSTEM_COLOR_EMOJI_CANDIDATES: &[&str] = &[
+    // macOS
+    "/System/Library/Fonts/Apple Color Emoji.ttc",
+    // Linux
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/noto-emoji/NotoColorEmoji.ttf",
+    "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
+    "/usr/share/fonts/NotoColorEmoji.ttf",
+    "/usr/share/fonts/TTF/NotoColorEmoji.ttf",
+    // Windows
+    "C:\\Windows\\Fonts\\seguiemj.ttf",
+];
+
+static SYSTEM_COLOR_EMOJI_CACHE: OnceLock<Option<ColorEmojiFont>> = OnceLock::new();
+
+impl ColorEmojiFont {
+    /// Load a color emoji font from `path`, locating the first collection face containing
+    /// embedded PNG bitmap strikes (`sbix` / `CBDT` / `EBDT`).
+    pub fn from_path(path: impl AsRef<Path>) -> Option<Self> {
+        let bytes = std::fs::read(path.as_ref()).ok()?;
+        Self::from_bytes(Arc::new(bytes))
+    }
+
+    /// Parse a color emoji font from shared font bytes.
+    pub fn from_bytes(data: Arc<Vec<u8>>) -> Option<Self> {
+        let face_count = ttf_parser::fonts_in_collection(&data).unwrap_or(1);
+        for idx in 0..face_count {
+            if let Ok(face) = ttf_parser::Face::parse(&data, idx) {
+                let probe_gid = face
+                    .glyph_index('😀')
+                    .or_else(|| face.glyph_index('🔥'))
+                    .or_else(|| face.glyph_index('❤'));
+                if let Some(gid) = probe_gid {
+                    if face
+                        .glyph_raster_image(gid, 64)
+                        .is_some_and(|img| img.format == ttf_parser::RasterImageFormat::PNG)
+                    {
+                        return Some(Self {
+                            data,
+                            face_index: idx,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a `ttf_parser::GlyphId` for a single Unicode scalar or multi-codepoint emoji
+    /// grapheme (handling `VS16` variation selectors and OpenType `GSUB` ligature chains).
+    fn resolve_glyph_id(
+        &self,
+        face: &ttf_parser::Face<'_>,
+        text: &str,
+    ) -> Option<ttf_parser::GlyphId> {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+        // VS15 (`U+FE0E`) explicitly requests monochrome text presentation.
+        if chars.contains(&'\u{FE0E}') {
+            return None;
+        }
+
+        if chars.len() == 1 {
+            return face.glyph_index(chars[0]);
+        }
+
+        if chars.len() == 2 && chars[1] == '\u{FE0F}' {
+            return face
+                .glyph_variation_index(chars[0], '\u{FE0F}')
+                .or_else(|| face.glyph_index(chars[0]));
+        }
+
+        // Collect glyph IDs for OpenType GSUB ligature matching (used by NotoColorEmoji).
+        let gids_full: Option<Vec<ttf_parser::GlyphId>> =
+            chars.iter().map(|&c| face.glyph_index(c)).collect();
+        if let Some(ref gids) = gids_full {
+            if let Some(lig_gid) = resolve_gsub_ligature(face, gids) {
+                return Some(lig_gid);
+            }
+        }
+
+        // Retry GSUB matching with VS16 stripped (some emoji fonts omit FE0F in ligatures).
+        if chars.contains(&'\u{FE0F}') {
+            let gids_no_vs: Option<Vec<ttf_parser::GlyphId>> = chars
+                .iter()
+                .filter(|&&c| c != '\u{FE0F}')
+                .map(|&c| face.glyph_index(c))
+                .collect();
+            if let Some(ref gids) = gids_no_vs {
+                if gids.len() == 1 {
+                    return Some(gids[0]);
+                }
+                if let Some(lig_gid) = resolve_gsub_ligature(face, gids) {
+                    return Some(lig_gid);
+                }
+            }
+        }
+
+        // Graceful fallback: render the leading base emoji's color strike instead of '?'.
+        for &c in &chars {
+            if c == '\u{200D}' || c == '\u{FE0F}' {
+                continue;
+            }
+            if let Some(gid) = face
+                .glyph_variation_index(c, '\u{FE0F}')
+                .or_else(|| face.glyph_index(c))
+            {
+                return Some(gid);
+            }
+        }
+        None
+    }
+
+    /// Decode a single emoji character into an RGBA8 bitmap scaled cleanly to fit
+    /// `(max_w, max_h)` while preserving aspect ratio.
+    pub fn decode_char_rgba(
+        &self,
+        c: char,
+        ppem: u16,
+        max_w: u32,
+        max_h: u32,
+    ) -> Option<DecodedColorGlyph> {
+        let mut buf = [0u8; 4];
+        self.decode_grapheme_rgba(c.encode_utf8(&mut buf), ppem, max_w, max_h)
+    }
+
+    /// Decode an emoji character or multi-codepoint grapheme cluster into a scaled RGBA8 bitmap.
+    pub fn decode_grapheme_rgba(
+        &self,
+        text: &str,
+        ppem: u16,
+        max_w: u32,
+        max_h: u32,
+    ) -> Option<DecodedColorGlyph> {
+        if max_w == 0 || max_h == 0 {
+            return None;
+        }
+        let face = ttf_parser::Face::parse(&self.data, self.face_index).ok()?;
+        let gid = self.resolve_glyph_id(&face, text)?;
+        let raster = face.glyph_raster_image(gid, ppem.max(16))?;
+        if raster.format != ttf_parser::RasterImageFormat::PNG {
+            return None;
+        }
+
+        let img = image::load_from_memory(raster.data).ok()?;
+        let rgba = img.to_rgba8();
+        let (src_w, src_h) = rgba.dimensions();
+        if src_w == 0 || src_h == 0 {
+            return None;
+        }
+
+        let scale = (max_w as f32 / src_w as f32).min(max_h as f32 / src_h as f32);
+        let dst_w = ((src_w as f32 * scale).round() as u32).clamp(1, max_w);
+        let dst_h = ((src_h as f32 * scale).round() as u32).clamp(1, max_h);
+
+        let pixels = if dst_w == src_w && dst_h == src_h {
+            rgba.into_raw()
+        } else {
+            image::imageops::resize(&rgba, dst_w, dst_h, image::imageops::FilterType::Lanczos3)
+                .into_raw()
+        };
+
+        Some(DecodedColorGlyph {
+            width: dst_w,
+            height: dst_h,
+            rgba: pixels,
+        })
+    }
+}
+
+/// Walk OpenType GSUB Type-4 (Ligature Substitution) lookups to resolve multi-codepoint emoji
+/// glyph sequences (e.g. flags, skin tones, ZWJ families in `NotoColorEmoji.ttf`).
+fn resolve_gsub_ligature(
+    face: &ttf_parser::Face<'_>,
+    gids: &[ttf_parser::GlyphId],
+) -> Option<ttf_parser::GlyphId> {
+    if gids.len() < 2 {
+        return None;
+    }
+    let gsub = face.tables().gsub?;
+    let first = gids[0];
+    let tail = &gids[1..];
+    for lookup in gsub.lookups.into_iter() {
+        for subtable in lookup
+            .subtables
+            .into_iter::<ttf_parser::gsub::SubstitutionSubtable<'_>>()
+        {
+            if let ttf_parser::gsub::SubstitutionSubtable::Ligature(lig_sub) = subtable {
+                if let Some(cov_idx) = lig_sub.coverage.get(first) {
+                    if let Some(set) = lig_sub.ligature_sets.get(cov_idx) {
+                        for lig in set.into_iter() {
+                            if lig.components.len() as usize == tail.len()
+                                && lig
+                                    .components
+                                    .into_iter()
+                                    .zip(tail.iter())
+                                    .all(|(a, &b)| a == b)
+                            {
+                                return Some(lig.glyph);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Load (and process-wide cache) the platform color emoji font lazily so the ~192 MiB
+/// `Apple Color Emoji.ttc` is read at most once and shared across all windows and font zooms.
+pub fn load_system_color_emoji_font() -> Option<ColorEmojiFont> {
+    SYSTEM_COLOR_EMOJI_CACHE
+        .get_or_init(|| {
+            for path in SYSTEM_COLOR_EMOJI_CANDIDATES {
+                if let Some(font) = ColorEmojiFont::from_path(path) {
+                    info!("Loaded system color emoji font: {}", path);
+                    return Some(font);
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+/// Returns `true` for Unicode codepoints whose default presentation is Emoji_Presentation
+/// (so they render in full color rather than monochrome outlines, while leaving text-default
+/// symbols like `#`, `0-9`, `⚙`, `⌘`, `▶`, `✓` crisp monochrome unless paired with `U+FE0F`).
+#[inline]
+pub fn is_default_emoji_presentation(c: char) -> bool {
+    let cp = c as u32;
+    matches!(
+        cp,
+        0x231A..=0x231B
+            | 0x23E9..=0x23EC
+            | 0x23F0
+            | 0x23F3
+            | 0x25FD..=0x25FE
+            | 0x2614..=0x2615
+            | 0x2648..=0x2653
+            | 0x267F
+            | 0x2693
+            | 0x26A1
+            | 0x26AA..=0x26AB
+            | 0x26BD..=0x26BE
+            | 0x26C4..=0x26C5
+            | 0x26CE
+            | 0x26D4
+            | 0x26EA
+            | 0x26F2..=0x26F3
+            | 0x26F5
+            | 0x26FA
+            | 0x26FD
+            | 0x2705
+            | 0x270A..=0x270B
+            | 0x2728
+            | 0x274C
+            | 0x274E
+            | 0x2753..=0x2755
+            | 0x2757
+            | 0x2795..=0x2797
+            | 0x27B0
+            | 0x27BF
+            | 0x2B1B..=0x2B1C
+            | 0x2B50
+            | 0x2B55
+            | 0x1F004
+            | 0x1F0CF
+            | 0x1F1E6..=0x1F1FF
+            | 0x1F201
+            | 0x1F21A
+            | 0x1F22F
+            | 0x1F232..=0x1F236
+            | 0x1F238..=0x1F23A
+            | 0x1F250..=0x1F251
+            | 0x1F300..=0x1FAFF
+    )
+}
+
+/// Returns `true` if a multi-codepoint grapheme should prefer the color emoji atlas.
+#[inline]
+pub fn is_color_emoji_grapheme(text: &str) -> bool {
+    let mut has_vs15 = false;
+    let mut has_emoji_cue = false;
+    let mut regional_count = 0usize;
+
+    for c in text.chars() {
+        let cp = c as u32;
+        if cp == 0xFE0E {
+            has_vs15 = true;
+        } else if cp == 0xFE0F
+            || cp == 0x200D
+            || cp == 0x20E3
+            || (0x1F3FB..=0x1F3FF).contains(&cp)
+            || is_default_emoji_presentation(c)
+        {
+            has_emoji_cue = true;
+        }
+        if (0x1F1E6..=0x1F1FF).contains(&cp) {
+            regional_count += 1;
+        }
+    }
+
+    !has_vs15 && (has_emoji_cue || regional_count >= 2)
+}
+
+/// Key identifying a cached single-codepoint glyph in the texture atlas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GlyphKey {
     pub c: char,
@@ -236,7 +613,16 @@ pub struct GlyphKey {
     pub is_italic: bool,
 }
 
-/// Metadata, UV bounds, and typographic advance width of an allocated glyph in the atlas.
+/// Key identifying a cached multi-codepoint grapheme cluster in the texture atlas.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GraphemeKey {
+    pub text: String,
+    pub is_bold: bool,
+    pub is_italic: bool,
+    pub target_cells: u8,
+}
+
+/// Metadata, UV bounds, color flag, and typographic advance width of an allocated glyph.
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphInfo {
     pub uv_min: [f32; 2],
@@ -244,9 +630,12 @@ pub struct GlyphInfo {
     pub size: [f32; 2],
     pub offset: [f32; 2],
     pub advance: f32,
+    pub is_color: bool,
 }
 
-/// 2D dynamic texture atlas for font glyph caching with user-configured font chains & CJK fallback.
+/// 2D dynamic texture atlas pair: monochrome `R8Unorm` for text glyphs and `Rgba8Unorm` for
+/// full-color emoji bitmaps, with deferred frame-boundary overflow resets to prevent mid-frame
+/// UV corruption.
 pub struct GlyphAtlas {
     pub texture: Texture,
     pub texture_view: wgpu::TextureView,
@@ -256,10 +645,23 @@ pub struct GlyphAtlas {
     cursor_x: u32,
     cursor_y: u32,
     row_height: u32,
+    pub color_texture: Texture,
+    pub color_texture_view: wgpu::TextureView,
+    pub color_sampler: wgpu::Sampler,
+    pub color_width: u32,
+    pub color_height: u32,
+    color_cursor_x: u32,
+    color_cursor_y: u32,
+    color_row_height: u32,
+    mono_needs_clear: bool,
+    color_needs_clear: bool,
+    pub atlas_generation: u64,
     cache: HashMap<GlyphKey, GlyphInfo>,
+    grapheme_cache: HashMap<GraphemeKey, GlyphInfo>,
     regular_font: FontFace,
     bold_font: Option<FontFace>,
     italic_font: Option<FontFace>,
+    bold_italic_font: Option<FontFace>,
     fallback_fonts: Vec<FallbackFont>,
     system_fallback_cursor: usize,
     pub font_size: f32,
@@ -294,6 +696,7 @@ const SYSTEM_CJK_CANDIDATES: &[&str] = &[
 
 impl GlyphAtlas {
     pub const ATLAS_SIZE: u32 = 2048;
+    pub const COLOR_ATLAS_SIZE: u32 = 2048;
 
     pub fn new(
         device: &wgpu::Device,
@@ -339,15 +742,52 @@ impl GlyphAtlas {
             ..Default::default()
         });
 
+        let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("skterm_color_emoji_atlas"),
+            size: Extent3d {
+                width: Self::COLOR_ATLAS_SIZE,
+                height: Self::COLOR_ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let color_texture_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("skterm_color_emoji_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
         // Load configured font chain
-        let (regular_font, bold_font, italic_font, fallback_fonts) =
+        let (regular_font, bold_font, italic_font, bold_italic_font, fallback_fonts) =
             if let Some(data) = custom_font_data {
                 let font = FontFace::from_bytes(data.to_vec(), FontSettings::default())
                     .map_err(|e| anyhow::anyhow!("Failed to parse custom font: {}", e))?;
-                let bold = font.with_weight(BOLD_WEIGHT);
-                (font, bold, None, Vec::new())
+                let bold = load_ttc_style_face(data, true, false)
+                    .or_else(|| font.with_weight(BOLD_WEIGHT));
+                let italic = load_ttc_style_face(data, false, true);
+                let bold_italic = load_ttc_style_face(data, true, true);
+                (font, bold, italic, bold_italic, Vec::new())
             } else {
-                load_configured_font_chain(font_family, fallback_families)
+                let chain = load_font_chain(font_family, fallback_families);
+                (
+                    chain.regular,
+                    chain.bold,
+                    chain.italic,
+                    chain.bold_italic,
+                    chain.fallbacks,
+                )
             };
 
         // Compute metrics for cell dimensions
@@ -361,11 +801,6 @@ impl GlyphAtlas {
             .max(1.0);
         let cell_height = base_cell_height;
 
-        // Vertically center glyphs within character cell height.
-        // Terminal text lines and cursors are visually judged by prompt characters (e.g. '>') and capital letters.
-        // Aligning the visual center of standard glyphs to cell_height / 2 ensures that the cursor quad
-        // (which spans the entire cell_height) frames text symmetrically with equal margins above and below,
-        // preventing the cursor from appearing noticeably lower or sagging beneath the text line.
         let gt_metric = regular_font.metrics('>', font_size);
         let baseline_offset = if gt_metric.height > 0 {
             let gt_h = gt_metric.height as f32;
@@ -383,11 +818,14 @@ impl GlyphAtlas {
         };
 
         info!(
-            "Font Engine Loaded: family='{}', size={}, cell_w={}, cell_h={}, fallbacks_count={}",
+            "Font Engine Loaded: family='{}', size={}, cell_w={}, cell_h={}, bold={}, italic={}, bold_italic={}, fallbacks_count={}",
             font_family,
             font_size,
             cell_width,
             cell_height,
+            bold_font.is_some(),
+            italic_font.is_some(),
+            bold_italic_font.is_some(),
             fallback_fonts.len()
         );
 
@@ -400,10 +838,23 @@ impl GlyphAtlas {
             cursor_x: 1,
             cursor_y: 1,
             row_height: 0,
+            color_texture,
+            color_texture_view,
+            color_sampler,
+            color_width: Self::COLOR_ATLAS_SIZE,
+            color_height: Self::COLOR_ATLAS_SIZE,
+            color_cursor_x: 1,
+            color_cursor_y: 1,
+            color_row_height: 0,
+            mono_needs_clear: false,
+            color_needs_clear: false,
+            atlas_generation: 0,
             cache: HashMap::new(),
+            grapheme_cache: HashMap::new(),
             regular_font,
             bold_font,
             italic_font,
+            bold_italic_font,
             fallback_fonts,
             system_fallback_cursor: 0,
             font_size,
@@ -421,6 +872,38 @@ impl GlyphAtlas {
         }
 
         Ok(atlas)
+    }
+
+    /// Flush any deferred atlas clears at the start of a new frame before instance UVs are built,
+    /// avoiding mid-frame texture overwrites that would corrupt already-queued glyph quads.
+    pub fn begin_frame(&mut self) {
+        if self.mono_needs_clear {
+            warn!("Monochrome glyph atlas full; resetting cache at frame boundary.");
+            self.cache.retain(|_, info| info.is_color);
+            self.grapheme_cache.retain(|_, info| info.is_color);
+            self.cursor_x = 1;
+            self.cursor_y = 1;
+            self.row_height = 0;
+            self.mono_needs_clear = false;
+            self.atlas_generation = self.atlas_generation.wrapping_add(1);
+        }
+        if self.color_needs_clear {
+            warn!("Color emoji atlas full; resetting cache at frame boundary.");
+            self.cache.retain(|_, info| !info.is_color);
+            self.grapheme_cache.retain(|_, info| !info.is_color);
+            self.color_cursor_x = 1;
+            self.color_cursor_y = 1;
+            self.color_row_height = 0;
+            self.color_needs_clear = false;
+            self.atlas_generation = self.atlas_generation.wrapping_add(1);
+        }
+    }
+
+    /// Returns `true` if either texture atlas overflowed during the current frame and will reset
+    /// cleanly at the next `begin_frame()`.
+    #[inline]
+    pub fn needs_redraw_for_atlas_reset(&self) -> bool {
+        self.mono_needs_clear || self.color_needs_clear
     }
 
     /// Update vertical cell height and baseline offset based on the user's `line_height` multiplier
@@ -447,30 +930,51 @@ impl GlyphAtlas {
         };
     }
 
+    /// Select the best primary face for `(is_bold, is_italic)` and whether it is natively italic.
+    fn select_primary_face(&self, is_bold: bool, is_italic: bool) -> (&FontFace, bool) {
+        match FontStyle::from_flags(is_bold, is_italic) {
+            FontStyle::BoldItalic => {
+                if let Some(bi) = self.bold_italic_font.as_ref() {
+                    (bi, true)
+                } else if let Some(b) = self.bold_font.as_ref() {
+                    (b, false)
+                } else if let Some(i) = self.italic_font.as_ref() {
+                    (i, true)
+                } else {
+                    (&self.regular_font, false)
+                }
+            }
+            FontStyle::Bold => (self.bold_font.as_ref().unwrap_or(&self.regular_font), false),
+            FontStyle::Italic => {
+                if let Some(i) = self.italic_font.as_ref() {
+                    (i, true)
+                } else {
+                    (&self.regular_font, false)
+                }
+            }
+            FontStyle::Regular => (&self.regular_font, false),
+        }
+    }
+
     /// Lazily load the next available system CJK / Unicode fallback font on demand.
     fn load_next_system_fallback(&mut self) -> Option<usize> {
         while self.system_fallback_cursor < SYSTEM_CJK_CANDIDATES.len() {
             let path = SYSTEM_CJK_CANDIDATES[self.system_fallback_cursor];
             self.system_fallback_cursor += 1;
             if let Ok(bytes) = std::fs::read(path) {
-                let companion_bold =
-                    if path.ends_with("Hiragino Sans GB.ttc") || path.ends_with("Menlo.ttc") {
-                        FontFace::from_bytes(
-                            bytes.clone(),
-                            FontSettings {
-                                collection_index: 1,
-                                ..Default::default()
-                            },
-                        )
-                        .ok()
-                    } else {
-                        None
-                    };
+                let ttc_bold = load_ttc_style_face(&bytes, true, false);
+                let ttc_italic = load_ttc_style_face(&bytes, false, true);
+                let ttc_bold_italic = load_ttc_style_face(&bytes, true, true);
                 if let Ok(regular) = FontFace::from_bytes(bytes, FontSettings::default()) {
                     info!("Loaded system CJK fallback font: {}", path);
-                    let bold = companion_bold.or_else(|| regular.with_weight(BOLD_WEIGHT));
+                    let bold = ttc_bold.or_else(|| regular.with_weight(BOLD_WEIGHT));
                     let idx = self.fallback_fonts.len();
-                    self.fallback_fonts.push(FallbackFont { regular, bold });
+                    self.fallback_fonts.push(FallbackFont {
+                        regular,
+                        bold,
+                        italic: ttc_italic,
+                        bold_italic: ttc_bold_italic,
+                    });
                     return Some(idx);
                 }
             }
@@ -478,169 +982,28 @@ impl GlyphAtlas {
         None
     }
 
-    /// Retrieve glyph from cache or rasterize (checking primary font, configured fallbacks, then system fallbacks) and upload to GPU texture.
-    pub fn get_or_insert_glyph(
+    /// Allocate and upload a monochrome R8 bitmap into the monochrome atlas.
+    fn upload_mono_bitmap(
         &mut self,
         queue: &Queue,
-        c: char,
-        is_bold: bool,
-        is_italic: bool,
+        metrics: &fontdue::Metrics,
+        bitmap: &[u8],
+        advance: f32,
     ) -> Option<GlyphInfo> {
-        let key = GlyphKey {
-            c,
-            is_bold,
-            is_italic,
-        };
-
-        if let Some(&info) = self.cache.get(&key) {
-            return Some(info);
-        }
-
-        // 1. Check primary font
-        let primary = if let (true, Some(bold)) = (is_bold, self.bold_font.as_ref()) {
-            bold
-        } else if let (true, Some(italic)) = (is_italic, self.italic_font.as_ref()) {
-            italic
-        } else {
-            &self.regular_font
-        };
-
-        let (metrics, bitmap) = if primary.lookup_glyph_index(c) != 0 {
-            rasterize_fitted_glyph(
-                primary,
-                c,
-                self.font_size,
-                self.cell_width,
-                self.cell_height,
-            )
-        } else {
-            let target_cells = unicode_width::UnicodeWidthChar::width(c)
-                .unwrap_or(1)
-                .max(1);
-            let mut found = None;
-
-            // For single-cell characters (e.g. `⌘`, `⇧`, `⌥`, `⌃`, `↩`), prefer a fallback
-            // font whose glyph is natively single-cell (`advance_width <= cell_width * 1.25`)
-            // over a CJK font where the same codepoint is drawn as a 2-cell full-width glyph.
-            if target_cells == 1 {
-                for fallback in &self.fallback_fonts {
-                    let face = if is_bold {
-                        fallback.bold.as_ref().unwrap_or(&fallback.regular)
-                    } else {
-                        &fallback.regular
-                    };
-                    if face.lookup_glyph_index(c) != 0 {
-                        let m = face.metrics(c, self.font_size);
-                        if m.advance_width <= self.cell_width * 1.25 {
-                            found = Some(rasterize_fitted_glyph(
-                                face,
-                                c,
-                                self.font_size,
-                                self.cell_width,
-                                self.cell_height,
-                            ));
-                            break;
-                        }
-                    }
-                }
-
-                // If no configured fallback had a native 1-cell glyph, also check the first
-                // system monospace fallback (e.g. Menlo.ttc on macOS) before accepting a
-                // 2-cell CJK glyph.
-                if found.is_none() && self.system_fallback_cursor == 0 {
-                    if let Some(idx) = self.load_next_system_fallback() {
-                        let fallback = &self.fallback_fonts[idx];
-                        let face = if is_bold {
-                            fallback.bold.as_ref().unwrap_or(&fallback.regular)
-                        } else {
-                            &fallback.regular
-                        };
-                        if face.lookup_glyph_index(c) != 0 {
-                            let m = face.metrics(c, self.font_size);
-                            if m.advance_width <= self.cell_width * 1.25 {
-                                found = Some(rasterize_fitted_glyph(
-                                    face,
-                                    c,
-                                    self.font_size,
-                                    self.cell_width,
-                                    self.cell_height,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 2. Check already-loaded fallback chain (selecting Bold face when `is_bold` is true)
-            if found.is_none() {
-                for fallback in &self.fallback_fonts {
-                    let face = if is_bold {
-                        fallback.bold.as_ref().unwrap_or(&fallback.regular)
-                    } else {
-                        &fallback.regular
-                    };
-                    if face.lookup_glyph_index(c) != 0 {
-                        found = Some(rasterize_fitted_glyph(
-                            face,
-                            c,
-                            self.font_size,
-                            self.cell_width,
-                            self.cell_height,
-                        ));
-                        break;
-                    }
-                }
-            }
-
-            // 3. Progressively load system fallback fonts until one covers `c`
-            while found.is_none() {
-                let Some(idx) = self.load_next_system_fallback() else {
-                    break;
-                };
-                let fallback = &self.fallback_fonts[idx];
-                let face = if is_bold {
-                    fallback.bold.as_ref().unwrap_or(&fallback.regular)
-                } else {
-                    &fallback.regular
-                };
-                if face.lookup_glyph_index(c) != 0 {
-                    found = Some(rasterize_fitted_glyph(
-                        face,
-                        c,
-                        self.font_size,
-                        self.cell_width,
-                        self.cell_height,
-                    ));
-                }
-            }
-
-            match found {
-                Some(res) => res,
-                None => self.regular_font.rasterize('?', self.font_size),
-            }
-        };
-
         let glyph_w = metrics.width as u32;
         let glyph_h = metrics.height as u32;
-        let advance = if metrics.advance_width > 0.0 {
-            metrics.advance_width
-        } else {
-            unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) as f32 * self.cell_width
-        };
 
         if glyph_w == 0 || glyph_h == 0 {
-            let info = GlyphInfo {
+            return Some(GlyphInfo {
                 uv_min: [0.0, 0.0],
                 uv_max: [0.0, 0.0],
                 size: [0.0, 0.0],
                 offset: [0.0, 0.0],
                 advance,
-            };
-            self.cache.insert(key, info);
-            return Some(info);
+                is_color: false,
+            });
         }
 
-        // Shelf packing algorithm
         if self.cursor_x + glyph_w + 1 >= self.width {
             self.cursor_x = 1;
             self.cursor_y += self.row_height + 1;
@@ -648,11 +1011,8 @@ impl GlyphAtlas {
         }
 
         if self.cursor_y + glyph_h + 1 >= self.height {
-            warn!("Glyph atlas full! Clearing cache.");
-            self.cache.clear();
-            self.cursor_x = 1;
-            self.cursor_y = 1;
-            self.row_height = 0;
+            self.mono_needs_clear = true;
+            return None;
         }
 
         let alloc_x = self.cursor_x;
@@ -661,7 +1021,6 @@ impl GlyphAtlas {
         self.cursor_x += glyph_w + 1;
         self.row_height = self.row_height.max(glyph_h);
 
-        // Upload glyph bitmap to GPU atlas texture
         queue.write_texture(
             TexelCopyTextureInfo {
                 texture: &self.texture,
@@ -673,7 +1032,7 @@ impl GlyphAtlas {
                 },
                 aspect: TextureAspect::All,
             },
-            &bitmap,
+            bitmap,
             TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(glyph_w),
@@ -695,15 +1054,367 @@ impl GlyphAtlas {
             (alloc_y + glyph_h) as f32 / self.height as f32,
         ];
 
-        let info = GlyphInfo {
+        Some(GlyphInfo {
             uv_min,
             uv_max,
             size: [glyph_w as f32, glyph_h as f32],
             offset: [metrics.xmin as f32, metrics.ymin as f32],
             advance,
+            is_color: false,
+        })
+    }
+
+    /// Allocate and upload an RGBA8 color emoji bitmap into the color atlas, centered inside
+    /// `target_cells * cell_width` horizontally and `cell_height` vertically.
+    fn upload_color_bitmap(
+        &mut self,
+        queue: &Queue,
+        decoded: &DecodedColorGlyph,
+        target_cells: usize,
+    ) -> Option<GlyphInfo> {
+        let glyph_w = decoded.width;
+        let glyph_h = decoded.height;
+        if glyph_w == 0 || glyph_h == 0 {
+            return None;
+        }
+
+        if self.color_cursor_x + glyph_w + 1 >= self.color_width {
+            self.color_cursor_x = 1;
+            self.color_cursor_y += self.color_row_height + 1;
+            self.color_row_height = 0;
+        }
+
+        if self.color_cursor_y + glyph_h + 1 >= self.color_height {
+            self.color_needs_clear = true;
+            return None;
+        }
+
+        let alloc_x = self.color_cursor_x;
+        let alloc_y = self.color_cursor_y;
+
+        self.color_cursor_x += glyph_w + 1;
+        self.color_row_height = self.color_row_height.max(glyph_h);
+
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &self.color_texture,
+                mip_level: 0,
+                origin: Origin3d {
+                    x: alloc_x,
+                    y: alloc_y,
+                    z: 0,
+                },
+                aspect: TextureAspect::All,
+            },
+            &decoded.rgba,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(glyph_w * 4),
+                rows_per_image: Some(glyph_h),
+            },
+            Extent3d {
+                width: glyph_w,
+                height: glyph_h,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let uv_min = [
+            alloc_x as f32 / self.color_width as f32,
+            alloc_y as f32 / self.color_height as f32,
+        ];
+        let uv_max = [
+            (alloc_x + glyph_w) as f32 / self.color_width as f32,
+            (alloc_y + glyph_h) as f32 / self.color_height as f32,
+        ];
+
+        let span_w = (target_cells.max(1) as f32 * self.cell_width).max(glyph_w as f32);
+        let offset_x = ((span_w - glyph_w as f32) * 0.5).round();
+        // `renderer.rs` computes `glyph_y = y + baseline - offset[1] - size[1]`.
+        // Setting `offset[1]` below centers the bitmap vertically within `[y, y + cell_height]`.
+        let top_pad = ((self.cell_height - glyph_h as f32) * 0.5).round();
+        let offset_y = self.baseline_offset - glyph_h as f32 - top_pad;
+
+        Some(GlyphInfo {
+            uv_min,
+            uv_max,
+            size: [glyph_w as f32, glyph_h as f32],
+            offset: [offset_x, offset_y],
+            advance: span_w,
+            is_color: true,
+        })
+    }
+
+    /// Attempt to rasterize `c` via the monochrome primary + fallback font chain.
+    /// Returns `(metrics, bitmap, found_in_font)`.
+    fn rasterize_mono_char(
+        &mut self,
+        c: char,
+        is_bold: bool,
+        is_italic: bool,
+    ) -> Option<(fontdue::Metrics, Vec<u8>)> {
+        // 1. Check primary font
+        let (primary, primary_is_italic) = self.select_primary_face(is_bold, is_italic);
+        if primary.lookup_glyph_index(c) != 0 {
+            let (m, b) = rasterize_fitted_glyph(
+                primary,
+                c,
+                self.font_size,
+                self.cell_width,
+                self.cell_height,
+            );
+            return Some(if is_italic && !primary_is_italic {
+                shear_mono_bitmap(m, b)
+            } else {
+                (m, b)
+            });
+        }
+
+        let target_cells = unicode_width::UnicodeWidthChar::width(c)
+            .unwrap_or(1)
+            .max(1);
+        let mut found: Option<(fontdue::Metrics, Vec<u8>, bool)> = None;
+
+        // For single-cell characters (e.g. `⌘`, `⇧`, `⌥`, `⌃`, `↩`), prefer a fallback
+        // font whose glyph is natively single-cell (`advance_width <= cell_width * 1.25`)
+        // over a CJK font where the same codepoint is drawn as a 2-cell full-width glyph.
+        if target_cells == 1 {
+            for fallback in &self.fallback_fonts {
+                let (face, face_italic) = fallback.select_face(is_bold, is_italic);
+                if face.lookup_glyph_index(c) != 0 {
+                    let m = face.metrics(c, self.font_size);
+                    if m.advance_width <= self.cell_width * 1.25 {
+                        let (rm, rb) = rasterize_fitted_glyph(
+                            face,
+                            c,
+                            self.font_size,
+                            self.cell_width,
+                            self.cell_height,
+                        );
+                        found = Some((rm, rb, face_italic));
+                        break;
+                    }
+                }
+            }
+
+            if found.is_none() && self.system_fallback_cursor == 0 {
+                if let Some(idx) = self.load_next_system_fallback() {
+                    let fallback = &self.fallback_fonts[idx];
+                    let (face, face_italic) = fallback.select_face(is_bold, is_italic);
+                    if face.lookup_glyph_index(c) != 0 {
+                        let m = face.metrics(c, self.font_size);
+                        if m.advance_width <= self.cell_width * 1.25 {
+                            let (rm, rb) = rasterize_fitted_glyph(
+                                face,
+                                c,
+                                self.font_size,
+                                self.cell_width,
+                                self.cell_height,
+                            );
+                            found = Some((rm, rb, face_italic));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Check already-loaded fallback chain
+        if found.is_none() {
+            for fallback in &self.fallback_fonts {
+                let (face, face_italic) = fallback.select_face(is_bold, is_italic);
+                if face.lookup_glyph_index(c) != 0 {
+                    let (rm, rb) = rasterize_fitted_glyph(
+                        face,
+                        c,
+                        self.font_size,
+                        self.cell_width,
+                        self.cell_height,
+                    );
+                    found = Some((rm, rb, face_italic));
+                    break;
+                }
+            }
+        }
+
+        // 3. Progressively load system fallback fonts until one covers `c`
+        while found.is_none() {
+            let Some(idx) = self.load_next_system_fallback() else {
+                break;
+            };
+            let fallback = &self.fallback_fonts[idx];
+            let (face, face_italic) = fallback.select_face(is_bold, is_italic);
+            if face.lookup_glyph_index(c) != 0 {
+                let (rm, rb) = rasterize_fitted_glyph(
+                    face,
+                    c,
+                    self.font_size,
+                    self.cell_width,
+                    self.cell_height,
+                );
+                found = Some((rm, rb, face_italic));
+            }
+        }
+
+        found.map(|(m, b, face_italic)| {
+            if is_italic && !face_italic {
+                shear_mono_bitmap(m, b)
+            } else {
+                (m, b)
+            }
+        })
+    }
+
+    /// Try decoding an emoji string into the color emoji atlas.
+    fn try_insert_color_emoji(
+        &mut self,
+        queue: &Queue,
+        text: &str,
+        target_cells: usize,
+    ) -> Option<GlyphInfo> {
+        let emoji_font = load_system_color_emoji_font()?;
+        let cells = target_cells.max(1);
+        let max_w = ((cells as f32 * self.cell_width).floor() as u32).max(1);
+        let max_h = (self.cell_height.floor() as u32).max(1);
+        let ppem = (self.font_size.ceil().clamp(16.0, 256.0)) as u16;
+        let decoded = emoji_font.decode_grapheme_rgba(text, ppem, max_w, max_h)?;
+        self.upload_color_bitmap(queue, &decoded, cells)
+    }
+
+    /// Retrieve glyph from cache or rasterize (routing default-presentation color emoji to the
+    /// RGBA8 color atlas and regular text to the R8 monochrome atlas) and upload to GPU texture.
+    pub fn get_or_insert_glyph(
+        &mut self,
+        queue: &Queue,
+        c: char,
+        is_bold: bool,
+        is_italic: bool,
+    ) -> Option<GlyphInfo> {
+        let key = GlyphKey {
+            c,
+            is_bold,
+            is_italic,
         };
 
+        if let Some(&info) = self.cache.get(&key) {
+            return Some(info);
+        }
+
+        let target_cells = unicode_width::UnicodeWidthChar::width(c)
+            .unwrap_or(1)
+            .max(1);
+
+        // 1. Default-presentation color emoji (e.g. 😀, 🔥, 🚀, ✅, ⚡, 🦀) -> RGBA color atlas first
+        if is_default_emoji_presentation(c) {
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            if let Some(info) = self.try_insert_color_emoji(queue, s, target_cells) {
+                self.cache.insert(key, info);
+                return Some(info);
+            }
+        }
+
+        // 2. Monochrome primary + fallback font chain
+        let mono_res = self.rasterize_mono_char(c, is_bold, is_italic);
+
+        // 3. Last-resort color emoji check for non-ASCII chars missing from all mono fonts
+        let (metrics, bitmap) = match mono_res {
+            Some(res) => res,
+            None => {
+                if !c.is_ascii() {
+                    let mut buf = [0u8; 4];
+                    let s = c.encode_utf8(&mut buf);
+                    if let Some(info) = self.try_insert_color_emoji(queue, s, target_cells) {
+                        self.cache.insert(key, info);
+                        return Some(info);
+                    }
+                }
+                self.regular_font.rasterize('?', self.font_size)
+            }
+        };
+
+        let advance = if metrics.advance_width > 0.0 {
+            metrics.advance_width
+        } else {
+            target_cells as f32 * self.cell_width
+        };
+
+        let info = self.upload_mono_bitmap(queue, &metrics, &bitmap, advance)?;
         self.cache.insert(key, info);
+        Some(info)
+    }
+
+    /// Retrieve or rasterize a multi-codepoint grapheme cluster (e.g. `❤️` with VS16, ZWJ emoji,
+    /// skin-tone modifiers, flags, or NFD base + combining marks like `e\u{0301}`).
+    ///
+    /// Designed as the Stage 2 integration entry point for `ScreenBuffer::cell_grapheme`.
+    pub fn get_or_insert_grapheme(
+        &mut self,
+        queue: &Queue,
+        text: &str,
+        is_bold: bool,
+        is_italic: bool,
+        target_cells: usize,
+    ) -> Option<GlyphInfo> {
+        let mut chars = text.chars();
+        let first = chars.next()?;
+        if chars.next().is_none() {
+            return self.get_or_insert_glyph(queue, first, is_bold, is_italic);
+        }
+
+        let clamped_cells = target_cells.clamp(1, 2) as u8;
+        let key = GraphemeKey {
+            text: text.to_string(),
+            is_bold,
+            is_italic,
+            target_cells: clamped_cells,
+        };
+        if let Some(&info) = self.grapheme_cache.get(&key) {
+            return Some(info);
+        }
+
+        // 1. Color emoji grapheme clusters (VS16, ZWJ, skin tones, regional indicator flags, keycaps)
+        if is_color_emoji_grapheme(text) {
+            if let Some(info) = self.try_insert_color_emoji(queue, text, clamped_cells as usize) {
+                self.grapheme_cache.insert(key, info);
+                return Some(info);
+            }
+        }
+
+        // 2. Monochrome compositing for base + combining marks (e.g. NFD macOS filenames) or VS15 text
+        let visible_chars: Vec<char> = text
+            .chars()
+            .filter(|&ch| ch != '\u{FE0E}' && ch != '\u{FE0F}' && ch != '\u{200D}')
+            .collect();
+        let &base_char = visible_chars.first()?;
+        if visible_chars.len() == 1 {
+            let info = self.get_or_insert_glyph(queue, base_char, is_bold, is_italic)?;
+            self.grapheme_cache.insert(key, info);
+            return Some(info);
+        }
+
+        let (base_m, base_bmp) = self
+            .rasterize_mono_char(base_char, is_bold, is_italic)
+            .unwrap_or_else(|| self.regular_font.rasterize(base_char, self.font_size));
+
+        let mut layers: Vec<(fontdue::Metrics, Vec<u8>)> = Vec::with_capacity(visible_chars.len());
+        layers.push((base_m, base_bmp));
+        for &mark_char in &visible_chars[1..] {
+            if let Some(layer) = self.rasterize_mono_char(mark_char, is_bold, is_italic) {
+                if layer.0.width > 0 && layer.0.height > 0 {
+                    layers.push(layer);
+                }
+            }
+        }
+
+        let (comp_metrics, comp_bitmap) = composite_mono_grapheme(&layers);
+        let advance = if comp_metrics.advance_width > 0.0 {
+            comp_metrics.advance_width
+        } else {
+            clamped_cells as f32 * self.cell_width
+        };
+
+        let info = self.upload_mono_bitmap(queue, &comp_metrics, &comp_bitmap, advance)?;
+        self.grapheme_cache.insert(key, info);
         Some(info)
     }
 
@@ -725,6 +1436,129 @@ impl GlyphAtlas {
             .map(|c| self.glyph_advance(queue, c, is_bold, false))
             .sum()
     }
+}
+
+/// Apply a subtle synthetic oblique shear (~12 degrees) to a monochrome bitmap when a font family
+/// (such as `Monaco.ttf` or a CJK fallback) does not provide a native Italic face.
+pub fn shear_mono_bitmap(
+    mut metrics: fontdue::Metrics,
+    bitmap: Vec<u8>,
+) -> (fontdue::Metrics, Vec<u8>) {
+    let src_w = metrics.width;
+    let src_h = metrics.height;
+    if src_w == 0 || src_h == 0 || bitmap.len() < src_w * src_h {
+        return (metrics, bitmap);
+    }
+
+    const SLOPE: f32 = 0.21;
+    let max_shift = ((src_h as f32) * SLOPE).ceil() as usize;
+    if max_shift == 0 {
+        return (metrics, bitmap);
+    }
+
+    let dst_w = src_w + max_shift;
+    let mut dst = vec![0u8; dst_w * src_h];
+    for y in 0..src_h {
+        // Higher rows (smaller y in top-down bitmap) shift further right.
+        let shift = ((src_h - 1 - y) as f32) * SLOPE;
+        let shift_i = shift.floor() as isize;
+        let frac = shift - shift.floor();
+        for dx in 0..dst_w {
+            let sx = dx as isize - shift_i;
+            let s0 = if sx >= 0 && (sx as usize) < src_w {
+                bitmap[y * src_w + sx as usize] as f32
+            } else {
+                0.0
+            };
+            let s1 = if sx > 0 && ((sx - 1) as usize) < src_w {
+                bitmap[y * src_w + (sx - 1) as usize] as f32
+            } else {
+                0.0
+            };
+            dst[y * dst_w + dx] = (s0 * (1.0 - frac) + s1 * frac).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    metrics.width = dst_w;
+    metrics.xmin -= (max_shift as i32) / 3;
+    (metrics, dst)
+}
+
+/// Composite a base glyph and one or more combining mark bitmaps into a single monochrome bitmap
+/// aligned on the baseline (`ymin`) and centered over the base glyph.
+pub fn composite_mono_grapheme(
+    layers: &[(fontdue::Metrics, Vec<u8>)],
+) -> (fontdue::Metrics, Vec<u8>) {
+    if layers.is_empty() {
+        return (fontdue::Metrics::default(), Vec::new());
+    }
+    if layers.len() == 1 {
+        return layers[0].clone();
+    }
+
+    let base_m = layers[0].0;
+    let base_center_x = base_m.xmin as f32 + base_m.width as f32 * 0.5;
+
+    // Resolve each layer's (x0, y_bottom) in baseline-relative integer pixel coordinates.
+    let mut placed: Vec<(i32, i32, usize, usize, &[u8])> = Vec::with_capacity(layers.len());
+    for (idx, (m, bmp)) in layers.iter().enumerate() {
+        if m.width == 0 || m.height == 0 {
+            continue;
+        }
+        let px_x = if idx == 0 {
+            m.xmin
+        } else if m.xmin < 0 {
+            // Combining marks with negative left side bearing anchor relative to the base advance.
+            (base_m.advance_width.round() as i32) + m.xmin
+        } else {
+            (base_center_x - (m.width as f32) * 0.5).round() as i32
+        };
+        placed.push((px_x, m.ymin, m.width, m.height, bmp.as_slice()));
+    }
+
+    if placed.is_empty() {
+        return (base_m, Vec::new());
+    }
+
+    let min_x = placed.iter().map(|p| p.0).min().unwrap();
+    let max_x = placed.iter().map(|p| p.0 + p.2 as i32).max().unwrap();
+    let min_y = placed.iter().map(|p| p.1).min().unwrap();
+    let max_y = placed.iter().map(|p| p.1 + p.3 as i32).max().unwrap();
+
+    let out_w = (max_x - min_x).max(1) as usize;
+    let out_h = (max_y - min_y).max(1) as usize;
+    let mut out = vec![0u8; out_w * out_h];
+
+    for (px_x, px_ymin, w, h, bmp) in placed {
+        let dst_x0 = (px_x - min_x) as usize;
+        // Bitmap row 0 is the top edge (`max_y - 1` in baseline-up coordinates).
+        let layer_top = px_ymin + h as i32;
+        let dst_y0 = (max_y - layer_top) as usize;
+        for row in 0..h {
+            let dy = dst_y0 + row;
+            if dy >= out_h {
+                continue;
+            }
+            for col in 0..w {
+                let dx = dst_x0 + col;
+                if dx >= out_w {
+                    continue;
+                }
+                let src_a = bmp[row * w + col];
+                let dst_slot = &mut out[dy * out_w + dx];
+                if src_a > *dst_slot {
+                    *dst_slot = src_a;
+                }
+            }
+        }
+    }
+
+    let mut out_metrics = base_m;
+    out_metrics.xmin = min_x;
+    out_metrics.ymin = min_y;
+    out_metrics.width = out_w;
+    out_metrics.height = out_h;
+    (out_metrics, out)
 }
 
 /// Rasterize `c` using `face` at `font_size`, fitting and centering the glyph
@@ -1148,32 +1982,59 @@ pub fn find_font_file(query: &str) -> Option<(FontFace, PathBuf)> {
     None
 }
 
-/// Locate or derive a Bold (`700`) companion face for `query` given its loaded `regular_face`.
-///
-/// 1. Prefers a dedicated static `*Bold` font file if one is installed.
-/// 2. Otherwise, if `regular_face` is a Variable Font with a `wght` axis (such as
-///    `NotoSansTC-VariableFont_wght.ttf`), derives a `wght = 700` instance directly from it.
-/// 3. Finally, if `regular_face` came from a static file without a matching static `*Bold`
-///    file, checks if a Variable Font candidate for `query` exists and loads it at `wght = 700`.
-fn load_bold_companion(query: &str, regular_face: &FontFace) -> Option<FontFace> {
-    let clean_q = clean_name(query);
-    if clean_q == "menlo" {
-        if let Some(path) = direct_candidate("menlo") {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(face) = FontFace::from_bytes(
-                    bytes,
+/// Scan a TrueType Collection (`.ttc`) buffer using `ttf-parser` to locate the exact face matching
+/// `(want_bold, want_italic)` (e.g. `Menlo.ttc` index 1 = Bold, 2 = Italic, 3 = Bold Italic).
+fn load_ttc_style_face(bytes: &[u8], want_bold: bool, want_italic: bool) -> Option<FontFace> {
+    let count = ttf_parser::fonts_in_collection(bytes)?;
+    for idx in 0..count {
+        if let Ok(face) = ttf_parser::Face::parse(bytes, idx) {
+            let face_bold = face.is_bold();
+            let face_italic = face.is_italic() || face.is_oblique();
+            if face_bold == want_bold && face_italic == want_italic {
+                if let Ok(loaded) = FontFace::from_bytes(
+                    bytes.to_vec(),
                     FontSettings {
-                        collection_index: 1,
+                        collection_index: idx,
                         ..Default::default()
                     },
                 ) {
+                    return Some(loaded);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Locate or derive a Bold (`700`) companion face for `query` given its loaded `regular_face`.
+fn load_bold_companion(
+    query: &str,
+    regular_face: &FontFace,
+    regular_path: Option<&Path>,
+) -> Option<FontFace> {
+    if let Some(path) = regular_path {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("ttc"))
+        {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Some(face) = load_ttc_style_face(&bytes, true, false) {
                     return Some(face);
                 }
             }
         }
-        return None;
     }
-    if clean_q == "monaco" {
+
+    let clean_q = clean_name(query);
+    if clean_q == "menlo" {
+        if let Some(path) = direct_candidate("menlo") {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Some(face) = load_ttc_style_face(&bytes, true, false) {
+                    return Some(face);
+                }
+            }
+        }
         return None;
     }
 
@@ -1200,6 +2061,67 @@ fn load_bold_companion(query: &str, regular_face: &FontFace) -> Option<FontFace>
     }
 
     None
+}
+
+/// Locate an Italic / Oblique companion face for `query` (including TTC collections like `Menlo.ttc`).
+fn load_italic_companion(query: &str, regular_path: Option<&Path>) -> Option<FontFace> {
+    if let Some(path) = regular_path {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("ttc"))
+        {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Some(face) = load_ttc_style_face(&bytes, false, true) {
+                    return Some(face);
+                }
+            }
+        }
+    }
+
+    let base_q = family_of(query.trim());
+    let italic_query = format!("{}Italic", base_q);
+    if let Some((i_font, _)) = find_font_file(&italic_query) {
+        return Some(i_font);
+    }
+    let oblique_query = format!("{}Oblique", base_q);
+    if let Some((o_font, _)) = find_font_file(&oblique_query) {
+        return Some(o_font);
+    }
+    None
+}
+
+/// Locate a Bold+Italic / Bold+Oblique companion face for `query` (including TTC collections
+/// like `Menlo.ttc` and Variable Italic fonts).
+fn load_bold_italic_companion(
+    query: &str,
+    regular_path: Option<&Path>,
+    italic_face: Option<&FontFace>,
+) -> Option<FontFace> {
+    if let Some(path) = regular_path {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("ttc"))
+        {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Some(face) = load_ttc_style_face(&bytes, true, true) {
+                    return Some(face);
+                }
+            }
+        }
+    }
+
+    let base_q = family_of(query.trim());
+    let bi_query = format!("{}BoldItalic", base_q);
+    if let Some((bi_font, _)) = find_font_file(&bi_query) {
+        return Some(bi_font);
+    }
+    let bo_query = format!("{}BoldOblique", base_q);
+    if let Some((bo_font, _)) = find_font_file(&bo_query) {
+        return Some(bo_font);
+    }
+    italic_face.and_then(|f| f.with_weight(BOLD_WEIGHT))
 }
 
 /// Distinct font family names installed on this machine, for the settings UI.
@@ -1323,16 +2245,17 @@ fn family_of(stem: &str) -> String {
     current.to_string()
 }
 
-/// Load full configured font chain (Primary Monospace + Fallbacks)
-pub fn load_configured_font_chain(
-    family_str: &str,
-    fallback_families: &[String],
-) -> (
-    FontFace,
-    Option<FontFace>,
-    Option<FontFace>,
-    Vec<FallbackFont>,
-) {
+/// Full resolved font chain including Bold, Italic, Bold+Italic, and Fallback families.
+pub struct LoadedFontChain {
+    pub regular: FontFace,
+    pub bold: Option<FontFace>,
+    pub italic: Option<FontFace>,
+    pub bold_italic: Option<FontFace>,
+    pub fallbacks: Vec<FallbackFont>,
+}
+
+/// Load full configured font chain (Primary Monospace + Bold/Italic/BoldItalic + Fallbacks).
+pub fn load_font_chain(family_str: &str, fallback_families: &[String]) -> LoadedFontChain {
     let mut queries = Vec::new();
 
     for token in family_str.split(',') {
@@ -1352,35 +2275,27 @@ pub fn load_configured_font_chain(
     let mut primary_font: Option<FontFace> = None;
     let mut bold_font: Option<FontFace> = None;
     let mut italic_font: Option<FontFace> = None;
+    let mut bold_italic_font: Option<FontFace> = None;
     let mut fallback_fonts: Vec<FallbackFont> = Vec::new();
 
     for q in &queries {
         if let Some((font, path)) = find_font_file(q) {
             if primary_font.is_none() {
                 info!("Found primary font match for '{}': {:?}", q, path);
-                bold_font = load_bold_companion(q, &font);
-
-                // Query italic/oblique variants if not a single-file TTC like Menlo
-                let clean_q = clean_name(q);
-                if clean_q != "menlo" && clean_q != "monaco" {
-                    let base_q = family_of(q.trim());
-                    let italic_query = format!("{}Italic", base_q);
-                    if let Some((i_font, _)) = find_font_file(&italic_query) {
-                        italic_font = Some(i_font);
-                    } else {
-                        let oblique_query = format!("{}Oblique", base_q);
-                        if let Some((o_font, _)) = find_font_file(&oblique_query) {
-                            italic_font = Some(o_font);
-                        }
-                    }
-                }
+                bold_font = load_bold_companion(q, &font, Some(&path));
+                italic_font = load_italic_companion(q, Some(&path));
+                bold_italic_font = load_bold_italic_companion(q, Some(&path), italic_font.as_ref());
                 primary_font = Some(font);
             } else {
                 info!("Found fallback font match for '{}': {:?}", q, path);
-                let bold = load_bold_companion(q, &font);
+                let bold = load_bold_companion(q, &font, Some(&path));
+                let italic = load_italic_companion(q, Some(&path));
+                let bold_italic = load_bold_italic_companion(q, Some(&path), italic.as_ref());
                 fallback_fonts.push(FallbackFont {
                     regular: font,
                     bold,
+                    italic,
+                    bold_italic,
                 });
             }
         }
@@ -1400,8 +2315,14 @@ pub fn load_configured_font_chain(
         ];
         for d in defaults {
             if let Ok(b) = std::fs::read(d) {
+                let ttc_bold = load_ttc_style_face(&b, true, false);
+                let ttc_italic = load_ttc_style_face(&b, false, true);
+                let ttc_bold_italic = load_ttc_style_face(&b, true, true);
                 if let Ok(f) = FontFace::from_bytes(b, FontSettings::default()) {
                     info!("Loaded default fallback primary monospace font: {}", d);
+                    bold_font = ttc_bold.or_else(|| f.with_weight(BOLD_WEIGHT));
+                    italic_font = ttc_italic;
+                    bold_italic_font = ttc_bold_italic;
                     return f;
                 }
             }
@@ -1409,7 +2330,27 @@ pub fn load_configured_font_chain(
         panic!("FATAL: No valid monospace font found on system!");
     });
 
-    (primary, bold_font, italic_font, fallback_fonts)
+    LoadedFontChain {
+        regular: primary,
+        bold: bold_font,
+        italic: italic_font,
+        bold_italic: bold_italic_font,
+        fallbacks: fallback_fonts,
+    }
+}
+
+/// Load full configured font chain (backwards-compatible tuple wrapper).
+pub fn load_configured_font_chain(
+    family_str: &str,
+    fallback_families: &[String],
+) -> (
+    FontFace,
+    Option<FontFace>,
+    Option<FontFace>,
+    Vec<FallbackFont>,
+) {
+    let chain = load_font_chain(family_str, fallback_families);
+    (chain.regular, chain.bold, chain.italic, chain.fallbacks)
 }
 
 #[cfg(test)]
@@ -1608,7 +2549,7 @@ mod tests {
     #[test]
     fn fallback_font_chain_loads_regular_and_bold_for_cjk() {
         if let Some((regular, path)) = find_font_file("NotoSansTC") {
-            let bold = load_bold_companion("NotoSansTC", &regular)
+            let bold = load_bold_companion("NotoSansTC", &regular, Some(&path))
                 .expect("NotoSansTC should resolve a Bold companion face");
 
             if let Some(w) = regular.variable_weight() {
@@ -1673,6 +2614,8 @@ mod tests {
                     fallbacks.push(FallbackFont {
                         regular,
                         bold: None,
+                        italic: None,
+                        bold_italic: None,
                     });
                 }
             }
@@ -1850,6 +2793,8 @@ mod tests {
                     fallbacks.push(FallbackFont {
                         regular,
                         bold: None,
+                        italic: None,
+                        bold_italic: None,
                     });
                 }
             }
@@ -1943,5 +2888,115 @@ mod tests {
             left_margin,
             right_margin
         );
+    }
+
+    #[test]
+    fn test_menlo_loads_bold_italic_and_bold_italic_faces() {
+        if !Path::new("/System/Library/Fonts/Menlo.ttc").exists() {
+            return;
+        }
+        let chain = load_font_chain("Menlo", &[]);
+        assert!(chain.bold.is_some(), "Menlo.ttc must resolve Bold face");
+        assert!(chain.italic.is_some(), "Menlo.ttc must resolve Italic face");
+        assert!(
+            chain.bold_italic.is_some(),
+            "Menlo.ttc must resolve Bold+Italic face"
+        );
+
+        let (_, reg_bmp) = chain.regular.rasterize('A', 32.0);
+        let (_, ita_bmp) = chain.italic.as_ref().unwrap().rasterize('A', 32.0);
+        let (_, bi_bmp) = chain.bold_italic.as_ref().unwrap().rasterize('A', 32.0);
+        let (_, b_bmp) = chain.bold.as_ref().unwrap().rasterize('A', 32.0);
+        assert_ne!(reg_bmp, ita_bmp, "Menlo Italic must differ from Regular");
+        assert_ne!(b_bmp, bi_bmp, "Menlo BoldItalic must differ from Bold");
+        assert_ne!(ita_bmp, bi_bmp, "Menlo BoldItalic must differ from Italic");
+    }
+
+    #[test]
+    fn test_synthetic_italic_shear_produces_slanted_bitmap() {
+        let chain = load_font_chain("Menlo", &[]);
+        let (orig_m, orig_bmp) = chain.regular.rasterize('H', 32.0);
+        let (sheared_m, sheared_bmp) = shear_mono_bitmap(orig_m, orig_bmp.clone());
+        assert!(sheared_m.width > orig_m.width);
+        assert_eq!(sheared_m.height, orig_m.height);
+        let ink: u64 = sheared_bmp.iter().map(|&v| v as u64).sum();
+        assert!(ink > 0);
+    }
+
+    #[test]
+    fn test_composite_mono_grapheme_nfd_combining_mark() {
+        let chain = load_font_chain("Menlo", &[]);
+        let base = chain.regular.rasterize('e', 32.0);
+        let acute = chain.regular.rasterize('\u{0301}', 32.0);
+        if acute.0.width == 0 || acute.0.height == 0 {
+            return;
+        }
+        let (comp_m, comp_bmp) = composite_mono_grapheme(&[base.clone(), acute]);
+        assert!(comp_m.width >= base.0.width);
+        assert!(comp_m.height >= base.0.height);
+        let base_ink: u64 = base.1.iter().map(|&v| v as u64).sum();
+        let comp_ink: u64 = comp_bmp.iter().map(|&v| v as u64).sum();
+        assert!(
+            comp_ink > base_ink,
+            "Composited NFD 'é' ink ({comp_ink}) should exceed base 'e' ({base_ink})"
+        );
+    }
+
+    #[test]
+    fn test_color_emoji_decoding_when_system_font_present() {
+        let Some(emoji_font) = load_system_color_emoji_font() else {
+            // Gracefully skip on headless CI systems without Apple Color Emoji / Noto Color Emoji
+            return;
+        };
+
+        // Single-codepoint default emoji
+        let fire = emoji_font
+            .decode_char_rgba('🔥', 32, 36, 36)
+            .expect("🔥 should decode from system color emoji font");
+        assert!(fire.width > 0 && fire.width <= 36);
+        assert!(fire.height > 0 && fire.height <= 36);
+        assert_eq!(fire.rgba.len(), (fire.width * fire.height * 4) as usize);
+        // Must have non-zero alpha AND actual color variation (not all grayscale)
+        let has_color = fire
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[3] > 32 && (px[0] != px[1] || px[1] != px[2]));
+        assert!(has_color, "Decoded 🔥 emoji must contain RGBA color pixels");
+
+        // VS16 emoji presentation grapheme (❤️ = U+2764 + U+FE0F)
+        let heart = emoji_font
+            .decode_grapheme_rgba("\u{2764}\u{FE0F}", 32, 36, 36)
+            .expect("❤️ (VS16) should decode from system color emoji font");
+        assert!(heart.width > 0 && heart.height > 0);
+        assert_eq!(heart.rgba.len(), (heart.width * heart.height * 4) as usize);
+
+        // VS15 text presentation selector must NOT return a color bitmap
+        assert!(
+            emoji_font
+                .decode_grapheme_rgba("\u{2764}\u{FE0E}", 32, 36, 36)
+                .is_none(),
+            "VS15 text presentation must bypass color emoji bitmap"
+        );
+    }
+
+    #[test]
+    fn test_emoji_presentation_classification() {
+        assert!(is_default_emoji_presentation('🔥'));
+        assert!(is_default_emoji_presentation('🚀'));
+        assert!(is_default_emoji_presentation('✅'));
+        assert!(!is_default_emoji_presentation('A'));
+        assert!(!is_default_emoji_presentation('#'));
+        assert!(!is_default_emoji_presentation('⚙'));
+        assert!(!is_default_emoji_presentation('⌘'));
+
+        assert!(is_color_emoji_grapheme("\u{2764}\u{FE0F}"));
+        assert!(is_color_emoji_grapheme("\u{2699}\u{FE0F}"));
+        assert!(is_color_emoji_grapheme("👍🏽"));
+        assert!(is_color_emoji_grapheme("🇺🇸"));
+        assert!(is_color_emoji_grapheme("👨‍👩‍👧‍👦"));
+        assert!(!is_color_emoji_grapheme("\u{2764}\u{FE0E}"));
+        assert!(!is_color_emoji_grapheme("e\u{0301}"));
     }
 }

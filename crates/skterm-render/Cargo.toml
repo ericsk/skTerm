@@ -13,6 +13,8 @@ wgpu = { workspace = true }
 bytemuck = { workspace = true }
 fontdue = { workspace = true }
 ab_glyph = { workspace = true }
+image = { workspace = true }
+ttf-parser = "0.25"
 unicode-width = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

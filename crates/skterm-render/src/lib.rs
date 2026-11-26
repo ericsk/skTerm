@@ -8,14 +8,18 @@ pub mod renderer;
 pub mod shader;
 
 pub use agent_panel::{AgentPanelHit, AgentPanelLayout, PanelRect};
-pub use atlas::{is_terminal_friendly_font, GlyphAtlas, GlyphInfo, GlyphKey};
+pub use atlas::{
+    is_terminal_friendly_font, load_system_color_emoji_font, ColorEmojiFont, DecodedColorGlyph,
+    FontStyle, GlyphAtlas, GlyphInfo, GlyphKey, GraphemeKey,
+};
 pub use pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
 pub use renderer::{
-    char_display_cells, clip_image_quad_to_bounds, color_to_rgba_themed,
-    color_to_rgba_with_dynamic_palette, for_each_ellipsized_glyph, text_display_cells,
-    wide_cell_center_offset, AgentPanelState, AgentSidebarItem, AgentStatus, PaneRenderItem,
-    PreeditOverlayLayout, RenderSurfaceOutcome, RenderTheme, ScrollbarMetrics, TabItem,
-    TermRenderer, TopDropdownMenu, TopDropdownMenuItem, TopRightButtons,
+    char_display_cells, classify_image_z_layer, clip_image_quad_to_bounds, color_to_rgba_themed,
+    color_to_rgba_with_dynamic_palette, contrast_cursor_fg, for_each_ellipsized_glyph,
+    partition_image_z_layers, text_display_cells, wide_cell_center_offset, AgentPanelState,
+    AgentSidebarItem, AgentStatus, ImageZLayer, PaneRenderItem, PreeditOverlayLayout,
+    RenderSurfaceOutcome, RenderTheme, ScrollbarMetrics, TabItem, TermRenderer, TopDropdownMenu,
+    TopDropdownMenuItem, TopRightButtons, KITTY_Z_BELOW_BG_THRESHOLD,
 };
 
 /// skterm-render version and basic info
@@ -307,5 +311,114 @@ mod tests {
             [0.0, 0.0, 200.0, 200.0]
         )
         .is_none());
+    }
+
+    #[test]
+    fn test_bold_as_bright_without_ansi_palette_and_default_fg_preserved() {
+        use skterm_core::{Color, NamedColor};
+        use std::collections::HashMap;
+
+        // Default theme has `ansi_palette: None`: bold ANSI 0..7 must still promote to 8..15!
+        let default_theme = RenderTheme::default();
+        assert!(default_theme.ansi_palette.is_none());
+        assert_eq!(
+            color_to_rgba_themed(Color::Named(NamedColor::Red), false, true, &default_theme),
+            color_to_rgba(Color::Named(NamedColor::BrightRed), false),
+            "Bold Named(Red) without ansi_palette must promote to BrightRed"
+        );
+        assert_eq!(
+            color_to_rgba_themed(Color::Indexed(2), false, true, &default_theme),
+            color_to_rgba(Color::Indexed(10), false),
+            "Bold Indexed(2) without ansi_palette must promote to Indexed(10)"
+        );
+        // Background colors must NOT be promoted by bold_as_bright
+        assert_eq!(
+            color_to_rgba_themed(Color::Named(NamedColor::Red), true, true, &default_theme),
+            color_to_rgba(Color::Named(NamedColor::Red), true)
+        );
+
+        // Bold DefaultFg must stay default_fg and NOT turn into OSC 4 index 15!
+        let mut dyn_pal = HashMap::new();
+        dyn_pal.insert(15u8, (255, 0, 255));
+        assert_eq!(
+            color_to_rgba_with_dynamic_palette(
+                Color::DefaultFg,
+                false,
+                true,
+                &default_theme,
+                Some(&dyn_pal),
+            ),
+            default_theme.default_fg,
+            "Bold DefaultFg must never turn into OSC 4 index 15"
+        );
+        // Even with a theme ansi_palette, bold DefaultFg must remain theme.default_fg (e.g. light themes)
+        let mut pal = [[0.0f32; 4]; 16];
+        pal[15] = [1.0, 1.0, 1.0, 1.0];
+        let light_theme = RenderTheme {
+            default_fg: [0.1, 0.1, 0.1, 1.0],
+            ansi_palette: Some(pal),
+            ..Default::default()
+        };
+        assert_eq!(
+            color_to_rgba_themed(Color::DefaultFg, false, true, &light_theme),
+            light_theme.default_fg
+        );
+    }
+
+    #[test]
+    fn test_kitty_z_index_layer_classification_and_partition() {
+        assert_eq!(classify_image_z_layer(i32::MIN), ImageZLayer::BelowCellBg);
+        assert_eq!(
+            classify_image_z_layer(KITTY_Z_BELOW_BG_THRESHOLD - 1),
+            ImageZLayer::BelowCellBg
+        );
+        assert_eq!(
+            classify_image_z_layer(KITTY_Z_BELOW_BG_THRESHOLD),
+            ImageZLayer::BelowText
+        );
+        assert_eq!(classify_image_z_layer(-1), ImageZLayer::BelowText);
+        assert_eq!(classify_image_z_layer(0), ImageZLayer::AboveText);
+        assert_eq!(classify_image_z_layer(42), ImageZLayer::AboveText);
+
+        let mut zs = vec![
+            5,
+            -1,
+            i32::MIN,
+            0,
+            KITTY_Z_BELOW_BG_THRESHOLD,
+            -1_500_000_000,
+        ];
+        zs.sort_unstable();
+        let (below_bg_end, below_text_end) = partition_image_z_layers(&zs);
+        assert_eq!(
+            &zs[..below_bg_end],
+            &[i32::MIN, -1_500_000_000],
+            "Tier 2 must hold z < INT32_MIN/2"
+        );
+        assert_eq!(
+            &zs[below_bg_end..below_text_end],
+            &[KITTY_Z_BELOW_BG_THRESHOLD, -1],
+            "Tier 4 must hold INT32_MIN/2 <= z < 0"
+        );
+        assert_eq!(&zs[below_text_end..], &[0, 5], "Tier 6 must hold z >= 0");
+    }
+
+    #[test]
+    fn test_contrast_cursor_fg_ensures_legibility() {
+        // Dark theme bg + bright white cursor -> uses dark default_bg
+        assert_eq!(
+            contrast_cursor_fg([1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 1.0]),
+            [0.0, 0.0, 0.0, 1.0]
+        );
+        // Dark theme bg + very dark cursor -> falls back to pure white for legibility
+        assert_eq!(
+            contrast_cursor_fg([0.05, 0.05, 0.05, 1.0], [0.0, 0.0, 0.0, 1.0]),
+            [1.0, 1.0, 1.0, 1.0]
+        );
+        // Light theme bg + bright yellow cursor -> falls back to pure black for legibility
+        assert_eq!(
+            contrast_cursor_fg([1.0, 0.95, 0.2, 1.0], [0.98, 0.98, 0.98, 1.0]),
+            [0.0, 0.0, 0.0, 1.0]
+        );
     }
 }

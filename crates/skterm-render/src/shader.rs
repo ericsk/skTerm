@@ -16,6 +16,12 @@ var glyph_texture: texture_2d<f32>;
 @group(0) @binding(2)
 var glyph_sampler: sampler;
 
+@group(0) @binding(3)
+var color_glyph_texture: texture_2d<f32>;
+
+@group(0) @binding(4)
+var color_glyph_sampler: sampler;
+
 // --- Background Instanced Quad ---
 struct BgInstance {
     @location(0) rect: vec4<f32>,   // [x, y, w, h] in screen pixels
@@ -57,17 +63,19 @@ fn fs_bg(in: BgVertexOutput) -> @location(0) vec4<f32> {
     return in.color;
 }
 
-// --- Text Glyph Instanced Quad ---
+// --- Text Glyph Instanced Quad (Monochrome R8 + Color Emoji RGBA8) ---
 struct GlyphInstance {
     @location(0) rect: vec4<f32>,   // [x, y, w, h] in screen pixels
     @location(1) uv: vec4<f32>,     // [u_min, v_min, u_max, v_max]
     @location(2) color: vec4<f32>,  // [r, g, b, a]
+    @location(3) is_color: u32,     // 0 = monochrome R8 glyph, 1 = RGBA8 color emoji
 };
 
 struct GlyphVertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) @interpolate(flat) is_color: u32,
 };
 
 @vertex
@@ -105,12 +113,17 @@ fn vs_glyph(
     out.position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
     out.uv = uv;
     out.color = instance.color;
+    out.is_color = instance.is_color;
     return out;
 }
 
 @fragment
 fn fs_glyph(in: GlyphVertexOutput) -> @location(0) vec4<f32> {
-    let alpha = textureSample(glyph_texture, glyph_sampler, in.uv).r;
+    if (in.is_color != 0u) {
+        let texel = textureSampleLevel(color_glyph_texture, color_glyph_sampler, in.uv, 0.0);
+        return vec4<f32>(texel.rgb, texel.a * in.color.a);
+    }
+    let alpha = textureSampleLevel(glyph_texture, glyph_sampler, in.uv, 0.0).r;
     return vec4<f32>(in.color.rgb, in.color.a * alpha);
 }
 

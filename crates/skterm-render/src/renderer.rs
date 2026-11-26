@@ -1,14 +1,15 @@
 //! Main Terminal Renderer combining wgpu Device, Queue, Surface, Atlas, Graphics Images, and Pipelines.
 
 use crate::agent_panel::AgentPanelLayout;
-use crate::atlas::GlyphAtlas;
+use crate::atlas::{GlyphAtlas, GlyphInfo};
 use crate::box_drawing::draw_custom_block_or_box_char;
 use crate::pipeline::{color_to_rgba, BgInstance, GlyphInstance, ImageInstance, TerminalPipeline};
 use skterm_core::{
     CellFlags, Color, CursorShape, NamedColor, PlaceholderCellMeta, ScreenGrid,
-    KITTY_PLACEHOLDER_CHAR,
+    KITTY_PLACEHOLDER_CHAR, PLACEHOLDER_META_TAG,
 };
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use tracing::info;
 use wgpu::{
@@ -657,6 +658,83 @@ pub struct CachedGpuImage {
     pub last_used_frame: u64,
 }
 
+/// Kitty/Ghostty z-index threshold separating images drawn *behind* non-default cell backgrounds
+/// (`z < INT32_MIN / 2`) from images drawn *above* cell backgrounds and *below* text (`.. 0`).
+pub const KITTY_Z_BELOW_BG_THRESHOLD: i32 = i32::MIN / 2;
+
+/// Semantic render tier for a Kitty/Sixel/OSC 1337 graphic placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImageZLayer {
+    /// `z < i32::MIN / 2`: drawn behind non-default cell backgrounds.
+    BelowCellBg = 0,
+    /// `i32::MIN / 2 <= z < 0`: drawn above cell backgrounds, below text/decorations/cursor.
+    BelowText = 1,
+    /// `z >= 0`: drawn above text/decorations/cursor, below UI chrome overlays.
+    AboveText = 2,
+}
+
+/// Classify a Kitty z-index into its GPU render tier.
+#[inline]
+pub const fn classify_image_z_layer(z_index: i32) -> ImageZLayer {
+    if z_index < KITTY_Z_BELOW_BG_THRESHOLD {
+        ImageZLayer::BelowCellBg
+    } else if z_index < 0 {
+        ImageZLayer::BelowText
+    } else {
+        ImageZLayer::AboveText
+    }
+}
+
+/// Given a slice of z-indices sorted in ascending order, return `(below_bg_end, below_text_end)`
+/// partitioning it into `[0..below_bg_end]` (`BelowCellBg`), `[below_bg_end..below_text_end]`
+/// (`BelowText`), and `[below_text_end..]` (`AboveText`).
+#[inline]
+pub fn partition_image_z_layers(sorted_z: &[i32]) -> (usize, usize) {
+    let below_bg_end = sorted_z.partition_point(|&z| z < KITTY_Z_BELOW_BG_THRESHOLD);
+    let below_text_end = sorted_z.partition_point(|&z| z < 0);
+    (below_bg_end, below_text_end)
+}
+
+#[inline]
+fn srgb_channel_to_linear(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[inline]
+fn relative_luminance(rgba: [f32; 4]) -> f32 {
+    0.2126 * srgb_channel_to_linear(rgba[0])
+        + 0.7152 * srgb_channel_to_linear(rgba[1])
+        + 0.0722 * srgb_channel_to_linear(rgba[2])
+}
+
+#[inline]
+fn contrast_ratio(l1: f32, l2: f32) -> f32 {
+    let (hi, lo) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Choose a high-contrast foreground color for a glyph rendered on top of a focused solid block
+/// cursor (prefers `default_bg` when WCAG contrast >= 4.5, otherwise picks black or white).
+pub fn contrast_cursor_fg(cursor_rgba: [f32; 4], default_bg: [f32; 4]) -> [f32; 4] {
+    let l_cursor = relative_luminance(cursor_rgba);
+    let l_bg = relative_luminance(default_bg);
+    if contrast_ratio(l_cursor, l_bg) >= 4.5 {
+        return [default_bg[0], default_bg[1], default_bg[2], 1.0];
+    }
+    let c_black = contrast_ratio(l_cursor, 0.0);
+    let c_white = contrast_ratio(l_cursor, 1.0);
+    if c_black >= c_white {
+        [0.0, 0.0, 0.0, 1.0]
+    } else {
+        [1.0, 1.0, 1.0, 1.0]
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ImageDrawCall {
     texture_id: u32,
@@ -784,8 +862,19 @@ pub struct TermRenderer {
     // that building them doesn't hold a borrow on `self`.
     bg_instances: Vec<BgInstance>,
     glyph_instances: Vec<GlyphInstance>,
+    bg_tier1: Vec<BgInstance>,
+    bg_tier3: Vec<BgInstance>,
+    bg_tier5_decor: Vec<BgInstance>,
+    bg_tier5_top: Vec<BgInstance>,
+    bg_tier7_ui: Vec<BgInstance>,
+    glyph_tier5: Vec<GlyphInstance>,
+    glyph_tier7_ui: Vec<GlyphInstance>,
     image_draw_calls: Vec<ImageDrawCall>,
     image_instances: Vec<ImageInstance>,
+
+    /// Optional per-pane hovered OSC 8 hyperlink IDs for hover-underline rendering.
+    hovered_hyperlinks: HashMap<usize, NonZeroU32>,
+    hovered_hyperlinks_by_grid: HashMap<usize, NonZeroU32>,
 
     perf: FrameProfiler,
 }
@@ -1051,8 +1140,17 @@ impl TermRenderer {
             // the realloc chain. These only ever grow to the high-water mark.
             bg_instances: Vec::with_capacity(4096),
             glyph_instances: Vec::with_capacity(12288),
+            bg_tier1: Vec::with_capacity(64),
+            bg_tier3: Vec::with_capacity(2048),
+            bg_tier5_decor: Vec::with_capacity(2048),
+            bg_tier5_top: Vec::with_capacity(128),
+            bg_tier7_ui: Vec::with_capacity(256),
+            glyph_tier5: Vec::with_capacity(12288),
+            glyph_tier7_ui: Vec::with_capacity(512),
             image_draw_calls: Vec::new(),
             image_instances: Vec::new(),
+            hovered_hyperlinks: HashMap::new(),
+            hovered_hyperlinks_by_grid: HashMap::new(),
             perf: FrameProfiler::from_env(),
         })
     }
@@ -1257,6 +1355,70 @@ impl TermRenderer {
         self.atlas.measure_text_width(&self.queue, text, is_bold)
     }
 
+    /// Set (or clear) the hovered OSC 8 hyperlink ID for the pane at `pane_index` in the
+    /// `panes` slice passed to `render_workspace*`. Passing `None` or `Some(0)` clears it.
+    pub fn set_hovered_hyperlink(&mut self, pane_index: usize, hyperlink_id: Option<u32>) {
+        match hyperlink_id.and_then(NonZeroU32::new) {
+            Some(id) if (id.get() & PLACEHOLDER_META_TAG) == 0 => {
+                self.hovered_hyperlinks.insert(pane_index, id);
+            }
+            _ => {
+                self.hovered_hyperlinks.remove(&pane_index);
+            }
+        }
+    }
+
+    /// Set (or clear) the hovered OSC 8 hyperlink ID keyed by a pane's `ScreenGrid` reference.
+    pub fn set_hovered_hyperlink_for_grid(&mut self, grid: &ScreenGrid, hyperlink_id: Option<u32>) {
+        let key = grid as *const ScreenGrid as usize;
+        match hyperlink_id.and_then(NonZeroU32::new) {
+            Some(id) if (id.get() & PLACEHOLDER_META_TAG) == 0 => {
+                self.hovered_hyperlinks_by_grid.insert(key, id);
+            }
+            _ => {
+                self.hovered_hyperlinks_by_grid.remove(&key);
+            }
+        }
+    }
+
+    /// Clear all hovered OSC 8 hyperlink states across panes.
+    pub fn clear_hovered_hyperlinks(&mut self) {
+        self.hovered_hyperlinks.clear();
+        self.hovered_hyperlinks_by_grid.clear();
+    }
+
+    /// Look up or rasterize a terminal cell's glyph, routing multi-codepoint grapheme clusters
+    /// (Stage 2 `ScreenBuffer::cell_grapheme` hook) through `GlyphAtlas::get_or_insert_grapheme`
+    /// and single-codepoint cells through `GlyphAtlas::get_or_insert_glyph`.
+    pub fn lookup_cell_glyph(
+        &mut self,
+        c: char,
+        grapheme: Option<&str>,
+        is_bold: bool,
+        is_italic: bool,
+        target_cells: usize,
+    ) -> Option<GlyphInfo> {
+        if let Some(text) = grapheme {
+            if !text.is_empty() {
+                return self.atlas.get_or_insert_grapheme(
+                    &self.queue,
+                    text,
+                    is_bold,
+                    is_italic,
+                    target_cells,
+                );
+            }
+        }
+        self.atlas
+            .get_or_insert_glyph(&self.queue, c, is_bold, is_italic)
+    }
+
+    /// Returns `true` if either glyph texture atlas overflowed during the previous frame and
+    /// requires a follow-up redraw so newly-cleared entries are populated.
+    pub fn needs_redraw_for_atlas_reset(&self) -> bool {
+        self.atlas.needs_redraw_for_atlas_reset()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_text_line(
         &mut self,
@@ -1299,6 +1461,7 @@ impl TermRenderer {
                             glyph_info.uv_max[1],
                         ],
                         color,
+                        is_color: u32::from(glyph_info.is_color),
                     });
                 }
             }
@@ -1350,6 +1513,7 @@ impl TermRenderer {
                                 glyph_info.uv_max[1],
                             ],
                             color,
+                            is_color: u32::from(glyph_info.is_color),
                         });
                     }
                 }
@@ -1439,11 +1603,13 @@ impl TermRenderer {
                     rect: [start_x, ay, ga.size[0], ga.size[1]],
                     uv: [ga.uv_min[0], ga.uv_min[1], ga.uv_max[0], ga.uv_max[1]],
                     color: ai_fg,
+                    is_color: u32::from(ga.is_color),
                 });
                 glyphs.push(GlyphInstance {
                     rect: [start_x + ga.size[0] + gap, iy, gi.size[0], gi.size[1]],
                     uv: [gi.uv_min[0], gi.uv_min[1], gi.uv_max[0], gi.uv_max[1]],
                     color: ai_fg,
+                    is_color: u32::from(gi.is_color),
                 });
             }
         }
@@ -1518,6 +1684,7 @@ impl TermRenderer {
                     rect: [gx, gy, gw, gh],
                     uv: [g.uv_min[0], g.uv_min[1], g.uv_max[0], g.uv_max[1]],
                     color: prefs_fg,
+                    is_color: u32::from(g.is_color),
                 });
                 drew_gear = true;
             }
@@ -1924,15 +2091,30 @@ impl TermRenderer {
         let acquire_ns = self.perf.since(frame_start);
 
         self.frame_counter = self.frame_counter.wrapping_add(1);
+        self.atlas.begin_frame();
 
         // Borrow the persistent scratch buffers for the duration of this frame.
         // `take` leaves empty Vecs behind (no allocation) and we hand the buffers
         // back at the end, so the capacity built up by previous frames is reused.
         let mut bg_instances = std::mem::take(&mut self.bg_instances);
         let mut glyph_instances = std::mem::take(&mut self.glyph_instances);
+        let mut bg_tier1 = std::mem::take(&mut self.bg_tier1);
+        let mut bg_tier3 = std::mem::take(&mut self.bg_tier3);
+        let mut bg_tier5_decor = std::mem::take(&mut self.bg_tier5_decor);
+        let mut bg_tier5_top = std::mem::take(&mut self.bg_tier5_top);
+        let mut bg_tier7_ui = std::mem::take(&mut self.bg_tier7_ui);
+        let mut glyph_tier5 = std::mem::take(&mut self.glyph_tier5);
+        let mut glyph_tier7_ui = std::mem::take(&mut self.glyph_tier7_ui);
         let mut image_draw_calls = std::mem::take(&mut self.image_draw_calls);
         bg_instances.clear();
         glyph_instances.clear();
+        bg_tier1.clear();
+        bg_tier3.clear();
+        bg_tier5_decor.clear();
+        bg_tier5_top.clear();
+        bg_tier7_ui.clear();
+        glyph_tier5.clear();
+        glyph_tier7_ui.clear();
         image_draw_calls.clear();
         let mut next_image_order: u32 = 0;
 
@@ -1948,16 +2130,16 @@ impl TermRenderer {
         let screen_h = self.config.height as f32;
         let sidebar_open = panel_state.open;
 
-        // 1. Full Screen Background
+        // Tier 1: Full Screen Background
         let mut full_bg = self.theme.default_bg;
         full_bg[3] *= self.opacity;
 
-        bg_instances.push(BgInstance {
+        bg_tier1.push(BgInstance {
             rect: [0.0, 0.0, screen_w, screen_h],
             color: full_bg,
         });
 
-        // 2. Tab Bar (splits only the main window area, excluding the right sidebar)
+        // Tier 7 UI: Tab Bar (splits only the main window area, excluding the right sidebar)
         if tab_bar_h > 0.0 && !tabs.is_empty() {
             let reserved_right = if sidebar_open && panel_state.width_px > 0.0 {
                 AgentPanelLayout::reserved_width(panel_state.width_px, scale)
@@ -1967,13 +2149,13 @@ impl TermRenderer {
             let main_w = (screen_w - reserved_right).max(0.0);
 
             // 2.1 Tab Bar Header Background (Deep translucent frosted bar)
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [0.0, 0.0, main_w, tab_bar_h],
                 color: [0.06, 0.07, 0.09, 1.0],
             });
 
             // Bottom 1px subtle divider
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [0.0, tab_bar_h - 1.0, main_w, 1.0],
                 color: [0.18, 0.20, 0.26, 0.8],
             });
@@ -2001,25 +2183,25 @@ impl TermRenderer {
 
                 if tab.is_active {
                     // Active Tab: Floating Card Capsule with subtle border and Active Blue Indicator
-                    bg_instances.push(BgInstance {
+                    bg_tier7_ui.push(BgInstance {
                         rect: [tab_x, tab_y, tab_w, tab_h],
                         color: [0.15, 0.17, 0.23, 1.0],
                     });
                     // Top / Left / Right subtle border line
-                    bg_instances.push(BgInstance {
+                    bg_tier7_ui.push(BgInstance {
                         rect: [tab_x, tab_y, tab_w, 1.0],
                         color: [0.28, 0.32, 0.42, 0.8],
                     });
-                    bg_instances.push(BgInstance {
+                    bg_tier7_ui.push(BgInstance {
                         rect: [tab_x, tab_y, 1.0, tab_h],
                         color: [0.28, 0.32, 0.42, 0.5],
                     });
-                    bg_instances.push(BgInstance {
+                    bg_tier7_ui.push(BgInstance {
                         rect: [tab_x + tab_w - 1.0, tab_y, 1.0, tab_h],
                         color: [0.28, 0.32, 0.42, 0.5],
                     });
                     // Active Blue Indicator line at bottom of capsule (#0A84FF)
-                    bg_instances.push(BgInstance {
+                    bg_tier7_ui.push(BgInstance {
                         rect: [
                             tab_x + 3.0 * scale,
                             tab_y + tab_h - 2.0,
@@ -2030,7 +2212,7 @@ impl TermRenderer {
                     });
                 } else {
                     // Inactive Tab: Subtle dark capsule
-                    bg_instances.push(BgInstance {
+                    bg_tier7_ui.push(BgInstance {
                         rect: [tab_x, tab_y, tab_w, tab_h],
                         color: [0.09, 0.10, 0.13, 0.6],
                     });
@@ -2053,7 +2235,7 @@ impl TermRenderer {
                         } else {
                             [0.45, 0.48, 0.55, 0.6]
                         };
-                        glyph_instances.push(GlyphInstance {
+                        glyph_tier7_ui.push(GlyphInstance {
                             rect: [draw_x, draw_y, glyph_info.size[0], glyph_info.size[1]],
                             uv: [
                                 glyph_info.uv_min[0],
@@ -2062,6 +2244,7 @@ impl TermRenderer {
                                 glyph_info.uv_max[1],
                             ],
                             color: close_color,
+                            is_color: u32::from(glyph_info.is_color),
                         });
                     }
                 }
@@ -2077,7 +2260,7 @@ impl TermRenderer {
                 };
 
                 self.draw_text_line_ellipsized(
-                    &mut glyph_instances,
+                    &mut glyph_tier7_ui,
                     &tab.title,
                     text_start_x,
                     text_y,
@@ -2092,13 +2275,13 @@ impl TermRenderer {
                     let bar_x = tab_x + 3.0 * scale;
                     let bar_y = tab_y + tab_h - bar_h;
                     let bar_avail = (tab_w - 6.0 * scale).max(2.0);
-                    bg_instances.push(BgInstance {
+                    bg_tier7_ui.push(BgInstance {
                         rect: [bar_x, bar_y, bar_avail, bar_h],
                         color: [1.0, 1.0, 1.0, 0.10],
                     });
                     let (seg_x, seg_w, seg_color) = progress_bar_segment(prog, bar_x, bar_avail);
                     if seg_w > 0.0 {
-                        bg_instances.push(BgInstance {
+                        bg_tier7_ui.push(BgInstance {
                             rect: [seg_x, bar_y, seg_w, bar_h],
                             color: seg_color,
                         });
@@ -2111,11 +2294,11 @@ impl TermRenderer {
             let plus_btn_x = last_tab_right + 2.0 * scale;
             let plus_btn_y = tab_y + (tab_h - plus_btn_w) / 2.0;
 
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [plus_btn_x, plus_btn_y, plus_btn_w, plus_btn_w],
                 color: [0.12, 0.14, 0.18, 0.7],
             });
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [plus_btn_x, plus_btn_y, plus_btn_w, 1.0],
                 color: [0.22, 0.25, 0.33, 0.6],
             });
@@ -2127,7 +2310,7 @@ impl TermRenderer {
                 if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
                     let draw_x = plus_btn_x + (plus_btn_w - glyph_info.size[0]) / 2.0;
                     let draw_y = plus_btn_y + (plus_btn_w - glyph_info.size[1]) / 2.0;
-                    glyph_instances.push(GlyphInstance {
+                    glyph_tier7_ui.push(GlyphInstance {
                         rect: [draw_x, draw_y, glyph_info.size[0], glyph_info.size[1]],
                         uv: [
                             glyph_info.uv_min[0],
@@ -2136,23 +2319,24 @@ impl TermRenderer {
                             glyph_info.uv_max[1],
                         ],
                         color: [0.80, 0.84, 0.94, 0.9],
+                        is_color: u32::from(glyph_info.is_color),
                     });
                 }
             }
 
             // Dropdown Menu chevron "v" Button
             let chevron_x = plus_btn_x + plus_btn_w + 2.0 * scale;
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [chevron_x, plus_btn_y, chevron_w, plus_btn_w],
                 color: [0.12, 0.14, 0.18, 0.7],
             });
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [chevron_x, plus_btn_y, chevron_w, 1.0],
                 color: [0.22, 0.25, 0.33, 0.6],
             });
             let chevron_label_w = self.measure_text_width("v", false);
             self.draw_text_line(
-                &mut glyph_instances,
+                &mut glyph_tier7_ui,
                 "v",
                 chevron_x + (chevron_w - chevron_label_w) / 2.0,
                 plus_btn_y + (plus_btn_w - cell_h) / 2.0,
@@ -2163,8 +2347,8 @@ impl TermRenderer {
 
             // 2.4 Right-aligned [AI] and [⚙] Action Buttons
             self.draw_top_right_buttons(
-                &mut bg_instances,
-                &mut glyph_instances,
+                &mut bg_tier7_ui,
+                &mut glyph_tier7_ui,
                 &right_btns,
                 &panel_state,
                 false,
@@ -2172,20 +2356,15 @@ impl TermRenderer {
             );
         }
 
-        // 2.5 Global AI Agents Panel
+        // Tier 7 UI: Global AI Agents Panel
         if sidebar_open && panel_state.width_px > 0.0 {
             let layout =
                 AgentPanelLayout::new(screen_w, screen_h, tab_bar_h, panel_state.width_px, scale);
-            self.draw_agent_panel(
-                &mut bg_instances,
-                &mut glyph_instances,
-                &layout,
-                &panel_state,
-            );
+            self.draw_agent_panel(&mut bg_tier7_ui, &mut glyph_tier7_ui, &layout, &panel_state);
         }
 
         // 3. Panes and Images
-        for pane in panes {
+        for (pane_idx, pane) in panes.iter().enumerate() {
             let px = pane.rect_x;
             let py = pane.rect_y;
             let pw = pane.rect_w;
@@ -2225,7 +2404,8 @@ impl TermRenderer {
                 ];
             }
 
-            bg_instances.push(BgInstance {
+            // Tier 1: Pane default background & split borders
+            bg_tier1.push(BgInstance {
                 rect: [px, py, pw, ph],
                 color: pane_theme.default_bg,
             });
@@ -2237,19 +2417,19 @@ impl TermRenderer {
             };
 
             if panes.len() > 1 {
-                bg_instances.push(BgInstance {
+                bg_tier1.push(BgInstance {
                     rect: [px, py, pw, 1.0],
                     color: border_col,
                 });
-                bg_instances.push(BgInstance {
+                bg_tier1.push(BgInstance {
                     rect: [px, py + ph - 1.0, pw, 1.0],
                     color: border_col,
                 });
-                bg_instances.push(BgInstance {
+                bg_tier1.push(BgInstance {
                     rect: [px, py, 1.0, ph],
                     color: border_col,
                 });
-                bg_instances.push(BgInstance {
+                bg_tier1.push(BgInstance {
                     rect: [px + pw - 1.0, py, 1.0, ph],
                     color: border_col,
                 });
@@ -2309,6 +2489,33 @@ impl TermRenderer {
                 None
             };
 
+            let hovered_link_id = self
+                .hovered_hyperlinks_by_grid
+                .get(&(pane.grid as *const ScreenGrid as usize))
+                .copied()
+                .or_else(|| self.hovered_hyperlinks.get(&pane_idx).copied());
+
+            let show_cursor = active_buf.cursor.visible
+                && active_buf.scroll_offset == 0
+                && preedit_grid_span.is_none();
+            let cursor_is_wide = show_cursor
+                && active_buf
+                    .get_visible_row(active_buf.cursor.row)
+                    .and_then(|row| row.cells.get(active_buf.cursor.col))
+                    .is_some_and(|cell| cell.flags.contains(CellFlags::WIDE_CHAR))
+                && active_buf.cursor.col + 1 < active_buf.cols;
+            let focused_block_cursor = if show_cursor
+                && pane.is_focused
+                && active_buf.cursor.shape == CursorShape::Block
+            {
+                Some((active_buf.cursor.row, active_buf.cursor.col, cursor_is_wide))
+            } else {
+                None
+            };
+            let cursor_contrast_fg =
+                contrast_cursor_fg(pane_theme.cursor_color, pane_theme.default_bg);
+            let mut drew_focused_block_cursor = false;
+
             let top_global_row = active_buf
                 .scrollback
                 .len()
@@ -2332,7 +2539,7 @@ impl TermRenderer {
                             Some(0) => [0.30, 0.80, 0.52, 0.55],
                             _ => [0.48, 0.56, 0.72, 0.45],
                         };
-                        bg_instances.push(BgInstance {
+                        bg_tier3.push(BgInstance {
                             rect: [
                                 mark_x,
                                 y + mark_pad_y,
@@ -2345,13 +2552,6 @@ impl TermRenderer {
                 }
 
                 if let Some(row) = active_buf.get_visible_row(r_idx) {
-                    // `ScreenBuffer::search` emits matches in ascending `global_row`
-                    // order, so this row's matches are a contiguous subslice. Finding
-                    // it once per row turns the per-cell highlight test from
-                    // O(cells * total_matches) into O(cells * matches_on_this_row),
-                    // which is 0 or 1 for almost every row. Searching a common word
-                    // in a 10k-line scrollback used to make every frame scan
-                    // thousands of matches for each of ~30k visible cells.
                     let row_match_start = pane
                         .search_matches
                         .partition_point(|m| m.global_row < global_row);
@@ -2392,9 +2592,20 @@ impl TermRenderer {
                             .map(|s| s.contains(r_idx, c_idx))
                             .unwrap_or(false);
 
+                        let is_hovered_link = hovered_link_id.is_some()
+                            && cell.hyperlink_id == hovered_link_id
+                            && cell
+                                .hyperlink_id
+                                .is_some_and(|id| (id.get() & PLACEHOLDER_META_TAG) == 0);
+
+                        let is_solid_cursor_origin = focused_block_cursor
+                            .is_some_and(|(cr, cc, _)| r_idx == cr && c_idx == cc);
+                        let is_under_solid_cursor =
+                            focused_block_cursor.is_some_and(|(cr, cc, wide)| {
+                                r_idx == cr && (c_idx == cc || (wide && c_idx == cc + 1))
+                            });
+
                         // Fast-path: Skip default empty blank cells (typically 80-90% of screen).
-                        // Gated on this row's matches, not the whole pane's: an active
-                        // search used to disable this fast path for the entire screen.
                         if cell.c == ' '
                             && cell.bg == Color::DefaultBg
                             && !cell.flags.intersects(
@@ -2404,6 +2615,8 @@ impl TermRenderer {
                                     | CellFlags::OVERLINE,
                             )
                             && !is_selected
+                            && !is_hovered_link
+                            && !is_under_solid_cursor
                             && row_matches.is_empty()
                         {
                             continue;
@@ -2411,6 +2624,7 @@ impl TermRenderer {
 
                         let is_inverse = cell.flags.contains(CellFlags::INVERSE);
                         let is_bold_flag = cell.flags.contains(CellFlags::BOLD);
+                        let is_dim_flag = cell.flags.contains(CellFlags::DIM);
                         let (mut fg_rgba, bg_rgba) = if is_inverse {
                             (
                                 color_to_rgba_with_dynamic_palette(
@@ -2447,26 +2661,25 @@ impl TermRenderer {
                             )
                         };
 
-                        if cell.flags.contains(CellFlags::DIM) {
+                        if is_dim_flag {
                             fg_rgba[0] *= 0.66;
                             fg_rgba[1] *= 0.66;
                             fg_rgba[2] *= 0.66;
                         }
 
+                        // Tier 3: Non-default cell backgrounds (above z < INT32_MIN/2, below z < 0)
                         if bg_rgba != pane_theme.default_bg {
-                            bg_instances.push(BgInstance {
+                            bg_tier3.push(BgInstance {
                                 rect: [x, y, cell_w, cell_h],
                                 color: bg_rgba,
                             });
                         }
 
-                        // Highlight search matches
+                        // Tier 3: Highlight search matches
                         if !row_matches.is_empty() {
                             let mut match_highlight = None;
                             for (i, m) in row_matches.iter().enumerate() {
                                 if c_idx >= m.start_col && c_idx <= m.end_col {
-                                    // `active_search_idx` indexes the full match list,
-                                    // so map this row-local index back.
                                     if pane.active_search_idx == Some(row_match_start + i) {
                                         match_highlight = Some([0.98, 0.68, 0.12, 0.90]);
                                         break;
@@ -2476,15 +2689,16 @@ impl TermRenderer {
                                 }
                             }
                             if let Some(hl_col) = match_highlight {
-                                bg_instances.push(BgInstance {
+                                bg_tier3.push(BgInstance {
                                     rect: [x, y, cell_w, cell_h],
                                     color: hl_col,
                                 });
                             }
                         }
 
+                        // Tier 5: Selection highlight (above z < 0 images, behind text)
                         if is_selected {
-                            bg_instances.push(BgInstance {
+                            bg_tier5_decor.push(BgInstance {
                                 rect: [x, y, cell_w, cell_h],
                                 color: pane_theme.selection_color,
                             });
@@ -2494,32 +2708,55 @@ impl TermRenderer {
                             }
                         }
 
+                        // Tier 5: Focused solid block cursor (2 cells wide on wide chars) + readable fg contrast
+                        if is_solid_cursor_origin {
+                            let cw = if cursor_is_wide {
+                                (cell_w * 2.0).min((px + pw - x).max(cell_w))
+                            } else {
+                                cell_w
+                            };
+                            let mut cur_col = pane_theme.cursor_color;
+                            cur_col[3] = cur_col[3].max(0.95);
+                            bg_tier5_decor.push(BgInstance {
+                                rect: [x, y, cw, cell_h],
+                                color: cur_col,
+                            });
+                            drew_focused_block_cursor = true;
+                        }
+                        if is_under_solid_cursor {
+                            fg_rgba = cursor_contrast_fg;
+                        }
+
+                        // Tier 5: Underlines, hovered OSC 8 hyperlink underline, overline, strikethrough
                         if !cell.flags.contains(CellFlags::HIDDEN) {
                             let line_h = scale.round().max(1.0);
+                            let ul_y =
+                                (y + baseline + (2.0 * scale).round()).min(y + cell_h - line_h);
                             if cell.flags.contains(CellFlags::UNDERLINE) {
-                                let ul_rgba = cell
-                                    .underline_color_id
-                                    .and_then(|id| pane.grid.get_underline_color(id))
-                                    .map(|col| {
-                                        color_to_rgba_with_dynamic_palette(
-                                            col,
-                                            false,
-                                            false,
-                                            &pane_theme,
-                                            pane.dynamic_palette,
-                                        )
-                                    })
-                                    .unwrap_or(fg_rgba);
-                                let ul_y =
-                                    (y + baseline + (2.0 * scale).round()).min(y + cell_h - line_h);
+                                let ul_rgba = if is_under_solid_cursor {
+                                    fg_rgba
+                                } else {
+                                    cell.underline_color_id
+                                        .and_then(|id| pane.grid.get_underline_color(id))
+                                        .map(|col| {
+                                            color_to_rgba_with_dynamic_palette(
+                                                col,
+                                                false,
+                                                false,
+                                                &pane_theme,
+                                                pane.dynamic_palette,
+                                            )
+                                        })
+                                        .unwrap_or(fg_rgba)
+                                };
 
                                 if cell.flags.contains(CellFlags::DOUBLE_UNDERLINE) {
                                     let top_ul_y = (ul_y - 2.0 * line_h).max(y);
-                                    bg_instances.push(BgInstance {
+                                    bg_tier5_decor.push(BgInstance {
                                         rect: [x, top_ul_y, cell_w, line_h],
                                         color: ul_rgba,
                                     });
-                                    bg_instances.push(BgInstance {
+                                    bg_tier5_decor.push(BgInstance {
                                         rect: [x, ul_y, cell_w, line_h],
                                         color: ul_rgba,
                                     });
@@ -2531,44 +2768,50 @@ impl TermRenderer {
                                         } else {
                                             ul_y
                                         };
-                                        bg_instances.push(BgInstance {
+                                        bg_tier5_decor.push(BgInstance {
                                             rect: [x + step as f32 * seg_w, sy, seg_w, line_h],
                                             color: ul_rgba,
                                         });
                                     }
                                 } else if cell.flags.contains(CellFlags::DOTTED_UNDERLINE) {
                                     let dot_w = (cell_w / 4.0).max(1.0);
-                                    bg_instances.push(BgInstance {
+                                    bg_tier5_decor.push(BgInstance {
                                         rect: [x, ul_y, dot_w, line_h],
                                         color: ul_rgba,
                                     });
-                                    bg_instances.push(BgInstance {
+                                    bg_tier5_decor.push(BgInstance {
                                         rect: [x + 2.0 * dot_w, ul_y, dot_w, line_h],
                                         color: ul_rgba,
                                     });
                                 } else if cell.flags.contains(CellFlags::DASHED_UNDERLINE) {
                                     let dash_w = (cell_w * 0.65).max(1.0);
                                     let dash_x = x + (cell_w - dash_w) * 0.5;
-                                    bg_instances.push(BgInstance {
+                                    bg_tier5_decor.push(BgInstance {
                                         rect: [dash_x, ul_y, dash_w, line_h],
                                         color: ul_rgba,
                                     });
                                 } else {
-                                    bg_instances.push(BgInstance {
+                                    bg_tier5_decor.push(BgInstance {
                                         rect: [x, ul_y, cell_w, line_h],
                                         color: ul_rgba,
                                     });
                                 }
+                            } else if is_hovered_link {
+                                // Hovered OSC 8 hyperlink underline
+                                bg_tier5_decor.push(BgInstance {
+                                    rect: [x, ul_y, cell_w, line_h],
+                                    color: fg_rgba,
+                                });
                             }
                             if cell.flags.contains(CellFlags::OVERLINE) {
-                                bg_instances.push(BgInstance {
+                                bg_tier5_decor.push(BgInstance {
                                     rect: [x, y, cell_w, line_h],
                                     color: fg_rgba,
                                 });
                             }
                             if cell.flags.contains(CellFlags::STRIKETHROUGH) {
                                 let st_y = (y + (cell_h * 0.5).round()).min(y + cell_h - line_h);
-                                bg_instances.push(BgInstance {
+                                bg_tier5_decor.push(BgInstance {
                                     rect: [x, st_y, cell_w, line_h],
                                     color: fg_rgba,
                                 });
@@ -2760,7 +3003,8 @@ impl TermRenderer {
                                 .flags
                                 .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::HIDDEN)
                         {
-                            // Procedural gap-free rendering for Unicode Block Elements and Box Drawing
+                            // Tier 5: Procedural gap-free rendering for Block Elements, Box Drawing,
+                            // Braille Patterns, and Legacy Computing Sextants (above z < 0 images)
                             if draw_custom_block_or_box_char(
                                 cell.c,
                                 x,
@@ -2768,28 +3012,42 @@ impl TermRenderer {
                                 cell_w,
                                 cell_h,
                                 fg_rgba,
-                                &mut bg_instances,
+                                &mut bg_tier5_decor,
                             ) {
                                 continue;
                             }
 
                             let is_bold = cell.flags.contains(CellFlags::BOLD);
                             let is_italic = cell.flags.contains(CellFlags::ITALIC);
+                            let target_cells = if cell.flags.contains(CellFlags::WIDE_CHAR) {
+                                2
+                            } else {
+                                1
+                            };
 
-                            if let Some(glyph_info) = self.atlas.get_or_insert_glyph(
-                                &self.queue,
+                            if let Some(glyph_info) = self.lookup_cell_glyph(
                                 cell.c,
+                                None,
                                 is_bold,
                                 is_italic,
+                                target_cells,
                             ) {
                                 if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
-                                    let wide_pad_x =
-                                        wide_cell_center_offset(cell.c, glyph_info.advance, cell_w);
+                                    let wide_pad_x = if glyph_info.is_color {
+                                        0.0
+                                    } else {
+                                        wide_cell_center_offset(cell.c, glyph_info.advance, cell_w)
+                                    };
                                     let glyph_x = x + wide_pad_x + glyph_info.offset[0];
                                     let glyph_y =
                                         y + baseline - glyph_info.offset[1] - glyph_info.size[1];
+                                    let glyph_color = if glyph_info.is_color {
+                                        [1.0, 1.0, 1.0, if is_dim_flag { 0.66 } else { 1.0 }]
+                                    } else {
+                                        fg_rgba
+                                    };
 
-                                    glyph_instances.push(GlyphInstance {
+                                    glyph_tier5.push(GlyphInstance {
                                         rect: [
                                             glyph_x,
                                             glyph_y,
@@ -2802,7 +3060,8 @@ impl TermRenderer {
                                             glyph_info.uv_max[0],
                                             glyph_info.uv_max[1],
                                         ],
-                                        color: fg_rgba,
+                                        color: glyph_color,
+                                        is_color: u32::from(glyph_info.is_color),
                                     });
                                 }
                             }
@@ -2839,7 +3098,7 @@ impl TermRenderer {
                                     if x + w_px > px + pw {
                                         break;
                                     }
-                                    bg_instances.push(BgInstance {
+                                    bg_tier5_decor.push(BgInstance {
                                         rect: [x, y, w_px, cell_h],
                                         color: preedit_bg,
                                     });
@@ -2852,16 +3111,20 @@ impl TermRenderer {
                                         ) {
                                             if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0
                                             {
-                                                let wide_pad_x = wide_cell_center_offset(
-                                                    c,
-                                                    glyph_info.advance,
-                                                    cell_w,
-                                                );
+                                                let wide_pad_x = if glyph_info.is_color {
+                                                    0.0
+                                                } else {
+                                                    wide_cell_center_offset(
+                                                        c,
+                                                        glyph_info.advance,
+                                                        cell_w,
+                                                    )
+                                                };
                                                 let glyph_x = x + wide_pad_x + glyph_info.offset[0];
                                                 let glyph_y = y + baseline
                                                     - glyph_info.offset[1]
                                                     - glyph_info.size[1];
-                                                glyph_instances.push(GlyphInstance {
+                                                glyph_tier5.push(GlyphInstance {
                                                     rect: [
                                                         glyph_x,
                                                         glyph_y,
@@ -2875,6 +3138,7 @@ impl TermRenderer {
                                                         glyph_info.uv_max[1],
                                                     ],
                                                     color: preedit_fg,
+                                                    is_color: u32::from(glyph_info.is_color),
                                                 });
                                             }
                                         }
@@ -2887,35 +3151,86 @@ impl TermRenderer {
                 }
             }
 
-            // Cursor (suppressed while inline IME preedit cells occupy the cursor position)
-            if pane.is_focused
-                && active_buf.cursor.visible
-                && active_buf.scroll_offset == 0
-                && preedit_grid_span.is_none()
-            {
+            // Tier 5: Cursor (hollow outline when unfocused; solid block / beam / underline when focused)
+            if show_cursor {
                 let cur_x = px + self.padding_x + (active_buf.cursor.col as f32 * cell_w);
                 let cur_y = py + self.padding_y + (active_buf.cursor.row as f32 * cell_h);
+                let cursor_cell_w = if cursor_is_wide {
+                    (cell_w * 2.0).min((px + pw - cur_x).max(cell_w))
+                } else {
+                    cell_w
+                };
 
                 if cur_x + cell_w <= px + pw && cur_y + cell_h <= py + ph {
-                    let (cx, cy, cw, ch) = match active_buf.cursor.shape {
-                        CursorShape::Block => (cur_x, cur_y, cell_w, cell_h),
-                        CursorShape::Beam => (cur_x, cur_y, 2.0 * self.scale_factor, cell_h),
-                        CursorShape::Underline => (
-                            cur_x,
-                            cur_y + baseline,
-                            cell_w,
-                            (2.0 * self.scale_factor).max(1.0),
-                        ),
-                    };
-
-                    bg_instances.push(BgInstance {
-                        rect: [cx, cy, cw, ch],
-                        color: pane_theme.cursor_color,
-                    });
+                    if !pane.is_focused {
+                        // Crisp 1px-2px hollow outline rectangle for unfocused panes
+                        let border = (1.0 * self.scale_factor).round().clamp(1.0, 2.0);
+                        let mut outline_col = pane_theme.cursor_color;
+                        outline_col[3] = outline_col[3].max(0.85);
+                        bg_tier5_top.push(BgInstance {
+                            rect: [cur_x, cur_y, cursor_cell_w, border],
+                            color: outline_col,
+                        });
+                        bg_tier5_top.push(BgInstance {
+                            rect: [cur_x, cur_y + cell_h - border, cursor_cell_w, border],
+                            color: outline_col,
+                        });
+                        let inner_h = (cell_h - 2.0 * border).max(0.0);
+                        if inner_h > 0.0 {
+                            bg_tier5_top.push(BgInstance {
+                                rect: [cur_x, cur_y + border, border, inner_h],
+                                color: outline_col,
+                            });
+                            bg_tier5_top.push(BgInstance {
+                                rect: [
+                                    cur_x + cursor_cell_w - border,
+                                    cur_y + border,
+                                    border,
+                                    inner_h,
+                                ],
+                                color: outline_col,
+                            });
+                        }
+                    } else {
+                        match active_buf.cursor.shape {
+                            CursorShape::Block => {
+                                if !drew_focused_block_cursor {
+                                    let mut cur_col = pane_theme.cursor_color;
+                                    cur_col[3] = cur_col[3].max(0.95);
+                                    bg_tier5_decor.push(BgInstance {
+                                        rect: [cur_x, cur_y, cursor_cell_w, cell_h],
+                                        color: cur_col,
+                                    });
+                                }
+                            }
+                            CursorShape::Beam => {
+                                bg_tier5_top.push(BgInstance {
+                                    rect: [
+                                        cur_x,
+                                        cur_y,
+                                        (2.0 * self.scale_factor).max(1.0),
+                                        cell_h,
+                                    ],
+                                    color: pane_theme.cursor_color,
+                                });
+                            }
+                            CursorShape::Underline => {
+                                bg_tier5_top.push(BgInstance {
+                                    rect: [
+                                        cur_x,
+                                        cur_y + baseline,
+                                        cursor_cell_w,
+                                        (2.0 * self.scale_factor).max(1.0),
+                                    ],
+                                    color: pane_theme.cursor_color,
+                                });
+                            }
+                        }
+                    }
                 }
             }
 
-            // Vertical Scrollbar (Overlay on right side of pane)
+            // Tier 5 top: Vertical Scrollbar (Overlay on right side of pane)
             if !pane.grid.is_alternate {
                 if let Some(metrics) = ScrollbarMetrics::compute(
                     px,
@@ -2931,7 +3246,6 @@ impl TermRenderer {
                 ) {
                     let is_active = pane.is_scrollbar_dragging || pane.is_scrollbar_hovered;
 
-                    // Track background
                     if is_active || pane.is_recently_scrolled {
                         let track_alpha = if pane.is_scrollbar_dragging {
                             0.08
@@ -2940,7 +3254,7 @@ impl TermRenderer {
                         } else {
                             0.03
                         };
-                        bg_instances.push(BgInstance {
+                        bg_tier5_top.push(BgInstance {
                             rect: [
                                 metrics.track_x,
                                 metrics.track_y,
@@ -2951,7 +3265,6 @@ impl TermRenderer {
                         });
                     }
 
-                    // Thumb
                     let thumb_alpha = if pane.is_scrollbar_dragging {
                         0.75
                     } else if pane.is_scrollbar_hovered {
@@ -2967,7 +3280,7 @@ impl TermRenderer {
                     let thumb_color = [1.0, 1.0, 1.0, thumb_alpha];
                     let corner = 1.0 * scale;
                     if metrics.thumb_h > 4.0 * scale && metrics.thumb_w > 2.0 * scale {
-                        bg_instances.push(BgInstance {
+                        bg_tier5_top.push(BgInstance {
                             rect: [
                                 metrics.thumb_x + corner,
                                 metrics.thumb_y,
@@ -2976,7 +3289,7 @@ impl TermRenderer {
                             ],
                             color: thumb_color,
                         });
-                        bg_instances.push(BgInstance {
+                        bg_tier5_top.push(BgInstance {
                             rect: [
                                 metrics.thumb_x,
                                 metrics.thumb_y + corner,
@@ -2985,7 +3298,7 @@ impl TermRenderer {
                             ],
                             color: thumb_color,
                         });
-                        bg_instances.push(BgInstance {
+                        bg_tier5_top.push(BgInstance {
                             rect: [
                                 metrics.thumb_x + corner,
                                 metrics.thumb_y + metrics.thumb_h - corner,
@@ -2995,7 +3308,7 @@ impl TermRenderer {
                             color: thumb_color,
                         });
                     } else {
-                        bg_instances.push(BgInstance {
+                        bg_tier5_top.push(BgInstance {
                             rect: [
                                 metrics.thumb_x,
                                 metrics.thumb_y,
@@ -3008,16 +3321,16 @@ impl TermRenderer {
                 }
             }
 
-            // Per-pane `OSC 9;4` top progress bar (2px sleek strip along pane top edge)
+            // Tier 5 top: Per-pane `OSC 9;4` top progress bar (2px sleek strip along pane top edge)
             if let Some(prog) = pane.progress {
                 let bar_h = (2.0 * scale).max(1.0);
-                bg_instances.push(BgInstance {
+                bg_tier5_top.push(BgInstance {
                     rect: [px, py, pw, bar_h],
                     color: [1.0, 1.0, 1.0, 0.10],
                 });
                 let (seg_x, seg_w, seg_color) = progress_bar_segment(prog, px, pw);
                 if seg_w > 0.0 {
-                    bg_instances.push(BgInstance {
+                    bg_tier5_top.push(BgInstance {
                         rect: [seg_x, py, seg_w, bar_h],
                         color: seg_color,
                     });
@@ -3025,12 +3338,7 @@ impl TermRenderer {
             }
         }
 
-        let normal_bg_len = bg_instances.len();
-        let normal_glyph_len = glyph_instances.len();
-
-        // Foreground Pane Overlays (Floating Cmd+F Find Bar)
-        // Drawn in the overlay pass so their opaque backgrounds cleanly cover any
-        // underlying terminal glyphs on the same cells.
+        // Tier 7 UI: Foreground Pane Overlays (Floating Cmd+F Find Bar)
         for pane in panes {
             let px = pane.rect_x;
             let py = pane.rect_y;
@@ -3058,18 +3366,18 @@ impl TermRenderer {
                 let bar_y = py + 8.0 * scale;
 
                 // Capsule background
-                bg_instances.push(BgInstance {
+                bg_tier7_ui.push(BgInstance {
                     rect: [bar_x, bar_y, bar_w, bar_h],
                     color: [0.10, 0.12, 0.17, 0.96],
                 });
                 // Top accent line
-                bg_instances.push(BgInstance {
+                bg_tier7_ui.push(BgInstance {
                     rect: [bar_x, bar_y, bar_w, 2.0 * scale],
                     color: [0.039, 0.518, 1.00, 0.95],
                 });
 
                 self.draw_text_line(
-                    &mut glyph_instances,
+                    &mut glyph_tier7_ui,
                     &label,
                     bar_x + 12.0 * scale,
                     bar_y + 6.0 * scale,
@@ -3080,7 +3388,7 @@ impl TermRenderer {
             }
         }
 
-        // Floating Notification Toast Overlay (`OSC 9` / `OSC 99` / `OSC 777`)
+        // Tier 7 UI: Floating Notification Toast Overlay (`OSC 9` / `OSC 99` / `OSC 777`)
         if let Some((toast_title, toast_body)) = panel_state.toast {
             let main_w = if sidebar_open {
                 (screen_w - panel_state.width_px).max(120.0)
@@ -3103,8 +3411,7 @@ impl TermRenderer {
             let toast_x = (main_w - toast_w - 14.0 * scale).max(6.0 * scale);
             let toast_y = tab_bar_h + 10.0 * scale;
 
-            // Drop shadow + dark glass body + left accent bar
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [
                     toast_x - 2.0 * scale,
                     toast_y + 2.0 * scale,
@@ -3113,11 +3420,11 @@ impl TermRenderer {
                 ],
                 color: [0.0, 0.0, 0.0, 0.42],
             });
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [toast_x, toast_y, toast_w, toast_h],
                 color: [0.11, 0.13, 0.19, 0.96],
             });
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [toast_x, toast_y, (3.0 * scale).max(2.0), toast_h],
                 color: [0.25, 0.62, 1.0, 0.98],
             });
@@ -3125,7 +3432,7 @@ impl TermRenderer {
             let text_x = toast_x + 12.0 * scale;
             let max_text_w = (toast_w - 20.0 * scale).max(40.0);
             self.draw_text_line_ellipsized(
-                &mut glyph_instances,
+                &mut glyph_tier7_ui,
                 toast_title,
                 text_x,
                 toast_y + 6.0 * scale,
@@ -3135,7 +3442,7 @@ impl TermRenderer {
             );
             if has_body {
                 self.draw_text_line_ellipsized(
-                    &mut glyph_instances,
+                    &mut glyph_tier7_ui,
                     toast_body,
                     text_x,
                     toast_y + cell_h + 10.0 * scale,
@@ -3146,7 +3453,7 @@ impl TermRenderer {
             }
         }
 
-        // Floating Top-Right [AI] [⚙] Pill Overlay when Tab Bar is hidden (auto 1-tab or never)
+        // Tier 7 UI: Floating Top-Right [AI] [⚙] Pill Overlay when Tab Bar is hidden
         if tab_bar_h <= 0.0 && panel_state.show_floating_top_right {
             let main_w = if sidebar_open {
                 (screen_w - panel_state.width_px).max(0.0)
@@ -3155,8 +3462,8 @@ impl TermRenderer {
             };
             let right_btns = TopRightButtons::compute(main_w, 0.0, scale);
             self.draw_top_right_buttons(
-                &mut bg_instances,
-                &mut glyph_instances,
+                &mut bg_tier7_ui,
+                &mut glyph_tier7_ui,
                 &right_btns,
                 &panel_state,
                 true,
@@ -3164,7 +3471,7 @@ impl TermRenderer {
             );
         }
 
-        // Floating Top Dropdown / Context Menu Overlay
+        // Tier 7 UI: Floating Top Dropdown / Context Menu Overlay
         if let Some(menu) = top_menu {
             let row_h = 24.0 * scale;
             let sep_h = 6.0 * scale;
@@ -3177,8 +3484,7 @@ impl TermRenderer {
                 }
             }
 
-            // Layer 1: Ambient deep drop shadow
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [
                     menu.x - 4.0 * scale,
                     menu.y - 1.0,
@@ -3187,8 +3493,7 @@ impl TermRenderer {
                 ],
                 color: [0.0, 0.0, 0.0, 0.35],
             });
-            // Layer 2: Soft direct shadow
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [
                     menu.x - 2.0 * scale,
                     menu.y - 0.5,
@@ -3198,13 +3503,11 @@ impl TermRenderer {
                 color: [0.0, 0.0, 0.0, 0.45],
             });
 
-            // Layer 3: Crisp 1px border outline
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [menu.x - 1.0, menu.y - 1.0, menu.width + 2.0, total_h + 2.0],
                 color: [0.28, 0.31, 0.40, 1.0],
             });
-            // Layer 4: 100% Solid opaque dark background (no transparency, zero bleed-through)
-            bg_instances.push(BgInstance {
+            bg_tier7_ui.push(BgInstance {
                 rect: [menu.x, menu.y, menu.width, total_h],
                 color: [0.11, 0.12, 0.16, 1.0],
             });
@@ -3212,7 +3515,7 @@ impl TermRenderer {
             let mut cur_y = menu.y + 3.0 * scale;
             for (idx, item) in menu.items.iter().enumerate() {
                 if item.is_separator {
-                    bg_instances.push(BgInstance {
+                    bg_tier7_ui.push(BgInstance {
                         rect: [
                             menu.x + 8.0 * scale,
                             cur_y + sep_h / 2.0,
@@ -3225,7 +3528,7 @@ impl TermRenderer {
                 } else {
                     let is_hovered = menu.hovered_idx == Some(idx);
                     if is_hovered {
-                        bg_instances.push(BgInstance {
+                        bg_tier7_ui.push(BgInstance {
                             rect: [menu.x + 3.0 * scale, cur_y, menu.width - 6.0 * scale, row_h],
                             color: [0.22, 0.32, 0.52, 1.0],
                         });
@@ -3247,7 +3550,7 @@ impl TermRenderer {
                     };
 
                     self.draw_text_line_ellipsized(
-                        &mut glyph_instances,
+                        &mut glyph_tier7_ui,
                         &item.label,
                         menu.x + 10.0 * scale,
                         cur_y + (row_h - cell_h) / 2.0,
@@ -3258,7 +3561,7 @@ impl TermRenderer {
 
                     if let Some((sc, sc_w)) = sc_info {
                         self.draw_text_line(
-                            &mut glyph_instances,
+                            &mut glyph_tier7_ui,
                             sc,
                             menu.x + menu.width - sc_w - 10.0 * scale,
                             cur_y + (row_h - cell_h) / 2.0,
@@ -3276,6 +3579,28 @@ impl TermRenderer {
                 }
             }
         }
+
+        // Pack the tiered BgInstance and GlyphInstance slices into single contiguous GPU buffers.
+        let t1_bg_end = bg_tier1.len() as u32;
+        bg_instances.extend_from_slice(&bg_tier1);
+        let t3_bg_start = t1_bg_end;
+        bg_instances.extend_from_slice(&bg_tier3);
+        let t3_bg_end = bg_instances.len() as u32;
+        let t5d_bg_start = t3_bg_end;
+        bg_instances.extend_from_slice(&bg_tier5_decor);
+        let t5d_bg_end = bg_instances.len() as u32;
+        let t5t_bg_start = t5d_bg_end;
+        bg_instances.extend_from_slice(&bg_tier5_top);
+        let t5t_bg_end = bg_instances.len() as u32;
+        let t7_bg_start = t5t_bg_end;
+        bg_instances.extend_from_slice(&bg_tier7_ui);
+        let t7_bg_end = bg_instances.len() as u32;
+
+        let t5_glyph_end = glyph_tier5.len() as u32;
+        glyph_instances.extend_from_slice(&glyph_tier5);
+        let t7_glyph_start = t5_glyph_end;
+        glyph_instances.extend_from_slice(&glyph_tier7_ui);
+        let t7_glyph_end = glyph_instances.len() as u32;
 
         // Upload instances to GPU buffers
         let build_ns = self.perf.since(build_start);
@@ -3301,23 +3626,20 @@ impl TermRenderer {
             );
         }
 
-        // Images must have ALL their instances uploaded *before* the render pass.
-        //
-        // `Queue::write_buffer` is not ordered with respect to commands recorded into a
-        // command encoder: every queued write is flushed before the submitted command
-        // buffer executes. Writing one instance at a time inside the pass would therefore
-        // leave only the last write visible, and every image would be drawn at the last
-        // image's rect. Instead we upload the whole array once and select per draw via
-        // the instance index.
+        // Sort image draw calls into Ghostty/Kitty z-index tiers:
+        //   - Tier 2: `z < INT32_MIN / 2` (behind non-default cell backgrounds)
+        //   - Tier 4: `INT32_MIN / 2 <= z < 0` (above cell backgrounds, below text/decorations/cursor)
+        //   - Tier 6: `z >= 0` (above text/decorations/cursor, below UI overlays)
         image_draw_calls.retain(|c| self.image_cache.contains_key(&c.texture_id));
         image_draw_calls.sort_unstable_by_key(|c| (c.z_index, c.order));
-        let neg_z_end = image_draw_calls.partition_point(|c| c.z_index < 0);
+        let below_bg_end = image_draw_calls
+            .partition_point(|c| classify_image_z_layer(c.z_index) == ImageZLayer::BelowCellBg);
+        let below_text_end = image_draw_calls
+            .partition_point(|c| classify_image_z_layer(c.z_index) != ImageZLayer::AboveText);
 
         if !image_draw_calls.is_empty() {
             self.pipeline
                 .ensure_image_capacity(&self.device, image_draw_calls.len());
-            // De-interleave into a reused buffer rather than `collect()`ing a fresh
-            // Vec, which allocated once per frame whenever any image was on screen.
             let mut img_instances = std::mem::take(&mut self.image_instances);
             img_instances.clear();
             img_instances.extend(image_draw_calls.iter().map(|c| c.instance));
@@ -3360,18 +3682,18 @@ impl TermRenderer {
 
             render_pass.set_bind_group(0, &self.pipeline.bind_group, &[]);
 
-            // 1. Draw Base Background Quads (cells, selections, scrollbars, tab bar, agent panel)
-            if normal_bg_len > 0 {
+            // Tier 1: Pane background clear & split borders
+            if t1_bg_end > 0 {
                 render_pass.set_pipeline(&self.pipeline.bg_pipeline);
                 render_pass.set_vertex_buffer(0, self.pipeline.bg_instance_buffer.slice(..));
-                render_pass.draw(0..6, 0..normal_bg_len as u32);
+                render_pass.draw(0..6, 0..t1_bg_end);
             }
 
-            // 2a. Draw Background-Layer Graphic Images (`z < 0`, behind terminal text)
-            if neg_z_end > 0 {
+            // Tier 2: Kitty images with `z < INT32_MIN / 2` (behind non-default cell backgrounds)
+            if below_bg_end > 0 {
                 render_pass.set_pipeline(&self.pipeline.image_pipeline);
                 render_pass.set_vertex_buffer(0, self.pipeline.image_instance_buffer.slice(..));
-                for (idx, call) in image_draw_calls[..neg_z_end].iter().enumerate() {
+                for (idx, call) in image_draw_calls[..below_bg_end].iter().enumerate() {
                     if let Some(entry) = self.image_cache.get(&call.texture_id) {
                         render_pass.set_bind_group(1, &entry.bind_group, &[]);
                         let idx = idx as u32;
@@ -3380,38 +3702,74 @@ impl TermRenderer {
                 }
             }
 
-            // 3. Draw Base Text Glyphs (terminal text, tab bar text, agent panel text)
-            if normal_glyph_len > 0 {
-                render_pass.set_pipeline(&self.pipeline.glyph_pipeline);
-                render_pass.set_vertex_buffer(0, self.pipeline.glyph_instance_buffer.slice(..));
-                render_pass.draw(0..6, 0..normal_glyph_len as u32);
+            // Tier 3: Non-default cell backgrounds, search highlights, semantic prompt marks
+            if t3_bg_end > t3_bg_start {
+                render_pass.set_pipeline(&self.pipeline.bg_pipeline);
+                render_pass.set_vertex_buffer(0, self.pipeline.bg_instance_buffer.slice(..));
+                render_pass.draw(0..6, t3_bg_start..t3_bg_end);
             }
 
-            // 2b. Draw Foreground-Layer Graphic Images (`z >= 0` & Unicode Placeholders, above text)
-            if neg_z_end < image_draw_calls.len() {
+            // Tier 4: Kitty images with `INT32_MIN / 2 <= z < 0` (above cell bgs, below text/decor/cursor)
+            if below_text_end > below_bg_end {
                 render_pass.set_pipeline(&self.pipeline.image_pipeline);
                 render_pass.set_vertex_buffer(0, self.pipeline.image_instance_buffer.slice(..));
-                for (offset, call) in image_draw_calls[neg_z_end..].iter().enumerate() {
+                for (offset, call) in image_draw_calls[below_bg_end..below_text_end]
+                    .iter()
+                    .enumerate()
+                {
                     if let Some(entry) = self.image_cache.get(&call.texture_id) {
                         render_pass.set_bind_group(1, &entry.bind_group, &[]);
-                        let idx = (neg_z_end + offset) as u32;
+                        let idx = (below_bg_end + offset) as u32;
                         render_pass.draw(0..6, idx..idx + 1);
                     }
                 }
             }
 
-            // 4. Floating Top Dropdown Menu & Find Bar Overlays
-            // Drawn strictly AFTER all base backgrounds, images, and text glyphs so that
-            // terminal characters and images behind the menu never bleed through.
-            if bg_instances.len() > normal_bg_len {
+            // Tier 5a: Selection, focused solid block cursor, underlines/overline/strikethrough/hyperlink hover,
+            // procedural box-drawing/block/braille/sextant geometry, and inline IME preedit bg
+            if t5d_bg_end > t5d_bg_start {
                 render_pass.set_pipeline(&self.pipeline.bg_pipeline);
                 render_pass.set_vertex_buffer(0, self.pipeline.bg_instance_buffer.slice(..));
-                render_pass.draw(0..6, normal_bg_len as u32..bg_instances.len() as u32);
+                render_pass.draw(0..6, t5d_bg_start..t5d_bg_end);
             }
-            if glyph_instances.len() > normal_glyph_len {
+
+            // Tier 5b: Terminal text glyphs (mono R8 + color emoji RGBA8) and inline IME preedit glyphs
+            if t5_glyph_end > 0 {
                 render_pass.set_pipeline(&self.pipeline.glyph_pipeline);
                 render_pass.set_vertex_buffer(0, self.pipeline.glyph_instance_buffer.slice(..));
-                render_pass.draw(0..6, normal_glyph_len as u32..glyph_instances.len() as u32);
+                render_pass.draw(0..6, 0..t5_glyph_end);
+            }
+
+            // Tier 5c: Hollow unfocused cursor outline, beam/underline cursor, scrollbars, pane progress
+            if t5t_bg_end > t5t_bg_start {
+                render_pass.set_pipeline(&self.pipeline.bg_pipeline);
+                render_pass.set_vertex_buffer(0, self.pipeline.bg_instance_buffer.slice(..));
+                render_pass.draw(0..6, t5t_bg_start..t5t_bg_end);
+            }
+
+            // Tier 6: Kitty images with `z >= 0` & Unicode placeholders (above text)
+            if below_text_end < image_draw_calls.len() {
+                render_pass.set_pipeline(&self.pipeline.image_pipeline);
+                render_pass.set_vertex_buffer(0, self.pipeline.image_instance_buffer.slice(..));
+                for (offset, call) in image_draw_calls[below_text_end..].iter().enumerate() {
+                    if let Some(entry) = self.image_cache.get(&call.texture_id) {
+                        render_pass.set_bind_group(1, &entry.bind_group, &[]);
+                        let idx = (below_text_end + offset) as u32;
+                        render_pass.draw(0..6, idx..idx + 1);
+                    }
+                }
+            }
+
+            // Tier 7: UI Chrome & Overlays (tab bar, AI agents panel, Find bar, toasts, dropdown menus)
+            if t7_bg_end > t7_bg_start {
+                render_pass.set_pipeline(&self.pipeline.bg_pipeline);
+                render_pass.set_vertex_buffer(0, self.pipeline.bg_instance_buffer.slice(..));
+                render_pass.draw(0..6, t7_bg_start..t7_bg_end);
+            }
+            if t7_glyph_end > t7_glyph_start {
+                render_pass.set_pipeline(&self.pipeline.glyph_pipeline);
+                render_pass.set_vertex_buffer(0, self.pipeline.glyph_instance_buffer.slice(..));
+                render_pass.draw(0..6, t7_glyph_start..t7_glyph_end);
             }
         }
 
@@ -3443,6 +3801,13 @@ impl TermRenderer {
         // Hand the buffers back so the next frame reuses this frame's capacity.
         self.bg_instances = bg_instances;
         self.glyph_instances = glyph_instances;
+        self.bg_tier1 = bg_tier1;
+        self.bg_tier3 = bg_tier3;
+        self.bg_tier5_decor = bg_tier5_decor;
+        self.bg_tier5_top = bg_tier5_top;
+        self.bg_tier7_ui = bg_tier7_ui;
+        self.glyph_tier5 = glyph_tier5;
+        self.glyph_tier7_ui = glyph_tier7_ui;
         self.image_draw_calls = image_draw_calls;
 
         Ok(RenderSurfaceOutcome::Presented)
@@ -3473,14 +3838,7 @@ pub fn color_to_rgba_themed(
     theme: &RenderTheme,
 ) -> [f32; 4] {
     match color {
-        Color::DefaultFg => {
-            if is_bold && !is_bg {
-                if let Some(palette) = theme.ansi_palette {
-                    return palette[15];
-                }
-            }
-            theme.default_fg
-        }
+        Color::DefaultFg => theme.default_fg,
         Color::DefaultBg => theme.default_bg,
         Color::Named(named) => {
             let mut idx = named as usize;
@@ -3492,7 +3850,7 @@ pub fn color_to_rgba_themed(
                     return palette[idx];
                 }
             }
-            color_to_rgba(color, is_bg)
+            color_to_rgba(Color::Indexed(idx as u8), is_bg)
         }
         Color::Indexed(idx) if idx < 16 => {
             let mut target_idx = idx as usize;
@@ -3502,7 +3860,7 @@ pub fn color_to_rgba_themed(
             if let Some(palette) = theme.ansi_palette {
                 return palette[target_idx];
             }
-            color_to_rgba(color, is_bg)
+            color_to_rgba(Color::Indexed(target_idx as u8), is_bg)
         }
         _ => color_to_rgba(color, is_bg),
     }
@@ -3520,7 +3878,6 @@ pub fn color_to_rgba_with_dynamic_palette(
     if let Some(dyn_pal) = dynamic_palette {
         if !dyn_pal.is_empty() {
             let target_idx = match color {
-                Color::DefaultFg if is_bold && !is_bg => Some(15u8),
                 Color::Named(named) => {
                     let mut idx = named as u8;
                     if is_bold && !is_bg && idx < 8 {
