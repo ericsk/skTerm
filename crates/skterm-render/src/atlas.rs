@@ -1145,23 +1145,37 @@ impl GlyphAtlas {
         })
     }
 
-    /// Attempt to rasterize `c` via the monochrome primary + fallback font chain.
-    /// Returns `(metrics, bitmap, found_in_font)`.
+    /// Attempt to rasterize `c` via the monochrome primary + fallback font chain,
+    /// using Unicode default cell width.
     fn rasterize_mono_char(
         &mut self,
         c: char,
         is_bold: bool,
         is_italic: bool,
     ) -> Option<(fontdue::Metrics, Vec<u8>)> {
+        self.rasterize_mono_char_for_cells(c, is_bold, is_italic, None)
+    }
+
+    /// Attempt to rasterize `c` via the monochrome primary + fallback font chain,
+    /// fitting the glyph into `target_cells_override` grid cells when provided
+    /// (e.g. `Some(1)` for VS15 text-presentation clusters narrowed to 1 cell).
+    fn rasterize_mono_char_for_cells(
+        &mut self,
+        c: char,
+        is_bold: bool,
+        is_italic: bool,
+        target_cells_override: Option<usize>,
+    ) -> Option<(fontdue::Metrics, Vec<u8>)> {
         // 1. Check primary font
         let (primary, primary_is_italic) = self.select_primary_face(is_bold, is_italic);
         if primary.lookup_glyph_index(c) != 0 {
-            let (m, b) = rasterize_fitted_glyph(
+            let (m, b) = rasterize_fitted_glyph_in_cells(
                 primary,
                 c,
                 self.font_size,
                 self.cell_width,
                 self.cell_height,
+                target_cells_override,
             );
             return Some(if is_italic && !primary_is_italic {
                 shear_mono_bitmap(m, b)
@@ -1170,13 +1184,17 @@ impl GlyphAtlas {
             });
         }
 
-        let target_cells = unicode_width::UnicodeWidthChar::width(c)
-            .unwrap_or(1)
+        let target_cells = target_cells_override
+            .unwrap_or_else(|| {
+                unicode_width::UnicodeWidthChar::width(c)
+                    .unwrap_or(1)
+                    .max(1)
+            })
             .max(1);
         let mut found: Option<(fontdue::Metrics, Vec<u8>, bool)> = None;
 
-        // For single-cell characters (e.g. `⌘`, `⇧`, `⌥`, `⌃`, `↩`), prefer a fallback
-        // font whose glyph is natively single-cell (`advance_width <= cell_width * 1.25`)
+        // For single-cell characters (e.g. `⌘`, `⇧`, `⌥`, `⌃`, `↩`, or VS15-narrowed symbols),
+        // prefer a fallback font whose glyph is natively single-cell (`advance_width <= cell_width * 1.25`)
         // over a CJK font where the same codepoint is drawn as a 2-cell full-width glyph.
         if target_cells == 1 {
             for fallback in &self.fallback_fonts {
@@ -1184,12 +1202,13 @@ impl GlyphAtlas {
                 if face.lookup_glyph_index(c) != 0 {
                     let m = face.metrics(c, self.font_size);
                     if m.advance_width <= self.cell_width * 1.25 {
-                        let (rm, rb) = rasterize_fitted_glyph(
+                        let (rm, rb) = rasterize_fitted_glyph_in_cells(
                             face,
                             c,
                             self.font_size,
                             self.cell_width,
                             self.cell_height,
+                            target_cells_override,
                         );
                         found = Some((rm, rb, face_italic));
                         break;
@@ -1204,12 +1223,13 @@ impl GlyphAtlas {
                     if face.lookup_glyph_index(c) != 0 {
                         let m = face.metrics(c, self.font_size);
                         if m.advance_width <= self.cell_width * 1.25 {
-                            let (rm, rb) = rasterize_fitted_glyph(
+                            let (rm, rb) = rasterize_fitted_glyph_in_cells(
                                 face,
                                 c,
                                 self.font_size,
                                 self.cell_width,
                                 self.cell_height,
+                                target_cells_override,
                             );
                             found = Some((rm, rb, face_italic));
                         }
@@ -1223,12 +1243,13 @@ impl GlyphAtlas {
             for fallback in &self.fallback_fonts {
                 let (face, face_italic) = fallback.select_face(is_bold, is_italic);
                 if face.lookup_glyph_index(c) != 0 {
-                    let (rm, rb) = rasterize_fitted_glyph(
+                    let (rm, rb) = rasterize_fitted_glyph_in_cells(
                         face,
                         c,
                         self.font_size,
                         self.cell_width,
                         self.cell_height,
+                        target_cells_override,
                     );
                     found = Some((rm, rb, face_italic));
                     break;
@@ -1244,12 +1265,13 @@ impl GlyphAtlas {
             let fallback = &self.fallback_fonts[idx];
             let (face, face_italic) = fallback.select_face(is_bold, is_italic);
             if face.lookup_glyph_index(c) != 0 {
-                let (rm, rb) = rasterize_fitted_glyph(
+                let (rm, rb) = rasterize_fitted_glyph_in_cells(
                     face,
                     c,
                     self.font_size,
                     self.cell_width,
                     self.cell_height,
+                    target_cells_override,
                 );
                 found = Some((rm, rb, face_italic));
             }
@@ -1386,15 +1408,26 @@ impl GlyphAtlas {
             .filter(|&ch| ch != '\u{FE0E}' && ch != '\u{FE0F}' && ch != '\u{200D}')
             .collect();
         let &base_char = visible_chars.first()?;
+        let cell_span = clamped_cells as usize;
         if visible_chars.len() == 1 {
-            let info = self.get_or_insert_glyph(queue, base_char, is_bold, is_italic)?;
+            // Strictly monochrome path fitted to `cell_span` so VS15 sequences (e.g. `\u{231A}\u{FE0E}`
+            // narrowed to 1 cell) never re-enter `get_or_insert_glyph`'s 2-cell color emoji path.
+            let (metrics, bitmap) = self
+                .rasterize_mono_char_for_cells(base_char, is_bold, is_italic, Some(cell_span))
+                .unwrap_or_else(|| self.regular_font.rasterize('?', self.font_size));
+            let advance = if metrics.advance_width > 0.0 {
+                metrics.advance_width
+            } else {
+                cell_span as f32 * self.cell_width
+            };
+            let info = self.upload_mono_bitmap(queue, &metrics, &bitmap, advance)?;
             self.grapheme_cache.insert(key, info);
             return Some(info);
         }
 
         let (base_m, base_bmp) = self
-            .rasterize_mono_char(base_char, is_bold, is_italic)
-            .unwrap_or_else(|| self.regular_font.rasterize(base_char, self.font_size));
+            .rasterize_mono_char_for_cells(base_char, is_bold, is_italic, Some(cell_span))
+            .unwrap_or_else(|| self.regular_font.rasterize('?', self.font_size));
 
         let mut layers: Vec<(fontdue::Metrics, Vec<u8>)> = Vec::with_capacity(visible_chars.len());
         layers.push((base_m, base_bmp));
@@ -1573,13 +1606,30 @@ pub fn rasterize_fitted_glyph(
     cell_width: f32,
     cell_height: f32,
 ) -> (fontdue::Metrics, Vec<u8>) {
+    rasterize_fitted_glyph_in_cells(face, c, font_size, cell_width, cell_height, None)
+}
+
+/// Same as [`rasterize_fitted_glyph`], with an optional `target_cells_override` to fit a
+/// glyph into an explicit cell span (e.g., `Some(1)` for VS15 text-presentation emoji).
+pub fn rasterize_fitted_glyph_in_cells(
+    face: &FontFace,
+    c: char,
+    font_size: f32,
+    cell_width: f32,
+    cell_height: f32,
+    target_cells_override: Option<usize>,
+) -> (fontdue::Metrics, Vec<u8>) {
     let (mut metrics, mut bitmap) = face.rasterize(c, font_size);
     if c.is_ascii() || metrics.width == 0 || metrics.height == 0 || cell_width <= 0.0 {
         return (metrics, bitmap);
     }
 
-    let target_cells = unicode_width::UnicodeWidthChar::width(c)
-        .unwrap_or(1)
+    let target_cells = target_cells_override
+        .unwrap_or_else(|| {
+            unicode_width::UnicodeWidthChar::width(c)
+                .unwrap_or(1)
+                .max(1)
+        })
         .max(1) as f32;
     let allocated_width = (cell_width * target_cells).max(1.0);
 
@@ -2998,5 +3048,92 @@ mod tests {
         assert!(is_color_emoji_grapheme("👨‍👩‍👧‍👦"));
         assert!(!is_color_emoji_grapheme("\u{2764}\u{FE0E}"));
         assert!(!is_color_emoji_grapheme("e\u{0301}"));
+    }
+
+    #[test]
+    fn test_vs15_text_presentation_stays_monochrome_and_fits_one_cell() {
+        // 1. Direct cell-override fitting: even for a codepoint with Unicode width 2 (⌚ U+231A),
+        // `target_cells_override = Some(1)` must constrain bitmap width and advance to 1 cell.
+        let chain = load_font_chain("Menlo", &[]);
+        let font_size = 28.0_f32;
+        let cell_w = chain
+            .regular
+            .metrics('M', font_size)
+            .advance_width
+            .ceil()
+            .max(1.0);
+        let cell_h = (font_size * 1.2).ceil();
+
+        let watch = '\u{231A}';
+        assert_eq!(unicode_width::UnicodeWidthChar::width(watch), Some(2));
+        if let Some(face) = std::iter::once(&chain.regular)
+            .chain(chain.fallbacks.iter().map(|f| &f.regular))
+            .find(|f| f.lookup_glyph_index(watch) != 0)
+        {
+            let (m1, _) =
+                rasterize_fitted_glyph_in_cells(face, watch, font_size, cell_w, cell_h, Some(1));
+            assert!(
+                m1.width as f32 <= cell_w + 1.0,
+                "VS15 fitted width {} must fit 1 cell ({})",
+                m1.width,
+                cell_w
+            );
+            assert!(
+                m1.advance_width <= cell_w + 0.01,
+                "VS15 fitted advance {} must fit 1 cell ({})",
+                m1.advance_width,
+                cell_w
+            );
+        }
+
+        // 2. End-to-end GlyphAtlas::get_or_insert_grapheme check when a headless wgpu adapter exists:
+        // `\u{231A}\u{FE0E}` with `target_cells = 1` MUST stay monochrome (`is_color == false`) and
+        // fit within 1 cell instead of re-entering the 2-cell color emoji path.
+        fn block_on_ready<F: std::future::Future>(fut: F) -> F::Output {
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            let mut fut = std::pin::pin!(fut);
+            loop {
+                match fut.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(v) => return v,
+                    std::task::Poll::Pending => std::thread::yield_now(),
+                }
+            }
+        }
+
+        let instance = wgpu::Instance::default();
+        if let Ok(adapter) =
+            block_on_ready(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                ..Default::default()
+            }))
+        {
+            if let Ok((device, queue)) =
+                block_on_ready(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            {
+                let mut atlas = GlyphAtlas::new(&device, &queue, 28.0, None).expect("atlas");
+                let info = atlas
+                    .get_or_insert_grapheme(&queue, "\u{231A}\u{FE0E}", false, false, 1)
+                    .expect("VS15 watch grapheme should rasterize");
+                assert!(
+                    !info.is_color,
+                    "VS15 text presentation `\\u{{231A}}\\u{{FE0E}}` must stay monochrome, not RGBA color emoji"
+                );
+                assert!(
+                    info.size[0] <= atlas.cell_width + 1.0,
+                    "VS15 glyph width {} must fit within 1 cell ({})",
+                    info.size[0],
+                    atlas.cell_width
+                );
+                assert!(
+                    info.advance <= atlas.cell_width + 0.5,
+                    "VS15 glyph advance {} must fit within 1 cell ({})",
+                    info.advance,
+                    atlas.cell_width
+                );
+            }
+        }
     }
 }

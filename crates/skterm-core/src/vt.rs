@@ -1606,15 +1606,20 @@ impl Perform for TerminalState {
                     }
                 }
                 if requested.is_empty() {
-                    let entries: Vec<(u16, bool)> =
+                    let mut entries: Vec<(u16, bool)> =
                         self.saved_dec_modes.iter().map(|(&k, &v)| (k, v)).collect();
+                    entries.sort_unstable_by_key(|&(mode, _)| mode);
                     for (mode, val) in entries {
-                        self.set_dec_private_mode(mode, val);
+                        if self.get_dec_private_mode(mode) != Some(val) {
+                            self.set_dec_private_mode(mode, val);
+                        }
                     }
                 } else {
                     for mode in requested {
                         if let Some(&val) = self.saved_dec_modes.get(&mode) {
-                            self.set_dec_private_mode(mode, val);
+                            if self.get_dec_private_mode(mode) != Some(val) {
+                                self.set_dec_private_mode(mode, val);
+                            }
                         }
                     }
                 }

@@ -2173,3 +2173,39 @@ fn test_vt_spec_bugfixes_decstbm_restore_cursor_ed3_ris_and_image_lifecycle() {
     assert_eq!(t_reflow.grid().active().prompt_marks.back().unwrap().row, 1);
     assert_eq!(t_reflow.grid().active().images[0].row, 1);
 }
+
+#[test]
+fn test_xtrestore_skips_unchanged_modes_and_preserves_cursor_and_2048() {
+    use skterm_core::MouseProtocol;
+
+    let mut term = Terminal::new_headless(12, 40, 20);
+    term.resize_with_cell_size(12, 40, 10.0, 20.0).unwrap();
+
+    // Prime a distinct saved cursor so any spurious `?1049l` restore would visibly clobber cursor
+    term.feed_bytes(b"\x1b[2;3H\x1b7");
+    // Enable in-band resize (?2048h) and consume its initial CSI 48 report
+    term.feed_bytes(b"\x1b[?2048h");
+    assert!(
+        !term.take_pending_responses().is_empty(),
+        "initial ?2048h must emit a CSI 48 report"
+    );
+
+    // Save all DEC private modes (`CSI ? s`), then move cursor and toggle `?1000h`
+    term.feed_bytes(b"\x1b[?s\x1b[6;15H\x1b[?1000h");
+    assert_eq!(term.grid().active().cursor.row, 5);
+    assert_eq!(term.grid().active().cursor.col, 14);
+    assert_eq!(term.state.mouse_protocol, MouseProtocol::Normal);
+    assert!(term.take_pending_responses().is_empty());
+
+    // No-arg `XTRESTORE` (`CSI ? r`) must restore `?1000` off WITHOUT homing cursor (`?6l`),
+    // WITHOUT clobbering cursor via stale `?1049l` saved cursor, and WITHOUT emitting a duplicate `CSI 48`
+    term.feed_bytes(b"\x1b[?r");
+    assert_eq!(term.state.mouse_protocol, MouseProtocol::None);
+    assert!(term.state.in_band_resize);
+    assert_eq!(term.grid().active().cursor.row, 5);
+    assert_eq!(term.grid().active().cursor.col, 14);
+    assert!(
+        term.take_pending_responses().is_empty(),
+        "unchanged ?2048h must not emit a duplicate CSI 48 report on XTRESTORE"
+    );
+}
