@@ -3,7 +3,9 @@
 #[cfg(target_os = "macos")]
 use super::macos::get_nswindow;
 use super::App;
-use crate::input::{check_tab_switch, normalize_shortcut_char};
+use crate::input::{
+    check_tab_switch, normalize_shortcut_char, KeyModifierFlags, KITTY_FLAG_REPORT_EVENTS,
+};
 use crate::layout::SplitDirection;
 use std::time::{Duration, Instant};
 use winit::event::{ElementState, Ime, KeyEvent};
@@ -127,14 +129,35 @@ impl App {
         event: &KeyEvent,
     ) {
         if event.state != ElementState::Pressed {
+            // Never leak a KKP release event into the PTY when a modal UI overlay is open
+            // or when the matching key press was consumed by a GUI shortcut.
+            if self.last_consumed_shortcut_key == Some(event.physical_key) {
+                self.last_consumed_shortcut_key = None;
+                return;
+            }
+            if self.editing_agent_pane.is_some()
+                || self
+                    .last_native_menu_action_time
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(25))
+            {
+                return;
+            }
+            let key_mods = KeyModifierFlags::from_modifiers_state(
+                self.modifiers,
+                self.caps_lock,
+                self.num_lock,
+            );
             if let Some(session) = self.sessions.get_mut(&window_id) {
+                if session.menu_open || session.search_open {
+                    return;
+                }
                 if let Some(tab) = session.workspace.active_tab_mut() {
                     if let Some(term) = tab.active_terminal_mut() {
                         let kitty_flags = term.state.kitty_keyboard_flags();
-                        if (kitty_flags & 2) != 0 {
-                            if let Some(bytes) = crate::input::encode_key_event_with_modes(
+                        if (kitty_flags & KITTY_FLAG_REPORT_EVENTS) != 0 {
+                            if let Some(bytes) = crate::input::encode_key_event_with_full_modes(
                                 event,
-                                self.modifiers,
+                                key_mods,
                                 term.state.application_cursor_keys,
                                 kitty_flags,
                                 term.state.modify_other_keys,
@@ -148,6 +171,31 @@ impl App {
             return;
         }
 
+        // Track lock-key state for KKP modifier bits (+64 CapsLock, +128 NumLock).
+        if !event.repeat {
+            match event.logical_key {
+                Key::Named(NamedKey::CapsLock) => {
+                    self.caps_lock = !self.caps_lock;
+                }
+                Key::Named(NamedKey::NumLock) => {
+                    self.num_lock = !self.num_lock;
+                }
+                Key::Character(ref s)
+                    if !self.modifiers.control_key()
+                        && !self.modifiers.alt_key()
+                        && !self.modifiers.super_key() =>
+                {
+                    let mut chars = s.chars();
+                    if let (Some(ch), None) = (chars.next(), chars.next()) {
+                        if ch.is_ascii_alphabetic() {
+                            self.caps_lock = ch.is_ascii_uppercase() != self.modifiers.shift_key();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // 0. If top dropdown or right-click context menu is open, Escape dismisses it
         if event.logical_key == Key::Named(NamedKey::Escape) {
             if let Some(session) = self.sessions.get_mut(&window_id) {
@@ -155,6 +203,7 @@ impl App {
                     session.menu_open = false;
                     session.menu_hovered_idx = None;
                     session.window.request_redraw();
+                    self.last_consumed_shortcut_key = Some(event.physical_key);
                     return;
                 }
             }
@@ -162,6 +211,7 @@ impl App {
 
         // 1. Tab Switching by Number (Ctrl+1~9 on Windows/Linux, Cmd+1~9 on macOS)
         if let Some(digit) = check_tab_switch(event, self.modifiers) {
+            self.last_consumed_shortcut_key = Some(event.physical_key);
             let target_idx = digit - 1;
 
             #[cfg(target_os = "macos")]
@@ -224,6 +274,7 @@ impl App {
             && !self.modifiers.super_key()
             && !self.modifiers.alt_key()
         {
+            self.last_consumed_shortcut_key = Some(event.physical_key);
             if let Some(session) = self.sessions.get_mut(&window_id) {
                 if self.modifiers.shift_key() {
                     session.workspace.prev_tab();
@@ -248,11 +299,13 @@ impl App {
                 .last_native_menu_action_time
                 .is_some_and(|t| t.elapsed() < Duration::from_millis(25))
             {
+                self.last_consumed_shortcut_key = Some(event.physical_key);
                 return;
             }
             if let Some(s) = normalize_shortcut_char(&event.logical_key, event.physical_key) {
                 match s.as_str() {
                     "+" | "=" => {
+                        self.last_consumed_shortcut_key = Some(event.physical_key);
                         if let Some(session) = self.sessions.get_mut(&window_id) {
                             if self.modifiers.alt_key() {
                                 session.workspace.equalize_active_panes();
@@ -266,6 +319,7 @@ impl App {
                         return;
                     }
                     "-" => {
+                        self.last_consumed_shortcut_key = Some(event.physical_key);
                         if let Some(session) = self.sessions.get_mut(&window_id) {
                             let cur_pt = session.renderer.font_size_pt;
                             let _ = session.renderer.update_font_size((cur_pt - 1.0).max(8.0));
@@ -275,6 +329,7 @@ impl App {
                         return;
                     }
                     "0" => {
+                        self.last_consumed_shortcut_key = Some(event.physical_key);
                         if let Some(session) = self.sessions.get_mut(&window_id) {
                             let def_pt = self.config_manager.current_config.font.size;
                             let _ = session.renderer.update_font_size(def_pt);
@@ -296,6 +351,7 @@ impl App {
         {
             if let Some(ch) = normalize_shortcut_char(&event.logical_key, event.physical_key) {
                 if ch == "[" || ch == "]" {
+                    self.last_consumed_shortcut_key = Some(event.physical_key);
                     if let Some(session) = self.sessions.get_mut(&window_id) {
                         if let Some(tab) = session.workspace.active_tab_mut() {
                             if ch == "[" {
@@ -322,6 +378,7 @@ impl App {
             _ => matches!(event.physical_key, PhysicalKey::Code(KeyCode::Comma)),
         };
         if (is_ctrl || is_super) && is_comma {
+            self.last_consumed_shortcut_key = Some(event.physical_key);
             self.open_preferences_window(event_loop);
             return;
         }
@@ -352,8 +409,11 @@ impl App {
                 .last_native_menu_action_time
                 .is_some_and(|t| t.elapsed() < Duration::from_millis(25))
             {
+                self.last_consumed_shortcut_key = Some(event.physical_key);
                 return;
             }
+            // Tentatively mark as consumed; cleared below if unmatched and passed to KKP.
+            self.last_consumed_shortcut_key = Some(event.physical_key);
             // Check NamedKey first (Enter, Arrow keys)
             match event.logical_key {
                 Key::Named(NamedKey::Enter) if is_shift => {
@@ -721,11 +781,24 @@ impl App {
             }
 
             #[cfg(target_os = "macos")]
-            return;
+            {
+                let kitty_active = self
+                    .sessions
+                    .get(&window_id)
+                    .and_then(|s| s.workspace.active_tab())
+                    .and_then(|t| t.active_terminal())
+                    .is_some_and(|term| term.state.kitty_keyboard_flags() != 0);
+                if !kitty_active {
+                    return;
+                }
+            }
+            // Unmatched Super/Cmd chord falling through to KKP: allow its release too.
+            self.last_consumed_shortcut_key = None;
         }
 
         // Handle Agent Task Label Inline Rename input when editing_agent_pane is active
         if self.editing_agent_pane.is_some() {
+            self.last_consumed_shortcut_key = Some(event.physical_key);
             if event.state == ElementState::Pressed {
                 // While IME preedit composition is active, let the IME handle keys
                 if !self.ime_preedit.is_empty() {
@@ -847,6 +920,7 @@ impl App {
         // Handle Find Bar input when search_open is active
         if let Some(session) = self.sessions.get_mut(&window_id) {
             if session.search_open {
+                self.last_consumed_shortcut_key = Some(event.physical_key);
                 if event.state == ElementState::Pressed {
                     let just_committed_ime = self
                         .last_ime_commit_time
@@ -899,7 +973,21 @@ impl App {
         }
 
         // Shift+PageUp / Shift+PageDown / Shift+Home / Shift+End quick scrolling
-        if is_shift && !self.modifiers.control_key() && !self.modifiers.alt_key() {
+        // Only intercept on the primary screen when Kitty Keyboard Protocol is inactive;
+        // alternate-screen TUIs and KKP apps expect these modified navigation keys directly.
+        let allow_shift_scroll = self
+            .sessions
+            .get(&window_id)
+            .and_then(|s| s.workspace.active_tab())
+            .and_then(|t| t.active_terminal())
+            .is_some_and(|term| {
+                !term.grid().is_alternate && term.state.kitty_keyboard_flags() == 0
+            });
+        if allow_shift_scroll
+            && is_shift
+            && !self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+        {
             match event.logical_key {
                 Key::Named(NamedKey::PageUp) => {
                     if let Some(session) = self.sessions.get_mut(&window_id) {
@@ -911,6 +999,7 @@ impl App {
                                     .scroll_display(page_lines as isize);
                                 session.last_scroll_time = Some(Instant::now());
                                 session.window.request_redraw();
+                                self.last_consumed_shortcut_key = Some(event.physical_key);
                                 return;
                             }
                         }
@@ -926,6 +1015,7 @@ impl App {
                                     .scroll_display(-(page_lines as isize));
                                 session.last_scroll_time = Some(Instant::now());
                                 session.window.request_redraw();
+                                self.last_consumed_shortcut_key = Some(event.physical_key);
                                 return;
                             }
                         }
@@ -939,6 +1029,7 @@ impl App {
                                 term.grid_mut().active_mut().scroll_offset = max_scroll;
                                 session.last_scroll_time = Some(Instant::now());
                                 session.window.request_redraw();
+                                self.last_consumed_shortcut_key = Some(event.physical_key);
                                 return;
                             }
                         }
@@ -951,6 +1042,7 @@ impl App {
                                 term.grid_mut().active_mut().scroll_offset = 0;
                                 session.last_scroll_time = Some(Instant::now());
                                 session.window.request_redraw();
+                                self.last_consumed_shortcut_key = Some(event.physical_key);
                                 return;
                             }
                         }
@@ -961,6 +1053,8 @@ impl App {
         }
 
         // Send Normal Key to PTY
+        let key_mods =
+            KeyModifierFlags::from_modifiers_state(self.modifiers, self.caps_lock, self.num_lock);
         let mut status_changed = false;
         if let Some(session) = self.sessions.get_mut(&window_id) {
             let mut pty_updated = false;
@@ -970,9 +1064,9 @@ impl App {
                     let app_cursor = term.state.application_cursor_keys;
                     let kitty_flags = term.state.kitty_keyboard_flags();
                     let modify_other_keys = term.state.modify_other_keys;
-                    if let Some(bytes) = crate::input::encode_key_event_with_modes(
+                    if let Some(bytes) = crate::input::encode_key_event_with_full_modes(
                         event,
-                        self.modifiers,
+                        key_mods,
                         app_cursor,
                         kitty_flags,
                         modify_other_keys,

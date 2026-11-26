@@ -44,6 +44,13 @@ pub struct TerminalSession {
     pub last_scroll_time: Option<Instant>,
     pub hovered_url: Option<String>,
     pub scroll_pixel_accumulator: f64,
+    pub scroll_pixel_accumulator_x: f64,
+    /// Currently pressed mouse button reported to a pane via xterm mouse tracking (`?1000`/`?1002`/`?1003`),
+    /// stored as `(pane_id, button)` so drag motion and release always target the originating pane.
+    pub mouse_reported_button: Option<(PaneId, winit::event::MouseButton)>,
+    /// Last `(pane_id, col, row)` sent as a mouse motion report (`?1002`/`?1003`),
+    /// used to deduplicate consecutive motion reports on the same cell.
+    pub last_mouse_motion_cell: Option<(PaneId, usize, usize)>,
     pub search_open: bool,
     pub search_query: String,
     pub search_matches: Vec<skterm_core::SearchMatch>,
@@ -122,7 +129,7 @@ impl TerminalSession {
     ///
     /// If any visible pane in the active tab is mid-batch in DEC Mode `?2026`
     /// (Synchronized Output), defer the repaint in [`FramePacer`] until `?2026l`
-    /// arrives or the 100ms safety timeout expires.
+    /// arrives or the 1000ms safety timeout expires.
     pub fn request_output_redraw(&mut self) {
         if self
             .workspace
@@ -138,7 +145,7 @@ impl TerminalSession {
     }
 
     /// Release a frame the pacer deferred, or report when it comes due so the
-    /// caller can arm the event loop's timer. Also enforces the 100ms safety
+    /// caller can arm the event loop's timer. Also enforces the 1000ms safety
     /// timeout for DEC Mode `?2026` (Synchronized Output) across all visible panes.
     pub fn flush_paced_redraw(&mut self) -> Option<Instant> {
         let now = Instant::now();
@@ -627,7 +634,11 @@ impl TerminalSession {
 
         for (tab_idx, tab) in self.workspace.tabs.iter_mut().enumerate() {
             let is_active_tab = tab_idx == active_tab_idx;
+            let active_pane_id = tab.active_pane_id;
+            let zoomed_pane_id = tab.zoomed_pane_id;
             for id in tab.root.all_leaf_ids() {
+                let is_active_pane = id == active_pane_id;
+                let is_pane_visible = is_active_tab && zoomed_pane_id.is_none_or(|zid| zid == id);
                 let Some(terminal) = tab.root.find_terminal_mut(id) else {
                     continue;
                 };
@@ -682,8 +693,9 @@ impl TerminalSession {
                 // 3. Desktop Notifications (`OSC 9` / `OSC 99` / `OSC 777`)
                 let notifs = terminal.take_pending_notifications();
                 for notif in notifs {
-                    let is_currently_viewed = is_window_focused && !is_occluded && is_active_tab;
-                    let is_invisible = is_occluded || !is_active_tab;
+                    let is_currently_viewed =
+                        is_window_focused && !is_occluded && is_active_tab && is_active_pane;
+                    let is_invisible = is_occluded || !is_pane_visible;
 
                     let should_deliver = if notif.force_when_focused {
                         true
@@ -824,18 +836,16 @@ impl TerminalSession {
         None
     }
 
-    /// Resolve `(mouse_x, mouse_y)` into `(row, col)` clamped to the active pane's bounds,
-    /// used while dragging a text selection so dragging past the right/bottom edge still
-    /// selects to the end of wrapped lines.
-    pub fn get_active_pane_cell_clamped(
+    /// Resolve `(mouse_x, mouse_y)` into `(row, col)` clamped to `pane_id`'s bounds.
+    pub fn get_pane_cell_clamped(
         &self,
+        pane_id: PaneId,
         mouse_x: f32,
         mouse_y: f32,
         tab_bar_h: f32,
     ) -> Option<(usize, usize)> {
         let active_tab = self.workspace.active_tab()?;
-        let active_pane_id = active_tab.active_pane_id;
-        let term = active_tab.root.find_terminal(active_pane_id)?;
+        let term = active_tab.root.find_terminal(pane_id)?;
         let buf = term.grid().active();
 
         let pane_rects = self.workspace.compute_active_pane_rects_with_scale(
@@ -845,9 +855,7 @@ impl TerminalSession {
             self.renderer.scale_factor,
         );
 
-        let (_, rect) = pane_rects
-            .into_iter()
-            .find(|(id, _)| *id == active_pane_id)?;
+        let (_, rect) = pane_rects.into_iter().find(|(id, _)| *id == pane_id)?;
         let cell_w = self.renderer.cell_width().max(1.0);
         let cell_h = self.renderer.cell_height().max(1.0);
         let pad_x = self.renderer.padding_x;
@@ -860,6 +868,19 @@ impl TerminalSession {
         let row = ((rel_y / cell_h).floor() as usize).min(buf.rows.saturating_sub(1));
 
         Some((row, col))
+    }
+
+    /// Resolve `(mouse_x, mouse_y)` into `(row, col)` clamped to the active pane's bounds,
+    /// used while dragging a text selection so dragging past the right/bottom edge still
+    /// selects to the end of wrapped lines.
+    pub fn get_active_pane_cell_clamped(
+        &self,
+        mouse_x: f32,
+        mouse_y: f32,
+        tab_bar_h: f32,
+    ) -> Option<(usize, usize)> {
+        let active_pane_id = self.workspace.active_tab()?.active_pane_id;
+        self.get_pane_cell_clamped(active_pane_id, mouse_x, mouse_y, tab_bar_h)
     }
 
     pub fn sync_all_pane_sizes(&mut self, tab_bar_h: f32) {

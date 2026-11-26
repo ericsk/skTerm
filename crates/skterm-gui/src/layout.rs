@@ -459,6 +459,9 @@ impl PaneNode {
     }
 }
 
+/// Safety timeout for DEC Mode `?2026` (Synchronized Output) matching Ghostty's 1-second limit.
+pub const SYNCHRONIZED_OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
 /// A single tab containing a BSP tree of panes.
 pub struct Tab {
     pub id: TabId,
@@ -699,16 +702,19 @@ impl Tab {
     }
 
     /// Whether any visible pane in this tab is currently inside a DEC Mode `?2026`
-    /// (Synchronized Output) batch within its 100ms safety timeout.
+    /// (Synchronized Output) batch within its 1000ms safety timeout.
     pub fn is_synchronized_output_active(&self) -> bool {
         self.visible_leaf_ids().into_iter().any(|id| {
-            self.root
-                .find_terminal(id)
-                .is_some_and(|t| t.state.is_synchronized_output_active())
+            self.root.find_terminal(id).is_some_and(|t| {
+                t.state.synchronized_output
+                    && t.state
+                        .synchronized_output_since
+                        .is_some_and(|since| since.elapsed() < SYNCHRONIZED_OUTPUT_TIMEOUT)
+            })
         })
     }
 
-    /// Enforce the 100ms safety timeout for DEC Mode `?2026` (Synchronized Output)
+    /// Enforce the 1000ms safety timeout for DEC Mode `?2026` (Synchronized Output)
     /// across all visible panes in this tab.
     ///
     /// Returns `(expired, next_deadline)` where `expired` is `true` if any pane's
@@ -724,7 +730,7 @@ impl Tab {
             if let Some(term) = self.root.find_terminal_mut(id) {
                 if term.state.synchronized_output {
                     if let Some(since) = term.state.synchronized_output_since {
-                        let timeout_at = since + std::time::Duration::from_millis(100);
+                        let timeout_at = since + SYNCHRONIZED_OUTPUT_TIMEOUT;
                         if now < timeout_at {
                             earliest_deadline = Some(match earliest_deadline {
                                 Some(cur) if cur <= timeout_at => cur,

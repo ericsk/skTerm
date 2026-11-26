@@ -148,7 +148,11 @@ impl App {
         #[cfg(target_os = "macos")]
         {
             use winit::platform::macos::WindowAttributesExtMacOS;
-            window_attrs = window_attrs.with_title_hidden(false);
+            window_attrs = window_attrs.with_title_hidden(false).with_option_as_alt(
+                super::macos::parse_macos_option_as_alt(
+                    &self.config_manager.current_config.terminal.option_as_alt,
+                ),
+            );
             if self.config_manager.current_config.window.decorations == "transparent" {
                 window_attrs = window_attrs.with_titlebar_transparent(true);
             }
@@ -289,8 +293,12 @@ impl App {
         let render_theme = self.build_render_theme();
         renderer.set_theme(render_theme);
 
-        let tab_bar_h = self.get_tab_bar_height();
-        workspace.sync_pane_sizes(
+        let tab_bar_h = super::compute_tab_bar_height(
+            &self.config_manager.current_config.window.tab_bar_style,
+            workspace.tabs.len(),
+            renderer.scale_factor,
+        );
+        workspace.sync_pane_sizes_with_scale(
             renderer.config.width as f32,
             renderer.config.height as f32,
             renderer.cell_width(),
@@ -298,6 +306,7 @@ impl App {
             renderer.padding_x,
             renderer.padding_y,
             tab_bar_h,
+            renderer.scale_factor,
         );
 
         let window_id = window.id();
@@ -320,6 +329,9 @@ impl App {
             last_scroll_time: None,
             hovered_url: None,
             scroll_pixel_accumulator: 0.0,
+            scroll_pixel_accumulator_x: 0.0,
+            mouse_reported_button: None,
+            last_mouse_motion_cell: None,
             search_open: false,
             search_query: String::new(),
             search_matches: Vec::new(),

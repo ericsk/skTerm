@@ -9,7 +9,9 @@ use super::menu::{
 };
 use super::session::ScrollbarDragState;
 use super::App;
+use crate::input::{encode_mouse_button, encode_mouse_motion, encode_mouse_wheel_step};
 use crate::layout::SplitDirection;
+use skterm_core::vt::MouseProtocol;
 use skterm_core::{Selection, SelectionMode};
 use skterm_render::{AgentPanelHit, AgentPanelLayout, ScrollbarMetrics, TopRightButtons};
 use std::time::Instant;
@@ -198,6 +200,33 @@ impl App {
                 return;
             }
 
+            // 1.5 Handling Mouse Drag Motion Reporting (?1002 ButtonEvent / ?1003 AnyEvent)
+            if let Some((pane_id, reported_btn)) = session.mouse_reported_button {
+                if let Some((row, col)) = session.get_pane_cell_clamped(pane_id, mx, my, tab_bar_h)
+                {
+                    if session.last_mouse_motion_cell != Some((pane_id, col, row)) {
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            if let Some(term) = tab.root.find_terminal_mut(pane_id) {
+                                let proto = term.state.mouse_protocol;
+                                let fmt = term.state.mouse_format;
+                                if let Some(bytes) = encode_mouse_motion(
+                                    Some(reported_btn),
+                                    row,
+                                    col,
+                                    self.modifiers,
+                                    proto,
+                                    fmt,
+                                ) {
+                                    session.last_mouse_motion_cell = Some((pane_id, col, row));
+                                    let _ = term.write_to_pty(&bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
             // 2. Handling Text Selection Dragging
             if session.is_mouse_down {
                 if let Some((row, col)) = session.get_active_pane_cell_clamped(mx, my, tab_bar_h) {
@@ -307,12 +336,27 @@ impl App {
                 }
 
                 if !is_over_splitter {
-                    // Check hyperlink and OSC 22 pointer shape under cursor
-                    let (detected_url, pane_pointer) = if let Some((pane_id, row, col)) =
-                        session.get_pane_and_cell_at(mx, my, tab_bar_h)
-                    {
-                        if let Some(tab) = session.workspace.active_tab() {
-                            if let Some(t) = tab.root.find_terminal(pane_id) {
+                    // Check hyperlink, OSC 22 pointer shape, and ?1003 AnyEvent hover motion under cursor
+                    let cell_hit = session.get_pane_and_cell_at(mx, my, tab_bar_h);
+                    let (detected_url, pane_pointer) = if let Some((pane_id, row, col)) = cell_hit {
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            if let Some(t) = tab.root.find_terminal_mut(pane_id) {
+                                if !self.modifiers.shift_key()
+                                    && t.state.mouse_protocol == MouseProtocol::AnyEvent
+                                    && session.last_mouse_motion_cell != Some((pane_id, col, row))
+                                {
+                                    if let Some(bytes) = encode_mouse_motion(
+                                        None,
+                                        row,
+                                        col,
+                                        self.modifiers,
+                                        MouseProtocol::AnyEvent,
+                                        t.state.mouse_format,
+                                    ) {
+                                        session.last_mouse_motion_cell = Some((pane_id, col, row));
+                                        let _ = t.write_to_pty(&bytes);
+                                    }
+                                }
                                 (t.url_at(row, col), t.state.active_pointer_shape())
                             } else {
                                 (None, skterm_core::PointerShape::Default)
@@ -324,7 +368,10 @@ impl App {
                         (None, skterm_core::PointerShape::Default)
                     };
 
-                    session.hovered_url = detected_url;
+                    if session.hovered_url != detected_url {
+                        session.hovered_url = detected_url;
+                        session.window.request_redraw();
+                    }
 
                     if is_link_modifier && session.hovered_url.is_some() {
                         session.window.set_cursor_visible(true);
@@ -861,6 +908,40 @@ impl App {
         if let Some(session) = self.sessions.get_mut(&window_id) {
             let (mx, my) = session.mouse_pos;
 
+            // Release for a button that was pressed under terminal mouse reporting (?1000/?1002/?1003):
+            // always match the originating pane even if the pointer dragged outside or Shift changed.
+            if state == ElementState::Released {
+                if let Some((pane_id, pressed_btn)) = session.mouse_reported_button {
+                    if pressed_btn == button {
+                        session.mouse_reported_button = None;
+                        session.last_mouse_motion_cell = None;
+                        let cell = session
+                            .get_pane_and_cell_at(mx, my, tab_bar_h)
+                            .filter(|(pid, _, _)| *pid == pane_id)
+                            .map(|(_, r, c)| (r, c))
+                            .or_else(|| session.get_pane_cell_clamped(pane_id, mx, my, tab_bar_h));
+                        if let Some((row, col)) = cell {
+                            if let Some(tab) = session.workspace.active_tab_mut() {
+                                if let Some(term) = tab.root.find_terminal_mut(pane_id) {
+                                    if let Some(bytes) = encode_mouse_button(
+                                        button,
+                                        false,
+                                        row,
+                                        col,
+                                        self.modifiers,
+                                        term.state.mouse_protocol,
+                                        term.state.mouse_format,
+                                    ) {
+                                        let _ = term.write_to_pty(&bytes);
+                                    }
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+
             if button == MouseButton::Left {
                 if state == ElementState::Pressed {
                     let scale = session.renderer.scale_factor;
@@ -999,6 +1080,49 @@ impl App {
                         return;
                     }
 
+                    // 2.7 Terminal Mouse Protocol Press (?9 / ?1000 / ?1002 / ?1003).
+                    // Holding Shift bypasses mouse reporting so local text selection stays reachable.
+                    if !self.modifiers.shift_key() {
+                        if let Some((pane_id, row, col)) =
+                            session.get_pane_and_cell_at(mx, my, tab_bar_h)
+                        {
+                            let mut handled_by_protocol = false;
+                            if let Some(tab) = session.workspace.active_tab_mut() {
+                                if let Some(term) = tab.root.find_terminal_mut(pane_id) {
+                                    let proto = term.state.mouse_protocol;
+                                    let fmt = term.state.mouse_format;
+                                    if proto != MouseProtocol::None {
+                                        if let Some(bytes) = encode_mouse_button(
+                                            MouseButton::Left,
+                                            true,
+                                            row,
+                                            col,
+                                            self.modifiers,
+                                            proto,
+                                            fmt,
+                                        ) {
+                                            term.grid_mut().active_mut().selection = None;
+                                            let _ = term.write_to_pty(&bytes);
+                                            tab.active_pane_id = pane_id;
+                                            if proto != MouseProtocol::X10 {
+                                                session.mouse_reported_button =
+                                                    Some((pane_id, MouseButton::Left));
+                                                session.last_mouse_motion_cell =
+                                                    Some((pane_id, col, row));
+                                            }
+                                            handled_by_protocol = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if handled_by_protocol {
+                                session.sync_focus_events();
+                                session.window.request_redraw();
+                                return;
+                            }
+                        }
+                    }
+
                     session.is_mouse_down = true;
                     session.has_dragged_selection = false;
 
@@ -1071,35 +1195,86 @@ impl App {
                         session.window.request_redraw();
                     }
                 }
-            } else if button == MouseButton::Right && state == ElementState::Pressed {
-                // Focus the pane under the right-click first
-                if let Some((pane_id, _, _)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
-                    if let Some(tab) = session.workspace.active_tab_mut() {
-                        tab.active_pane_id = pane_id;
+            } else if state == ElementState::Pressed
+                && matches!(
+                    button,
+                    MouseButton::Middle
+                        | MouseButton::Right
+                        | MouseButton::Back
+                        | MouseButton::Forward
+                )
+            {
+                // Forward non-left buttons to terminal mouse protocol (?9/?1000/?1002/?1003)
+                // unless Shift is held (Shift acts as local override for context menu / paste).
+                if !self.modifiers.shift_key() {
+                    if let Some((pane_id, row, col)) =
+                        session.get_pane_and_cell_at(mx, my, tab_bar_h)
+                    {
+                        let mut handled_by_protocol = false;
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            if let Some(term) = tab.root.find_terminal_mut(pane_id) {
+                                let proto = term.state.mouse_protocol;
+                                let fmt = term.state.mouse_format;
+                                if proto != MouseProtocol::None {
+                                    tab.active_pane_id = pane_id;
+                                    if let Some(bytes) = encode_mouse_button(
+                                        button,
+                                        true,
+                                        row,
+                                        col,
+                                        self.modifiers,
+                                        proto,
+                                        fmt,
+                                    ) {
+                                        let _ = term.write_to_pty(&bytes);
+                                        if proto != MouseProtocol::X10 {
+                                            session.mouse_reported_button = Some((pane_id, button));
+                                            session.last_mouse_motion_cell =
+                                                Some((pane_id, col, row));
+                                        }
+                                        handled_by_protocol = true;
+                                    }
+                                }
+                            }
+                        }
+                        if handled_by_protocol {
+                            session.sync_focus_events();
+                            session.window.request_redraw();
+                            return;
+                        }
                     }
                 }
 
-                let default_is_paste = self
-                    .config_manager
-                    .current_config
-                    .terminal
-                    .right_click_action
-                    .eq_ignore_ascii_case("paste");
-                let shift_held = self.modifiers.shift_key();
-                let do_paste = if shift_held {
-                    !default_is_paste
-                } else {
-                    default_is_paste
-                };
+                if button == MouseButton::Right {
+                    // Focus the pane under the right-click first
+                    if let Some((pane_id, _, _)) = session.get_pane_and_cell_at(mx, my, tab_bar_h) {
+                        if let Some(tab) = session.workspace.active_tab_mut() {
+                            tab.active_pane_id = pane_id;
+                        }
+                    }
 
-                if do_paste {
-                    session.paste_from_clipboard(self.clipboard.as_ref());
-                } else {
-                    session.menu_open = true;
-                    session.menu_is_context = true;
-                    session.menu_anchor = (mx, my);
-                    session.menu_hovered_idx = None;
-                    session.window.request_redraw();
+                    let default_is_paste = self
+                        .config_manager
+                        .current_config
+                        .terminal
+                        .right_click_action
+                        .eq_ignore_ascii_case("paste");
+                    let shift_held = self.modifiers.shift_key();
+                    let do_paste = if shift_held {
+                        !default_is_paste
+                    } else {
+                        default_is_paste
+                    };
+
+                    if do_paste {
+                        session.paste_from_clipboard(self.clipboard.as_ref());
+                    } else {
+                        session.menu_open = true;
+                        session.menu_is_context = true;
+                        session.menu_anchor = (mx, my);
+                        session.menu_hovered_idx = None;
+                        session.window.request_redraw();
+                    }
                 }
             }
         }
@@ -1113,49 +1288,55 @@ impl App {
         delta: MouseScrollDelta,
     ) {
         if let Some(session) = self.sessions.get_mut(&window_id) {
-            let lines = match delta {
-                MouseScrollDelta::LineDelta(_, y) => {
+            let (lines_x, lines_y) = match delta {
+                MouseScrollDelta::LineDelta(x, y) => {
                     session.scroll_pixel_accumulator = 0.0;
-                    y as i32
+                    session.scroll_pixel_accumulator_x = 0.0;
+                    (x as i32, y as i32)
                 }
                 MouseScrollDelta::PixelDelta(pos) => {
-                    let scale = session.renderer.cell_height().max(1.0) as f64;
+                    let scale_y = session.renderer.cell_height().max(1.0) as f64;
+                    let scale_x = session.renderer.cell_width().max(1.0) as f64;
                     session.scroll_pixel_accumulator += pos.y;
-                    let lines = (session.scroll_pixel_accumulator / scale) as i32;
-                    session.scroll_pixel_accumulator -= lines as f64 * scale;
-                    lines
+                    let ly = (session.scroll_pixel_accumulator / scale_y) as i32;
+                    session.scroll_pixel_accumulator -= ly as f64 * scale_y;
+                    session.scroll_pixel_accumulator_x += pos.x;
+                    let lx = (session.scroll_pixel_accumulator_x / scale_x) as i32;
+                    session.scroll_pixel_accumulator_x -= lx as f64 * scale_x;
+                    (lx, ly)
                 }
             };
 
-            if lines != 0 {
+            if lines_x != 0 || lines_y != 0 {
                 let (mx, my) = session.mouse_pos;
-                let cell_pos = session
-                    .get_pane_and_cell_at(mx, my, tab_bar_h)
-                    .map(|(_, row, col)| (row + 1, col + 1))
-                    .unwrap_or((1, 1));
+                let hovered = session.get_pane_and_cell_at(mx, my, tab_bar_h);
+                let (row, col) = hovered.map(|(_, r, c)| (r, c)).unwrap_or((0, 0));
 
                 if let Some(tab) = session.workspace.active_tab_mut() {
-                    if let Some(terminal) = tab.active_terminal_mut() {
-                        if terminal.state.mouse_protocol != skterm_core::vt::MouseProtocol::None {
-                            let button = if lines > 0 { 64 } else { 65 };
-                            let (row, col) = cell_pos;
+                    let target_pane = hovered.map(|(pid, _, _)| pid).unwrap_or(tab.active_pane_id);
+                    if let Some(terminal) = tab.root.find_terminal_mut(target_pane) {
+                        if terminal.state.mouse_protocol != MouseProtocol::None {
+                            let fmt = terminal.state.mouse_format;
                             let mut payload = Vec::new();
-                            for _ in 0..lines.unsigned_abs() {
-                                if terminal.state.mouse_format == skterm_core::vt::MouseFormat::Sgr
-                                {
-                                    payload.extend_from_slice(
-                                        format!("\x1b[<{};{};{}M", button, col, row).as_bytes(),
-                                    );
-                                } else {
-                                    let cb = (button + 32) as u8;
-                                    let cx = (col.min(223) + 32) as u8;
-                                    let cy = (row.min(223) + 32) as u8;
-                                    payload.extend_from_slice(&[0x1b, b'[', b'M', cb, cx, cy]);
+                            if lines_y != 0 {
+                                let button = if lines_y > 0 { 64 } else { 65 };
+                                let step =
+                                    encode_mouse_wheel_step(button, row, col, self.modifiers, fmt);
+                                for _ in 0..lines_y.unsigned_abs() {
+                                    payload.extend_from_slice(&step);
+                                }
+                            }
+                            if lines_x != 0 {
+                                let button = if lines_x > 0 { 66 } else { 67 };
+                                let step =
+                                    encode_mouse_wheel_step(button, row, col, self.modifiers, fmt);
+                                for _ in 0..lines_x.unsigned_abs() {
+                                    payload.extend_from_slice(&step);
                                 }
                             }
                             let _ = terminal.write_to_pty(&payload);
-                        } else if terminal.grid().is_alternate {
-                            let seq: &[u8] = if lines > 0 {
+                        } else if lines_y != 0 && terminal.grid().is_alternate {
+                            let seq: &[u8] = if lines_y > 0 {
                                 if terminal.state.application_cursor_keys {
                                     b"\x1bOA"
                                 } else {
@@ -1167,15 +1348,15 @@ impl App {
                                 b"\x1b[B"
                             };
                             let mut payload = Vec::new();
-                            for _ in 0..lines.unsigned_abs() {
+                            for _ in 0..lines_y.unsigned_abs() {
                                 payload.extend_from_slice(seq);
                             }
                             let _ = terminal.write_to_pty(&payload);
-                        } else {
+                        } else if lines_y != 0 {
                             terminal
                                 .grid_mut()
                                 .active_mut()
-                                .scroll_display(lines as isize);
+                                .scroll_display(lines_y as isize);
                             session.last_scroll_time = Some(Instant::now());
                             session.window.request_redraw();
                         }

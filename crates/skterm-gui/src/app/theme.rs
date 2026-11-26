@@ -214,6 +214,15 @@ impl App {
                     .window
                     .set_decorations(new_cfg.window.decorations != "none");
             }
+            #[cfg(target_os = "macos")]
+            {
+                use winit::platform::macos::WindowExtMacOS;
+                session
+                    .window
+                    .set_option_as_alt(super::macos::parse_macos_option_as_alt(
+                        &new_cfg.terminal.option_as_alt,
+                    ));
+            }
             session.workspace.update_cursor_shape(cursor_shape);
             session.sync_all_pane_sizes(tab_bar_h);
             session.request_redraw();

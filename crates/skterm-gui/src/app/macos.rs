@@ -2,6 +2,19 @@
 
 use winit::window::Window;
 
+/// Map `config.terminal.option_as_alt` to winit's macOS [`winit::platform::macos::OptionAsAlt`].
+#[cfg(target_os = "macos")]
+pub(crate) fn parse_macos_option_as_alt(val: &str) -> winit::platform::macos::OptionAsAlt {
+    use winit::platform::macos::OptionAsAlt;
+    match val.trim().to_ascii_lowercase().as_str() {
+        "both" => OptionAsAlt::Both,
+        "only_left" | "left" => OptionAsAlt::OnlyLeft,
+        "only_right" | "right" => OptionAsAlt::OnlyRight,
+        "none" | "false" => OptionAsAlt::None,
+        _ => OptionAsAlt::Both,
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn get_nswindow(window: &Window) -> *mut objc2::runtime::AnyObject {
     use objc2::msg_send;
@@ -346,4 +359,28 @@ pub unsafe fn style_macos_tab_bar(active_win_ptr: *mut objc2::runtime::AnyObject
         return;
     }
     walk_for_tab_buttons(frame_view, active_win_ptr, content_view);
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::parse_macos_option_as_alt;
+    use winit::platform::macos::OptionAsAlt;
+
+    #[test]
+    fn parse_option_as_alt_variants() {
+        assert_eq!(parse_macos_option_as_alt("both"), OptionAsAlt::Both);
+        assert_eq!(
+            parse_macos_option_as_alt("only_left"),
+            OptionAsAlt::OnlyLeft
+        );
+        assert_eq!(parse_macos_option_as_alt("left"), OptionAsAlt::OnlyLeft);
+        assert_eq!(
+            parse_macos_option_as_alt("only_right"),
+            OptionAsAlt::OnlyRight
+        );
+        assert_eq!(parse_macos_option_as_alt("right"), OptionAsAlt::OnlyRight);
+        assert_eq!(parse_macos_option_as_alt("none"), OptionAsAlt::None);
+        assert_eq!(parse_macos_option_as_alt("false"), OptionAsAlt::None);
+        assert_eq!(parse_macos_option_as_alt("unknown"), OptionAsAlt::Both);
+    }
 }

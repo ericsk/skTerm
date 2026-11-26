@@ -43,8 +43,23 @@ use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::window::WindowId;
+
+/// Compute the inline tab bar height in physical pixels for a given style, tab count, and HiDPI scale.
+pub(crate) fn compute_tab_bar_height(tab_bar_style: &str, tab_count: usize, scale: f32) -> f32 {
+    match tab_bar_style {
+        "never" => 0.0,
+        "always" => 36.0 * scale,
+        _ => {
+            if tab_count > 1 {
+                36.0 * scale
+            } else {
+                0.0
+            }
+        }
+    }
+}
 
 /// skTerm GUI Application instance managing multiple native window sessions or native tabs.
 pub struct App {
@@ -62,6 +77,12 @@ pub struct App {
     pub last_agent_toggle_click: u64,
     pub clipboard: Option<Arc<Mutex<Clipboard>>>,
     pub modifiers: ModifiersState,
+    /// Tracked lock-key states for Kitty Keyboard Protocol modifier bits (`+64` / `+128`).
+    pub caps_lock: bool,
+    pub num_lock: bool,
+    /// Physical key consumed by an application shortcut on press, so its matching
+    /// `ElementState::Released` event does not leak a KKP `:3u` release into the PTY.
+    pub last_consumed_shortcut_key: Option<PhysicalKey>,
     /// Set whenever `current_config` differs from what is on disk. Both window
     /// geometry changes and live preference edits funnel through here so there is
     /// only ever one writer, debounced by `last_config_change`.
@@ -128,6 +149,9 @@ impl App {
             last_agent_toggle_click: crate::macos_titlebar::click_count(),
             clipboard,
             modifiers: ModifiersState::default(),
+            caps_lock: false,
+            num_lock: false,
+            last_consumed_shortcut_key: None,
             pending_config_save: false,
             last_config_change: None,
             editing_agent_pane: None,
@@ -255,17 +279,7 @@ impl App {
             .map(|s| s.renderer.scale_factor)
             .unwrap_or(1.0);
 
-        match tab_bar_style {
-            "never" => 0.0,
-            "always" => 36.0 * scale,
-            _ => {
-                if tab_count > 1 {
-                    36.0 * scale
-                } else {
-                    0.0
-                }
-            }
-        }
+        compute_tab_bar_height(tab_bar_style, tab_count, scale)
     }
 
     pub fn active_session(&self) -> Option<&TerminalSession> {

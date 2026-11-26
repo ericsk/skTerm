@@ -26,11 +26,16 @@ pub use i18n::{current_locale, set_locale, strings, tr, I18nStrings, Locale};
 pub use icon::{apply_window_icon, configure_window_attributes, get_app_icon};
 pub use input::{
     check_tab_switch, check_tab_switch_for_os, encode_key, encode_key_event,
-    encode_key_event_with_modes, encode_key_with_modes, is_tab_switch_modifier,
-    is_tab_switch_modifier_for_os, parse_tab_switch_digit,
+    encode_key_event_with_full_modes, encode_key_event_with_modes, encode_key_input,
+    encode_key_with_modes, encode_mouse_button, encode_mouse_motion, encode_mouse_wheel_step,
+    is_tab_switch_modifier, is_tab_switch_modifier_for_os, mouse_modifier_bits,
+    parse_tab_switch_digit, KeyInput, KeyModifierFlags, KITTY_FLAG_DISAMBIGUATE,
+    KITTY_FLAG_REPORT_ALL_KEYS, KITTY_FLAG_REPORT_ALTERNATE, KITTY_FLAG_REPORT_EVENTS,
+    KITTY_FLAG_REPORT_TEXT,
 };
 pub use layout::{
     PaneId, PaneNode, PollOutcome, Rect, SplitDirection, SplitterBar, Tab, TabId, Workspace,
+    SYNCHRONIZED_OUTPUT_TIMEOUT,
 };
 pub use preferences_window::{PreferencesCategory, PreferencesWindow};
 
@@ -1425,10 +1430,17 @@ mod tests {
         assert!(!tab.has_dirty_visible_pane());
         assert!(!tab.is_synchronized_output_active());
 
-        // Unzooming restores pane 2 visibility; timeout releases stuck ?2026
+        // Unzooming restores pane 2 visibility; 1000ms safety timeout keeps ?2026 active at 500ms
+        // and releases stuck ?2026 after 1000ms.
         tab.zoomed_pane_id = None;
         assert!(tab.is_synchronized_output_active());
-        let future = Instant::now() + Duration::from_secs(2);
+        let mid = Instant::now() + Duration::from_millis(500);
+        let (released_mid, next_deadline_mid) = tab.poll_synchronized_output_timeout(mid);
+        assert!(!released_mid);
+        assert!(next_deadline_mid.is_some());
+        assert!(tab.is_synchronized_output_active());
+
+        let future = Instant::now() + SYNCHRONIZED_OUTPUT_TIMEOUT + Duration::from_millis(100);
         let (released, next_deadline) = tab.poll_synchronized_output_timeout(future);
         assert!(released);
         assert!(next_deadline.is_none());
@@ -1472,5 +1484,13 @@ mod tests {
 
         let after_window = now + Duration::from_millis(1600);
         assert!(ws.next_active_output_expiry(after_window, None).is_none());
+    }
+
+    #[test]
+    fn test_compute_tab_bar_height_respects_hidpi_scale() {
+        assert_eq!(crate::app::compute_tab_bar_height("never", 3, 2.0), 0.0);
+        assert_eq!(crate::app::compute_tab_bar_height("always", 1, 2.0), 72.0);
+        assert_eq!(crate::app::compute_tab_bar_height("auto", 1, 2.0), 0.0);
+        assert_eq!(crate::app::compute_tab_bar_height("auto", 2, 2.0), 72.0);
     }
 }
