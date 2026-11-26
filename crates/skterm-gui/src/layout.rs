@@ -457,6 +457,28 @@ impl PaneNode {
             }
         }
     }
+
+    /// Sync active GUI theme default colors (`OSC 4/10/11/12/21;?`) and dark/light
+    /// color scheme (`?2031` / `CSI ? 996 n`) into every terminal in this subtree.
+    pub fn apply_theme_colors(
+        &mut self,
+        fg: [u8; 3],
+        bg: [u8; 3],
+        cursor: [u8; 3],
+        palette_16: [[u8; 3]; 16],
+        is_dark: bool,
+    ) {
+        match self {
+            PaneNode::Leaf { terminal, .. } => {
+                terminal.set_default_colors(fg, bg, cursor, palette_16);
+                terminal.set_color_scheme(is_dark);
+            }
+            PaneNode::Split { first, second, .. } => {
+                first.apply_theme_colors(fg, bg, cursor, palette_16, is_dark);
+                second.apply_theme_colors(fg, bg, cursor, palette_16, is_dark);
+            }
+        }
+    }
 }
 
 /// Safety timeout for DEC Mode `?2026` (Synchronized Output) matching Ghostty's 1-second limit.
@@ -757,6 +779,28 @@ impl Tab {
                 .is_some_and(|t| t.grid().is_dirty())
         })
     }
+
+    /// Advance active Kitty Graphics animations across all visible panes in this tab.
+    /// Returns `(any_frame_changed, earliest_next_deadline)`.
+    pub fn tick_visible_animations(
+        &mut self,
+        now: std::time::Instant,
+    ) -> (bool, Option<std::time::Instant>) {
+        let mut dirty = false;
+        let mut earliest: Option<std::time::Instant> = None;
+        for id in self.visible_leaf_ids() {
+            if let Some(term) = self.root.find_terminal_mut(id) {
+                let (pane_dirty, pane_next) = term.tick_animations(now);
+                if pane_dirty {
+                    dirty = true;
+                }
+                if let Some(at) = pane_next {
+                    earliest = Some(earliest.map_or(at, |cur| cur.min(at)));
+                }
+            }
+        }
+        (dirty, earliest)
+    }
 }
 
 /// What a `Workspace::poll_all_ptys` sweep actually changed.
@@ -784,6 +828,10 @@ impl PollOutcome {
     }
 }
 
+/// Stored GUI theme defaults `(fg, bg, cursor, palette_16, is_dark)` applied to
+/// every existing and newly spawned pane in a [`Workspace`].
+type StoredThemeColors = ([u8; 3], [u8; 3], [u8; 3], [[u8; 3]; 16], bool);
+
 /// Workspace holding multiple tabs and managing global layouts.
 pub struct Workspace {
     pub tabs: Vec<Tab>,
@@ -792,6 +840,7 @@ pub struct Workspace {
     pub sidebar_width: f32,
     next_tab_id: u32,
     next_pane_id: u32,
+    default_theme_colors: Option<StoredThemeColors>,
 }
 
 impl Workspace {
@@ -827,6 +876,7 @@ impl Workspace {
             sidebar_width: 220.0,
             next_tab_id,
             next_pane_id,
+            default_theme_colors: None,
         })
     }
 
@@ -849,6 +899,7 @@ impl Workspace {
             sidebar_width: 220.0,
             next_tab_id: 2,
             next_pane_id: 2,
+            default_theme_colors: None,
         }
     }
 
@@ -877,7 +928,7 @@ impl Workspace {
         self.next_pane_id += 1;
 
         let title = format!("Tab {}", self.tabs.len() + 1);
-        let tab = Tab::new_with_options(
+        let mut tab = Tab::new_with_options(
             tab_id,
             title,
             rows,
@@ -886,6 +937,10 @@ impl Workspace {
             scrollback_lines,
             options,
         )?;
+        if let Some((fg, bg, cursor, palette_16, is_dark)) = self.default_theme_colors {
+            tab.root
+                .apply_theme_colors(fg, bg, cursor, palette_16, is_dark);
+        }
         self.tabs.push(tab);
         self.active_tab_idx = self.tabs.len() - 1;
         Ok(tab_id)
@@ -900,15 +955,23 @@ impl Workspace {
         options: PtySpawnOptions,
     ) -> anyhow::Result<PaneId> {
         let mut next_id = self.next_pane_id;
+        let theme_colors = self.default_theme_colors;
         let res = if let Some(tab) = self.active_tab_mut() {
-            tab.split_active_with_options(
+            let new_pane_id = tab.split_active_with_options(
                 direction,
                 &mut next_id,
                 rows,
                 cols,
                 scrollback_lines,
                 options,
-            )
+            )?;
+            if let Some((fg, bg, cursor, palette_16, is_dark)) = theme_colors {
+                if let Some(term) = tab.root.find_terminal_mut(new_pane_id) {
+                    term.set_default_colors(fg, bg, cursor, palette_16);
+                    term.set_color_scheme(is_dark);
+                }
+            }
+            Ok(new_pane_id)
         } else {
             Err(anyhow::anyhow!("No active tab in workspace"))
         };
@@ -1197,6 +1260,51 @@ impl Workspace {
         for tab in &mut self.tabs {
             tab.root.update_cursor_shape(shape);
         }
+    }
+
+    /// Sync active GUI theme default colors (`OSC 4/10/11/12/21;?`) and dark/light
+    /// color scheme (`?2031` / `CSI ? 996 n`) across all existing panes, and remember
+    /// them so every subsequently spawned tab or split pane inherits them automatically.
+    pub fn apply_theme_colors(
+        &mut self,
+        fg: [u8; 3],
+        bg: [u8; 3],
+        cursor: [u8; 3],
+        palette_16: [[u8; 3]; 16],
+        is_dark: bool,
+    ) {
+        self.default_theme_colors = Some((fg, bg, cursor, palette_16, is_dark));
+        for tab in &mut self.tabs {
+            tab.root
+                .apply_theme_colors(fg, bg, cursor, palette_16, is_dark);
+        }
+    }
+
+    /// Poll `OSC 9;4` 15-second stale progress timeouts across all tabs and panes.
+    /// Returns `(any_cleared, earliest_next_timeout)` so the event loop can request a
+    /// redraw when stale progress expires and arm `ControlFlow::WaitUntil` for active bars.
+    pub fn poll_progress_timeouts(
+        &mut self,
+        now: std::time::Instant,
+    ) -> (bool, Option<std::time::Instant>) {
+        const PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        let mut cleared = false;
+        let mut earliest: Option<std::time::Instant> = None;
+        for tab in &mut self.tabs {
+            for id in tab.root.all_leaf_ids() {
+                if let Some(term) = tab.root.find_terminal_mut(id) {
+                    if term.poll_progress_timeout(now) {
+                        cleared = true;
+                    } else if term.state.progress.is_some() {
+                        if let Some(updated_at) = term.state.progress_updated_at {
+                            let deadline = updated_at + PROGRESS_TIMEOUT;
+                            earliest = Some(earliest.map_or(deadline, |cur| cur.min(deadline)));
+                        }
+                    }
+                }
+            }
+        }
+        (cleared, earliest)
     }
 
     /// Scan all tabs and panes to find running AI Agent CLI instances.
@@ -1872,5 +1980,117 @@ impl ProcessTreeCache {
         // Cache fallback so we never repeatedly run failing lookups on every frame
         self.cwd_cache.insert(pid, "workspace".to_string());
         "workspace".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn workspace_apply_theme_colors_syncs_osc_queries_and_color_scheme_2031() {
+        let mut ws = Workspace::new_headless(24, 80);
+        let mut palette = [[0u8; 3]; 16];
+        palette[1] = [0xaa, 0x22, 0x33];
+
+        // Enable ?2031 color-scheme update notifications on the headless pane
+        {
+            let term = ws.active_tab_mut().unwrap().active_terminal_mut().unwrap();
+            term.feed_bytes(b"\x1b[?2031h");
+            let _ = term.take_pending_responses();
+        }
+
+        // Apply light theme colors -> should update defaults and emit CSI ? 997 ; 2 n
+        ws.apply_theme_colors(
+            [0x11, 0x22, 0x33],
+            [0xfd, 0xf6, 0xe3],
+            [0x44, 0x55, 0x66],
+            palette,
+            false,
+        );
+
+        let term = ws.active_tab_mut().unwrap().active_terminal_mut().unwrap();
+        assert_eq!(term.take_pending_responses(), b"\x1b[?997;2n");
+
+        // Verify OSC 10/11/12/4;? queries return the synced theme RGBs
+        term.feed_bytes(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\\x1b]4;1;?\x1b\\");
+        let resp = String::from_utf8(term.take_pending_responses()).unwrap();
+        assert!(resp.contains("10;rgb:1111/2222/3333"), "got {resp:?}");
+        assert!(resp.contains("11;rgb:fdfd/f6f6/e3e3"), "got {resp:?}");
+        assert!(resp.contains("12;rgb:4444/5555/6666"), "got {resp:?}");
+        assert!(resp.contains("4;1;rgb:aaaa/2222/3333"), "got {resp:?}");
+
+        // Switching back to dark emits CSI ? 997 ; 1 n
+        ws.apply_theme_colors(
+            [0xee, 0xee, 0xee],
+            [0x00, 0x00, 0x00],
+            [0xff, 0xff, 0xff],
+            palette,
+            true,
+        );
+        let term = ws.active_tab_mut().unwrap().active_terminal_mut().unwrap();
+        assert_eq!(term.take_pending_responses(), b"\x1b[?997;1n");
+    }
+
+    #[test]
+    fn workspace_poll_progress_timeouts_schedules_and_clears_stale_osc9_4() {
+        let mut ws = Workspace::new_headless(24, 80);
+        let t0 = Instant::now();
+        {
+            let term = ws.active_tab_mut().unwrap().active_terminal_mut().unwrap();
+            term.feed_bytes(b"\x1b]9;4;1;50\x07");
+            term.state.progress_updated_at = Some(t0);
+        }
+
+        // At +5s: still active, returns exact 15s deadline
+        let (cleared_early, next_due) = ws.poll_progress_timeouts(t0 + Duration::from_secs(5));
+        assert!(!cleared_early);
+        assert_eq!(next_due, Some(t0 + Duration::from_secs(15)));
+
+        // At +15s: stale progress cleared, no further wake scheduled
+        let (cleared_due, next_after) = ws.poll_progress_timeouts(t0 + Duration::from_secs(15));
+        assert!(cleared_due);
+        assert_eq!(next_after, None);
+        assert!(ws
+            .active_tab()
+            .unwrap()
+            .active_terminal()
+            .unwrap()
+            .state
+            .progress
+            .is_none());
+    }
+
+    #[test]
+    fn tab_tick_visible_animations_advances_kitty_frames_and_returns_deadline() {
+        let mut ws = Workspace::new_headless(10, 20);
+        let t0 = Instant::now();
+        {
+            let term = ws.active_tab_mut().unwrap().active_terminal_mut().unwrap();
+            // Transmit 1x1 RGBA base frame (red) with id=7, add frame 2 (green) z=40ms, start running (s=3)
+            let red_b64 = skterm_core::encode_base64_standard(&[255, 0, 0, 255]);
+            let green_b64 = skterm_core::encode_base64_standard(&[0, 255, 0, 255]);
+            let seq = format!(
+                "\x1b_Ga=T,f=32,s=1,v=1,i=7,q=2;{red_b64}\x1b\\\
+                 \x1b_Ga=f,f=32,s=1,v=1,i=7,z=40,q=2;{green_b64}\x1b\\\
+                 \x1b_Ga=a,i=7,s=3,z=40,q=2;\x1b\\"
+            );
+            term.feed_bytes(seq.as_bytes());
+            if let Some(img) = term.grid_mut().kitty_images.get_mut(&7) {
+                img.next_frame_at = Some(t0 + Duration::from_millis(40));
+            }
+        }
+
+        // Before deadline: no frame change, returns exact upcoming deadline
+        let tab = ws.active_tab_mut().unwrap();
+        let (dirty1, next1) = tab.tick_visible_animations(t0 + Duration::from_millis(10));
+        assert!(!dirty1);
+        assert_eq!(next1, Some(t0 + Duration::from_millis(40)));
+
+        // At deadline: advances frame, marks dirty, and returns next deadline
+        let (dirty2, next2) = tab.tick_visible_animations(t0 + Duration::from_millis(40));
+        assert!(dirty2);
+        assert!(next2.is_some_and(|d| d > t0 + Duration::from_millis(40)));
     }
 }

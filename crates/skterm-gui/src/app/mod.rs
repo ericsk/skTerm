@@ -26,7 +26,8 @@ pub use menu::{
     build_context_menu, build_context_menu_for_locale, build_top_dropdown_menu,
     build_top_dropdown_menu_for_locale, hit_test_dropdown_menu, TopMenuAction,
 };
-pub use session::{ScrollbarDragState, TerminalSession};
+pub use session::{compute_pane_pixel_coords, ScrollbarDragState, TerminalSession};
+pub use theme::{extract_core_theme_colors, relative_luminance, CoreThemeColors};
 pub use window::is_rect_visible_on_monitors;
 
 use crate::config::ConfigManager;
@@ -473,6 +474,8 @@ impl ApplicationHandler<AppEvent> for App {
                             style_macos_tab_bar(win_ptr);
                         }
                     }
+                } else {
+                    session.hovered_hyperlink = None;
                 }
                 session.sync_focus_events();
                 session.request_redraw();
@@ -522,6 +525,31 @@ impl ApplicationHandler<AppEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.handle_cursor_moved(window_id, tab_bar_h, position)
+            }
+
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    let had_hover = session.hovered_hyperlink.take().is_some()
+                        | session.hovered_url.take().is_some();
+                    if had_hover {
+                        session.window.request_redraw();
+                    }
+                }
+            }
+
+            WindowEvent::ThemeChanged(_os_theme) => {
+                // Keep `OSC 4/10/11/12/21;?` and DEC Mode `?2031` color-scheme reports
+                // aligned with the active terminal theme's actual background luminance.
+                let core_colors = extract_core_theme_colors(&self.build_render_theme());
+                if let Some(session) = self.sessions.get_mut(&window_id) {
+                    session.workspace.apply_theme_colors(
+                        core_colors.fg,
+                        core_colors.bg,
+                        core_colors.cursor,
+                        core_colors.palette_16,
+                        core_colors.is_dark,
+                    );
+                }
             }
 
             WindowEvent::MouseInput { state, button, .. } => {

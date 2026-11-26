@@ -1253,8 +1253,26 @@ fn mouse_button_code(button: MouseButton) -> Option<u8> {
     }
 }
 
-/// Encode a mouse button press or release event for xterm / SGR mouse protocols.
-/// `row` and `col` are 0-based grid coordinates.
+/// Select the 0-based `(y, x)` coordinates for mouse reporting according to `format`:
+/// - `MouseFormat::SgrPixels` (`?1016`): physical pixel offsets `(px_y, px_x)` relative to pane content origin
+/// - `MouseFormat::Sgr` (`?1006`) / `MouseFormat::X10`: cell coordinates `(row, col)`
+#[inline]
+pub fn resolve_mouse_report_coords(
+    format: MouseFormat,
+    row: usize,
+    col: usize,
+    px_x: usize,
+    px_y: usize,
+) -> (usize, usize) {
+    match format {
+        MouseFormat::SgrPixels => (px_y, px_x),
+        MouseFormat::Sgr | MouseFormat::X10 => (row, col),
+    }
+}
+
+/// Encode a mouse button press or release event for xterm / SGR / SGR-Pixels mouse protocols.
+/// `row` and `col` are 0-based grid coordinates for `X10`/`Sgr`, or 0-based physical pixel
+/// coordinates `(px_y, px_x)` relative to pane content origin for `SgrPixels` (`?1016`).
 pub fn encode_mouse_button(
     button: MouseButton,
     pressed: bool,
@@ -1280,7 +1298,7 @@ pub fn encode_mouse_button(
     let row_1 = row + 1;
 
     match format {
-        MouseFormat::Sgr => {
+        MouseFormat::Sgr | MouseFormat::SgrPixels => {
             let cb = base | mods;
             let suffix = if pressed { 'M' } else { 'm' };
             Some(format!("\x1b[<{cb};{col_1};{row_1}{suffix}").into_bytes())
@@ -1300,7 +1318,8 @@ pub fn encode_mouse_button(
 
 /// Encode a mouse motion event (`?1002` ButtonEvent drag or `?1003` AnyEvent drag/hover).
 /// `button` is `Some(btn)` when dragging with a button held, or `None` for hover motion under `?1003`.
-/// `row` and `col` are 0-based grid coordinates.
+/// `row` and `col` are 0-based grid coordinates for `X10`/`Sgr`, or 0-based physical pixel
+/// coordinates `(px_y, px_x)` relative to pane content origin for `SgrPixels` (`?1016`).
 pub fn encode_mouse_motion(
     button: Option<MouseButton>,
     row: usize,
@@ -1323,7 +1342,9 @@ pub fn encode_mouse_motion(
     let row_1 = row + 1;
 
     match format {
-        MouseFormat::Sgr => Some(format!("\x1b[<{cb};{col_1};{row_1}M").into_bytes()),
+        MouseFormat::Sgr | MouseFormat::SgrPixels => {
+            Some(format!("\x1b[<{cb};{col_1};{row_1}M").into_bytes())
+        }
         MouseFormat::X10 => {
             if base >= 128 {
                 return None;
@@ -1337,7 +1358,8 @@ pub fn encode_mouse_motion(
 }
 
 /// Encode a single mouse wheel step (`64` = up, `65` = down, `66` = left, `67` = right)
-/// with xterm modifier bits (Shift +4, Alt +8, Ctrl +16). `row` and `col` are 0-based.
+/// with xterm modifier bits (Shift +4, Alt +8, Ctrl +16). `row` and `col` are 0-based grid
+/// coordinates for `X10`/`Sgr`, or 0-based physical pixel coordinates `(px_y, px_x)` for `SgrPixels`.
 pub fn encode_mouse_wheel_step(
     wheel_button: u8,
     row: usize,
@@ -1349,7 +1371,9 @@ pub fn encode_mouse_wheel_step(
     let col_1 = col + 1;
     let row_1 = row + 1;
     match format {
-        MouseFormat::Sgr => format!("\x1b[<{cb};{col_1};{row_1}M").into_bytes(),
+        MouseFormat::Sgr | MouseFormat::SgrPixels => {
+            format!("\x1b[<{cb};{col_1};{row_1}M").into_bytes()
+        }
         MouseFormat::X10 => {
             let cb_byte = cb.saturating_add(32);
             let cx = (col_1.min(223) + 32) as u8;
@@ -2277,6 +2301,89 @@ mod tests {
             )
             .as_deref(),
             Some(b"\x1b[57360u".as_slice())
+        );
+    }
+
+    #[test]
+    fn sgr_pixels_mouse_encoding_press_release_motion_and_wheel() {
+        // Coordinate resolver picks (px_y, px_x) for SgrPixels and (row, col) for Sgr/X10
+        assert_eq!(
+            resolve_mouse_report_coords(MouseFormat::SgrPixels, 2, 5, 1919, 1079),
+            (1079, 1919)
+        );
+        assert_eq!(
+            resolve_mouse_report_coords(MouseFormat::Sgr, 2, 5, 1919, 1079),
+            (2, 5)
+        );
+        assert_eq!(
+            resolve_mouse_report_coords(MouseFormat::X10, 2, 5, 1919, 1079),
+            (2, 5)
+        );
+
+        // Press at 0-based pixel (0, 0) -> 1-based (1, 1)
+        let (ry, rx) = resolve_mouse_report_coords(MouseFormat::SgrPixels, 0, 0, 0, 0);
+        assert_eq!(
+            encode_mouse_button(
+                MouseButton::Left,
+                true,
+                ry,
+                rx,
+                ModifiersState::empty(),
+                MouseProtocol::Normal,
+                MouseFormat::SgrPixels,
+            )
+            .as_deref(),
+            Some(b"\x1b[<0;1;1M".as_slice())
+        );
+
+        // Release at large physical pixel (1439, 899) -> 1-based (1440, 900)
+        let (ry, rx) = resolve_mouse_report_coords(MouseFormat::SgrPixels, 10, 20, 1439, 899);
+        assert_eq!(
+            encode_mouse_button(
+                MouseButton::Right,
+                false,
+                ry,
+                rx,
+                ModifiersState::CONTROL,
+                MouseProtocol::Normal,
+                MouseFormat::SgrPixels,
+            )
+            .as_deref(),
+            Some(b"\x1b[<18;1440;900m".as_slice())
+        );
+
+        // Drag motion (?1002) with Left button at pixel (312, 405) -> 1-based (313, 406)
+        assert_eq!(
+            encode_mouse_motion(
+                Some(MouseButton::Left),
+                405,
+                312,
+                ModifiersState::ALT,
+                MouseProtocol::ButtonEvent,
+                MouseFormat::SgrPixels,
+            )
+            .as_deref(),
+            Some(b"\x1b[<40;313;406M".as_slice())
+        );
+
+        // Hover motion (?1003) with no button at pixel (99, 200) -> cb=35, 1-based (100, 201)
+        assert_eq!(
+            encode_mouse_motion(
+                None,
+                200,
+                99,
+                ModifiersState::empty(),
+                MouseProtocol::AnyEvent,
+                MouseFormat::SgrPixels,
+            )
+            .as_deref(),
+            Some(b"\x1b[<35;100;201M".as_slice())
+        );
+
+        // Wheel up (64) + Shift (+4) at pixel (500, 250) -> cb=68, 1-based (501, 251)
+        assert_eq!(
+            encode_mouse_wheel_step(64, 250, 500, ModifiersState::SHIFT, MouseFormat::SgrPixels),
+            b"\x1b[<68;501;251M"
         );
     }
 }

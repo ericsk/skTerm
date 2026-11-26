@@ -2,9 +2,65 @@
 
 use super::App;
 use crate::config::{parse_hex_color, Config, Theme};
-use skterm_render::RenderTheme;
+use skterm_render::{color_to_rgba, RenderTheme};
 use std::time::Instant;
 use tracing::info;
+
+/// Extracted 8-bit RGB theme defaults and dark-mode classification for syncing into `skterm-core`
+/// (`OSC 4/10/11/12/21;?` queries and DEC Mode `?2031` / `CSI ? 996 n` color scheme reporting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreThemeColors {
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+    pub cursor: [u8; 3],
+    pub palette_16: [[u8; 3]; 16],
+    pub is_dark: bool,
+}
+
+#[inline]
+fn rgba_f32_to_rgb_u8(c: [f32; 4]) -> [u8; 3] {
+    [
+        (c[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
+}
+
+/// WCAG 2.x sRGB relative luminance in `[0.0, 1.0]`.
+pub fn relative_luminance(rgb: [f32; 4]) -> f32 {
+    #[inline]
+    fn linearize(c: f32) -> f32 {
+        let c = c.clamp(0.0, 1.0);
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * linearize(rgb[0]) + 0.7152 * linearize(rgb[1]) + 0.0722 * linearize(rgb[2])
+}
+
+/// Extract `(fg, bg, cursor, palette_16, is_dark)` from the active [`RenderTheme`].
+/// `is_dark` is determined by WCAG relative luminance of `theme.default_bg` (`< 0.179`).
+pub fn extract_core_theme_colors(theme: &RenderTheme) -> CoreThemeColors {
+    let fg = rgba_f32_to_rgb_u8(theme.default_fg);
+    let bg = rgba_f32_to_rgb_u8(theme.default_bg);
+    let cursor = rgba_f32_to_rgb_u8(theme.cursor_color);
+    let palette_16 = match theme.ansi_palette {
+        Some(pal) => std::array::from_fn(|i| rgba_f32_to_rgb_u8(pal[i])),
+        None => std::array::from_fn(|i| {
+            rgba_f32_to_rgb_u8(color_to_rgba(skterm_core::Color::Indexed(i as u8), false))
+        }),
+    };
+    let is_dark = relative_luminance(theme.default_bg) < 0.179;
+    CoreThemeColors {
+        fg,
+        bg,
+        cursor,
+        palette_16,
+        is_dark,
+    }
+}
 
 impl App {
     pub fn build_render_theme(&self) -> RenderTheme {
@@ -185,6 +241,7 @@ impl App {
         }
 
         let render_theme = self.build_render_theme();
+        let core_colors = extract_core_theme_colors(&render_theme);
         let tab_bar_h = self.get_tab_bar_height();
 
         let cursor_shape = match new_cfg.cursor.shape.as_str() {
@@ -209,6 +266,13 @@ impl App {
                 .update_padding(new_cfg.window.padding_x, new_cfg.window.padding_y);
             session.renderer.update_opacity(new_cfg.window.opacity);
             session.renderer.set_theme(render_theme);
+            session.workspace.apply_theme_colors(
+                core_colors.fg,
+                core_colors.bg,
+                core_colors.cursor,
+                core_colors.palette_16,
+                core_colors.is_dark,
+            );
             if decorations_changed {
                 session
                     .window
@@ -236,5 +300,49 @@ impl App {
             self.pending_config_save = true;
             self.last_config_change = Some(Instant::now());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_core_theme_colors_classifies_dark_and_light_backgrounds() {
+        // Dark theme (OLED black default)
+        let dark = RenderTheme::default();
+        let dark_colors = extract_core_theme_colors(&dark);
+        assert!(dark_colors.is_dark);
+        assert_eq!(dark_colors.bg, [0, 0, 0]);
+        assert_eq!(dark_colors.fg, [245, 245, 247]);
+        // Fallback ANSI palette (when `ansi_palette` is `None`) matches `color_to_rgba`
+        assert_eq!(dark_colors.palette_16[0], [0, 0, 0]);
+        assert_eq!(dark_colors.palette_16[15], [255, 255, 255]);
+
+        // Dark preset (Dracula)
+        let dracula = Theme::get("dracula");
+        let dracula_render = RenderTheme {
+            default_fg: dracula.foreground,
+            default_bg: dracula.background,
+            cursor_color: dracula.cursor,
+            ansi_palette: Some(dracula.palette),
+            ..RenderTheme::default()
+        };
+        let dracula_colors = extract_core_theme_colors(&dracula_render);
+        assert!(dracula_colors.is_dark);
+        assert_eq!(dracula_colors.palette_16[1], [230, 71, 71]);
+
+        // Light background (Solarized Light `#fdf6e3`)
+        let light = RenderTheme {
+            default_fg: [0.40, 0.48, 0.51, 1.0],
+            default_bg: [0.992, 0.965, 0.890, 1.0],
+            cursor_color: [0.40, 0.48, 0.51, 1.0],
+            ansi_palette: None,
+            ..RenderTheme::default()
+        };
+        let light_colors = extract_core_theme_colors(&light);
+        assert!(!light_colors.is_dark);
+        assert!(relative_luminance(light.default_bg) > 0.8);
+        assert_eq!(light_colors.bg, [253, 246, 227]);
     }
 }

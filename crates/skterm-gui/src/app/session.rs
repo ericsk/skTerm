@@ -43,6 +43,9 @@ pub struct TerminalSession {
     pub hovered_scrollbar_pane: Option<PaneId>,
     pub last_scroll_time: Option<Instant>,
     pub hovered_url: Option<String>,
+    /// Currently hovered explicit OSC 8 hyperlink `(pane_id, hyperlink_id)` (excluding
+    /// Kitty placeholder bit 31), underlined in the renderer while Cmd/Ctrl is held.
+    pub hovered_hyperlink: Option<(PaneId, u32)>,
     pub scroll_pixel_accumulator: f64,
     pub scroll_pixel_accumulator_x: f64,
     /// Currently pressed mouse button reported to a pane via xterm mouse tracking (`?1000`/`?1002`/`?1003`),
@@ -796,12 +799,15 @@ impl TerminalSession {
         }
     }
 
-    pub fn get_pane_and_cell_at(
+    /// Resolve `(mouse_x, mouse_y)` into `(pane_id, row, col, px_x, px_y)` where
+    /// `(row, col)` are 0-based grid coordinates and `(px_x, px_y)` are 0-based
+    /// physical pixel coordinates relative to the pane's terminal content origin.
+    pub fn get_pane_hit_with_pixels(
         &self,
         mouse_x: f32,
         mouse_y: f32,
         tab_bar_h: f32,
-    ) -> Option<(PaneId, usize, usize)> {
+    ) -> Option<(PaneId, usize, usize, usize, usize)> {
         let pane_rects = self.workspace.compute_active_pane_rects_with_scale(
             self.renderer.config.width as f32,
             self.renderer.config.height as f32,
@@ -813,8 +819,8 @@ impl TerminalSession {
 
         for (id, rect) in pane_rects {
             if rect.contains(mouse_x, mouse_y) {
-                let cell_w = self.renderer.cell_width();
-                let cell_h = self.renderer.cell_height();
+                let cell_w = self.renderer.cell_width().max(1.0);
+                let cell_h = self.renderer.cell_height().max(1.0);
                 let pad_x = self.renderer.padding_x;
                 let pad_y = self.renderer.padding_y;
 
@@ -824,26 +830,44 @@ impl TerminalSession {
                 let mut col = (rel_x / cell_w).floor() as usize;
                 let mut row = (rel_y / cell_h).floor() as usize;
 
-                if let Some(term) = active_tab.and_then(|t| t.root.find_terminal(id)) {
+                let (px_x, px_y) = if let Some(term) =
+                    active_tab.and_then(|t| t.root.find_terminal(id))
+                {
                     let buf = term.grid().active();
                     col = col.min(buf.cols.saturating_sub(1));
                     row = row.min(buf.rows.saturating_sub(1));
-                }
+                    compute_pane_pixel_coords(
+                        mouse_x, mouse_y, rect, pad_x, pad_y, cell_w, cell_h, buf.cols, buf.rows,
+                    )
+                } else {
+                    (rel_x.floor() as usize, rel_y.floor() as usize)
+                };
 
-                return Some((id, row, col));
+                return Some((id, row, col, px_x, px_y));
             }
         }
         None
     }
 
-    /// Resolve `(mouse_x, mouse_y)` into `(row, col)` clamped to `pane_id`'s bounds.
-    pub fn get_pane_cell_clamped(
+    pub fn get_pane_and_cell_at(
+        &self,
+        mouse_x: f32,
+        mouse_y: f32,
+        tab_bar_h: f32,
+    ) -> Option<(PaneId, usize, usize)> {
+        self.get_pane_hit_with_pixels(mouse_x, mouse_y, tab_bar_h)
+            .map(|(id, row, col, _, _)| (id, row, col))
+    }
+
+    /// Resolve `(mouse_x, mouse_y)` clamped to `pane_id`'s bounds, returning
+    /// `(row, col, px_x, px_y)` (all 0-based relative to the pane's content origin).
+    pub fn get_pane_cell_and_pixel_clamped(
         &self,
         pane_id: PaneId,
         mouse_x: f32,
         mouse_y: f32,
         tab_bar_h: f32,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<(usize, usize, usize, usize)> {
         let active_tab = self.workspace.active_tab()?;
         let term = active_tab.root.find_terminal(pane_id)?;
         let buf = term.grid().active();
@@ -866,8 +890,23 @@ impl TerminalSession {
 
         let col = ((rel_x / cell_w).floor() as usize).min(buf.cols.saturating_sub(1));
         let row = ((rel_y / cell_h).floor() as usize).min(buf.rows.saturating_sub(1));
+        let (px_x, px_y) = compute_pane_pixel_coords(
+            mouse_x, mouse_y, rect, pad_x, pad_y, cell_w, cell_h, buf.cols, buf.rows,
+        );
 
-        Some((row, col))
+        Some((row, col, px_x, px_y))
+    }
+
+    /// Resolve `(mouse_x, mouse_y)` into `(row, col)` clamped to `pane_id`'s bounds.
+    pub fn get_pane_cell_clamped(
+        &self,
+        pane_id: PaneId,
+        mouse_x: f32,
+        mouse_y: f32,
+        tab_bar_h: f32,
+    ) -> Option<(usize, usize)> {
+        self.get_pane_cell_and_pixel_clamped(pane_id, mouse_x, mouse_y, tab_bar_h)
+            .map(|(row, col, _, _)| (row, col))
     }
 
     /// Resolve `(mouse_x, mouse_y)` into `(row, col)` clamped to the active pane's bounds,
@@ -969,6 +1008,29 @@ impl TerminalSession {
     }
 }
 
+/// Compute 0-based physical pixel coordinates `(px_x, px_y)` relative to a pane's terminal
+/// content origin `(rect.x + pad_x, rect.y + pad_y)`, clamped to the pane's active cell grid
+/// pixel dimensions `[0, cols * cell_w - 1]` × `[0, rows * cell_h - 1]` for DEC Mode `?1016`
+/// (SGR-Pixels) mouse reporting.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_pane_pixel_coords(
+    mouse_x: f32,
+    mouse_y: f32,
+    rect: Rect,
+    pad_x: f32,
+    pad_y: f32,
+    cell_w: f32,
+    cell_h: f32,
+    cols: usize,
+    rows: usize,
+) -> (usize, usize) {
+    let max_px_x = ((cols.max(1) as f32) * cell_w.max(1.0)).round().max(1.0) as usize - 1;
+    let max_px_y = ((rows.max(1) as f32) * cell_h.max(1.0)).round().max(1.0) as usize - 1;
+    let px_x = ((mouse_x - rect.x - pad_x).max(0.0).floor() as usize).min(max_px_x);
+    let px_y = ((mouse_y - rect.y - pad_y).max(0.0).floor() as usize).min(max_px_y);
+    (px_x, px_y)
+}
+
 /// Deliver a non-blocking native OS desktop notification using safe positional argv passing
 /// (immune to AppleScript / shell injection).
 fn dispatch_os_notification(title: String, body: String) {
@@ -1008,4 +1070,34 @@ fn dispatch_os_notification(title: String, body: String) {
                 let _ = (title, body);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_pane_pixel_coords_uses_content_origin_and_clamps() {
+        let rect = Rect::new(100.0, 50.0, 740.0, 460.0);
+        // Content origin is (100 + 10, 50 + 8) = (110, 58); 80x24 cells of 9x18 => 720x432 px (max 719, 431)
+        assert_eq!(
+            compute_pane_pixel_coords(110.0, 58.0, rect, 10.0, 8.0, 9.0, 18.0, 80, 24),
+            (0, 0)
+        );
+        // Inside left/top padding clamps to (0, 0)
+        assert_eq!(
+            compute_pane_pixel_coords(102.0, 52.0, rect, 10.0, 8.0, 9.0, 18.0, 80, 24),
+            (0, 0)
+        );
+        // Arbitrary interior point
+        assert_eq!(
+            compute_pane_pixel_coords(235.7, 158.9, rect, 10.0, 8.0, 9.0, 18.0, 80, 24),
+            (125, 100)
+        );
+        // Beyond bottom-right edge clamps to (719, 431)
+        assert_eq!(
+            compute_pane_pixel_coords(999.0, 999.0, rect, 10.0, 8.0, 9.0, 18.0, 80, 24),
+            (719, 431)
+        );
+    }
 }

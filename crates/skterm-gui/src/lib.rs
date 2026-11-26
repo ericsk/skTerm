@@ -19,7 +19,9 @@ pub mod updater;
 
 pub use app::{
     build_context_menu_for_locale, build_top_dropdown_menu, build_top_dropdown_menu_for_locale,
-    hit_test_dropdown_menu, is_rect_visible_on_monitors, App, NativeMenuAction, TopMenuAction,
+    compute_pane_pixel_coords, extract_core_theme_colors, hit_test_dropdown_menu,
+    is_rect_visible_on_monitors, relative_luminance, App, CoreThemeColors, NativeMenuAction,
+    TopMenuAction,
 };
 pub use config::{default_config_template, parse_hex_color, Config, ConfigManager, Theme};
 pub use i18n::{current_locale, set_locale, strings, tr, I18nStrings, Locale};
@@ -29,9 +31,9 @@ pub use input::{
     encode_key_event_with_full_modes, encode_key_event_with_modes, encode_key_input,
     encode_key_with_modes, encode_mouse_button, encode_mouse_motion, encode_mouse_wheel_step,
     is_tab_switch_modifier, is_tab_switch_modifier_for_os, mouse_modifier_bits,
-    parse_tab_switch_digit, KeyInput, KeyModifierFlags, KITTY_FLAG_DISAMBIGUATE,
-    KITTY_FLAG_REPORT_ALL_KEYS, KITTY_FLAG_REPORT_ALTERNATE, KITTY_FLAG_REPORT_EVENTS,
-    KITTY_FLAG_REPORT_TEXT,
+    parse_tab_switch_digit, resolve_mouse_report_coords, KeyInput, KeyModifierFlags,
+    KITTY_FLAG_DISAMBIGUATE, KITTY_FLAG_REPORT_ALL_KEYS, KITTY_FLAG_REPORT_ALTERNATE,
+    KITTY_FLAG_REPORT_EVENTS, KITTY_FLAG_REPORT_TEXT,
 };
 pub use layout::{
     PaneId, PaneNode, PollOutcome, Rect, SplitDirection, SplitterBar, Tab, TabId, Workspace,

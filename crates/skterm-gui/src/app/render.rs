@@ -153,10 +153,23 @@ impl App {
                 session.renderer.scale_factor,
             );
 
+            #[cfg(target_os = "macos")]
+            let is_link_modifier = self.modifiers.super_key();
+            #[cfg(not(target_os = "macos"))]
+            let is_link_modifier = self.modifiers.control_key();
+
             let mut render_panes = Vec::new();
+            let mut hovered_pane_link: Option<(usize, u32)> = None;
             if let Some(active_tab) = session.workspace.active_tab() {
                 for (id, rect) in &pane_rects {
                     if let Some(t) = active_tab.root.find_terminal(*id) {
+                        if is_link_modifier {
+                            if let Some((hover_pid, link_id)) = session.hovered_hyperlink {
+                                if hover_pid == *id {
+                                    hovered_pane_link = Some((render_panes.len(), link_id));
+                                }
+                            }
+                        }
                         let is_focused = *id == active_tab.active_pane_id;
                         let is_scrollbar_hovered = session.hovered_scrollbar_pane == Some(*id);
                         let is_scrollbar_dragging = session
@@ -216,6 +229,13 @@ impl App {
                         });
                     }
                 }
+            }
+
+            session.renderer.clear_hovered_hyperlinks();
+            if let Some((pane_idx, link_id)) = hovered_pane_link {
+                session
+                    .renderer
+                    .set_hovered_hyperlink(pane_idx, Some(link_id));
             }
 
             let toast_pair = session
@@ -289,6 +309,9 @@ impl App {
                                 t.grid_mut().clear_dirty();
                             }
                         }
+                    }
+                    if session.renderer.needs_redraw_for_atlas_reset() {
+                        session.request_redraw();
                     }
                 }
                 Ok(RenderSurfaceOutcome::Reconfigured) | Ok(RenderSurfaceOutcome::Timeout) => {

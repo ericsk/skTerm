@@ -9,10 +9,12 @@ use super::menu::{
 };
 use super::session::ScrollbarDragState;
 use super::App;
-use crate::input::{encode_mouse_button, encode_mouse_motion, encode_mouse_wheel_step};
+use crate::input::{
+    encode_mouse_button, encode_mouse_motion, encode_mouse_wheel_step, resolve_mouse_report_coords,
+};
 use crate::layout::SplitDirection;
 use skterm_core::vt::MouseProtocol;
-use skterm_core::{Selection, SelectionMode};
+use skterm_core::{Selection, SelectionMode, PLACEHOLDER_META_TAG};
 use skterm_render::{AgentPanelHit, AgentPanelLayout, ScrollbarMetrics, TopRightButtons};
 use std::time::Instant;
 use tracing::{error, info};
@@ -22,6 +24,23 @@ use winit::dpi::{LogicalPosition, LogicalSize, Position, Size};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{CursorIcon, WindowId};
+
+/// Extract the explicit OSC 8 hyperlink ID at visible `(row, col)` of `term`,
+/// excluding Kitty Unicode placeholder metadata cells (which tag bit 31).
+pub(crate) fn osc8_hyperlink_id_at(
+    term: &skterm_core::Terminal,
+    row: usize,
+    col: usize,
+) -> Option<u32> {
+    let grid = term.grid();
+    let cell = grid.active().get_visible_row(row)?.cells.get(col)?;
+    let hid = cell.hyperlink_id?;
+    if (hid.get() & PLACEHOLDER_META_TAG) != 0 {
+        return None;
+    }
+    grid.get_hyperlink(hid)?;
+    Some(hid.get())
+}
 
 /// Open a URL using the default system browser in a cross-platform manner.
 pub fn open_url_in_browser(url: &str) -> anyhow::Result<()> {
@@ -202,22 +221,27 @@ impl App {
 
             // 1.5 Handling Mouse Drag Motion Reporting (?1002 ButtonEvent / ?1003 AnyEvent)
             if let Some((pane_id, reported_btn)) = session.mouse_reported_button {
-                if let Some((row, col)) = session.get_pane_cell_clamped(pane_id, mx, my, tab_bar_h)
+                if let Some((row, col, px_x, px_y)) =
+                    session.get_pane_cell_and_pixel_clamped(pane_id, mx, my, tab_bar_h)
                 {
-                    if session.last_mouse_motion_cell != Some((pane_id, col, row)) {
-                        if let Some(tab) = session.workspace.active_tab_mut() {
-                            if let Some(term) = tab.root.find_terminal_mut(pane_id) {
-                                let proto = term.state.mouse_protocol;
-                                let fmt = term.state.mouse_format;
+                    if let Some(tab) = session.workspace.active_tab_mut() {
+                        if let Some(term) = tab.root.find_terminal_mut(pane_id) {
+                            let proto = term.state.mouse_protocol;
+                            let fmt = term.state.mouse_format;
+                            let (report_y, report_x) =
+                                resolve_mouse_report_coords(fmt, row, col, px_x, px_y);
+                            if session.last_mouse_motion_cell != Some((pane_id, report_x, report_y))
+                            {
                                 if let Some(bytes) = encode_mouse_motion(
                                     Some(reported_btn),
-                                    row,
-                                    col,
+                                    report_y,
+                                    report_x,
                                     self.modifiers,
                                     proto,
                                     fmt,
                                 ) {
-                                    session.last_mouse_motion_cell = Some((pane_id, col, row));
+                                    session.last_mouse_motion_cell =
+                                        Some((pane_id, report_x, report_y));
                                     let _ = term.write_to_pty(&bytes);
                                 }
                             }
@@ -245,6 +269,11 @@ impl App {
                 }
             } else {
                 if over_ai || over_prefs {
+                    if session.hovered_hyperlink.take().is_some()
+                        | session.hovered_url.take().is_some()
+                    {
+                        session.window.request_redraw();
+                    }
                     session.window.set_cursor(CursorIcon::Pointer);
                     return;
                 }
@@ -306,6 +335,11 @@ impl App {
                 }
 
                 if session.hovered_scrollbar_pane.is_some() {
+                    if session.hovered_hyperlink.take().is_some()
+                        | session.hovered_url.take().is_some()
+                    {
+                        session.window.request_redraw();
+                    }
                     session.window.set_cursor(CursorIcon::Default);
                     return;
                 }
@@ -337,39 +371,61 @@ impl App {
 
                 if !is_over_splitter {
                     // Check hyperlink, OSC 22 pointer shape, and ?1003 AnyEvent hover motion under cursor
-                    let cell_hit = session.get_pane_and_cell_at(mx, my, tab_bar_h);
-                    let (detected_url, pane_pointer) = if let Some((pane_id, row, col)) = cell_hit {
-                        if let Some(tab) = session.workspace.active_tab_mut() {
-                            if let Some(t) = tab.root.find_terminal_mut(pane_id) {
-                                if !self.modifiers.shift_key()
-                                    && t.state.mouse_protocol == MouseProtocol::AnyEvent
-                                    && session.last_mouse_motion_cell != Some((pane_id, col, row))
-                                {
-                                    if let Some(bytes) = encode_mouse_motion(
-                                        None,
-                                        row,
-                                        col,
-                                        self.modifiers,
-                                        MouseProtocol::AnyEvent,
-                                        t.state.mouse_format,
-                                    ) {
-                                        session.last_mouse_motion_cell = Some((pane_id, col, row));
-                                        let _ = t.write_to_pty(&bytes);
+                    let cell_hit = session.get_pane_hit_with_pixels(mx, my, tab_bar_h);
+                    let (detected_url, detected_hyperlink, pane_pointer) =
+                        if let Some((pane_id, row, col, px_x, px_y)) = cell_hit {
+                            if let Some(tab) = session.workspace.active_tab_mut() {
+                                if let Some(t) = tab.root.find_terminal_mut(pane_id) {
+                                    if !self.modifiers.shift_key()
+                                        && t.state.mouse_protocol == MouseProtocol::AnyEvent
+                                    {
+                                        let fmt = t.state.mouse_format;
+                                        let (report_y, report_x) =
+                                            resolve_mouse_report_coords(fmt, row, col, px_x, px_y);
+                                        if session.last_mouse_motion_cell
+                                            != Some((pane_id, report_x, report_y))
+                                        {
+                                            if let Some(bytes) = encode_mouse_motion(
+                                                None,
+                                                report_y,
+                                                report_x,
+                                                self.modifiers,
+                                                MouseProtocol::AnyEvent,
+                                                fmt,
+                                            ) {
+                                                session.last_mouse_motion_cell =
+                                                    Some((pane_id, report_x, report_y));
+                                                let _ = t.write_to_pty(&bytes);
+                                            }
+                                        }
                                     }
+                                    (
+                                        t.url_at(row, col),
+                                        osc8_hyperlink_id_at(t, row, col).map(|id| (pane_id, id)),
+                                        t.state.active_pointer_shape(),
+                                    )
+                                } else {
+                                    (None, None, skterm_core::PointerShape::Default)
                                 }
-                                (t.url_at(row, col), t.state.active_pointer_shape())
                             } else {
-                                (None, skterm_core::PointerShape::Default)
+                                (None, None, skterm_core::PointerShape::Default)
                             }
                         } else {
-                            (None, skterm_core::PointerShape::Default)
-                        }
-                    } else {
-                        (None, skterm_core::PointerShape::Default)
-                    };
+                            (None, None, skterm_core::PointerShape::Default)
+                        };
 
+                    let mut hover_changed = false;
                     if session.hovered_url != detected_url {
                         session.hovered_url = detected_url;
+                        hover_changed = true;
+                    }
+                    if session.hovered_hyperlink != detected_hyperlink {
+                        session.hovered_hyperlink = detected_hyperlink;
+                        if is_link_modifier {
+                            hover_changed = true;
+                        }
+                    }
+                    if hover_changed {
                         session.window.request_redraw();
                     }
 
@@ -380,6 +436,11 @@ impl App {
                         apply_pointer_shape(&session.window, pane_pointer);
                     }
                 } else {
+                    if session.hovered_hyperlink.take().is_some()
+                        | session.hovered_url.take().is_some()
+                    {
+                        session.window.request_redraw();
+                    }
                     session.window.set_cursor_visible(true);
                 }
             }
@@ -915,22 +976,27 @@ impl App {
                     if pressed_btn == button {
                         session.mouse_reported_button = None;
                         session.last_mouse_motion_cell = None;
-                        let cell = session
-                            .get_pane_and_cell_at(mx, my, tab_bar_h)
-                            .filter(|(pid, _, _)| *pid == pane_id)
-                            .map(|(_, r, c)| (r, c))
-                            .or_else(|| session.get_pane_cell_clamped(pane_id, mx, my, tab_bar_h));
-                        if let Some((row, col)) = cell {
+                        let hit = session
+                            .get_pane_hit_with_pixels(mx, my, tab_bar_h)
+                            .filter(|(pid, _, _, _, _)| *pid == pane_id)
+                            .map(|(_, r, c, px, py)| (r, c, px, py))
+                            .or_else(|| {
+                                session.get_pane_cell_and_pixel_clamped(pane_id, mx, my, tab_bar_h)
+                            });
+                        if let Some((row, col, px_x, px_y)) = hit {
                             if let Some(tab) = session.workspace.active_tab_mut() {
                                 if let Some(term) = tab.root.find_terminal_mut(pane_id) {
+                                    let fmt = term.state.mouse_format;
+                                    let (report_y, report_x) =
+                                        resolve_mouse_report_coords(fmt, row, col, px_x, px_y);
                                     if let Some(bytes) = encode_mouse_button(
                                         button,
                                         false,
-                                        row,
-                                        col,
+                                        report_y,
+                                        report_x,
                                         self.modifiers,
                                         term.state.mouse_protocol,
-                                        term.state.mouse_format,
+                                        fmt,
                                     ) {
                                         let _ = term.write_to_pty(&bytes);
                                     }
@@ -1083,8 +1149,8 @@ impl App {
                     // 2.7 Terminal Mouse Protocol Press (?9 / ?1000 / ?1002 / ?1003).
                     // Holding Shift bypasses mouse reporting so local text selection stays reachable.
                     if !self.modifiers.shift_key() {
-                        if let Some((pane_id, row, col)) =
-                            session.get_pane_and_cell_at(mx, my, tab_bar_h)
+                        if let Some((pane_id, row, col, px_x, px_y)) =
+                            session.get_pane_hit_with_pixels(mx, my, tab_bar_h)
                         {
                             let mut handled_by_protocol = false;
                             if let Some(tab) = session.workspace.active_tab_mut() {
@@ -1092,11 +1158,13 @@ impl App {
                                     let proto = term.state.mouse_protocol;
                                     let fmt = term.state.mouse_format;
                                     if proto != MouseProtocol::None {
+                                        let (report_y, report_x) =
+                                            resolve_mouse_report_coords(fmt, row, col, px_x, px_y);
                                         if let Some(bytes) = encode_mouse_button(
                                             MouseButton::Left,
                                             true,
-                                            row,
-                                            col,
+                                            report_y,
+                                            report_x,
                                             self.modifiers,
                                             proto,
                                             fmt,
@@ -1108,7 +1176,7 @@ impl App {
                                                 session.mouse_reported_button =
                                                     Some((pane_id, MouseButton::Left));
                                                 session.last_mouse_motion_cell =
-                                                    Some((pane_id, col, row));
+                                                    Some((pane_id, report_x, report_y));
                                             }
                                             handled_by_protocol = true;
                                         }
@@ -1207,8 +1275,8 @@ impl App {
                 // Forward non-left buttons to terminal mouse protocol (?9/?1000/?1002/?1003)
                 // unless Shift is held (Shift acts as local override for context menu / paste).
                 if !self.modifiers.shift_key() {
-                    if let Some((pane_id, row, col)) =
-                        session.get_pane_and_cell_at(mx, my, tab_bar_h)
+                    if let Some((pane_id, row, col, px_x, px_y)) =
+                        session.get_pane_hit_with_pixels(mx, my, tab_bar_h)
                     {
                         let mut handled_by_protocol = false;
                         if let Some(tab) = session.workspace.active_tab_mut() {
@@ -1217,11 +1285,13 @@ impl App {
                                 let fmt = term.state.mouse_format;
                                 if proto != MouseProtocol::None {
                                     tab.active_pane_id = pane_id;
+                                    let (report_y, report_x) =
+                                        resolve_mouse_report_coords(fmt, row, col, px_x, px_y);
                                     if let Some(bytes) = encode_mouse_button(
                                         button,
                                         true,
-                                        row,
-                                        col,
+                                        report_y,
+                                        report_x,
                                         self.modifiers,
                                         proto,
                                         fmt,
@@ -1230,7 +1300,7 @@ impl App {
                                         if proto != MouseProtocol::X10 {
                                             session.mouse_reported_button = Some((pane_id, button));
                                             session.last_mouse_motion_cell =
-                                                Some((pane_id, col, row));
+                                                Some((pane_id, report_x, report_y));
                                         }
                                         handled_by_protocol = true;
                                     }
@@ -1309,49 +1379,72 @@ impl App {
 
             if lines_x != 0 || lines_y != 0 {
                 let (mx, my) = session.mouse_pos;
-                let hovered = session.get_pane_and_cell_at(mx, my, tab_bar_h);
-                let (row, col) = hovered.map(|(_, r, c)| (r, c)).unwrap_or((0, 0));
+                let hovered = session.get_pane_hit_with_pixels(mx, my, tab_bar_h);
+                let active_pane_id = session.workspace.active_tab().map(|t| t.active_pane_id);
+                let (target_pane, row, col, px_x, px_y) = match hovered {
+                    Some((pid, r, c, px, py)) => (pid, r, c, px, py),
+                    None => {
+                        let pid = active_pane_id.unwrap_or(0);
+                        let (r, c, px, py) = session
+                            .get_pane_cell_and_pixel_clamped(pid, mx, my, tab_bar_h)
+                            .unwrap_or((0, 0, 0, 0));
+                        (pid, r, c, px, py)
+                    }
+                };
 
                 if let Some(tab) = session.workspace.active_tab_mut() {
-                    let target_pane = hovered.map(|(pid, _, _)| pid).unwrap_or(tab.active_pane_id);
                     if let Some(terminal) = tab.root.find_terminal_mut(target_pane) {
                         if terminal.state.mouse_protocol != MouseProtocol::None {
                             let fmt = terminal.state.mouse_format;
+                            let (report_y, report_x) =
+                                resolve_mouse_report_coords(fmt, row, col, px_x, px_y);
                             let mut payload = Vec::new();
                             if lines_y != 0 {
                                 let button = if lines_y > 0 { 64 } else { 65 };
-                                let step =
-                                    encode_mouse_wheel_step(button, row, col, self.modifiers, fmt);
+                                let step = encode_mouse_wheel_step(
+                                    button,
+                                    report_y,
+                                    report_x,
+                                    self.modifiers,
+                                    fmt,
+                                );
                                 for _ in 0..lines_y.unsigned_abs() {
                                     payload.extend_from_slice(&step);
                                 }
                             }
                             if lines_x != 0 {
                                 let button = if lines_x > 0 { 66 } else { 67 };
-                                let step =
-                                    encode_mouse_wheel_step(button, row, col, self.modifiers, fmt);
+                                let step = encode_mouse_wheel_step(
+                                    button,
+                                    report_y,
+                                    report_x,
+                                    self.modifiers,
+                                    fmt,
+                                );
                                 for _ in 0..lines_x.unsigned_abs() {
                                     payload.extend_from_slice(&step);
                                 }
                             }
                             let _ = terminal.write_to_pty(&payload);
                         } else if lines_y != 0 && terminal.grid().is_alternate {
-                            let seq: &[u8] = if lines_y > 0 {
-                                if terminal.state.application_cursor_keys {
-                                    b"\x1bOA"
+                            if terminal.state.alternate_scroll {
+                                let seq: &[u8] = if lines_y > 0 {
+                                    if terminal.state.application_cursor_keys {
+                                        b"\x1bOA"
+                                    } else {
+                                        b"\x1b[A"
+                                    }
+                                } else if terminal.state.application_cursor_keys {
+                                    b"\x1bOB"
                                 } else {
-                                    b"\x1b[A"
+                                    b"\x1b[B"
+                                };
+                                let mut payload = Vec::new();
+                                for _ in 0..lines_y.unsigned_abs() {
+                                    payload.extend_from_slice(seq);
                                 }
-                            } else if terminal.state.application_cursor_keys {
-                                b"\x1bOB"
-                            } else {
-                                b"\x1b[B"
-                            };
-                            let mut payload = Vec::new();
-                            for _ in 0..lines_y.unsigned_abs() {
-                                payload.extend_from_slice(seq);
+                                let _ = terminal.write_to_pty(&payload);
                             }
-                            let _ = terminal.write_to_pty(&payload);
                         } else if lines_y != 0 {
                             terminal
                                 .grid_mut()
@@ -1408,4 +1501,24 @@ pub(crate) fn apply_pointer_shape(
         PointerShape::None => CursorIcon::Default,
     };
     window.set_cursor(icon);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn osc8_hyperlink_id_at_returns_real_link_and_excludes_kitty_placeholder() {
+        let mut term = skterm_core::Terminal::new_headless(4, 30, 10);
+        // Real OSC 8 hyperlink on cells 0..4
+        term.feed_bytes(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ plain");
+        let link_id = osc8_hyperlink_id_at(&term, 0, 0);
+        assert!(link_id.is_some());
+        assert_eq!(osc8_hyperlink_id_at(&term, 0, 3), link_id);
+        assert_eq!(osc8_hyperlink_id_at(&term, 0, 5), None);
+
+        // Kitty Unicode placeholder cell (U+10EEEE sets bit 31 PLACEHOLDER_META_TAG in hyperlink_id)
+        term.feed_bytes("\r\n\u{10EEEE}".as_bytes());
+        assert_eq!(osc8_hyperlink_id_at(&term, 1, 0), None);
+    }
 }

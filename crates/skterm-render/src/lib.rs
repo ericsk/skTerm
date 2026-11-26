@@ -14,12 +14,13 @@ pub use atlas::{
 };
 pub use pipeline::{color_to_rgba, BgInstance, GlyphInstance, TerminalPipeline};
 pub use renderer::{
-    char_display_cells, classify_image_z_layer, clip_image_quad_to_bounds, color_to_rgba_themed,
-    color_to_rgba_with_dynamic_palette, contrast_cursor_fg, for_each_ellipsized_glyph,
-    partition_image_z_layers, text_display_cells, wide_cell_center_offset, AgentPanelState,
-    AgentSidebarItem, AgentStatus, ImageZLayer, PaneRenderItem, PreeditOverlayLayout,
-    RenderSurfaceOutcome, RenderTheme, ScrollbarMetrics, TabItem, TermRenderer, TopDropdownMenu,
-    TopDropdownMenuItem, TopRightButtons, KITTY_Z_BELOW_BG_THRESHOLD,
+    cell_span_center_offset, cell_target_cells, char_display_cells, classify_image_z_layer,
+    clip_image_quad_to_bounds, color_to_rgba_themed, color_to_rgba_with_dynamic_palette,
+    contrast_cursor_fg, for_each_ellipsized_glyph, partition_image_z_layers, text_display_cells,
+    wide_cell_center_offset, AgentPanelState, AgentSidebarItem, AgentStatus, ImageZLayer,
+    PaneRenderItem, PreeditOverlayLayout, RenderSurfaceOutcome, RenderTheme, ScrollbarMetrics,
+    TabItem, TermRenderer, TopDropdownMenu, TopDropdownMenuItem, TopRightButtons,
+    KITTY_Z_BELOW_BG_THRESHOLD,
 };
 
 /// skterm-render version and basic info
@@ -420,5 +421,40 @@ mod tests {
             contrast_cursor_fg([1.0, 0.95, 0.2, 1.0], [0.98, 0.98, 0.98, 1.0]),
             [0.0, 0.0, 0.0, 1.0]
         );
+    }
+
+    #[test]
+    fn test_grapheme_cell_render_target_width_and_centering() {
+        let mut term = skterm_core::Terminal::new_headless(4, 20, 10);
+        // Feed NFD combining mark, VS16-promoted emoji, Regional Indicator flag, ZWJ emoji, and VS15-narrowed emoji
+        term.feed_bytes(
+            "e\u{0301}\u{2764}\u{FE0F}\u{1F1FA}\u{1F1F8}\u{1F468}\u{200D}\u{1F4BB}\u{231A}\u{FE0E}"
+                .as_bytes(),
+        );
+
+        let row = term.grid().active().get_visible_row(0).unwrap();
+
+        // col 0: NFD 'e' + U+0301 -> 1 cell
+        assert_eq!(row.cell_grapheme(0), Some("e\u{0301}"));
+        assert_eq!(cell_target_cells(row.cells[0].flags), 1);
+        assert_eq!(cell_span_center_offset(1, 9.0, 9.0), 0.0);
+
+        // col 1..2: Heart + VS16 -> promoted to 2 cells
+        assert_eq!(row.cell_grapheme(1), Some("\u{2764}\u{FE0F}"));
+        assert_eq!(cell_target_cells(row.cells[1].flags), 2);
+        assert_eq!(cell_span_center_offset(2, 12.0, 9.0), 3.0);
+
+        // col 3..4: Flag US -> 2 cells
+        assert_eq!(row.cell_grapheme(3), Some("\u{1F1FA}\u{1F1F8}"));
+        assert_eq!(cell_target_cells(row.cells[3].flags), 2);
+
+        // col 5..6: ZWJ Technologist -> 2 cells
+        assert_eq!(row.cell_grapheme(5), Some("\u{1F468}\u{200D}\u{1F4BB}"));
+        assert_eq!(cell_target_cells(row.cells[5].flags), 2);
+
+        // col 7: Watch + VS15 -> narrowed to 1 cell, must NOT center across 2 cells
+        assert_eq!(row.cell_grapheme(7), Some("\u{231A}\u{FE0E}"));
+        assert_eq!(cell_target_cells(row.cells[7].flags), 1);
+        assert_eq!(cell_span_center_offset(1, 9.0, 9.0), 0.0);
     }
 }

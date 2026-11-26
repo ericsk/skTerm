@@ -147,20 +147,36 @@ pub fn text_display_cells(text: &str) -> usize {
     text.chars().map(char_display_cells).sum()
 }
 
+/// Resolve the terminal grid cell span (`1` or `2`) occupied by a cell for glyph rasterization.
+#[inline]
+pub fn cell_target_cells(flags: CellFlags) -> usize {
+    if flags.contains(CellFlags::WIDE_CHAR) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Horizontal pixel offset to center a multi-cell wide glyph's typographic advance box
+/// inside its allocated `target_cells * cell_w` terminal grid span.
+#[inline]
+pub fn cell_span_center_offset(target_cells: usize, glyph_advance: f32, cell_w: f32) -> f32 {
+    if target_cells > 1 && glyph_advance > 0.0 {
+        let span_w = target_cells as f32 * cell_w;
+        if glyph_advance < span_w {
+            return ((span_w - glyph_advance) * 0.5).round();
+        }
+    }
+    0.0
+}
+
 /// Horizontal pixel offset to center a multi-cell wide glyph's typographic advance box
 /// inside its allocated `cells * cell_w` terminal grid span (e.g. centering a `1.0em` CJK
 /// glyph inside a `2 * cell_w` = `1.25em` monospace double-cell), while leaving all
 /// single-cell glyphs (ASCII, Nerd Font icons, Powerline triangles) untouched at `0.0`.
 #[inline]
 pub fn wide_cell_center_offset(c: char, glyph_advance: f32, cell_w: f32) -> f32 {
-    let cells = char_display_cells(c);
-    if cells > 1 && glyph_advance > 0.0 {
-        let span_w = cells as f32 * cell_w;
-        if glyph_advance < span_w {
-            return ((span_w - glyph_advance) * 0.5).round();
-        }
-    }
-    0.0
+    cell_span_center_offset(char_display_cells(c), glyph_advance, cell_w)
 }
 
 /// Lay out `text` inside `[x, x + max_w]` using per-glyph `(advance_px, payload)` from
@@ -2605,8 +2621,11 @@ impl TermRenderer {
                                 r_idx == cr && (c_idx == cc || (wide && c_idx == cc + 1))
                             });
 
+                        let grapheme = row.cell_grapheme(c_idx);
+
                         // Fast-path: Skip default empty blank cells (typically 80-90% of screen).
                         if cell.c == ' '
+                            && grapheme.is_none()
                             && cell.bg == Color::DefaultBg
                             && !cell.flags.intersects(
                                 CellFlags::INVERSE
@@ -2997,7 +3016,7 @@ impl TermRenderer {
                             continue;
                         }
 
-                        if cell.c != ' '
+                        if (cell.c != ' ' || grapheme.is_some())
                             && cell.c != '\0'
                             && !cell
                                 .flags
@@ -3005,29 +3024,27 @@ impl TermRenderer {
                         {
                             // Tier 5: Procedural gap-free rendering for Block Elements, Box Drawing,
                             // Braille Patterns, and Legacy Computing Sextants (above z < 0 images)
-                            if draw_custom_block_or_box_char(
-                                cell.c,
-                                x,
-                                y,
-                                cell_w,
-                                cell_h,
-                                fg_rgba,
-                                &mut bg_tier5_decor,
-                            ) {
+                            if grapheme.is_none()
+                                && draw_custom_block_or_box_char(
+                                    cell.c,
+                                    x,
+                                    y,
+                                    cell_w,
+                                    cell_h,
+                                    fg_rgba,
+                                    &mut bg_tier5_decor,
+                                )
+                            {
                                 continue;
                             }
 
                             let is_bold = cell.flags.contains(CellFlags::BOLD);
                             let is_italic = cell.flags.contains(CellFlags::ITALIC);
-                            let target_cells = if cell.flags.contains(CellFlags::WIDE_CHAR) {
-                                2
-                            } else {
-                                1
-                            };
+                            let target_cells = cell_target_cells(cell.flags);
 
                             if let Some(glyph_info) = self.lookup_cell_glyph(
                                 cell.c,
-                                None,
+                                grapheme,
                                 is_bold,
                                 is_italic,
                                 target_cells,
@@ -3035,6 +3052,12 @@ impl TermRenderer {
                                 if glyph_info.size[0] > 0.0 && glyph_info.size[1] > 0.0 {
                                     let wide_pad_x = if glyph_info.is_color {
                                         0.0
+                                    } else if grapheme.is_some() {
+                                        cell_span_center_offset(
+                                            target_cells,
+                                            glyph_info.advance,
+                                            cell_w,
+                                        )
                                     } else {
                                         wide_cell_center_offset(cell.c, glyph_info.advance, cell_w)
                                     };

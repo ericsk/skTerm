@@ -117,6 +117,30 @@ impl App {
                 }
             }
 
+            // Advance active Kitty Graphics animations across visible panes when not occluded
+            // and fold the earliest upcoming frame deadline into `ControlFlow::WaitUntil`.
+            if !session.is_occluded {
+                if let Some(tab) = session.workspace.active_tab_mut() {
+                    let (anim_dirty, anim_next) = tab.tick_visible_animations(now);
+                    if anim_dirty {
+                        session.request_output_redraw();
+                    }
+                    if let Some(due) = anim_next {
+                        arm(due);
+                    }
+                }
+            }
+
+            // Expire stale `OSC 9;4` progress bars after 15s and schedule wake for active bars.
+            let (progress_cleared, next_progress_deadline) =
+                session.workspace.poll_progress_timeouts(now);
+            if progress_cleared {
+                session.request_redraw();
+            }
+            if let Some(due) = next_progress_deadline {
+                arm(due);
+            }
+
             // Whatever held a frame back -- this poll or the `PtyWakeup` arm --
             // the deferred frame is owed a deadline, or output stopping mid-burst
             // would leave the last chunk undrawn.

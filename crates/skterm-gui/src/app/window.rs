@@ -292,6 +292,14 @@ impl App {
 
         let render_theme = self.build_render_theme();
         renderer.set_theme(render_theme);
+        let core_colors = super::theme::extract_core_theme_colors(&render_theme);
+        workspace.apply_theme_colors(
+            core_colors.fg,
+            core_colors.bg,
+            core_colors.cursor,
+            core_colors.palette_16,
+            core_colors.is_dark,
+        );
 
         let tab_bar_h = super::compute_tab_bar_height(
             &self.config_manager.current_config.window.tab_bar_style,
@@ -328,6 +336,7 @@ impl App {
             hovered_scrollbar_pane: None,
             last_scroll_time: None,
             hovered_url: None,
+            hovered_hyperlink: None,
             scroll_pixel_accumulator: 0.0,
             scroll_pixel_accumulator_x: 0.0,
             mouse_reported_button: None,
@@ -598,6 +607,9 @@ impl App {
                         .unwrap_or(skterm_core::PointerShape::Default);
                     super::input_mouse::apply_pointer_shape(&session.window, pane_pointer);
                 }
+            }
+            if session.hovered_hyperlink.is_some() {
+                session.window.request_redraw();
             }
         }
     }
