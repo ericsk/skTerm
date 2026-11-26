@@ -197,8 +197,8 @@ impl PtyProcess {
         let term_name = options.term.unwrap_or_else(|| "xterm-256color".to_string());
         cmd.env("TERM", term_name);
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", "skTerm");
-        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        cmd.env("TERM_PROGRAM", "ghostty");
+        cmd.env("TERM_PROGRAM_VERSION", "1.2.0");
         for (k, v) in extra_integration_envs {
             cmd.env(k, v);
         }

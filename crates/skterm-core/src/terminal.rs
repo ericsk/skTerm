@@ -500,9 +500,81 @@ impl Terminal {
         }
         if let Some(pty) = &self.pty {
             pty.resize_with_pixels(rows as u16, cols as u16, pixel_w, pixel_h)?;
-            self.last_pty_pixels = (pixel_w, pixel_h);
+        }
+        self.last_pty_pixels = (pixel_w, pixel_h);
+        if self.state.in_band_resize {
+            let report = format!("\x1b[48;{rows};{cols};{pixel_h};{pixel_w}t");
+            self.send_terminal_event(report.as_bytes());
         }
         Ok(())
+    }
+
+    /// Write an unsolicited terminal event report (e.g. `?2031` color scheme change, `?2048` resize)
+    /// directly to the PTY when live, or append to `pending_responses` in headless mode.
+    fn send_terminal_event(&mut self, bytes: &[u8]) {
+        if let Some(pty) = &self.pty {
+            let _ = pty.write_all(bytes);
+        } else {
+            self.state.pending_responses.extend_from_slice(bytes);
+        }
+    }
+
+    /// Update the OS/theme dark-vs-light color scheme state (`?2031` / `CSI ? 996 n`).
+    /// When DEC Mode `?2031` is enabled and the scheme changed, immediately notifies the PTY
+    /// with `\x1b[?997;1n` (dark) or `\x1b[?997;2n` (light).
+    pub fn set_color_scheme(&mut self, is_dark: bool) {
+        let changed = self.state.color_scheme_dark != is_dark;
+        self.state.color_scheme_dark = is_dark;
+        if changed && self.state.color_scheme_updates {
+            let seq: &[u8] = if is_dark {
+                b"\x1b[?997;1n"
+            } else {
+                b"\x1b[?997;2n"
+            };
+            self.send_terminal_event(seq);
+        }
+    }
+
+    /// Sync the active GUI theme's default foreground, background, cursor, and 16-color ANSI
+    /// palette into terminal state so `OSC 4/10/11/12/21;?` queries return accurate theme RGBs.
+    pub fn set_default_colors(
+        &mut self,
+        fg: [u8; 3],
+        bg: [u8; 3],
+        cursor: [u8; 3],
+        palette_16: [[u8; 3]; 16],
+    ) {
+        self.state.default_fg = fg;
+        self.state.default_bg = bg;
+        self.state.default_cursor = cursor;
+        self.state.default_palette = palette_16;
+    }
+
+    /// Clear a stale `OSC 9;4` progress bar if it has not been updated for 15 seconds.
+    /// Returns `true` if stale progress was cleared.
+    pub fn poll_progress_timeout(&mut self, now: std::time::Instant) -> bool {
+        const PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        if self.state.progress.is_none() {
+            self.state.progress_updated_at = None;
+            return false;
+        }
+        if let Some(updated_at) = self.state.progress_updated_at {
+            if now.saturating_duration_since(updated_at) >= PROGRESS_TIMEOUT {
+                self.state.progress = None;
+                self.state.progress_updated_at = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Advance any active Kitty Graphics animations due at or before `now`.
+    /// Returns `(any_frame_changed, next_animation_deadline)`.
+    pub fn tick_animations(
+        &mut self,
+        now: std::time::Instant,
+    ) -> (bool, Option<std::time::Instant>) {
+        self.state.tick_animations(now)
     }
 
     /// Immutable reference to the underlying ScreenGrid.

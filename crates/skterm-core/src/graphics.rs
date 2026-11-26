@@ -203,14 +203,11 @@ impl GraphicImage {
                 [off_x, off_y, w, h]
             }
             (Some(c), Some(r)) => {
+                // Per the Kitty Graphics Protocol specification, specifying both `c=` and `r=`
+                // stretches the image to fill the requested `c x r` cell box.
                 let box_w = c.max(1) as f32 * cell_w;
                 let box_h = r.max(1) as f32 * cell_h;
-                let scale = (box_w / src_w).min(box_h / src_h);
-                let w = src_w * scale;
-                let h = src_h * scale;
-                let pad_x = (box_w - w) * 0.5;
-                let pad_y = (box_h - h) * 0.5;
-                [off_x + pad_x, off_y + pad_y, w, h]
+                [off_x, off_y, box_w, box_h]
             }
         }
     }
@@ -236,6 +233,18 @@ impl GraphicImage {
     }
 }
 
+/// Playback state for Kitty Graphics Protocol animated images (`a=a,s=1|2|3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnimationState {
+    /// Animation stopped (`s=1`).
+    #[default]
+    Stopped,
+    /// Loading mode (`s=2`): plays through available frames and waits at the last frame for more.
+    Loading,
+    /// Running / looping mode (`s=3`): loops according to `loop_count` (`v=`).
+    Running,
+}
+
 /// Stored animation frame within a [`StoredImage`].
 #[derive(Debug, Clone)]
 pub struct AnimationFrame {
@@ -256,14 +265,26 @@ pub struct StoredImage {
     pub rgba_data: Arc<Vec<u8>>,
     pub frames: Vec<AnimationFrame>,
     pub active_frame: usize,
+    pub animation_state: AnimationState,
+    /// Raw Kitty `v=` loop control (`0` = default/infinite, `1` = infinite, `N > 1` = `N - 1` loops).
+    pub loop_count: u32,
+    /// Completed loop iterations in `AnimationState::Running`.
+    pub loops_completed: u32,
+    /// Scheduled timestamp for advancing to the next animation frame.
+    pub next_frame_at: Option<std::time::Instant>,
     pub seq: u64,
 }
 
 impl StoredImage {
     pub fn byte_len(&self) -> usize {
-        let base = self.rgba_data.len();
-        let extra: usize = self.frames.iter().skip(1).map(|f| f.rgba_data.len()).sum();
-        base.saturating_add(extra)
+        if self.frames.is_empty() {
+            self.rgba_data.len()
+        } else {
+            self.frames
+                .iter()
+                .map(|f| f.rgba_data.len())
+                .fold(0usize, usize::saturating_add)
+        }
     }
 }
 
@@ -662,6 +683,8 @@ pub struct KittyControlParams {
     pub unicode_placeholder: bool,
     /// `z`: Z-index for placement (`< 0` behind text, `>= 0` above text; or frame gap ms in `a=f`).
     pub z_index: i32,
+    /// Whether `z=` was explicitly specified in the control header.
+    pub has_z: bool,
     /// `d`: Deletion target selector for `a=d` (default `'a'`).
     pub delete_target: char,
     /// `P`: Parent image ID for relative placement (`0` if none).
@@ -701,6 +724,7 @@ impl Default for KittyControlParams {
             cursor_policy: 0,
             unicode_placeholder: false,
             z_index: 0,
+            has_z: false,
             delete_target: 'a',
             parent_id: 0,
             parent_placement_id: 0,
@@ -832,6 +856,7 @@ impl KittyControlParams {
                 "z" => {
                     if let Ok(val) = v.parse::<i32>() {
                         self.z_index = val;
+                        self.has_z = true;
                     }
                 }
                 "d" => {
@@ -871,6 +896,27 @@ impl KittyControlParams {
         is_ok: bool,
         msg: &str,
     ) -> Option<Vec<u8>> {
+        self.format_response_inner(resolved_id, None, is_ok, msg)
+    }
+
+    /// Format a Kitty animation frame (`a=f`) response including `r=<frame_num>`.
+    pub fn format_frame_response(
+        &self,
+        resolved_id: Option<u32>,
+        frame_num: u32,
+        is_ok: bool,
+        msg: &str,
+    ) -> Option<Vec<u8>> {
+        self.format_response_inner(resolved_id, Some(frame_num), is_ok, msg)
+    }
+
+    fn format_response_inner(
+        &self,
+        resolved_id: Option<u32>,
+        frame_num: Option<u32>,
+        is_ok: bool,
+        msg: &str,
+    ) -> Option<Vec<u8>> {
         if self.quiet >= 2 {
             return None;
         }
@@ -888,7 +934,7 @@ impl KittyControlParams {
             return None;
         }
 
-        let mut keys = Vec::with_capacity(3);
+        let mut keys = Vec::with_capacity(4);
         let id_to_report = if self.image_id != 0 {
             Some(self.image_id)
         } else {
@@ -902,6 +948,9 @@ impl KittyControlParams {
         }
         if self.placement_id != 0 {
             keys.push(format!("p={}", self.placement_id));
+        }
+        if let Some(r) = frame_num {
+            keys.push(format!("r={r}"));
         }
 
         let resp = format!("\x1b_G{};{}\x1b\\", keys.join(","), msg);

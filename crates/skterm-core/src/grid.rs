@@ -1,14 +1,117 @@
 //! Screen Buffer, Character Grid, Damage Tracking, Dual Buffer, Selection, and Terminal Graphics.
 
 use crate::graphics::{
-    kitty_diacritic_index, AnimationFrame, GraphicImage, PlaceholderCellMeta, StoredImage,
-    VirtualPlacement, KITTY_PLACEHOLDER_CHAR, MAX_IMAGE_STORAGE_BYTES, PLACEHOLDER_META_TAG,
+    kitty_diacritic_index, AnimationFrame, AnimationState, GraphicImage, PlaceholderCellMeta,
+    StoredImage, VirtualPlacement, KITTY_PLACEHOLDER_CHAR, MAX_IMAGE_STORAGE_BYTES,
+    PLACEHOLDER_META_TAG,
 };
 use bitflags::bitflags;
 use std::collections::{HashMap, VecDeque};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::sync::Arc;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Upper bound on UTF-8 bytes stored for a single cell's grapheme cluster (Zalgo DoS guard).
+const MAX_GRAPHEME_BYTES: usize = 128;
+
+#[inline]
+fn is_skin_tone_modifier(c: char) -> bool {
+    ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
+}
+
+#[inline]
+fn is_regional_indicator(c: char) -> bool {
+    ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
+}
+
+/// Compute the terminal cell display width (`1` or `2`) of a Unicode grapheme cluster,
+/// following Ghostty / DEC Mode `?2027` rules for combining marks, VS15/VS16 variation selectors,
+/// ZWJ emoji sequences, skin-tone modifiers, keycap sequences, and regional indicator flags.
+pub fn grapheme_display_width(g: &str) -> usize {
+    let mut chars = g.chars();
+    let Some(first) = chars.next() else {
+        return 0;
+    };
+    let Some(second) = chars.next() else {
+        return UnicodeWidthChar::width(first).unwrap_or(1).min(2);
+    };
+
+    // Regional indicator pair (e.g. "🇺🇸") -> always width 2.
+    if is_regional_indicator(first) && is_regional_indicator(second) {
+        return 2;
+    }
+
+    // Combining enclosing keycap (e.g. "1️⃣", "#️⃣", "*️⃣") -> width 2.
+    if g.contains('\u{20E3}') {
+        return 2;
+    }
+
+    // Emoji Fitzpatrick skin-tone modifier (e.g. "👍🏽", "☝🏽") -> width 2.
+    if g.chars().any(is_skin_tone_modifier) {
+        return 2;
+    }
+
+    // ZWJ sequences: emoji ZWJ sequences (e.g. "👨‍👩‍👧‍👦", "👩‍💻", "🏳️‍🌈", "❤️‍🔥") are width 2;
+    // non-emoji script ZWJ sequences (e.g. Indic conjuncts) follow their base width.
+    if g.contains('\u{200D}') {
+        if g.contains('\u{FE0F}')
+            || g.chars()
+                .any(|ch| UnicodeWidthChar::width(ch).unwrap_or(0) >= 2)
+        {
+            return 2;
+        }
+        return UnicodeWidthChar::width(first).unwrap_or(1).clamp(1, 2);
+    }
+
+    // Text presentation selector VS15 (U+FE0E) narrows emoji presentation to width 1.
+    if g.contains('\u{FE0E}') {
+        return 1;
+    }
+
+    // Emoji presentation selector VS16 (U+FE0F) widens emoji bases (e.g. "❤️", "⚙️", "☀️") to width 2.
+    if g.contains('\u{FE0F}') {
+        if UnicodeWidthStr::width(g) >= 2 {
+            return 2;
+        }
+        let cp = first as u32;
+        if matches!(
+            cp,
+            0x203C
+                | 0x2049
+                | 0x2122
+                | 0x2139
+                | 0x2194..=0x2199
+                | 0x21A9..=0x21AA
+                | 0x231A..=0x231B
+                | 0x2328
+                | 0x23CF
+                | 0x23E9..=0x23F3
+                | 0x23F8..=0x23FA
+                | 0x24C2
+                | 0x25AA..=0x25AB
+                | 0x25B6
+                | 0x25C0
+                | 0x25FB..=0x25FE
+                | 0x2600..=0x27BF
+                | 0x2934..=0x2935
+                | 0x2B05..=0x2B07
+                | 0x2B1B..=0x2B1C
+                | 0x2B50
+                | 0x2B55
+                | 0x3030
+                | 0x303D
+                | 0x3297
+                | 0x3299
+                | 0x1F000..=0x1FAFF
+        ) {
+            return 2;
+        }
+        return 1;
+    }
+
+    UnicodeWidthStr::width(g).clamp(1, 2)
+}
 
 bitflags! {
     /// Visual cell attributes (SGR styling) and character properties.
@@ -138,12 +241,15 @@ impl Cell {
     }
 }
 
-/// A row of terminal cells with dirty tracking for rendering efficiency.
+/// A row of terminal cells with dirty tracking and sparse multi-codepoint grapheme storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub cells: Vec<Cell>,
     pub is_dirty: bool,
     pub is_wrapped: bool,
+    /// Sparse storage for multi-codepoint grapheme clusters indexed by column.
+    /// `None` on pure single-codepoint rows (zero heap overhead in the common case).
+    pub graphemes: Option<Box<HashMap<u16, String>>>,
 }
 
 impl Row {
@@ -152,11 +258,102 @@ impl Row {
             cells: vec![Cell::default(); cols],
             is_dirty: true,
             is_wrapped: false,
+            graphemes: None,
+        }
+    }
+
+    /// Return the full multi-codepoint grapheme cluster stored at `col`, if any.
+    #[inline]
+    pub fn cell_grapheme(&self, col: usize) -> Option<&str> {
+        let map = self.graphemes.as_deref()?;
+        u16::try_from(col)
+            .ok()
+            .and_then(|c| map.get(&c).map(String::as_str))
+    }
+
+    /// Store a multi-codepoint grapheme cluster at `col`.
+    pub fn set_cell_grapheme(&mut self, col: usize, text: String) {
+        let Ok(col_u16) = u16::try_from(col) else {
+            return;
+        };
+        let map = self
+            .graphemes
+            .get_or_insert_with(|| Box::new(HashMap::new()));
+        map.insert(col_u16, text);
+    }
+
+    /// Remove any multi-codepoint grapheme cluster at `col`.
+    #[inline]
+    pub fn clear_cell_grapheme(&mut self, col: usize) {
+        if let Some(map) = self.graphemes.as_deref_mut() {
+            if let Ok(col_u16) = u16::try_from(col) {
+                map.remove(&col_u16);
+                if map.is_empty() {
+                    self.graphemes = None;
+                }
+            }
+        }
+    }
+
+    /// Remove all grapheme entries whose column lies in `start..end`.
+    pub fn clear_graphemes_in_range(&mut self, start: usize, end: usize) {
+        if let Some(map) = self.graphemes.as_deref_mut() {
+            map.retain(|&col, _| {
+                let c = col as usize;
+                c < start || c >= end
+            });
+            if map.is_empty() {
+                self.graphemes = None;
+            }
+        }
+    }
+
+    /// Shift grapheme column indices left after `delete_chars(from_col, count)`.
+    pub fn shift_graphemes_left(&mut self, from_col: usize, count: usize, cols: usize) {
+        let Some(old) = self.graphemes.take() else {
+            return;
+        };
+        let mut next = HashMap::with_capacity(old.len());
+        for (col_u16, g) in *old {
+            let c = col_u16 as usize;
+            if c < from_col {
+                next.insert(col_u16, g);
+            } else if c >= from_col + count && c < cols {
+                next.insert((c - count) as u16, g);
+            }
+        }
+        if !next.is_empty() {
+            self.graphemes = Some(Box::new(next));
+        }
+    }
+
+    /// Shift grapheme column indices right after `insert_chars(from_col, count)`.
+    pub fn shift_graphemes_right(&mut self, from_col: usize, count: usize, cols: usize) {
+        let Some(old) = self.graphemes.take() else {
+            return;
+        };
+        let mut next = HashMap::with_capacity(old.len());
+        for (col_u16, g) in *old {
+            let c = col_u16 as usize;
+            if c < from_col {
+                next.insert(col_u16, g);
+            } else if c + count < cols {
+                next.insert((c + count) as u16, g);
+            }
+        }
+        if !next.is_empty() {
+            self.graphemes = Some(Box::new(next));
         }
     }
 
     pub fn resize(&mut self, cols: usize) {
         self.cells.resize(cols, Cell::default());
+        if let Some(map) = self.graphemes.as_deref_mut() {
+            map.retain(|&col, _| (col as usize) < cols);
+            if map.is_empty() {
+                self.graphemes = None;
+            }
+        }
         self.is_dirty = true;
     }
 
@@ -182,6 +379,7 @@ impl Row {
 
     pub fn clear(&mut self, bg: Color) {
         self.cells.fill(Cell::blank(bg));
+        self.graphemes = None;
         self.is_dirty = true;
         self.is_wrapped = false;
     }
@@ -197,6 +395,7 @@ impl Row {
             self.cells.clear();
             self.cells.resize(cols, blank);
         }
+        self.graphemes = None;
         self.is_dirty = true;
         self.is_wrapped = false;
     }
@@ -367,6 +566,7 @@ pub struct Cursor {
     pub col: usize,
     pub shape: CursorShape,
     pub visible: bool,
+    pub blink: bool,
     pub pending_wrap: bool,
 }
 
@@ -377,6 +577,7 @@ impl Default for Cursor {
             col: 0,
             shape: CursorShape::Block,
             visible: true,
+            blink: true,
             pending_wrap: false,
         }
     }
@@ -394,8 +595,10 @@ pub struct SavedCursor {
     pub flags: CellFlags,
     pub shape: CursorShape,
     pub visible: bool,
+    pub blink: bool,
     pub pending_wrap: bool,
     pub origin_mode: bool,
+    pub auto_wrap: bool,
 }
 
 /// Text Selection Mode
@@ -475,6 +678,7 @@ pub struct ScreenBuffer {
     pub images: Vec<GraphicImage>,
     pub images_dirty: bool,
     pub last_placeholder_pos: Option<(usize, usize)>,
+    pub last_grapheme_pos: Option<(usize, usize)>,
     pub tab_stops: Vec<bool>,
     pub prompt_marks: VecDeque<PromptMark>,
     pub semantic_zone: SemanticZone,
@@ -498,10 +702,43 @@ impl ScreenBuffer {
             images: Vec::new(),
             images_dirty: false,
             last_placeholder_pos: None,
+            last_grapheme_pos: None,
             tab_stops,
             prompt_marks: VecDeque::new(),
             semantic_zone: SemanticZone::Idle,
         }
+    }
+
+    /// Return the multi-codepoint grapheme cluster stored at live grid `(row, col)`, if any.
+    #[inline]
+    pub fn cell_grapheme(&self, row: usize, col: usize) -> Option<&str> {
+        self.grid.get(row)?.cell_grapheme(col)
+    }
+
+    /// Return the multi-codepoint grapheme cluster stored at visible viewport `(screen_row, col)`, if any.
+    #[inline]
+    pub fn visible_cell_grapheme(&self, screen_row: usize, col: usize) -> Option<&str> {
+        self.get_visible_row(screen_row)?.cell_grapheme(col)
+    }
+
+    /// Reset an alternate screen buffer cleanly (rows, images, prompt marks, cursor, scroll region).
+    pub fn clear_alternate(&mut self) {
+        for row in &mut self.grid {
+            row.clear(Color::DefaultBg);
+        }
+        if !self.images.is_empty() {
+            self.images.clear();
+            self.images_dirty = true;
+        }
+        self.prompt_marks.clear();
+        self.selection = None;
+        self.scroll_offset = 0;
+        self.scroll_region = (0, self.rows.saturating_sub(1));
+        self.cursor.row = 0;
+        self.cursor.col = 0;
+        self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     fn resize_tab_stops(&mut self, new_cols: usize) {
@@ -543,6 +780,8 @@ impl ScreenBuffer {
             self.cursor.col = next.min(max_col);
         }
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     pub fn backward_tab(&mut self, count: usize) {
@@ -557,6 +796,8 @@ impl ScreenBuffer {
             self.cursor.col = prev;
         }
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     pub fn add_image(&mut self, img: GraphicImage) {
@@ -592,6 +833,7 @@ impl ScreenBuffer {
             return;
         }
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
 
         if new_cols != self.cols {
             self.reflow(new_rows, new_cols);
@@ -656,6 +898,7 @@ impl ScreenBuffer {
         self.cursor.col = self.cursor.col.min(self.cols.saturating_sub(1));
         self.cursor.pending_wrap = false;
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
         self.selection = None;
     }
 
@@ -726,6 +969,7 @@ impl ScreenBuffer {
         self.cursor.col = self.cursor.col.min(new_cols.saturating_sub(1));
         self.cursor.pending_wrap = false;
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
         self.selection = None;
     }
 
@@ -748,6 +992,7 @@ impl ScreenBuffer {
 
         struct LogicalLine {
             cells: Vec<Cell>,
+            graphemes: HashMap<usize, String>,
             is_wrapped: bool,
             cursor_offset: Option<usize>,
             was_soft_wrapped: bool,
@@ -756,12 +1001,16 @@ impl ScreenBuffer {
         let mut logical_lines: Vec<LogicalLine> = Vec::new();
         let mut current_line: Option<LogicalLine> = None;
         let mut grid_start_logical: Option<(usize, usize)> = None;
+        // Maps each old `abs_row` in `0..=last_needed_row` to `(logical_line_idx, cell_offset)`.
+        let mut old_row_anchors: Vec<(usize, usize)> = Vec::with_capacity(last_needed_row + 1);
 
         for abs_row in 0..=last_needed_row {
+            let line_idx = logical_lines.len();
+            let base_cell_idx = current_line.as_ref().map(|l| l.cells.len()).unwrap_or(0);
+            old_row_anchors.push((line_idx, base_cell_idx));
+
             if abs_row == total_scrollback {
-                let line_idx = logical_lines.len();
-                let cell_idx = current_line.as_ref().map(|l| l.cells.len()).unwrap_or(0);
-                grid_start_logical = Some((line_idx, cell_idx));
+                grid_start_logical = Some((line_idx, base_cell_idx));
             }
 
             let row = if abs_row < total_scrollback {
@@ -781,11 +1030,16 @@ impl ScreenBuffer {
 
             let mut cursor_offset_in_row = None;
             let mut row_cells: Vec<Cell> = Vec::with_capacity(len);
+            let mut row_graphemes: Vec<(usize, String)> = Vec::new();
             for (c_idx, cell) in row.cells[..len].iter().enumerate() {
                 if has_cursor && c_idx == cursor_col {
                     cursor_offset_in_row = Some(row_cells.len());
                 }
                 if !cell.flags.contains(CellFlags::WRAP_SPACER) {
+                    let out_idx = row_cells.len();
+                    if let Some(g) = row.cell_grapheme(c_idx) {
+                        row_graphemes.push((out_idx, g.to_string()));
+                    }
                     row_cells.push(*cell);
                 }
             }
@@ -800,6 +1054,9 @@ impl ScreenBuffer {
                         cur.cursor_offset = Some(base_offset + off);
                     }
                 }
+                for (rel_idx, g) in row_graphemes {
+                    cur.graphemes.insert(base_offset + rel_idx, g);
+                }
                 cur.cells.extend(row_cells);
                 cur.is_wrapped = row.is_wrapped;
                 cur.was_soft_wrapped = true;
@@ -810,8 +1067,13 @@ impl ScreenBuffer {
                     logical_lines.push(cur);
                 }
             } else {
+                let mut graphemes = HashMap::new();
+                for (rel_idx, g) in row_graphemes {
+                    graphemes.insert(rel_idx, g);
+                }
                 let line = LogicalLine {
                     cells: row_cells,
+                    graphemes,
                     is_wrapped: row.is_wrapped,
                     cursor_offset: cursor_offset_in_row,
                     was_soft_wrapped: row.is_wrapped,
@@ -831,6 +1093,7 @@ impl ScreenBuffer {
         if logical_lines.is_empty() {
             logical_lines.push(LogicalLine {
                 cells: Vec::new(),
+                graphemes: HashMap::new(),
                 is_wrapped: false,
                 cursor_offset: Some(0),
                 was_soft_wrapped: false,
@@ -840,6 +1103,8 @@ impl ScreenBuffer {
         let mut new_physical_rows: Vec<Row> = Vec::new();
         let mut new_cursor: Option<(usize, usize)> = None;
         let mut first_new_grid_row: Option<usize> = None;
+        // For each logical line: list of `(chunk_start_cell, new_physical_row_idx)` in ascending order.
+        let mut line_row_spans: Vec<Vec<(usize, usize)>> = Vec::with_capacity(logical_lines.len());
         // Extra physical rows that appeared *above the cursor* purely because a
         // visible, previously-unwrapped line had to be re-wrapped to fit the new
         // width. These get scrolled off the top so the cursor keeps its row --
@@ -852,9 +1117,11 @@ impl ScreenBuffer {
 
         for (line_idx, line) in logical_lines.iter().enumerate() {
             let total_cells = line.cells.len();
+            let mut spans: Vec<(usize, usize)> = Vec::new();
 
             if total_cells == 0 {
                 let row_idx = new_physical_rows.len();
+                spans.push((0, row_idx));
                 if first_new_grid_row.is_none() {
                     if let Some((g_line, _)) = grid_start_logical {
                         if line_idx >= g_line {
@@ -866,6 +1133,7 @@ impl ScreenBuffer {
                     new_cursor = Some((row_idx, 0));
                 }
                 new_physical_rows.push(Row::new(new_cols));
+                line_row_spans.push(spans);
                 continue;
             }
 
@@ -877,17 +1145,9 @@ impl ScreenBuffer {
 
             // Fast path: a line that already fits in the new width keeps its own
             // single physical row.
-            //
-            // Lines that do *not* fit fall through to the wrapping loop below. That
-            // used to truncate here instead, to stop the extra continuation rows from
-            // pushing the cursor down the screen -- a shell repainting relative to the
-            // cursor after SIGWINCH (`ESC[1A`) would then write to the wrong line.
-            // The cursor is now anchored by pushing the overflow into scrollback
-            // during the split at the end of this function, so wrapping is safe and
-            // nothing is destroyed. See `anchor` there, and
-            // `test_vt_prompt_line_preservation_on_resize`.
             if in_grid && !line.was_soft_wrapped && total_cells <= new_cols {
                 let row_idx = new_physical_rows.len();
+                spans.push((0, row_idx));
                 if first_new_grid_row.is_none() {
                     first_new_grid_row = Some(row_idx);
                 }
@@ -896,6 +1156,9 @@ impl ScreenBuffer {
                 let copy_len = total_cells.min(new_cols);
                 for c in 0..copy_len {
                     row.cells[c] = line.cells[c];
+                    if let Some(g) = line.graphemes.get(&c) {
+                        row.set_cell_grapheme(c, g.clone());
+                    }
                     if line.cursor_offset == Some(c) && new_cursor.is_none() {
                         new_cursor = Some((row_idx, c));
                     }
@@ -908,6 +1171,7 @@ impl ScreenBuffer {
                 }
                 row.is_wrapped = false;
                 new_physical_rows.push(row);
+                line_row_spans.push(spans);
                 continue;
             }
 
@@ -921,6 +1185,7 @@ impl ScreenBuffer {
             let mut i = 0;
             while i < total_cells {
                 let row_idx = new_physical_rows.len();
+                spans.push((i, row_idx));
                 if first_new_grid_row.is_none() {
                     if let Some((g_line, g_cell)) = grid_start_logical {
                         if line_idx > g_line || (line_idx == g_line && i >= g_cell) {
@@ -945,6 +1210,9 @@ impl ScreenBuffer {
                     }
 
                     row.cells[col] = cell;
+                    if let Some(g) = line.graphemes.get(&i) {
+                        row.set_cell_grapheme(col, g.clone());
+                    }
                     col += 1;
                     i += 1;
 
@@ -981,61 +1249,33 @@ impl ScreenBuffer {
             }
 
             if owes_anchor_debt && !cursor_placed_before_line {
-                // Count only the continuation rows this line inserted *above* the
-                // cursor; rows below it do not move the cursor.
                 let extra = match new_cursor {
-                    // The cursor landed on this line: everything before its chunk.
                     Some((cursor_row, _)) if cursor_row >= rows_before_line => {
                         cursor_row - rows_before_line
                     }
-                    // The cursor is still ahead of us, so this whole line sits above
-                    // it. One row is the line's own; the rest are new.
                     _ => new_physical_rows.len() - rows_before_line - 1,
                 };
                 anchor_debt += extra;
             }
+            line_row_spans.push(spans);
         }
 
         let total_new = new_physical_rows.len();
         let (cursor_row_abs, cursor_col_final) =
             new_cursor.unwrap_or((total_new.saturating_sub(1), 0));
         let natural_first_grid_row = first_new_grid_row.unwrap_or(0).min(cursor_row_abs);
-
-        // Cursor anchoring.
-        //
-        // Re-wrapping a line that no longer fits creates extra physical rows. Where
-        // those rows land above the cursor, the cursor slides down the screen -- and a
-        // shell that repaints relative to the cursor after SIGWINCH (`ESC[1A`) then
-        // writes to the wrong line and corrupts the display. That is why this function
-        // used to truncate such lines outright.
-        //
-        // Instead of dropping the overflow, scroll it off the top: start the grid
-        // `anchor_debt` rows further down, so the cursor keeps the row it had and the
-        // displaced rows become scrollback. Nothing is lost -- the user can scroll up
-        // to see it -- and the cursor stays where the shell expects.
-        //
-        // `anchor_debt` counts only rows introduced by re-wrapping a previously
-        // unwrapped visible line. Ordinary re-wrapping of already-wrapped lines is
-        // untouched, so the cursor still tracks its logical line the way it always did.
         let first_grid_row = (natural_first_grid_row + anchor_debt).min(cursor_row_abs);
 
         if first_grid_row > natural_first_grid_row {
-            // Sever the soft-wrap link across the new scrollback/grid boundary.
-            //
-            // The row we just pushed off the top may be flagged as continuing into the
-            // row that is now the top of the grid. Left alone, a later widening would
-            // coalesce the two back into one logical line -- but by then the shell has
-            // repainted the visible row in response to SIGWINCH, so the join would fuse
-            // the stale prefix onto unrelated new content. Declaring the split line
-            // hard keeps the resize idempotent.
-            //
-            // This only affects rows displaced by the anchoring above. Rows that reach
-            // scrollback by ordinary scrolling keep their flag and still re-join
-            // correctly.
             new_physical_rows[first_grid_row - 1].is_wrapped = false;
         }
 
         let grid_content_count = total_new.saturating_sub(first_grid_row);
+        let grid_origin_in_new = if grid_content_count <= new_rows {
+            first_grid_row
+        } else {
+            total_new - new_rows
+        };
 
         if grid_content_count <= new_rows {
             let mut scrollback_rows: VecDeque<Row> =
@@ -1080,11 +1320,58 @@ impl ScreenBuffer {
             self.cursor.col = cursor_col_final.min(new_cols.saturating_sub(1));
         }
 
+        // Remap `images` and `prompt_marks` row coordinates to their post-reflow physical rows.
+        if !self.images.is_empty() || !self.prompt_marks.is_empty() {
+            let map_old_rel_row = |old_rel: isize| -> isize {
+                let old_abs_i = total_scrollback as isize + old_rel;
+                if old_abs_i < 0 {
+                    return old_abs_i - grid_origin_in_new as isize;
+                }
+                let old_abs = old_abs_i as usize;
+                let lookup_row = |abs_r: usize| -> usize {
+                    let (l_idx, cell_off) = old_row_anchors[abs_r];
+                    let spans = &line_row_spans[l_idx];
+                    let pos = spans.partition_point(|&(start, _)| start <= cell_off);
+                    spans[pos.saturating_sub(1)].1
+                };
+                let new_abs = if old_abs <= last_needed_row {
+                    lookup_row(old_abs)
+                } else {
+                    let base = lookup_row(last_needed_row);
+                    base + (old_abs - last_needed_row)
+                };
+                new_abs as isize - grid_origin_in_new as isize
+            };
+
+            let min_row = -(self.scrollback.len() as isize);
+            if !self.images.is_empty() {
+                for img in &mut self.images {
+                    img.row = map_old_rel_row(img.row);
+                }
+                self.images
+                    .retain(|img| img.row + (img.height_cells.max(1) as isize) > min_row);
+                self.images_dirty = true;
+            }
+            if !self.prompt_marks.is_empty() {
+                for mark in &mut self.prompt_marks {
+                    mark.row = map_old_rel_row(mark.row);
+                }
+                self.prompt_marks
+                    .retain(|m| m.row >= min_row && m.row < new_rows as isize);
+                let mut sorted: Vec<PromptMark> = self.prompt_marks.drain(..).collect();
+                sorted.sort_by_key(|m| m.row);
+                sorted.dedup_by_key(|m| m.row);
+                self.prompt_marks = sorted.into();
+            }
+        }
+
         self.resize_tab_stops(new_cols);
         self.rows = new_rows;
         self.cols = new_cols;
         self.scroll_region = (0, new_rows.saturating_sub(1));
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
         self.scroll_offset = 0;
         self.selection = None;
     }
@@ -1160,7 +1447,7 @@ impl ScreenBuffer {
                 }
 
                 let mut line_str = String::new();
-                // If selection starts on the trailing spacer cell of a wide CJK character,
+                // If selection starts on the trailing spacer cell of a wide character,
                 // include the leading character cell so the first character isn't dropped.
                 if col_start > 0
                     && col_start < row.cells.len()
@@ -1168,16 +1455,19 @@ impl ScreenBuffer {
                         .flags
                         .contains(CellFlags::WIDE_CHAR_SPACER)
                 {
-                    let prev = &row.cells[col_start - 1];
+                    let prev_col = col_start - 1;
+                    let prev = &row.cells[prev_col];
                     if !prev
                         .flags
                         .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::WRAP_SPACER)
                     {
-                        line_str.push(if prev.c == KITTY_PLACEHOLDER_CHAR {
-                            ' '
+                        if prev.c == KITTY_PLACEHOLDER_CHAR {
+                            line_str.push(' ');
+                        } else if let Some(g) = row.cell_grapheme(prev_col) {
+                            line_str.push_str(g);
                         } else {
-                            prev.c
-                        });
+                            line_str.push(prev.c);
+                        }
                     }
                 }
 
@@ -1187,11 +1477,13 @@ impl ScreenBuffer {
                             .flags
                             .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::WRAP_SPACER)
                         {
-                            line_str.push(if cell.c == KITTY_PLACEHOLDER_CHAR {
-                                ' '
+                            if cell.c == KITTY_PLACEHOLDER_CHAR {
+                                line_str.push(' ');
+                            } else if let Some(g) = row.cell_grapheme(c_idx) {
+                                line_str.push_str(g);
                             } else {
-                                cell.c
-                            });
+                                line_str.push(cell.c);
+                            }
                         }
                     }
                 }
@@ -1217,6 +1509,7 @@ impl ScreenBuffer {
         self.cursor.col = col.min(self.cols.saturating_sub(1));
         self.cursor.pending_wrap = false;
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     pub fn move_up(&mut self, n: usize) {
@@ -1228,6 +1521,7 @@ impl ScreenBuffer {
         }
         self.cursor.pending_wrap = false;
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     pub fn move_down(&mut self, n: usize) {
@@ -1239,18 +1533,21 @@ impl ScreenBuffer {
         }
         self.cursor.pending_wrap = false;
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     pub fn move_forward(&mut self, n: usize) {
         self.cursor.col = (self.cursor.col + n).min(self.cols.saturating_sub(1));
         self.cursor.pending_wrap = false;
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     pub fn move_backward(&mut self, n: usize) {
         self.cursor.col = self.cursor.col.saturating_sub(n);
         self.cursor.pending_wrap = false;
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     pub fn linefeed(&mut self) {
@@ -1266,6 +1563,7 @@ impl ScreenBuffer {
         }
         self.cursor.pending_wrap = false;
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     pub fn newline(&mut self) {
@@ -1277,6 +1575,7 @@ impl ScreenBuffer {
         self.cursor.col = 0;
         self.cursor.pending_wrap = false;
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     pub fn scroll_up(&mut self, n: usize) {
@@ -1367,6 +1666,7 @@ impl ScreenBuffer {
             }
         }
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     pub fn scroll_down(&mut self, n: usize) {
@@ -1412,6 +1712,7 @@ impl ScreenBuffer {
             });
         }
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     /// Clean up any wide characters that would be split across the boundaries of `[start_col, end_col)`.
@@ -1433,10 +1734,12 @@ impl ScreenBuffer {
                 self.grid[row].cells[start_col - 1]
                     .flags
                     .remove(CellFlags::WIDE_CHAR);
+                self.grid[row].clear_cell_grapheme(start_col - 1);
             }
             self.grid[row].cells[start_col]
                 .flags
                 .remove(CellFlags::WIDE_CHAR_SPACER);
+            self.grid[row].clear_cell_grapheme(start_col);
         }
         if end_col < self.cols
             && self.grid[row].cells[end_col]
@@ -1448,12 +1751,48 @@ impl ScreenBuffer {
                 self.grid[row].cells[end_col - 1]
                     .flags
                     .remove(CellFlags::WIDE_CHAR);
+                self.grid[row].clear_cell_grapheme(end_col - 1);
             }
             self.grid[row].cells[end_col].c = ' ';
             self.grid[row].cells[end_col]
                 .flags
                 .remove(CellFlags::WIDE_CHAR_SPACER);
+            self.grid[row].clear_cell_grapheme(end_col);
         }
+    }
+
+    /// Returns `true` if `c` would attach to the preceding cell (Kitty placeholder diacritic or
+    /// grapheme cluster extension) rather than opening a new cell.
+    pub fn will_extend_grapheme(&self, c: char, grapheme_clustering: bool) -> bool {
+        if c == KITTY_PLACEHOLDER_CHAR {
+            return false;
+        }
+        if self.last_placeholder_pos.is_some() && kitty_diacritic_index(c).is_some() {
+            return true;
+        }
+        let Some((pr, pc)) = self.last_grapheme_pos else {
+            return false;
+        };
+        let Some(row) = self.grid.get(pr) else {
+            return false;
+        };
+        let Some(prev_cell) = row.cells.get(pc) else {
+            return false;
+        };
+        if c.is_ascii() && prev_cell.c.is_ascii() && row.cell_grapheme(pc).is_none() {
+            return false;
+        }
+        if !grapheme_clustering {
+            return UnicodeWidthChar::width(c) == Some(0);
+        }
+        let mut candidate = String::with_capacity(16);
+        if let Some(existing) = row.cell_grapheme(pc) {
+            candidate.push_str(existing);
+        } else {
+            candidate.push(prev_cell.c);
+        }
+        candidate.push(c);
+        UnicodeSegmentation::graphemes(candidate.as_str(), true).count() == 1
     }
 
     pub fn write_char(
@@ -1490,11 +1829,37 @@ impl ScreenBuffer {
         hyperlink_id: Option<NonZeroU32>,
         auto_wrap: bool,
     ) {
+        self.write_char_with_grapheme_mode(
+            c,
+            fg,
+            bg,
+            flags,
+            underline_color_id,
+            hyperlink_id,
+            auto_wrap,
+            true,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_char_with_grapheme_mode(
+        &mut self,
+        c: char,
+        fg: Color,
+        bg: Color,
+        flags: CellFlags,
+        underline_color_id: Option<NonZeroU16>,
+        hyperlink_id: Option<NonZeroU32>,
+        auto_wrap: bool,
+        grapheme_clustering: bool,
+    ) {
         let char_width = if c == KITTY_PLACEHOLDER_CHAR {
             1
         } else {
             UnicodeWidthChar::width(c).unwrap_or(1)
         };
+
+        // 1. Kitty Unicode placeholder diacritics immediately following U+10EEEE.
         if char_width == 0 {
             if let Some((pr, pc)) = self.last_placeholder_pos {
                 if let Some(diacritic_idx) = kitty_diacritic_index(c) {
@@ -1508,11 +1873,162 @@ impl ScreenBuffer {
                                 meta.push_diacritic(diacritic_idx);
                                 cell.hyperlink_id = Some(meta.pack());
                                 row.is_dirty = true;
+                                return;
                             }
                         }
                     }
                 }
             }
+        }
+
+        // 2. Grapheme cluster continuation onto the preceding base cell.
+        if c != KITTY_PLACEHOLDER_CHAR {
+            if let Some((pr, pc)) = self.last_grapheme_pos {
+                let fast_skip = self
+                    .grid
+                    .get(pr)
+                    .and_then(|row| {
+                        row.cells.get(pc).map(|prev| {
+                            c.is_ascii() && prev.c.is_ascii() && row.cell_grapheme(pc).is_none()
+                        })
+                    })
+                    .unwrap_or(true);
+
+                if !fast_skip {
+                    if let Some(row) = self.grid.get(pr) {
+                        if let Some(prev_cell) = row.cells.get(pc).copied() {
+                            let existing = row.cell_grapheme(pc);
+                            let mut candidate = String::with_capacity(
+                                existing.map_or(prev_cell.c.len_utf8(), str::len) + c.len_utf8(),
+                            );
+                            if let Some(ex) = existing {
+                                candidate.push_str(ex);
+                            } else {
+                                candidate.push(prev_cell.c);
+                            }
+                            candidate.push(c);
+
+                            let attaches = if grapheme_clustering {
+                                UnicodeSegmentation::graphemes(candidate.as_str(), true).count()
+                                    == 1
+                            } else {
+                                char_width == 0
+                            };
+
+                            if attaches {
+                                if candidate.len() > MAX_GRAPHEME_BYTES {
+                                    return;
+                                }
+                                let prev_was_wide = prev_cell.flags.contains(CellFlags::WIDE_CHAR);
+                                let new_width = if grapheme_clustering {
+                                    grapheme_display_width(&candidate)
+                                } else if prev_was_wide {
+                                    2
+                                } else {
+                                    1
+                                };
+
+                                if !prev_was_wide && new_width == 2 {
+                                    if pc + 1 < self.cols {
+                                        self.clear_split_wide_chars(pr, pc + 1, pc + 2);
+                                        let row = &mut self.grid[pr];
+                                        row.cells[pc].flags.insert(CellFlags::WIDE_CHAR);
+                                        row.set_cell_grapheme(pc, candidate);
+                                        row.clear_cell_grapheme(pc + 1);
+                                        let base = row.cells[pc];
+                                        let spacer = &mut row.cells[pc + 1];
+                                        spacer.c = ' ';
+                                        spacer.fg = base.fg;
+                                        spacer.bg = base.bg;
+                                        spacer.flags = (base.flags - CellFlags::WIDE_CHAR)
+                                            | CellFlags::WIDE_CHAR_SPACER;
+                                        spacer.underline_color_id = base.underline_color_id;
+                                        spacer.hyperlink_id = base.hyperlink_id;
+                                        row.is_dirty = true;
+
+                                        if pr == self.cursor.row {
+                                            if pc + 2 >= self.cols {
+                                                self.cursor.col = self.cols.saturating_sub(1);
+                                                self.cursor.pending_wrap = auto_wrap;
+                                            } else {
+                                                self.cursor.col = pc + 2;
+                                                self.cursor.pending_wrap = false;
+                                            }
+                                        }
+                                        return;
+                                    } else if auto_wrap && self.cols >= 2 && pr == self.cursor.row {
+                                        // Base char sat at the last column and promoted to width 2:
+                                        // wrap the whole grapheme cleanly onto the next line.
+                                        let mut moved_cell = prev_cell;
+                                        moved_cell.flags.insert(CellFlags::WIDE_CHAR);
+                                        let wrap_bg = moved_cell.bg;
+                                        {
+                                            let old_row = &mut self.grid[pr];
+                                            old_row.cells[pc] = Cell::blank(wrap_bg);
+                                            old_row.cells[pc].flags.insert(CellFlags::WRAP_SPACER);
+                                            old_row.clear_cell_grapheme(pc);
+                                            old_row.is_wrapped = true;
+                                            old_row.is_dirty = true;
+                                        }
+                                        self.newline_with_bg(wrap_bg);
+                                        let new_row_idx = self.cursor.row;
+                                        self.clear_split_wide_chars(new_row_idx, 0, 2);
+                                        let new_row = &mut self.grid[new_row_idx];
+                                        new_row.cells[0] = moved_cell;
+                                        new_row.set_cell_grapheme(0, candidate);
+                                        new_row.clear_cell_grapheme(1);
+                                        let spacer = &mut new_row.cells[1];
+                                        spacer.c = ' ';
+                                        spacer.fg = moved_cell.fg;
+                                        spacer.bg = moved_cell.bg;
+                                        spacer.flags = (moved_cell.flags - CellFlags::WIDE_CHAR)
+                                            | CellFlags::WIDE_CHAR_SPACER;
+                                        spacer.underline_color_id = moved_cell.underline_color_id;
+                                        spacer.hyperlink_id = moved_cell.hyperlink_id;
+                                        new_row.is_dirty = true;
+                                        self.last_grapheme_pos = Some((new_row_idx, 0));
+                                        if 2 >= self.cols {
+                                            self.cursor.col = self.cols.saturating_sub(1);
+                                            self.cursor.pending_wrap = auto_wrap;
+                                        } else {
+                                            self.cursor.col = 2;
+                                            self.cursor.pending_wrap = false;
+                                        }
+                                        return;
+                                    }
+                                } else if prev_was_wide && new_width == 1 && pc + 1 < self.cols {
+                                    let row = &mut self.grid[pr];
+                                    row.cells[pc].flags.remove(CellFlags::WIDE_CHAR);
+                                    let cell_bg = row.cells[pc].bg;
+                                    row.set_cell_grapheme(pc, candidate);
+                                    if row.cells[pc + 1]
+                                        .flags
+                                        .contains(CellFlags::WIDE_CHAR_SPACER)
+                                    {
+                                        row.cells[pc + 1] = Cell::blank(cell_bg);
+                                        row.clear_cell_grapheme(pc + 1);
+                                    }
+                                    row.is_dirty = true;
+                                    if pr == self.cursor.row {
+                                        self.cursor.col = pc + 1;
+                                        self.cursor.pending_wrap = false;
+                                    }
+                                    return;
+                                }
+
+                                let row = &mut self.grid[pr];
+                                row.set_cell_grapheme(pc, candidate);
+                                row.is_dirty = true;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Orphan zero-width codepoint with no base cell to attach to.
+        if char_width == 0 {
             return;
         }
 
@@ -1530,10 +2046,11 @@ impl ScreenBuffer {
                 return;
             }
             self.clear_split_wide_chars(self.cursor.row, self.cursor.col, self.cols);
-            self.grid[self.cursor.row].cells[self.cursor.col].reset();
+            self.grid[self.cursor.row].cells[self.cursor.col] = Cell::blank(bg);
             self.grid[self.cursor.row].cells[self.cursor.col]
                 .flags
                 .insert(CellFlags::WRAP_SPACER);
+            self.grid[self.cursor.row].clear_cell_grapheme(self.cursor.col);
             self.grid[self.cursor.row].is_wrapped = true;
             self.newline_with_bg(bg);
         }
@@ -1558,6 +2075,7 @@ impl ScreenBuffer {
         // Resolve the row once: this runs per printed character, and every
         // `self.grid[..]` is an index computation on the deque.
         let row = &mut self.grid[cur_row];
+        row.clear_cell_grapheme(cur_col);
         let cell = &mut row.cells[cur_col];
         cell.c = c;
         cell.fg = fg;
@@ -1569,11 +2087,14 @@ impl ScreenBuffer {
 
         if c == KITTY_PLACEHOLDER_CHAR {
             self.last_placeholder_pos = Some((cur_row, cur_col));
+            self.last_grapheme_pos = None;
         } else {
             self.last_placeholder_pos = None;
+            self.last_grapheme_pos = Some((cur_row, cur_col));
         }
 
         if char_width == 2 && cur_col + 1 < cols {
+            row.clear_cell_grapheme(cur_col + 1);
             let spacer_cell = &mut row.cells[cur_col + 1];
             spacer_cell.c = ' ';
             spacer_cell.fg = fg;
@@ -1608,7 +2129,10 @@ impl ScreenBuffer {
         // Shift the tail left, then blank the `count` columns it vacated.
         row.cells.copy_within(cur_col + count..cols, cur_col);
         row.cells[cols - count..].fill(Cell::blank(bg));
+        row.shift_graphemes_left(cur_col, count, cols);
         row.is_dirty = true;
+        self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     /// Insert `n` blank characters at the cursor position on the current line (ICH - CSI @).
@@ -1630,11 +2154,15 @@ impl ScreenBuffer {
         row.cells
             .copy_within(cur_col..cols - count, cur_col + count);
         row.cells[cur_col..cur_col + count].fill(Cell::blank(bg));
+        row.shift_graphemes_right(cur_col, count, cols);
         // A wide char pushed half-off the right edge leaves a dangling lead cell.
         if row.cells[cols - 1].flags.contains(CellFlags::WIDE_CHAR) {
             row.cells[cols - 1] = Cell::blank(bg);
+            row.clear_cell_grapheme(cols - 1);
         }
         row.is_dirty = true;
+        self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     /// Erase `n` characters starting at the cursor position without moving cursor (ECH - CSI X).
@@ -1650,7 +2178,10 @@ impl ScreenBuffer {
 
         let row = &mut self.grid[cur_row];
         row.cells[cur_col..end_col].fill(Cell::blank(bg));
+        row.clear_graphemes_in_range(cur_col, end_col);
         row.is_dirty = true;
+        self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     /// Insert `n` blank lines at the cursor row within the scroll region (IL - CSI L).
@@ -1662,6 +2193,7 @@ impl ScreenBuffer {
         }
         let count = n.min(bottom - cur_row + 1);
         let cols = self.cols;
+        let mut actual_inserted: isize = 0;
         for _ in 0..count {
             // The row pushed out of the bottom of the region becomes the blank row
             // inserted at the top, so no allocation is needed.
@@ -1670,8 +2202,37 @@ impl ScreenBuffer {
             };
             row.reuse_as_blank(cols, bg);
             self.grid.insert(cur_row, row);
+            actual_inserted += 1;
         }
+        if actual_inserted > 0 && !self.images.is_empty() {
+            let cur_i = cur_row as isize;
+            let bottom_i = bottom as isize;
+            self.images.retain_mut(|img| {
+                if img.row >= cur_i && img.row <= bottom_i {
+                    img.row += actual_inserted;
+                    img.row <= bottom_i
+                } else {
+                    true
+                }
+            });
+            self.images_dirty = true;
+        }
+        if actual_inserted > 0 && !self.prompt_marks.is_empty() {
+            let cur_i = cur_row as isize;
+            let bottom_i = bottom as isize;
+            self.prompt_marks.retain_mut(|m| {
+                if m.row >= cur_i && m.row <= bottom_i {
+                    m.row += actual_inserted;
+                    m.row <= bottom_i
+                } else {
+                    true
+                }
+            });
+        }
+        self.cursor.col = 0;
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     /// Delete `n` lines at the cursor row within the scroll region (DL - CSI M).
@@ -1683,14 +2244,44 @@ impl ScreenBuffer {
         }
         let count = n.min(bottom - cur_row + 1);
         let cols = self.cols;
+        let mut actual_deleted: isize = 0;
         for _ in 0..count {
             let Some(mut row) = self.grid.remove(cur_row) else {
                 break;
             };
             row.reuse_as_blank(cols, bg);
             self.grid.insert(bottom, row);
+            actual_deleted += 1;
         }
+        if actual_deleted > 0 && !self.images.is_empty() {
+            let cur_i = cur_row as isize;
+            let bottom_i = bottom as isize;
+            self.images.retain_mut(|img| {
+                if img.row >= cur_i && img.row <= bottom_i {
+                    img.row -= actual_deleted;
+                    img.row + (img.height_cells.max(1) as isize) > cur_i
+                } else {
+                    true
+                }
+            });
+            self.images_dirty = true;
+        }
+        if actual_deleted > 0 && !self.prompt_marks.is_empty() {
+            let cur_i = cur_row as isize;
+            let bottom_i = bottom as isize;
+            self.prompt_marks.retain_mut(|m| {
+                if m.row >= cur_i && m.row <= bottom_i {
+                    m.row -= actual_deleted;
+                    m.row >= cur_i
+                } else {
+                    true
+                }
+            });
+        }
+        self.cursor.col = 0;
         self.cursor.pending_wrap = false;
+        self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
     }
 
     pub fn erase_in_display(&mut self, mode: usize, bg: Color) {
@@ -1701,10 +2292,32 @@ impl ScreenBuffer {
                 self.clear_split_wide_chars(cur_row, cur_col, self.cols);
                 let row = &mut self.grid[cur_row];
                 row.cells[cur_col..].fill(Cell::blank(bg));
+                row.clear_graphemes_in_range(cur_col, self.cols);
                 row.is_dirty = true;
                 for row in self.grid.iter_mut().skip(cur_row + 1) {
                     row.clear(bg);
                 }
+                if !self.images.is_empty() {
+                    let cur_r = cur_row as isize;
+                    let prev_len = self.images.len();
+                    self.images.retain(|img| {
+                        let img_end_r = img.row + (img.height_cells.max(1) as isize);
+                        let img_end_c = img.col + img.width_cells.max(1);
+                        let erased_below = img_end_r > cur_r + 1 && img.row < self.rows as isize;
+                        let erased_on_cur =
+                            img.row <= cur_r && img_end_r > cur_r && img_end_c > cur_col;
+                        !(erased_below || erased_on_cur)
+                    });
+                    if self.images.len() != prev_len {
+                        self.images_dirty = true;
+                    }
+                }
+                let cur_r = cur_row as isize;
+                self.prompt_marks
+                    .retain(|m| m.row < cur_r || (cur_col > 0 && m.row == cur_r));
+                self.cursor.pending_wrap = false;
+                self.last_placeholder_pos = None;
+                self.last_grapheme_pos = None;
             }
             1 => {
                 let cur_row = self.cursor.row;
@@ -1716,30 +2329,55 @@ impl ScreenBuffer {
                 self.clear_split_wide_chars(cur_row, 0, end + 1);
                 let row = &mut self.grid[cur_row];
                 row.cells[..=end].fill(Cell::blank(bg));
+                row.clear_graphemes_in_range(0, end + 1);
                 row.is_dirty = true;
-            }
-            2 | 3 => {
-                for row in &mut self.grid {
-                    row.clear(bg);
-                }
-                if mode == 2 {
+                if !self.images.is_empty() {
+                    let cur_r = cur_row as isize;
                     let prev_len = self.images.len();
-                    self.images
-                        .retain(|img| img.row + (img.height_cells.max(1) as isize) <= 0);
+                    self.images.retain(|img| {
+                        let img_end_r = img.row + (img.height_cells.max(1) as isize);
+                        let in_scrollback_only = img_end_r <= 0;
+                        let strictly_below = img.row > cur_r;
+                        let strictly_right_on_cur = img.row == cur_r && img.col > end;
+                        in_scrollback_only || strictly_below || strictly_right_on_cur
+                    });
                     if self.images.len() != prev_len {
                         self.images_dirty = true;
                     }
-                    self.prompt_marks.retain(|m| m.row < 0);
-                } else {
-                    self.scrollback.clear();
-                    if !self.images.is_empty() {
-                        self.images.clear();
-                        self.images_dirty = true;
-                    }
-                    self.prompt_marks.clear();
                 }
+                let cur_r = cur_row as isize;
+                self.prompt_marks.retain(|m| m.row < 0 || m.row >= cur_r);
                 self.cursor.pending_wrap = false;
                 self.last_placeholder_pos = None;
+                self.last_grapheme_pos = None;
+            }
+            2 => {
+                for row in &mut self.grid {
+                    row.clear(bg);
+                }
+                let prev_len = self.images.len();
+                self.images
+                    .retain(|img| img.row + (img.height_cells.max(1) as isize) <= 0);
+                if self.images.len() != prev_len {
+                    self.images_dirty = true;
+                }
+                self.prompt_marks.retain(|m| m.row < 0);
+                self.cursor.pending_wrap = false;
+                self.last_placeholder_pos = None;
+                self.last_grapheme_pos = None;
+            }
+            3 => {
+                // Per xterm / Ghostty spec, CSI 3 J clears scrollback history ONLY,
+                // leaving the visible screen intact.
+                self.scrollback.clear();
+                self.scroll_offset = 0;
+                let prev_len = self.images.len();
+                self.images
+                    .retain(|img| img.row + (img.height_cells.max(1) as isize) > 0);
+                if self.images.len() != prev_len {
+                    self.images_dirty = true;
+                }
+                self.prompt_marks.retain(|m| m.row >= 0);
             }
             _ => {}
         }
@@ -1753,20 +2391,28 @@ impl ScreenBuffer {
                 self.clear_split_wide_chars(cur_row, cur_col, self.cols);
                 let row = &mut self.grid[cur_row];
                 row.cells[cur_col..].fill(Cell::blank(bg));
+                row.clear_graphemes_in_range(cur_col, self.cols);
                 row.is_wrapped = false;
                 row.is_dirty = true;
                 self.cursor.pending_wrap = false;
+                self.last_placeholder_pos = None;
+                self.last_grapheme_pos = None;
             }
             1 => {
                 let end = cur_col.min(self.cols.saturating_sub(1));
                 self.clear_split_wide_chars(cur_row, 0, end + 1);
                 let row = &mut self.grid[cur_row];
                 row.cells[..=end].fill(Cell::blank(bg));
+                row.clear_graphemes_in_range(0, end + 1);
                 row.is_dirty = true;
+                self.last_placeholder_pos = None;
+                self.last_grapheme_pos = None;
             }
             2 => {
                 self.grid[cur_row].clear(bg);
                 self.cursor.pending_wrap = false;
+                self.last_placeholder_pos = None;
+                self.last_grapheme_pos = None;
             }
             _ => {}
         }
@@ -1783,6 +2429,7 @@ impl ScreenBuffer {
         self.scroll_offset = 0;
         self.selection = None;
         self.last_placeholder_pos = None;
+        self.last_grapheme_pos = None;
         for row in &mut self.grid {
             row.clear(Color::DefaultBg);
         }
@@ -2365,6 +3012,10 @@ impl ScreenGrid {
             rgba_data: Arc::clone(&rgba_arc),
             frames: vec![frame0],
             active_frame: 0,
+            animation_state: AnimationState::Stopped,
+            loop_count: 0,
+            loops_completed: 0,
+            next_frame_at: None,
             seq: self.kitty_seq,
         };
         let added_bytes = stored.byte_len();
@@ -2518,6 +3169,18 @@ impl ScreenGrid {
         } else {
             &mut self.primary
         }
+    }
+
+    /// Return the multi-codepoint grapheme cluster stored at active grid `(row, col)`, if any.
+    #[inline]
+    pub fn cell_grapheme(&self, row: usize, col: usize) -> Option<&str> {
+        self.active().cell_grapheme(row, col)
+    }
+
+    /// Return the multi-codepoint grapheme cluster stored at active viewport `(screen_row, col)`, if any.
+    #[inline]
+    pub fn visible_cell_grapheme(&self, screen_row: usize, col: usize) -> Option<&str> {
+        self.active().visible_cell_grapheme(screen_row, col)
     }
 
     pub fn set_alternate(&mut self, alt: bool) {

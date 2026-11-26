@@ -2345,6 +2345,7 @@ dependencies = [
  "libc",
  "portable-pty",
  "tracing",
+ "unicode-segmentation",
  "unicode-width",
  "vte",
 ]

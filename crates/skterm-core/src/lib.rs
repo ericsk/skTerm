@@ -7,15 +7,15 @@ pub mod terminal;
 pub mod vt;
 
 pub use graphics::{
-    encode_base64_standard, kitty_diacritic_index, GraphicImage, KittyControlParams,
-    KittyGraphicsParser, Osc1337Action, Osc1337Dimension, Osc1337FileParams, Osc1337Layout,
-    Osc1337Parser, PlaceholderCellMeta, SixelDecoder, StoredImage, VirtualPlacement,
+    encode_base64_standard, kitty_diacritic_index, AnimationFrame, AnimationState, GraphicImage,
+    KittyControlParams, KittyGraphicsParser, Osc1337Action, Osc1337Dimension, Osc1337FileParams,
+    Osc1337Layout, Osc1337Parser, PlaceholderCellMeta, SixelDecoder, StoredImage, VirtualPlacement,
     KITTY_DIACRITICS, KITTY_PLACEHOLDER_CHAR, PLACEHOLDER_META_TAG,
 };
 pub use grid::{
-    Cell, CellFlags, Color, Cursor, CursorShape, NamedColor, PointerShape, ProgressState,
-    PromptMark, Row, ScreenBuffer, ScreenGrid, SearchMatch, Selection, SelectionMode, SemanticZone,
-    TerminalProgress,
+    grapheme_display_width, Cell, CellFlags, Color, Cursor, CursorShape, NamedColor, PointerShape,
+    ProgressState, PromptMark, Row, ScreenBuffer, ScreenGrid, SearchMatch, Selection,
+    SelectionMode, SemanticZone, TerminalProgress,
 };
 #[cfg(target_os = "macos")]
 pub use pty::process_cwd;
@@ -26,8 +26,8 @@ pub use pty::{
 };
 pub use terminal::Terminal;
 pub use vt::{
-    Charset, ClipboardRequest, MouseFormat, MouseProtocol, ProgramStatusKind, ProgramStatusRecord,
-    ProgramStatusState, TerminalNotification, TerminalState,
+    Charset, ClipboardRequest, MouseEncoding, MouseFormat, MouseProtocol, ProgramStatusKind,
+    ProgramStatusRecord, ProgramStatusState, TerminalNotification, TerminalState,
 };
 
 /// skterm-core library version and basic info

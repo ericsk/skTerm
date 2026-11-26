@@ -463,7 +463,7 @@ fn test_vt_device_queries_and_responses() {
     term.feed_bytes(b"\x1b[c\x1b[>c");
     assert_eq!(
         term.take_pending_responses(),
-        b"\x1b[?62;4;22c\x1b[>41;350;0c"
+        b"\x1b[?62;4;22;52c\x1b[>41;350;0c"
     );
 
     // DSR (\x1b[5n), CPR (\x1b[6n), and DECXCPR (\x1b[?6n)
@@ -797,10 +797,7 @@ fn test_vt_decstr_xtversion_and_xtwinops() {
 
     // XTVERSION (CSI > q)
     term.feed_bytes(b"\x1b[>q");
-    assert_eq!(
-        term.take_pending_responses(),
-        concat!("\x1bP>|skTerm(", env!("CARGO_PKG_VERSION"), ")\x1b\\").as_bytes()
-    );
+    assert_eq!(term.take_pending_responses(), b"\x1bP>|ghostty 1.2.0\x1b\\");
 
     // XTWINOPS: report text area size in chars (CSI 18 t) and cell size (CSI 16 t)
     term.feed_bytes(b"\x1b[18t\x1b[16t");
@@ -1602,18 +1599,19 @@ fn test_osc_133_633_semantic_prompts_navigation_and_shell_integration() {
         .join("skterm.fish")
         .is_file());
 
-    // Verify `PtyProcess::spawn_with_options` exports `TERM_PROGRAM=skTerm`
+    // Verify `PtyProcess::spawn_with_options` exports `TERM_PROGRAM=ghostty` & `TERM_PROGRAM_VERSION=1.2.0`
+    // without leaking `KITTY_WINDOW_ID` or `GHOSTTY_RESOURCES_DIR`.
     #[cfg(unix)]
     {
         let mut live = Terminal::new_with_options(
             10,
-            60,
+            80,
             50,
             PtySpawnOptions {
                 shell: Some("/bin/sh".to_string()),
                 args: vec![
                     "-c".to_string(),
-                    "printf '%s:%s\\n' \"$TERM_PROGRAM\" \"$TERM_PROGRAM_VERSION\"".to_string(),
+                    "printf '%s:%s:%s:%s\\n' \"$TERM_PROGRAM\" \"$TERM_PROGRAM_VERSION\" \"$TERM\" \"${GHOSTTY_RESOURCES_DIR:-unset}\"".to_string(),
                 ],
                 cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
                 ..Default::default()
@@ -1628,7 +1626,7 @@ fn test_osc_133_633_semantic_prompts_navigation_and_shell_integration() {
                 .iter()
                 .map(|c| c.c)
                 .collect();
-            if line0.contains("skTerm:") {
+            if line0.contains("ghostty:") {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(15));
@@ -1639,11 +1637,539 @@ fn test_osc_133_633_semantic_prompts_navigation_and_shell_integration() {
             .map(|c| c.c)
             .collect();
         assert!(
-            line0
-                .trim()
-                .starts_with(concat!("skTerm:", env!("CARGO_PKG_VERSION"))),
-            "expected TERM_PROGRAM=skTerm, got {:?}",
+            line0.trim().starts_with("ghostty:1.2.0:xterm-256color:"),
+            "expected TERM_PROGRAM=ghostty:1.2.0:xterm-256color, got {:?}",
             line0.trim()
         );
     }
+}
+
+#[test]
+fn test_ghostty_xtgettcap_da1_and_osc8_semicolons() {
+    let mut term = Terminal::new_headless(10, 80, 50);
+
+    // DA1 advertises OSC 52 clipboard (52)
+    term.feed_bytes(b"\x1b[c");
+    assert_eq!(term.take_pending_responses(), b"\x1b[?62;4;22;52c");
+
+    // XTGETTCAP: Hls, Sync, Smol, Rmol, BE, ED, BD, fullkbd
+    // Hex: Hls=486c73, Sync=53796e63, Smol=536d6f6c, Rmol=526d6f6c, BE=4245, ED=4544, BD=4244, fullkbd=66756c6c6b6264
+    term.feed_bytes(
+        b"\x1bP+q486c73;53796e63;536d6f6c;526d6f6c;4245;4544;4244;66756c6c6b6264\x1b\\",
+    );
+    let resp = String::from_utf8(term.take_pending_responses()).unwrap();
+    assert!(
+        resp.contains("\x1bP1+r486c73\x1b\\"),
+        "missing Hls: {resp:?}"
+    );
+    assert!(resp.contains("\x1bP1+r53796e63="), "missing Sync: {resp:?}");
+    assert!(
+        resp.contains("\x1bP1+r536d6f6c=1b5b35336d\x1b\\"),
+        "missing Smol: {resp:?}"
+    );
+    assert!(
+        resp.contains("\x1bP1+r526d6f6c=1b5b35356d\x1b\\"),
+        "missing Rmol: {resp:?}"
+    );
+    assert!(
+        resp.contains("\x1bP1+r4245=1b5b3f3230303468\x1b\\"),
+        "missing BE: {resp:?}"
+    );
+    assert!(
+        resp.contains("\x1bP1+r4544=1b5b3f3230303468\x1b\\"),
+        "missing ED: {resp:?}"
+    );
+    assert!(
+        resp.contains("\x1bP1+r4244=1b5b3f323030346c\x1b\\"),
+        "missing BD: {resp:?}"
+    );
+    assert!(
+        resp.contains("\x1bP1+r66756c6c6b6264\x1b\\"),
+        "missing fullkbd: {resp:?}"
+    );
+
+    // OSC 8 URI containing semicolons must not be truncated
+    term.feed_bytes(b"\x1b]8;;https://example.com/path;a=1;b=2\x07Link\x1b]8;;\x07");
+    assert_eq!(
+        term.url_at(0, 0).as_deref(),
+        Some("https://example.com/path;a=1;b=2")
+    );
+}
+
+#[test]
+fn test_dual_kkp_stack_mok_and_alt_screen_clearing() {
+    use base64::Engine;
+
+    let mut term = Terminal::new_headless(10, 40, 50);
+
+    // Primary shell enables KKP flags=1 and modifyOtherKeys=2
+    term.feed_bytes(b"\x1b[>1u\x1b[>4;2mPrimary");
+    assert_eq!(term.state.kitty_keyboard_flags(), 1);
+    assert_eq!(term.state.modify_other_keys, 2);
+
+    // Enter alt screen (?1049h): alt starts fresh with KKP=0 and MOK=0
+    term.feed_bytes(b"\x1b[?1049h");
+    assert!(term.grid().is_alternate);
+    assert_eq!(term.state.kitty_keyboard_flags(), 0);
+    assert_eq!(term.state.modify_other_keys, 0);
+
+    // TUI inside alt screen pushes KKP=3, sets MOK=1, writes text and places an image
+    let px = base64::engine::general_purpose::STANDARD.encode([255u8, 0, 0, 255]);
+    term.feed_bytes(
+        format!("\x1b[>3u\x1b[>4;1mAltContent\x1b_Ga=T,i=42,f=32,s=1,v=1,q=2;{px}\x1b\\")
+            .as_bytes(),
+    );
+    assert_eq!(term.state.kitty_keyboard_flags(), 3);
+    assert_eq!(term.state.modify_other_keys, 1);
+    assert_eq!(term.grid().alternate.images.len(), 1);
+
+    // Exit alt screen (?1049l): primary shell's KKP=1 and MOK=2 must survive intact!
+    term.feed_bytes(b"\x1b[?1049l");
+    assert!(!term.grid().is_alternate);
+    assert_eq!(term.state.kitty_keyboard_flags(), 1);
+    assert_eq!(term.state.modify_other_keys, 2);
+
+    // Re-entering alt screen via ?1049h must clear stale alt screen content AND alternate.images
+    term.feed_bytes(b"\x1b[?1049h");
+    assert!(term.grid().alternate.images.is_empty());
+    let alt_row0: String = term.grid().alternate.grid[0]
+        .cells
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(alt_row0.trim(), "");
+
+    // ?1047l clears alt buffer and images on exit
+    term.feed_bytes(format!("Stale1047\x1b_Ga=T,i=43,f=32,s=1,v=1,q=2;{px}\x1b\\").as_bytes());
+    assert_eq!(term.grid().alternate.images.len(), 1);
+    term.feed_bytes(b"\x1b[?1047l");
+    assert!(!term.grid().is_alternate);
+    assert!(term.grid().alternate.images.is_empty());
+    let cleared_row0: String = term.grid().alternate.grid[0]
+        .cells
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(cleared_row0.trim(), "");
+
+    // ?47 stays non-clearing per xterm spec
+    term.feed_bytes(b"\x1b[?47hKeepMe\x1b[?47l\x1b[?47h");
+    let kept: String = term.grid().alternate.grid[0].cells[0..6]
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(kept, "KeepMe");
+}
+
+#[test]
+fn test_mouse_modes_sgr_pixels_cursor_blink_decrqm_and_xtsave_xtrestore() {
+    use skterm_core::{MouseEncoding, MouseProtocol};
+
+    let mut term = Terminal::new_headless(10, 40, 50);
+
+    // Selective mouse protocol reset: disabling ?1000l while ?1003 is active must not clear ?1003
+    term.feed_bytes(b"\x1b[?1003h\x1b[?1000l");
+    assert_eq!(term.state.mouse_protocol, MouseProtocol::AnyEvent);
+    term.feed_bytes(b"\x1b[?1003l");
+    assert_eq!(term.state.mouse_protocol, MouseProtocol::None);
+
+    // SGR-Pixels (?1016) & selective format reset (?1006l must not clobber ?1016)
+    term.feed_bytes(b"\x1b[?1016h\x1b[?1006l");
+    assert_eq!(term.state.mouse_format, MouseEncoding::SgrPixels);
+    term.feed_bytes(b"\x1b[?1016$p");
+    assert_eq!(term.take_pending_responses(), b"\x1b[?1016;1$y");
+
+    // Cursor blink (?12), DECSCUSR odd/even, and DECRQSS " q"
+    term.feed_bytes(b"\x1b[2 q\x1bP$q q\x1b\\");
+    assert_eq!(term.grid().active().cursor.shape, CursorShape::Block);
+    assert!(!term.grid().active().cursor.blink);
+    assert_eq!(term.take_pending_responses(), b"\x1bP1$r2 q\x1b\\");
+
+    term.feed_bytes(b"\x1b[6 q\x1bP$q q\x1b\\");
+    assert_eq!(term.grid().active().cursor.shape, CursorShape::Beam);
+    assert!(!term.grid().active().cursor.blink);
+    assert_eq!(term.take_pending_responses(), b"\x1bP1$r6 q\x1b\\");
+
+    term.feed_bytes(b"\x1b[?12h\x1b[?12$p");
+    assert!(term.grid().active().cursor.blink);
+    assert_eq!(term.take_pending_responses(), b"\x1b[?12;1$y");
+
+    // ?1048 save/restore cursor
+    term.feed_bytes(b"\x1b[4;7H\x1b[?1048h\x1b[1;1H\x1b[?1048l");
+    assert_eq!(term.grid().active().cursor.row, 3);
+    assert_eq!(term.grid().active().cursor.col, 6);
+
+    // DECRQM recognizes ?1007, ?1048, ?2027, ?2031, ?2048
+    term.feed_bytes(b"\x1b[?1007$p\x1b[?1048$p\x1b[?2027$p\x1b[?2031$p\x1b[?2048$p");
+    assert_eq!(
+        term.take_pending_responses(),
+        b"\x1b[?1007;1$y\x1b[?1048;1$y\x1b[?2027;1$y\x1b[?2031;2$y\x1b[?2048;2$y"
+    );
+
+    // XTSAVE (CSI ? Ps s) and XTRESTORE (CSI ? Ps r)
+    term.feed_bytes(b"\x1b[?1004h\x1b[?2004h\x1b[?1007l");
+    term.feed_bytes(b"\x1b[?1004;2004;1007;2027s");
+    term.feed_bytes(b"\x1b[?1004l\x1b[?2004l\x1b[?1007h\x1b[?2027l");
+    assert!(!term.state.focus_events);
+    assert!(!term.state.bracketed_paste);
+    assert!(term.state.alternate_scroll);
+    assert!(!term.state.grapheme_clustering);
+    term.feed_bytes(b"\x1b[?1004;2004;1007;2027r");
+    assert!(term.state.focus_events);
+    assert!(term.state.bracketed_paste);
+    assert!(!term.state.alternate_scroll);
+    assert!(term.state.grapheme_clustering);
+}
+
+#[test]
+fn test_color_scheme_2031_in_band_resize_2048_theme_defaults_and_progress_timeout() {
+    let mut term = Terminal::new_headless(24, 80, 50);
+
+    // 1. ?2031 + CSI ? 996 n color scheme query and notifications
+    term.feed_bytes(b"\x1b[?996n");
+    assert_eq!(term.take_pending_responses(), b"\x1b[?997;1n"); // default dark
+
+    // Changing scheme while ?2031 is off updates state without emitting unsolicited report
+    term.set_color_scheme(false);
+    assert!(term.take_pending_responses().is_empty());
+    term.feed_bytes(b"\x1b[?996n");
+    assert_eq!(term.take_pending_responses(), b"\x1b[?997;2n");
+
+    // Enabling ?2031 subscribes to future changes (no duplicate on unchanged value)
+    term.feed_bytes(b"\x1b[?2031h");
+    term.set_color_scheme(false);
+    assert!(term.take_pending_responses().is_empty());
+    term.set_color_scheme(true);
+    assert_eq!(term.take_pending_responses(), b"\x1b[?997;1n");
+    term.set_color_scheme(false);
+    assert_eq!(term.take_pending_responses(), b"\x1b[?997;2n");
+
+    // 2. ?2048 in-band window resize reporting
+    term.resize_with_cell_size(24, 80, 10.0, 20.0).unwrap();
+    term.feed_bytes(b"\x1b[?2048h");
+    // Enabling ?2048 sends an immediate size report
+    assert_eq!(term.take_pending_responses(), b"\x1b[48;24;80;480;800t");
+    // Resizing sends an updated CSI 48 report
+    term.resize_with_cell_size(30, 100, 10.0, 20.0).unwrap();
+    assert_eq!(term.take_pending_responses(), b"\x1b[48;30;100;600;1000t");
+    // No-op resize emits nothing
+    term.resize_with_cell_size(30, 100, 10.0, 20.0).unwrap();
+    assert!(term.take_pending_responses().is_empty());
+    // Disabling ?2048 suppresses further reports
+    term.feed_bytes(b"\x1b[?2048l");
+    term.resize_with_cell_size(25, 90, 10.0, 20.0).unwrap();
+    assert!(term.take_pending_responses().is_empty());
+
+    // 3. Theme default colors reflected in OSC 4/10/11/12/21;? queries
+    let mut pal = [[0u8; 3]; 16];
+    pal[1] = [0xaa, 0x11, 0x22];
+    term.set_default_colors(
+        [0xee, 0xdd, 0xcc],
+        [0x11, 0x22, 0x33],
+        [0x44, 0x55, 0x66],
+        pal,
+    );
+    term.feed_bytes(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07\x1b]4;1;?\x07");
+    assert_eq!(
+        term.take_pending_responses(),
+        b"\x1b]10;rgb:eeee/dddd/cccc\x07\x1b]11;rgb:1111/2222/3333\x07\x1b]12;rgb:4444/5555/6666\x07\x1b]4;1;rgb:aaaa/1111/2222\x07"
+    );
+
+    // 4. Bare malformed `OSC 9;4` must be ignored (no notification toast `"4"`),
+    //    and `poll_progress_timeout` clears stale progress after 15s.
+    term.feed_bytes(b"\x1b]9;4\x07");
+    assert!(term.take_pending_notifications().is_empty());
+    assert!(term.state.progress.is_none());
+
+    term.feed_bytes(b"\x1b]9;4;1;55\x07");
+    assert!(term.state.progress.is_some());
+    let now = std::time::Instant::now();
+    assert!(!term.poll_progress_timeout(now + std::time::Duration::from_secs(10)));
+    assert!(term.state.progress.is_some());
+    assert!(term.poll_progress_timeout(now + std::time::Duration::from_secs(16)));
+    assert!(term.state.progress.is_none());
+}
+
+#[test]
+fn test_unicode_grapheme_clustering_mode_2027_and_reflow() {
+    use skterm_core::{CellFlags, Selection, SelectionMode};
+
+    let mut term = Terminal::new_headless(10, 40, 50);
+
+    // 1. NFD combining accents: "e\u{0301}" stays 1 cell with full grapheme preserved
+    term.feed_bytes("e\u{0301}x".as_bytes());
+    {
+        let buf = term.grid().active();
+        assert_eq!(buf.cursor.col, 2);
+        assert_eq!(buf.grid[0].cells[0].c, 'e');
+        assert!(!buf.grid[0].cells[0].flags.contains(CellFlags::WIDE_CHAR));
+        assert_eq!(buf.cell_grapheme(0, 0), Some("e\u{0301}"));
+        assert_eq!(buf.grid[0].cells[1].c, 'x');
+    }
+
+    // 2. VS16 emoji promotion: "❤️" (U+2764 + U+FE0F) promotes width 1 -> 2
+    term.feed_bytes("\r\n\u{2764}\u{FE0F}A".as_bytes());
+    {
+        let buf = term.grid().active();
+        assert_eq!(buf.cursor.col, 3);
+        assert_eq!(buf.grid[1].cells[0].c, '\u{2764}');
+        assert!(buf.grid[1].cells[0].flags.contains(CellFlags::WIDE_CHAR));
+        assert!(buf.grid[1].cells[1]
+            .flags
+            .contains(CellFlags::WIDE_CHAR_SPACER));
+        assert_eq!(buf.cell_grapheme(1, 0), Some("\u{2764}\u{FE0F}"));
+        assert_eq!(buf.grid[1].cells[2].c, 'A');
+    }
+
+    // 3. ZWJ emoji family: "👨‍👩‍👧‍👦" collapses into a single 2-cell cluster
+    term.feed_bytes("\r\n👨\u{200D}👩\u{200D}👧\u{200D}👦!".as_bytes());
+    {
+        let buf = term.grid().active();
+        assert_eq!(buf.cursor.col, 3);
+        assert!(buf.grid[2].cells[0].flags.contains(CellFlags::WIDE_CHAR));
+        assert!(buf.grid[2].cells[1]
+            .flags
+            .contains(CellFlags::WIDE_CHAR_SPACER));
+        assert_eq!(
+            buf.cell_grapheme(2, 0),
+            Some("👨\u{200D}👩\u{200D}👧\u{200D}👦")
+        );
+        assert_eq!(buf.grid[2].cells[2].c, '!');
+    }
+
+    // 4. Skin-tone modifier: "👍🏽" occupies 2 cols (not 4!)
+    term.feed_bytes("\r\n👍🏽Z".as_bytes());
+    {
+        let buf = term.grid().active();
+        assert_eq!(buf.cursor.col, 3);
+        assert!(buf.grid[3].cells[0].flags.contains(CellFlags::WIDE_CHAR));
+        assert!(buf.grid[3].cells[1]
+            .flags
+            .contains(CellFlags::WIDE_CHAR_SPACER));
+        assert_eq!(buf.cell_grapheme(3, 0), Some("👍🏽"));
+        assert_eq!(buf.grid[3].cells[2].c, 'Z');
+    }
+
+    // 5. Regional indicator flag pair: "🇺🇸🇯🇵" occupies 4 cols (two 2-cell clusters)
+    term.feed_bytes("\r\n🇺🇸🇯🇵".as_bytes());
+    {
+        let buf = term.grid().active();
+        assert_eq!(buf.cursor.col, 4);
+        assert!(buf.grid[4].cells[0].flags.contains(CellFlags::WIDE_CHAR));
+        assert!(buf.grid[4].cells[1]
+            .flags
+            .contains(CellFlags::WIDE_CHAR_SPACER));
+        assert_eq!(buf.cell_grapheme(4, 0), Some("🇺🇸"));
+        assert!(buf.grid[4].cells[2].flags.contains(CellFlags::WIDE_CHAR));
+        assert!(buf.grid[4].cells[3]
+            .flags
+            .contains(CellFlags::WIDE_CHAR_SPACER));
+        assert_eq!(buf.cell_grapheme(4, 2), Some("🇯🇵"));
+    }
+
+    // 6. Selection extracts full grapheme clusters cleanly
+    term.grid_mut().active_mut().selection =
+        Some(Selection::new((0, 0), (4, 3), SelectionMode::Simple));
+    let copied = term.grid().active().extract_selected_text();
+    assert_eq!(
+        copied,
+        "e\u{0301}x\n\u{2764}\u{FE0F}A\n👨\u{200D}👩\u{200D}👧\u{200D}👦!\n👍🏽Z\n🇺🇸🇯🇵"
+    );
+
+    // 7. Reflow preserves grapheme clusters across column changes
+    term.resize(10, 20).unwrap();
+    assert_eq!(term.grid().cell_grapheme(0, 0), Some("e\u{0301}"));
+    assert_eq!(
+        term.grid().cell_grapheme(2, 0),
+        Some("👨\u{200D}👩\u{200D}👧\u{200D}👦")
+    );
+    assert_eq!(term.grid().cell_grapheme(4, 0), Some("🇺🇸"));
+    assert_eq!(term.grid().cell_grapheme(4, 2), Some("🇯🇵"));
+
+    // 8. VS15 narrows Emoji_Presentation base (⌛ U+231B + U+FE0E -> width 1)
+    let mut t2 = Terminal::new_headless(5, 20, 10);
+    t2.feed_bytes("\u{231B}\u{FE0E}B".as_bytes());
+    assert_eq!(t2.grid().active().cursor.col, 2);
+    assert!(!t2.grid().active().grid[0].cells[0]
+        .flags
+        .contains(CellFlags::WIDE_CHAR));
+    assert_eq!(t2.grid().cell_grapheme(0, 0), Some("\u{231B}\u{FE0E}"));
+    assert_eq!(t2.grid().active().grid[0].cells[1].c, 'B');
+}
+
+#[test]
+fn test_kitty_graphics_stretch_animation_tick_and_delete_f() {
+    use base64::Engine;
+    use skterm_core::AnimationState;
+
+    let mut term = Terminal::new_headless(10, 40, 50);
+    term.resize_with_cell_size(10, 40, 10.0, 20.0).unwrap();
+
+    // 1. Both `c=` and `r=` stretch to fill `c x r` cells (no letterboxing)
+    let red_px = base64::engine::general_purpose::STANDARD.encode([255u8, 0, 0, 255].repeat(4));
+    term.feed_bytes(format!("\x1b_Ga=T,i=10,f=32,s=2,v=2,c=6,r=2,C=1;{red_px}\x1b\\").as_bytes());
+    assert_eq!(term.take_pending_responses(), b"\x1b_Gi=10;OK\x1b\\");
+    let img = &term.grid().active().images[0];
+    let [ox, oy, dw, dh] = img.compute_display_box(10.0, 20.0);
+    assert!((ox - 0.0).abs() < 1e-3 && (oy - 0.0).abs() < 1e-3);
+    assert!((dw - 60.0).abs() < 1e-3 && (dh - 40.0).abs() < 1e-3);
+
+    // 2. `a=f` returns `r=<frame_num>` in OK response and accounts for `kitty_storage_bytes`
+    let base_bytes = term.grid().kitty_storage_bytes;
+    let green_px = base64::engine::general_purpose::STANDARD.encode([0u8, 255, 0, 255].repeat(4));
+    let blue_px = base64::engine::general_purpose::STANDARD.encode([0u8, 0, 255, 255].repeat(4));
+    term.feed_bytes(format!("\x1b_Ga=f,i=10,f=32,s=2,v=2,X=1,z=50;{green_px}\x1b\\").as_bytes());
+    assert_eq!(term.take_pending_responses(), b"\x1b_Gi=10,r=2;OK\x1b\\");
+    term.feed_bytes(format!("\x1b_Ga=f,i=10,f=32,s=2,v=2,X=1,z=60;{blue_px}\x1b\\").as_bytes());
+    assert_eq!(term.take_pending_responses(), b"\x1b_Gi=10,r=3;OK\x1b\\");
+    assert_eq!(term.grid().kitty_storage_bytes, base_bytes * 3);
+
+    // 3. `a=a,s=3,v=2` plays frames 0 -> 1 -> 2 and stops after 1 loop (`v=2` => `v-1 = 1` loop)
+    term.feed_bytes(b"\x1b_Ga=a,i=10,s=3,v=2\x1b\\");
+    let _ = term.take_pending_responses();
+    assert_eq!(
+        term.grid().kitty_images[&10].animation_state,
+        AnimationState::Running
+    );
+    assert_eq!(term.grid().kitty_images[&10].active_frame, 0);
+
+    let t0 = std::time::Instant::now();
+    // Advance to frame 1 (green)
+    let (dirty1, next1) = term.tick_animations(t0 + std::time::Duration::from_millis(100));
+    assert!(dirty1);
+    assert!(next1.is_some());
+    assert_eq!(term.grid().kitty_images[&10].active_frame, 1);
+    assert_eq!(
+        &term.grid().active().images[0].rgba_data[..4],
+        &[0, 255, 0, 255]
+    );
+
+    // Advance to frame 2 (blue)
+    let (dirty2, next2) = term.tick_animations(t0 + std::time::Duration::from_millis(200));
+    assert!(dirty2);
+    assert!(next2.is_some());
+    assert_eq!(term.grid().kitty_images[&10].active_frame, 2);
+    assert_eq!(
+        &term.grid().active().images[0].rgba_data[..4],
+        &[0, 0, 255, 255]
+    );
+
+    // Finish loop 1 -> stops because `v=2` (`max_loops = 1`)
+    let (dirty3, next3) = term.tick_animations(t0 + std::time::Duration::from_millis(300));
+    assert!(!dirty3);
+    assert!(next3.is_none());
+    assert_eq!(
+        term.grid().kitty_images[&10].animation_state,
+        AnimationState::Stopped
+    );
+
+    // 4. Lowercase `d=f` resets to frame 0 and refreshes texture WITHOUT freeing stored frames;
+    //    uppercase `d=F` with `i=0` truncates extra frames and reclaims `kitty_storage_bytes`.
+    let tex_before = term.grid().kitty_images[&10].texture_id;
+    term.feed_bytes(b"\x1b_Ga=d,d=f,i=10\x1b\\");
+    assert_eq!(term.grid().kitty_images[&10].active_frame, 0);
+    assert_eq!(term.grid().kitty_images[&10].frames.len(), 3);
+    assert_ne!(term.grid().kitty_images[&10].texture_id, tex_before);
+    assert_eq!(
+        &term.grid().active().images[0].rgba_data[..4],
+        &[255, 0, 0, 255]
+    );
+
+    term.feed_bytes(b"\x1b_Ga=d,d=F\x1b\\");
+    assert_eq!(term.grid().kitty_images[&10].frames.len(), 1);
+    assert_eq!(term.grid().kitty_storage_bytes, base_bytes);
+}
+
+#[test]
+fn test_vt_spec_bugfixes_decstbm_restore_cursor_ed3_ris_and_image_lifecycle() {
+    use base64::Engine;
+
+    let mut term = Terminal::new_headless(8, 30, 50);
+    term.resize_with_cell_size(8, 30, 11.0, 22.0).unwrap();
+
+    // 1. DECSTBM homes cursor to (0, 0) when DECOM is OFF, and to (top-1, 0) when DECOM is ON
+    term.feed_bytes(b"\x1b[5;10H\x1b[3;6r");
+    assert_eq!(term.grid().active().cursor.row, 0);
+    assert_eq!(term.grid().active().cursor.col, 0);
+    term.feed_bytes(b"\x1b[?6h\x1b[3;6r");
+    assert_eq!(term.grid().active().cursor.row, 2);
+    assert_eq!(term.grid().active().cursor.col, 0);
+    term.feed_bytes(b"\x1b[?6l\x1b[r");
+
+    // 2. DECRC / restore_cursor is non-destructive and restores auto_wrap
+    term.feed_bytes(b"\x1b[?7l\x1b[4;8H\x1b7\x1b[?7h\x1b[1;1H\x1b8");
+    assert_eq!(term.grid().active().cursor.row, 3);
+    assert_eq!(term.grid().active().cursor.col, 7);
+    assert!(!term.state.auto_wrap);
+    // Second restore without re-saving must still work!
+    term.feed_bytes(b"\x1b[?7h\x1b[2;2H\x1b8");
+    assert_eq!(term.grid().active().cursor.row, 3);
+    assert_eq!(term.grid().active().cursor.col, 7);
+    assert!(!term.state.auto_wrap);
+    term.feed_bytes(b"\x1b[?7h");
+
+    // 3. CSI 3 J (ED 3) clears scrollback ONLY and leaves visible screen intact
+    let mut t_ed3 = Terminal::new_headless(4, 20, 50);
+    for i in 0..8 {
+        t_ed3.feed_bytes(format!("Row {i}\r\n").as_bytes());
+    }
+    t_ed3.feed_bytes(b"VisibleBottom");
+    assert!(!t_ed3.grid().active().scrollback.is_empty());
+    t_ed3.feed_bytes(b"\x1b[3J");
+    assert!(t_ed3.grid().active().scrollback.is_empty());
+    let bottom: String = t_ed3.grid().active().grid[3].cells[0..13]
+        .iter()
+        .map(|c| c.c)
+        .collect();
+    assert_eq!(bottom, "VisibleBottom");
+
+    // 4. RIS (ESC c) preserves pixel cell dimensions
+    term.feed_bytes(b"\x1bc");
+    assert!((term.grid().cell_width_px - 11.0).abs() < 1e-3);
+    assert!((term.grid().cell_height_px - 22.0).abs() < 1e-3);
+
+    // 5. IL / DL shift images and home cursor to col 0; ED 0 / ED 1 prune covered images
+    let px = base64::engine::general_purpose::STANDARD.encode([255u8, 0, 0, 255]);
+    term.feed_bytes(
+        format!("\x1b[3;5H\x1b_Ga=T,i=90,f=32,s=1,v=1,c=2,r=1,C=1,q=2;{px}\x1b\\").as_bytes(),
+    );
+    assert_eq!(term.grid().active().images[0].row, 2);
+    // IL at row 2 col 5 shifts image from row 2 -> row 3 and moves cursor to col 0
+    term.feed_bytes(b"\x1b[3;5H\x1b[1L");
+    assert_eq!(term.grid().active().cursor.col, 0);
+    assert_eq!(term.grid().active().images[0].row, 3);
+    // DL at row 3 shifts image back to row 2? Wait: DL at row 2 shifts row 3 -> row 2
+    term.feed_bytes(b"\x1b[3;5H\x1b[1M");
+    assert_eq!(term.grid().active().cursor.col, 0);
+    assert_eq!(term.grid().active().images[0].row, 2);
+    // ED 0 from row 2 col 0 prunes the image at row 2
+    term.feed_bytes(b"\x1b[3;1H\x1b[0J");
+    assert!(term.grid().active().images.is_empty());
+
+    // ED 1 from row 3 prunes an image at row 1 while keeping an image at row 5
+    term.feed_bytes(
+        format!("\x1b[2;1H\x1b_Ga=T,i=91,f=32,s=1,v=1,c=2,r=1,C=1,q=2;{px}\x1b\\").as_bytes(),
+    );
+    term.feed_bytes(
+        format!("\x1b[6;1H\x1b_Ga=T,i=92,f=32,s=1,v=1,c=2,r=1,C=1,q=2;{px}\x1b\\").as_bytes(),
+    );
+    assert_eq!(term.grid().active().images.len(), 2);
+    term.feed_bytes(b"\x1b[4;1H\x1b[1J");
+    assert_eq!(term.grid().active().images.len(), 1);
+    assert_eq!(term.grid().active().images[0].image_id, 92);
+
+    // 6. Reflow adjusts prompt_marks and image rows cleanly
+    let mut t_reflow = Terminal::new_headless(6, 20, 50);
+    t_reflow.feed_bytes(b"0123456789abcdefghij\r\n");
+    t_reflow.feed_bytes(
+        format!("\x1b]133;A\x07$ \x1b_Ga=T,i=99,f=32,s=1,v=1,c=1,r=1,C=1,q=2;{px}\x1b\\")
+            .as_bytes(),
+    );
+    assert_eq!(t_reflow.grid().active().prompt_marks.back().unwrap().row, 1);
+    assert_eq!(t_reflow.grid().active().images[0].row, 1);
+    // Narrow 20 -> 10: row 0 wraps into 2 rows, cursor stays anchored at row 1 (overflow scrolled to scrollback)
+    t_reflow.resize(6, 10).unwrap();
+    assert_eq!(t_reflow.grid().active().cursor.row, 1);
+    assert_eq!(t_reflow.grid().active().prompt_marks.back().unwrap().row, 1);
+    assert_eq!(t_reflow.grid().active().images[0].row, 1);
 }

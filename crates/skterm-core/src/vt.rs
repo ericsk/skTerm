@@ -2,8 +2,9 @@
 
 use crate::graphics::{
     composite_rgba_patch, decode_b64_flexible, decode_kitty_pixels, load_transmission_payload,
-    AnimationFrame, GraphicImage, KittyControlParams, KittyGraphicsParser, KittyParseStep,
-    Osc1337Action, Osc1337FileParams, Osc1337Parser, SixelDecoder, VirtualPlacement,
+    AnimationFrame, AnimationState, GraphicImage, KittyControlParams, KittyGraphicsParser,
+    KittyParseStep, Osc1337Action, Osc1337FileParams, Osc1337Parser, SixelDecoder,
+    VirtualPlacement,
 };
 use crate::grid::{
     CellFlags, Color, CursorShape, NamedColor, PointerShape, ProgressState, SavedCursor,
@@ -32,13 +33,17 @@ pub enum MouseProtocol {
     AnyEvent,
 }
 
-/// Mouse coordinate format
+/// Mouse coordinate format / encoding (`?1006` SGR, `?1016` SGR-Pixels, or legacy X10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MouseFormat {
     #[default]
     X10,
     Sgr,
+    SgrPixels,
 }
+
+/// Alias for [`MouseFormat`] matching terminal specification naming (`MouseEncoding::SgrPixels`).
+pub type MouseEncoding = MouseFormat;
 
 /// Character set designation for G0 / G1 slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -218,8 +223,21 @@ pub struct TerminalState {
     pub focus_events: bool,
     pub synchronized_output: bool,
     pub synchronized_output_since: Option<std::time::Instant>,
+    pub alternate_scroll: bool,
+    pub grapheme_clustering: bool,
+    pub color_scheme_updates: bool,
+    pub color_scheme_dark: bool,
+    pub in_band_resize: bool,
+    pub saved_dec_modes: HashMap<u16, bool>,
     pub modify_other_keys: u8,
+    pub primary_modify_other_keys: u8,
+    pub alt_modify_other_keys: u8,
     pub kitty_keyboard_stack: Vec<u16>,
+    pub alt_kitty_keyboard_stack: Vec<u16>,
+    pub default_fg: [u8; 3],
+    pub default_bg: [u8; 3],
+    pub default_cursor: [u8; 3],
+    pub default_palette: [[u8; 3]; 16],
     pub dynamic_palette: HashMap<u8, (u8, u8, u8)>,
     pub dynamic_fg: Option<(u8, u8, u8)>,
     pub dynamic_bg: Option<(u8, u8, u8)>,
@@ -229,6 +247,7 @@ pub struct TerminalState {
     pub pointer_shape: PointerShape,
     pub pointer_shape_stack: Vec<PointerShape>,
     pub progress: Option<TerminalProgress>,
+    pub progress_updated_at: Option<std::time::Instant>,
     pub mouse_protocol: MouseProtocol,
     pub mouse_format: MouseFormat,
     pub in_sixel: bool,
@@ -277,8 +296,21 @@ impl TerminalState {
             focus_events: false,
             synchronized_output: false,
             synchronized_output_since: None,
+            alternate_scroll: true,
+            grapheme_clustering: true,
+            color_scheme_updates: false,
+            color_scheme_dark: true,
+            in_band_resize: false,
+            saved_dec_modes: HashMap::new(),
             modify_other_keys: 0,
+            primary_modify_other_keys: 0,
+            alt_modify_other_keys: 0,
             kitty_keyboard_stack: Vec::new(),
+            alt_kitty_keyboard_stack: Vec::new(),
+            default_fg: [0xf5, 0xf5, 0xf7],
+            default_bg: [0x1a, 0x1b, 0x1e],
+            default_cursor: [0xf5, 0xf5, 0xf7],
+            default_palette: default_ansi_palette_16(),
             dynamic_palette: HashMap::new(),
             dynamic_fg: None,
             dynamic_bg: None,
@@ -288,6 +320,7 @@ impl TerminalState {
             pointer_shape: PointerShape::Default,
             pointer_shape_stack: Vec::new(),
             progress: None,
+            progress_updated_at: None,
             mouse_protocol: MouseProtocol::None,
             mouse_format: MouseFormat::X10,
             in_sixel: false,
@@ -350,30 +383,230 @@ impl TerminalState {
         self.insert_mode = false;
         self.synchronized_output = false;
         self.synchronized_output_since = None;
+        self.grapheme_clustering = true;
         self.pointer_shape = PointerShape::Default;
         self.pointer_shape_stack.clear();
         self.progress = None;
+        self.progress_updated_at = None;
         self.g0_charset = Charset::Ascii;
         self.g1_charset = Charset::Ascii;
         self.active_charset = 0;
         let active = self.grid.active_mut();
         active.cursor.visible = true;
+        active.cursor.blink = true;
         active.cursor.pending_wrap = false;
+        active.last_placeholder_pos = None;
+        active.last_grapheme_pos = None;
         active.scroll_region = (0, active.rows.saturating_sub(1));
         active.saved_cursor = None;
     }
 
     /// Returns true if DEC Private Mode `?2026` (Synchronized Output) is currently active
-    /// and within its 100ms safety timeout window.
+    /// and within its 1000ms safety timeout window.
     pub fn is_synchronized_output_active(&self) -> bool {
         self.synchronized_output
             && self
                 .synchronized_output_since
-                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(100))
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(1000))
+    }
+
+    #[inline]
+    fn active_kitty_keyboard_stack(&self) -> &Vec<u16> {
+        if self.grid.is_alternate {
+            &self.alt_kitty_keyboard_stack
+        } else {
+            &self.kitty_keyboard_stack
+        }
+    }
+
+    #[inline]
+    fn active_kitty_keyboard_stack_mut(&mut self) -> &mut Vec<u16> {
+        if self.grid.is_alternate {
+            &mut self.alt_kitty_keyboard_stack
+        } else {
+            &mut self.kitty_keyboard_stack
+        }
     }
 
     pub fn kitty_keyboard_flags(&self) -> u16 {
-        self.kitty_keyboard_stack.last().copied().unwrap_or(0)
+        self.active_kitty_keyboard_stack()
+            .last()
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[inline]
+    fn default_indexed_color(&self, idx: u8) -> (u8, u8, u8) {
+        if idx < 16 {
+            let c = self.default_palette[idx as usize];
+            (c[0], c[1], c[2])
+        } else {
+            default_indexed_rgb(idx)
+        }
+    }
+
+    /// Format a DEC Mode `?2048` in-band resize report (`CSI 48 ; rows ; cols ; h_px ; w_px t`).
+    pub fn format_in_band_resize_report(&self) -> String {
+        let rows = self.grid.active().rows;
+        let cols = self.grid.active().cols;
+        let w_px = (cols as f32 * self.grid.cell_width_px)
+            .round()
+            .clamp(0.0, u16::MAX as f32) as u16;
+        let h_px = (rows as f32 * self.grid.cell_height_px)
+            .round()
+            .clamp(0.0, u16::MAX as f32) as u16;
+        format!("\x1b[48;{rows};{cols};{h_px};{w_px}t")
+    }
+
+    /// Query a DEC private mode's boolean state for `DECRQM` (`CSI ? Ps $ p`) and `XTSAVE` (`CSI ? Ps s`).
+    pub fn get_dec_private_mode(&self, mode: u16) -> Option<bool> {
+        match mode {
+            1 => Some(self.application_cursor_keys),
+            6 => Some(self.origin_mode),
+            7 => Some(self.auto_wrap),
+            9 => Some(self.mouse_protocol == MouseProtocol::X10),
+            12 => Some(self.grid.active().cursor.blink),
+            25 => Some(self.grid.active().cursor.visible),
+            47 | 1047 | 1049 => Some(self.grid.is_alternate),
+            1000 => Some(self.mouse_protocol == MouseProtocol::Normal),
+            1002 => Some(self.mouse_protocol == MouseProtocol::ButtonEvent),
+            1003 => Some(self.mouse_protocol == MouseProtocol::AnyEvent),
+            1004 => Some(self.focus_events),
+            1006 => Some(self.mouse_format == MouseFormat::Sgr),
+            1007 => Some(self.alternate_scroll),
+            1016 => Some(self.mouse_format == MouseFormat::SgrPixels),
+            1048 => Some(self.grid.active().saved_cursor.is_some()),
+            2004 => Some(self.bracketed_paste),
+            2026 => Some(self.synchronized_output),
+            2027 => Some(self.grapheme_clustering),
+            2031 => Some(self.color_scheme_updates),
+            2048 => Some(self.in_band_resize),
+            _ => None,
+        }
+    }
+
+    /// Apply a DEC private mode set (`enable = true`) or reset (`enable = false`),
+    /// shared across `CSI ? Ps h/l` and `XTRESTORE` (`CSI ? Ps r`).
+    pub fn set_dec_private_mode(&mut self, mode: u16, enable: bool) {
+        match (mode, enable) {
+            (1, v) => self.application_cursor_keys = v,
+            (6, true) => {
+                self.origin_mode = true;
+                let active = self.grid.active_mut();
+                active.cursor.row = active.scroll_region.0;
+                active.cursor.col = 0;
+                active.cursor.pending_wrap = false;
+                active.last_placeholder_pos = None;
+                active.last_grapheme_pos = None;
+            }
+            (6, false) => {
+                self.origin_mode = false;
+                let active = self.grid.active_mut();
+                active.cursor.row = 0;
+                active.cursor.col = 0;
+                active.cursor.pending_wrap = false;
+                active.last_placeholder_pos = None;
+                active.last_grapheme_pos = None;
+            }
+            (7, true) => self.auto_wrap = true,
+            (7, false) => {
+                self.auto_wrap = false;
+                self.grid.active_mut().cursor.pending_wrap = false;
+            }
+            (9, true) => self.mouse_protocol = MouseProtocol::X10,
+            (9, false) => {
+                if self.mouse_protocol == MouseProtocol::X10 {
+                    self.mouse_protocol = MouseProtocol::None;
+                }
+            }
+            (12, v) => self.grid.active_mut().cursor.blink = v,
+            (25, v) => self.grid.active_mut().cursor.visible = v,
+            (47 | 1047 | 1049, true) => {
+                let was_alt = self.grid.is_alternate;
+                if mode == 1049 {
+                    self.save_cursor();
+                }
+                if !was_alt {
+                    self.primary_modify_other_keys = self.modify_other_keys;
+                    self.alt_modify_other_keys = 0;
+                    self.modify_other_keys = 0;
+                    self.alt_kitty_keyboard_stack.clear();
+                }
+                self.grid.set_alternate(true);
+                if mode == 1049 {
+                    self.grid.alternate.clear_alternate();
+                }
+            }
+            (47 | 1047 | 1049, false) => {
+                let was_alt = self.grid.is_alternate;
+                if mode == 1047 {
+                    self.grid.alternate.clear_alternate();
+                }
+                self.grid.set_alternate(false);
+                if mode == 1049 {
+                    self.restore_cursor();
+                }
+                if was_alt {
+                    self.alt_kitty_keyboard_stack.clear();
+                    self.alt_modify_other_keys = 0;
+                    self.modify_other_keys = self.primary_modify_other_keys;
+                    self.pointer_shape = PointerShape::Default;
+                    self.pointer_shape_stack.clear();
+                }
+            }
+            (1000, true) => self.mouse_protocol = MouseProtocol::Normal,
+            (1000, false) => {
+                if self.mouse_protocol == MouseProtocol::Normal {
+                    self.mouse_protocol = MouseProtocol::None;
+                }
+            }
+            (1002, true) => self.mouse_protocol = MouseProtocol::ButtonEvent,
+            (1002, false) => {
+                if self.mouse_protocol == MouseProtocol::ButtonEvent {
+                    self.mouse_protocol = MouseProtocol::None;
+                }
+            }
+            (1003, true) => self.mouse_protocol = MouseProtocol::AnyEvent,
+            (1003, false) => {
+                if self.mouse_protocol == MouseProtocol::AnyEvent {
+                    self.mouse_protocol = MouseProtocol::None;
+                }
+            }
+            (1004, v) => self.focus_events = v,
+            (1006, true) => self.mouse_format = MouseFormat::Sgr,
+            (1006, false) => {
+                if self.mouse_format == MouseFormat::Sgr {
+                    self.mouse_format = MouseFormat::X10;
+                }
+            }
+            (1007, v) => self.alternate_scroll = v,
+            (1016, true) => self.mouse_format = MouseFormat::SgrPixels,
+            (1016, false) => {
+                if self.mouse_format == MouseFormat::SgrPixels {
+                    self.mouse_format = MouseFormat::X10;
+                }
+            }
+            (1048, true) => self.save_cursor(),
+            (1048, false) => self.restore_cursor(),
+            (2004, v) => self.bracketed_paste = v,
+            (2026, true) => {
+                self.synchronized_output = true;
+                self.synchronized_output_since = Some(std::time::Instant::now());
+            }
+            (2026, false) => {
+                self.synchronized_output = false;
+                self.synchronized_output_since = None;
+            }
+            (2027, v) => self.grapheme_clustering = v,
+            (2031, v) => self.color_scheme_updates = v,
+            (2048, true) => {
+                self.in_band_resize = true;
+                let report = self.format_in_band_resize_report();
+                self.pending_responses.extend_from_slice(report.as_bytes());
+            }
+            (2048, false) => self.in_band_resize = false,
+            _ => {}
+        }
     }
 
     fn format_decrqss_sgr(&self) -> String {
@@ -455,19 +688,33 @@ impl TerminalState {
         let ul_id = self.current_underline_color_id;
         let hid = self.current_hyperlink_id;
         let auto_wrap = self.auto_wrap;
-        if self.insert_mode {
+        let grapheme_clustering = self.grapheme_clustering;
+        if self.insert_mode
+            && !self
+                .grid
+                .active()
+                .will_extend_grapheme(c, grapheme_clustering)
+        {
             let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
             if w > 0 {
                 self.grid.active_mut().insert_chars(w, bg);
             }
         }
-        self.grid
-            .active_mut()
-            .write_char_with_style(c, fg, bg, flags, ul_id, hid, auto_wrap);
+        self.grid.active_mut().write_char_with_grapheme_mode(
+            c,
+            fg,
+            bg,
+            flags,
+            ul_id,
+            hid,
+            auto_wrap,
+            grapheme_clustering,
+        );
     }
 
     fn save_cursor(&mut self) {
         let origin_mode = self.origin_mode;
+        let auto_wrap = self.auto_wrap;
         let active = self.grid.active_mut();
         active.saved_cursor = Some(SavedCursor {
             row: active.cursor.row,
@@ -479,25 +726,31 @@ impl TerminalState {
             flags: self.flags,
             shape: active.cursor.shape,
             visible: active.cursor.visible,
+            blink: active.cursor.blink,
             pending_wrap: active.cursor.pending_wrap,
             origin_mode,
+            auto_wrap,
         });
     }
 
     fn restore_cursor(&mut self) {
         let active = self.grid.active_mut();
-        if let Some(saved) = active.saved_cursor.take() {
+        if let Some(saved) = active.saved_cursor.clone() {
             active.cursor.row = saved.row.min(active.rows.saturating_sub(1));
             active.cursor.col = saved.col.min(active.cols.saturating_sub(1));
             active.cursor.shape = saved.shape;
             active.cursor.visible = saved.visible;
+            active.cursor.blink = saved.blink;
             active.cursor.pending_wrap = saved.pending_wrap;
+            active.last_placeholder_pos = None;
+            active.last_grapheme_pos = None;
             self.fg = saved.fg;
             self.bg = saved.bg;
             self.underline_color = saved.underline_color;
             self.current_underline_color_id = saved.underline_color_id;
             self.flags = saved.flags;
             self.origin_mode = saved.origin_mode;
+            self.auto_wrap = saved.auto_wrap;
         }
     }
 
@@ -719,6 +972,8 @@ impl Perform for TerminalState {
                 let active = self.grid.active_mut();
                 active.cursor.col = 0;
                 active.cursor.pending_wrap = false;
+                active.last_placeholder_pos = None;
+                active.last_grapheme_pos = None;
             }
             b'\t' => {
                 self.grid.active_mut().advance_tab(1);
@@ -851,10 +1106,14 @@ impl Perform for TerminalState {
                             format!("\x1bP1$r{};{}r\x1b\\", top + 1, bottom + 1)
                         }
                         " q" => {
-                            let code = match self.grid.active().cursor.shape {
-                                CursorShape::Block => 1,
-                                CursorShape::Underline => 3,
-                                CursorShape::Beam => 5,
+                            let cur = &self.grid.active().cursor;
+                            let code = match (cur.shape, cur.blink) {
+                                (CursorShape::Block, true) => 1,
+                                (CursorShape::Block, false) => 2,
+                                (CursorShape::Underline, true) => 3,
+                                (CursorShape::Underline, false) => 4,
+                                (CursorShape::Beam, true) => 5,
+                                (CursorShape::Beam, false) => 6,
                             };
                             format!("\x1bP1$r{code} q\x1b\\")
                         }
@@ -930,7 +1189,7 @@ impl Perform for TerminalState {
                             .dynamic_palette
                             .get(&idx)
                             .copied()
-                            .unwrap_or_else(|| default_indexed_rgb(idx));
+                            .unwrap_or_else(|| self.default_indexed_color(idx));
                         let rgb_str = format_osc_rgb(r, g, b);
                         let resp = format!("\x1b]4;{idx};{rgb_str}{terminator}");
                         self.pending_responses.extend_from_slice(resp.as_bytes());
@@ -982,7 +1241,12 @@ impl Perform for TerminalState {
             }
             b"8" => {
                 if params.len() >= 3 {
-                    if let Ok(uri) = std::str::from_utf8(params[2]) {
+                    let uri_cow: std::borrow::Cow<'_, [u8]> = if params.len() == 3 {
+                        std::borrow::Cow::Borrowed(params[2])
+                    } else {
+                        std::borrow::Cow::Owned(params[2..].join(&b';'))
+                    };
+                    if let Ok(uri) = std::str::from_utf8(&uri_cow) {
                         if !uri.is_empty() {
                             let explicit_id = std::str::from_utf8(params[1])
                                 .ok()
@@ -1118,6 +1382,11 @@ impl Perform for TerminalState {
                 } else if res == 0 {
                     self.modify_other_keys = 0;
                 }
+                if self.grid.is_alternate {
+                    self.alt_modify_other_keys = self.modify_other_keys;
+                } else {
+                    self.primary_modify_other_keys = self.modify_other_keys;
+                }
             }
             'H' | 'f' if intermediates.is_empty() => {
                 let mut row = 1;
@@ -1168,18 +1437,24 @@ impl Perform for TerminalState {
                 active.move_down((first_param as usize).max(1));
                 active.cursor.col = 0;
                 active.cursor.pending_wrap = false;
+                active.last_placeholder_pos = None;
+                active.last_grapheme_pos = None;
             }
             'F' if intermediates.is_empty() => {
                 let active = self.grid.active_mut();
                 active.move_up((first_param as usize).max(1));
                 active.cursor.col = 0;
                 active.cursor.pending_wrap = false;
+                active.last_placeholder_pos = None;
+                active.last_grapheme_pos = None;
             }
             'G' | '`' if intermediates.is_empty() => {
                 let col = (first_param as usize).max(1) - 1;
                 let active = self.grid.active_mut();
                 active.cursor.col = col.min(active.cols.saturating_sub(1));
                 active.cursor.pending_wrap = false;
+                active.last_placeholder_pos = None;
+                active.last_grapheme_pos = None;
             }
             'd' if intermediates.is_empty() => {
                 let rel_row = (first_param as usize).max(1) - 1;
@@ -1191,6 +1466,8 @@ impl Perform for TerminalState {
                     rel_row.min(active.rows.saturating_sub(1))
                 };
                 active.cursor.pending_wrap = false;
+                active.last_placeholder_pos = None;
+                active.last_grapheme_pos = None;
             }
             'I' if intermediates.is_empty() => {
                 // CHT: Cursor Forward Tabulation Ps tab stops
@@ -1253,19 +1530,46 @@ impl Perform for TerminalState {
                 .active_mut()
                 .scroll_down_with_bg((first_param as usize).max(1), self.bg),
             's' if intermediates.is_empty() => self.save_cursor(),
+            's' if is_private && intermediates.len() == 1 => {
+                // XTSAVE: CSI ? Ps ; ... s — save current DEC private mode values.
+                const ALL_SAVEABLE_DEC_MODES: &[u16] = &[
+                    1, 6, 7, 9, 12, 25, 47, 1000, 1002, 1003, 1004, 1006, 1007, 1016, 1047, 1049,
+                    2004, 2026, 2027, 2031, 2048,
+                ];
+                let mut had_explicit = false;
+                for param in params.iter() {
+                    for &mode in param {
+                        if mode != 0 {
+                            had_explicit = true;
+                            if let Some(val) = self.get_dec_private_mode(mode) {
+                                self.saved_dec_modes.insert(mode, val);
+                            }
+                        }
+                    }
+                }
+                if !had_explicit {
+                    for &mode in ALL_SAVEABLE_DEC_MODES {
+                        if let Some(val) = self.get_dec_private_mode(mode) {
+                            self.saved_dec_modes.insert(mode, val);
+                        }
+                    }
+                }
+            }
             'u' if intermediates.is_empty() => self.restore_cursor(),
             'u' if intermediates == b">" => {
-                // Kitty Keyboard Protocol: push flags onto stack (CSI > flags u)
-                if self.kitty_keyboard_stack.len() >= 16 {
-                    self.kitty_keyboard_stack.remove(0);
+                // Kitty Keyboard Protocol: push flags onto active buffer's stack (CSI > flags u)
+                let stack = self.active_kitty_keyboard_stack_mut();
+                if stack.len() >= 16 {
+                    stack.remove(0);
                 }
-                self.kitty_keyboard_stack.push(first_param);
+                stack.push(first_param);
             }
             'u' if intermediates == b"<" => {
-                // Kitty Keyboard Protocol: pop count entries from stack (CSI < count u)
+                // Kitty Keyboard Protocol: pop count entries from active buffer's stack (CSI < count u)
                 let count = (first_param as usize).max(1);
-                let new_len = self.kitty_keyboard_stack.len().saturating_sub(count);
-                self.kitty_keyboard_stack.truncate(new_len);
+                let stack = self.active_kitty_keyboard_stack_mut();
+                let new_len = stack.len().saturating_sub(count);
+                stack.truncate(new_len);
             }
             'u' if intermediates == b"=" => {
                 // Kitty Keyboard Protocol: set/modify current flags (CSI = flags ; mode u)
@@ -1278,10 +1582,11 @@ impl Perform for TerminalState {
                     3 => cur & !flags,
                     _ => flags,
                 };
-                if let Some(last) = self.kitty_keyboard_stack.last_mut() {
+                let stack = self.active_kitty_keyboard_stack_mut();
+                if let Some(last) = stack.last_mut() {
                     *last = next;
                 } else {
-                    self.kitty_keyboard_stack.push(next);
+                    stack.push(next);
                 }
             }
             'u' if intermediates == b"?" => {
@@ -1289,6 +1594,30 @@ impl Perform for TerminalState {
                 let flags = self.kitty_keyboard_flags();
                 let resp = format!("\x1b[?{flags}u");
                 self.pending_responses.extend_from_slice(resp.as_bytes());
+            }
+            'r' if is_private && intermediates.len() == 1 => {
+                // XTRESTORE: CSI ? Ps ; ... r — restore saved DEC private mode values.
+                let mut requested: Vec<u16> = Vec::new();
+                for param in params.iter() {
+                    for &mode in param {
+                        if mode != 0 {
+                            requested.push(mode);
+                        }
+                    }
+                }
+                if requested.is_empty() {
+                    let entries: Vec<(u16, bool)> =
+                        self.saved_dec_modes.iter().map(|(&k, &v)| (k, v)).collect();
+                    for (mode, val) in entries {
+                        self.set_dec_private_mode(mode, val);
+                    }
+                } else {
+                    for mode in requested {
+                        if let Some(&val) = self.saved_dec_modes.get(&mode) {
+                            self.set_dec_private_mode(mode, val);
+                        }
+                    }
+                }
             }
             'r' if intermediates.is_empty() => {
                 let mut top = 1;
@@ -1309,17 +1638,21 @@ impl Perform for TerminalState {
                     }
                 }
                 if top < bottom && bottom <= self.grid.active().rows {
+                    let origin_mode = self.origin_mode;
                     let active = self.grid.active_mut();
                     active.scroll_region = (top - 1, bottom - 1);
-                    active.cursor.row = top - 1;
+                    active.cursor.row = if origin_mode { top - 1 } else { 0 };
                     active.cursor.col = 0;
                     active.cursor.pending_wrap = false;
+                    active.last_placeholder_pos = None;
+                    active.last_grapheme_pos = None;
                 }
             }
             'c' if intermediates.is_empty() => {
-                // DA1: Primary Device Attributes (VT220 Level 2 + Sixel (4) + ANSI Color (22))
+                // DA1: Primary Device Attributes (VT220 Level 2 + Sixel (4) + ANSI Color (22) + OSC 52 Clipboard (52))
                 if first_param == 0 {
-                    self.pending_responses.extend_from_slice(b"\x1b[?62;4;22c");
+                    self.pending_responses
+                        .extend_from_slice(b"\x1b[?62;4;22;52c");
                 }
             }
             'c' if intermediates == b">" => {
@@ -1347,8 +1680,8 @@ impl Perform for TerminalState {
                 }
                 _ => {}
             },
-            'n' if is_private && intermediates.len() == 1 => {
-                if first_param == 6 {
+            'n' if is_private && intermediates.len() == 1 => match first_param {
+                6 => {
                     // DECXCPR: Extended Cursor Position Report (1-indexed)
                     let active = self.grid.active();
                     let row = if self.origin_mode {
@@ -1360,95 +1693,23 @@ impl Perform for TerminalState {
                     let resp = format!("\x1b[?{row};{col}R");
                     self.pending_responses.extend_from_slice(resp.as_bytes());
                 }
-            }
+                996 => {
+                    // Color Scheme DSR query: CSI ? 996 n -> CSI ? 997 ; 1 n (dark) or 2 n (light)
+                    let seq: &[u8] = if self.color_scheme_dark {
+                        b"\x1b[?997;1n"
+                    } else {
+                        b"\x1b[?997;2n"
+                    };
+                    self.pending_responses.extend_from_slice(seq);
+                }
+                _ => {}
+            },
             'p' if intermediates == b"?$" => {
                 // DECRQM: Request DEC Private Mode
-                let pm = match first_param {
-                    1 => {
-                        if self.application_cursor_keys {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    6 => {
-                        if self.origin_mode {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    7 => {
-                        if self.auto_wrap {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    25 => {
-                        if self.grid.active().cursor.visible {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    47 | 1047 | 1049 => {
-                        if self.grid.is_alternate {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    1000 => {
-                        if self.mouse_protocol == MouseProtocol::Normal {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    1002 => {
-                        if self.mouse_protocol == MouseProtocol::ButtonEvent {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    1003 => {
-                        if self.mouse_protocol == MouseProtocol::AnyEvent {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    1004 => {
-                        if self.focus_events {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    1006 => {
-                        if self.mouse_format == MouseFormat::Sgr {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    2004 => {
-                        if self.bracketed_paste {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    2026 => {
-                        if self.synchronized_output {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    _ => 0,
+                let pm = match self.get_dec_private_mode(first_param) {
+                    Some(true) => 1,
+                    Some(false) => 2,
+                    None => 0,
                 };
                 let resp = format!("\x1b[?{first_param};{pm}$y");
                 self.pending_responses.extend_from_slice(resp.as_bytes());
@@ -1472,36 +1733,7 @@ impl Perform for TerminalState {
                 for param in params.iter() {
                     for &mode in param {
                         if is_private && intermediates.len() == 1 {
-                            match mode {
-                                1 => self.application_cursor_keys = true,
-                                6 => {
-                                    self.origin_mode = true;
-                                    let active = self.grid.active_mut();
-                                    active.cursor.row = active.scroll_region.0;
-                                    active.cursor.col = 0;
-                                    active.cursor.pending_wrap = false;
-                                }
-                                7 => self.auto_wrap = true,
-                                25 => self.grid.active_mut().cursor.visible = true,
-                                47 | 1047 | 1049 => {
-                                    if mode == 1049 {
-                                        self.save_cursor();
-                                    }
-                                    self.grid.set_alternate(true);
-                                }
-                                2004 => self.bracketed_paste = true,
-                                2026 => {
-                                    self.synchronized_output = true;
-                                    self.synchronized_output_since =
-                                        Some(std::time::Instant::now());
-                                }
-                                1000 => self.mouse_protocol = MouseProtocol::Normal,
-                                1002 => self.mouse_protocol = MouseProtocol::ButtonEvent,
-                                1003 => self.mouse_protocol = MouseProtocol::AnyEvent,
-                                1004 => self.focus_events = true,
-                                1006 => self.mouse_format = MouseFormat::Sgr,
-                                _ => {}
-                            }
+                            self.set_dec_private_mode(mode, true);
                         } else if intermediates.is_empty() && mode == 4 {
                             self.insert_mode = true;
                         }
@@ -1512,45 +1744,7 @@ impl Perform for TerminalState {
                 for param in params.iter() {
                     for &mode in param {
                         if is_private && intermediates.len() == 1 {
-                            match mode {
-                                1 => self.application_cursor_keys = false,
-                                6 => {
-                                    self.origin_mode = false;
-                                    let active = self.grid.active_mut();
-                                    active.cursor.row = 0;
-                                    active.cursor.col = 0;
-                                    active.cursor.pending_wrap = false;
-                                }
-                                7 => {
-                                    self.auto_wrap = false;
-                                    self.grid.active_mut().cursor.pending_wrap = false;
-                                }
-                                25 => self.grid.active_mut().cursor.visible = false,
-                                47 | 1047 => {
-                                    self.grid.set_alternate(false);
-                                    self.kitty_keyboard_stack.clear();
-                                    self.modify_other_keys = 0;
-                                    self.pointer_shape = PointerShape::Default;
-                                    self.pointer_shape_stack.clear();
-                                }
-                                1049 => {
-                                    self.grid.set_alternate(false);
-                                    self.restore_cursor();
-                                    self.kitty_keyboard_stack.clear();
-                                    self.modify_other_keys = 0;
-                                    self.pointer_shape = PointerShape::Default;
-                                    self.pointer_shape_stack.clear();
-                                }
-                                2004 => self.bracketed_paste = false,
-                                2026 => {
-                                    self.synchronized_output = false;
-                                    self.synchronized_output_since = None;
-                                }
-                                1000 | 1002 | 1003 => self.mouse_protocol = MouseProtocol::None,
-                                1004 => self.focus_events = false,
-                                1006 => self.mouse_format = MouseFormat::X10,
-                                _ => {}
-                            }
+                            self.set_dec_private_mode(mode, false);
                         } else if intermediates.is_empty() && mode == 4 {
                             self.insert_mode = false;
                         }
@@ -1561,18 +1755,41 @@ impl Perform for TerminalState {
                 // DECSTR (Soft Terminal Reset)
                 self.soft_reset();
             }
-            'q' if intermediates == b" " => match first_param {
-                0..=2 => self.grid.active_mut().cursor.shape = CursorShape::Block,
-                3 | 4 => self.grid.active_mut().cursor.shape = CursorShape::Underline,
-                5 | 6 => self.grid.active_mut().cursor.shape = CursorShape::Beam,
-                _ => {}
-            },
+            'q' if intermediates == b" " => {
+                let cur = &mut self.grid.active_mut().cursor;
+                match first_param {
+                    0 | 1 => {
+                        cur.shape = CursorShape::Block;
+                        cur.blink = true;
+                    }
+                    2 => {
+                        cur.shape = CursorShape::Block;
+                        cur.blink = false;
+                    }
+                    3 => {
+                        cur.shape = CursorShape::Underline;
+                        cur.blink = true;
+                    }
+                    4 => {
+                        cur.shape = CursorShape::Underline;
+                        cur.blink = false;
+                    }
+                    5 => {
+                        cur.shape = CursorShape::Beam;
+                        cur.blink = true;
+                    }
+                    6 => {
+                        cur.shape = CursorShape::Beam;
+                        cur.blink = false;
+                    }
+                    _ => {}
+                }
+            }
             'q' if intermediates == b">" => {
-                // XTVERSION: CSI > q / CSI > 0 q -> DCS > | skTerm(<version>) ST
+                // XTVERSION: CSI > q / CSI > 0 q -> DCS > | ghostty 1.2.0 ST
                 if first_param == 0 {
-                    self.pending_responses.extend_from_slice(
-                        concat!("\x1bP>|skTerm(", env!("CARGO_PKG_VERSION"), ")\x1b\\").as_bytes(),
-                    );
+                    self.pending_responses
+                        .extend_from_slice(b"\x1bP>|ghostty 1.2.0\x1b\\");
                 }
             }
             't' if intermediates.is_empty() => {
@@ -1683,8 +1900,21 @@ impl Perform for TerminalState {
                 let rows = self.grid.active().rows;
                 let cols = self.grid.active().cols;
                 let max_scroll = self.grid.primary.max_scrollback;
+                let cell_w = self.grid.cell_width_px;
+                let cell_h = self.grid.cell_height_px;
+                let default_fg = self.default_fg;
+                let default_bg = self.default_bg;
+                let default_cursor = self.default_cursor;
+                let default_palette = self.default_palette;
+                let color_scheme_dark = self.color_scheme_dark;
                 let had_status = !self.program_statuses.is_empty();
                 *self = Self::new(rows, cols, max_scroll);
+                self.grid.set_cell_pixel_size(cell_w, cell_h);
+                self.default_fg = default_fg;
+                self.default_bg = default_bg;
+                self.default_cursor = default_cursor;
+                self.default_palette = default_palette;
+                self.color_scheme_dark = color_scheme_dark;
                 self.program_status_dirty = had_status;
             }
             _ => {}
@@ -1892,6 +2122,7 @@ impl TerminalState {
                 active.record_prompt_mark();
                 active.semantic_zone = SemanticZone::Prompt;
                 self.progress = None;
+                self.progress_updated_at = None;
             }
             Osc1337Action::CopyText(text) => {
                 self.pending_clipboard = Some(text.clone());
@@ -1926,7 +2157,11 @@ impl TerminalState {
         if args.is_empty() {
             return;
         }
-        if args.len() >= 2 && trim_ascii_bytes(args[0]) == b"4" {
+        if trim_ascii_bytes(args[0]) == b"4" {
+            // Bare malformed `OSC 9;4` must be ignored rather than firing a `"4"` toast.
+            if args.len() < 2 {
+                return;
+            }
             let state_code = std::str::from_utf8(trim_ascii_bytes(args[1]))
                 .ok()
                 .and_then(|s| s.parse::<u8>().ok())
@@ -1937,26 +2172,41 @@ impl TerminalState {
                 .and_then(|s| s.parse::<u16>().ok())
                 .map(|v| v.min(100) as u8);
 
-            self.progress = match state_code {
-                0 => None,
-                1 => Some(TerminalProgress {
-                    state: ProgressState::Normal,
-                    percent: pct_opt.unwrap_or(0),
-                }),
-                2 => Some(TerminalProgress {
-                    state: ProgressState::Error,
-                    percent: pct_opt.unwrap_or(100),
-                }),
-                3 => Some(TerminalProgress {
-                    state: ProgressState::Indeterminate,
-                    percent: 0,
-                }),
-                4 => Some(TerminalProgress {
-                    state: ProgressState::Paused,
-                    percent: pct_opt.unwrap_or(100),
-                }),
-                _ => self.progress,
-            };
+            match state_code {
+                0 => {
+                    self.progress = None;
+                    self.progress_updated_at = None;
+                }
+                1 => {
+                    self.progress = Some(TerminalProgress {
+                        state: ProgressState::Normal,
+                        percent: pct_opt.unwrap_or(0),
+                    });
+                    self.progress_updated_at = Some(std::time::Instant::now());
+                }
+                2 => {
+                    self.progress = Some(TerminalProgress {
+                        state: ProgressState::Error,
+                        percent: pct_opt.unwrap_or(100),
+                    });
+                    self.progress_updated_at = Some(std::time::Instant::now());
+                }
+                3 => {
+                    self.progress = Some(TerminalProgress {
+                        state: ProgressState::Indeterminate,
+                        percent: 0,
+                    });
+                    self.progress_updated_at = Some(std::time::Instant::now());
+                }
+                4 => {
+                    self.progress = Some(TerminalProgress {
+                        state: ProgressState::Paused,
+                        percent: pct_opt.unwrap_or(100),
+                    });
+                    self.progress_updated_at = Some(std::time::Instant::now());
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -1987,11 +2237,27 @@ impl TerminalState {
             let arg = trim_ascii_bytes(arg);
             if arg == b"?" {
                 let rgb_opt = match code {
-                    10 => Some(self.dynamic_fg.unwrap_or((0xf5, 0xf5, 0xf7))),
-                    11 => Some(self.dynamic_bg.unwrap_or((0x1a, 0x1b, 0x1e))),
-                    12 => Some(self.dynamic_cursor.unwrap_or((0xf5, 0xf5, 0xf7))),
+                    10 => Some(self.dynamic_fg.unwrap_or((
+                        self.default_fg[0],
+                        self.default_fg[1],
+                        self.default_fg[2],
+                    ))),
+                    11 => Some(self.dynamic_bg.unwrap_or((
+                        self.default_bg[0],
+                        self.default_bg[1],
+                        self.default_bg[2],
+                    ))),
+                    12 => Some(self.dynamic_cursor.unwrap_or((
+                        self.default_cursor[0],
+                        self.default_cursor[1],
+                        self.default_cursor[2],
+                    ))),
                     17 => Some(self.dynamic_selection_bg.unwrap_or((0x48, 0x52, 0x70))),
-                    19 => Some(self.dynamic_selection_fg.unwrap_or((0xf5, 0xf5, 0xf7))),
+                    19 => Some(self.dynamic_selection_fg.unwrap_or((
+                        self.default_fg[0],
+                        self.default_fg[1],
+                        self.default_fg[2],
+                    ))),
                     _ => None,
                 };
                 if let Some((r, g, b)) = rgb_opt {
@@ -2062,16 +2328,32 @@ impl TerminalState {
 
             if val == "?" {
                 let (r, g, b) = match slot {
-                    ColorSlot::Fg => self.dynamic_fg.unwrap_or((0xf5, 0xf5, 0xf7)),
-                    ColorSlot::Bg => self.dynamic_bg.unwrap_or((0x1a, 0x1b, 0x1e)),
-                    ColorSlot::Cursor => self.dynamic_cursor.unwrap_or((0xf5, 0xf5, 0xf7)),
+                    ColorSlot::Fg => self.dynamic_fg.unwrap_or((
+                        self.default_fg[0],
+                        self.default_fg[1],
+                        self.default_fg[2],
+                    )),
+                    ColorSlot::Bg => self.dynamic_bg.unwrap_or((
+                        self.default_bg[0],
+                        self.default_bg[1],
+                        self.default_bg[2],
+                    )),
+                    ColorSlot::Cursor => self.dynamic_cursor.unwrap_or((
+                        self.default_cursor[0],
+                        self.default_cursor[1],
+                        self.default_cursor[2],
+                    )),
                     ColorSlot::SelBg => self.dynamic_selection_bg.unwrap_or((0x48, 0x52, 0x70)),
-                    ColorSlot::SelFg => self.dynamic_selection_fg.unwrap_or((0xf5, 0xf5, 0xf7)),
+                    ColorSlot::SelFg => self.dynamic_selection_fg.unwrap_or((
+                        self.default_fg[0],
+                        self.default_fg[1],
+                        self.default_fg[2],
+                    )),
                     ColorSlot::Palette(idx) => self
                         .dynamic_palette
                         .get(&idx)
                         .copied()
-                        .unwrap_or_else(|| default_indexed_rgb(idx)),
+                        .unwrap_or_else(|| self.default_indexed_color(idx)),
                 };
                 resp_parts.push(format!("{key}=rgb:{r:02x}/{g:02x}/{b:02x}"));
             } else if val.is_empty() {
@@ -2363,6 +2645,7 @@ impl TerminalState {
                 active.record_prompt_mark();
                 active.semantic_zone = SemanticZone::Prompt;
                 self.progress = None;
+                self.progress_updated_at = None;
             }
             b"B" => {
                 self.grid.active_mut().semantic_zone = SemanticZone::CommandInput;
@@ -2379,6 +2662,7 @@ impl TerminalState {
                 active.complete_last_prompt_mark(exit_code);
                 active.semantic_zone = SemanticZone::Idle;
                 self.progress = None;
+                self.progress_updated_at = None;
             }
             b"P" if is_633 => {
                 for &prop in &args[1..] {
@@ -2625,8 +2909,10 @@ impl TerminalState {
                     self.execute_kitty_delete(&params);
                 }
                 'f' => match self.execute_kitty_frame(&params, payload) {
-                    Ok(image_id) => {
-                        if let Some(resp) = params.format_response(Some(image_id), true, "OK") {
+                    Ok((image_id, frame_num)) => {
+                        if let Some(resp) =
+                            params.format_frame_response(Some(image_id), frame_num, true, "OK")
+                        {
                             self.pending_responses.extend_from_slice(&resp);
                         }
                     }
@@ -3043,24 +3329,59 @@ impl TerminalState {
                 changed = active.images.len() != before;
             }
             'f' => {
-                let target_id = if params.image_id != 0 {
-                    Some(params.image_id)
+                let target_ids: Vec<u32> = if params.image_id != 0 {
+                    vec![params.image_id]
                 } else if params.image_number != 0 {
                     self.grid
                         .kitty_number_to_id
                         .get(&params.image_number)
                         .copied()
+                        .into_iter()
+                        .collect()
                 } else {
-                    None
+                    // `i=0` and `I=0`: apply to all stored Kitty images.
+                    self.grid.kitty_images.keys().copied().collect()
                 };
-                if let Some(id) = target_id {
+
+                let mut to_refresh = Vec::new();
+                for id in target_ids {
                     if let Some(stored) = self.grid.kitty_images.get_mut(&id) {
-                        if stored.frames.len() > 1 {
-                            stored.frames.truncate(1);
+                        let was_active_nonzero = stored.active_frame != 0;
+                        stored.animation_state = AnimationState::Stopped;
+                        stored.next_frame_at = None;
+                        stored.loops_completed = 0;
+
+                        if free_data {
+                            // Uppercase `d=F`: drop all extra animation frames and reclaim storage bytes.
+                            let old_bytes = stored.byte_len();
+                            if stored.frames.len() > 1 {
+                                stored.frames.truncate(1);
+                                stored.frames.shrink_to_fit();
+                            }
+                            if !stored.frames.is_empty() {
+                                stored.active_frame = 0;
+                                stored.rgba_data = Arc::clone(&stored.frames[0].rgba_data);
+                            }
+                            let new_bytes = stored.byte_len();
+                            self.grid.kitty_storage_bytes = self
+                                .grid
+                                .kitty_storage_bytes
+                                .saturating_sub(old_bytes.saturating_sub(new_bytes));
+                            if was_active_nonzero || old_bytes != new_bytes {
+                                to_refresh.push(id);
+                            }
+                        } else if !stored.frames.is_empty() {
+                            // Lowercase `d=f`: stop animation and reset display to base frame without freeing extra frames.
                             stored.active_frame = 0;
                             stored.rgba_data = Arc::clone(&stored.frames[0].rgba_data);
+                            if was_active_nonzero {
+                                to_refresh.push(id);
+                            }
                         }
                     }
+                }
+                for id in to_refresh {
+                    self.refresh_kitty_texture_bindings(id);
                 }
                 return;
             }
@@ -3131,7 +3452,7 @@ impl TerminalState {
         &mut self,
         params: &KittyControlParams,
         payload: Vec<u8>,
-    ) -> Result<u32, (&'static str, &'static str)> {
+    ) -> Result<(u32, u32), (&'static str, &'static str)> {
         let image_id = self.resolve_target_kitty_id(params)?;
         let (img_w, img_h) = {
             let stored = self
@@ -3158,15 +3479,24 @@ impl TerminalState {
         };
 
         let overwrite = params.cell_x_offset == 1;
-        let gap_ms = params.z_index.max(0) as u32;
+        let explicit_gap_ms = if params.has_z {
+            Some(if params.z_index < 0 {
+                0
+            } else {
+                params.z_index as u32
+            })
+        } else {
+            None
+        };
         let fill = params.cell_y_offset.to_be_bytes();
 
-        {
+        let (frame_num, old_bytes, new_bytes) = {
             let stored = self
                 .grid
                 .kitty_images
                 .get_mut(&image_id)
                 .ok_or(("ENOENT", "Image not found"))?;
+            let old_bytes = stored.byte_len();
 
             let edit_idx = if params.cols > 0 {
                 let idx = (params.cols - 1) as usize;
@@ -3179,7 +3509,7 @@ impl TerminalState {
                 None
             };
 
-            if let Some(idx) = edit_idx {
+            let frame_num = if let Some(idx) = edit_idx {
                 let mut canvas = (*stored.frames[idx].rgba_data).clone();
                 if patch_w > 0 && patch_h > 0 {
                     composite_rgba_patch(
@@ -3196,12 +3526,13 @@ impl TerminalState {
                 }
                 let arc = Arc::new(canvas);
                 stored.frames[idx].rgba_data = Arc::clone(&arc);
-                if gap_ms > 0 {
-                    stored.frames[idx].gap_ms = gap_ms;
+                if let Some(gap) = explicit_gap_ms {
+                    stored.frames[idx].gap_ms = gap;
                 }
                 if stored.active_frame == idx {
                     stored.rgba_data = arc;
                 }
+                (idx + 1) as u32
             } else {
                 let mut canvas = if params.rows > 0 {
                     let base_idx = (params.rows - 1) as usize;
@@ -3229,16 +3560,46 @@ impl TerminalState {
                 }
                 let frame_num = (stored.frames.len() + 1) as u32;
                 let arc = Arc::new(canvas);
+                let gap_ms = match explicit_gap_ms {
+                    Some(0) if params.z_index < 0 => 0,
+                    Some(g) if g > 0 => g,
+                    _ => 40,
+                };
                 stored.frames.push(AnimationFrame {
                     frame_number: frame_num,
                     rgba_data: arc,
-                    gap_ms: if gap_ms > 0 { gap_ms } else { 40 },
+                    gap_ms,
                 });
-            }
-        }
+                // If an image in `Loading` mode was parked at the previous last frame waiting
+                // for new frames, schedule advancing into the newly arrived frame.
+                if stored.animation_state == AnimationState::Loading
+                    && stored.next_frame_at.is_none()
+                {
+                    let cur_gap = stored
+                        .frames
+                        .get(stored.active_frame)
+                        .map(|f| f.gap_ms.max(1))
+                        .unwrap_or(40);
+                    stored.next_frame_at = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_millis(cur_gap as u64),
+                    );
+                }
+                frame_num
+            };
 
+            let new_bytes = stored.byte_len();
+            (frame_num, old_bytes, new_bytes)
+        };
+
+        self.grid.kitty_storage_bytes = self
+            .grid
+            .kitty_storage_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+        self.grid.enforce_kitty_storage_quota(image_id);
         self.refresh_kitty_texture_bindings(image_id);
-        Ok(image_id)
+        Ok((image_id, frame_num))
     }
 
     fn execute_kitty_compose(
@@ -3314,6 +3675,7 @@ impl TerminalState {
         params: &KittyControlParams,
     ) -> Result<u32, (&'static str, &'static str)> {
         let image_id = self.resolve_target_kitty_id(params)?;
+        let now = std::time::Instant::now();
         let switched = {
             let stored = self
                 .grid
@@ -3321,43 +3683,152 @@ impl TerminalState {
                 .get_mut(&image_id)
                 .ok_or(("ENOENT", "Image not found"))?;
 
-            if params.rows > 0 {
+            if params.rows > 0 && params.has_z {
                 let idx = (params.rows - 1) as usize;
                 if let Some(frame) = stored.frames.get_mut(idx) {
-                    if params.z_index >= 0 {
-                        frame.gap_ms = params.z_index as u32;
-                    }
+                    frame.gap_ms = params.z_index.max(0) as u32;
                 }
             }
 
+            if params.data_height > 0 {
+                stored.loop_count = params.data_height;
+                stored.loops_completed = 0;
+            }
+
+            let mut frame_switched = false;
             if params.cols > 0 {
                 let idx = (params.cols - 1) as usize;
                 if let Some(frame) = stored.frames.get(idx) {
                     stored.active_frame = idx;
                     stored.rgba_data = Arc::clone(&frame.rgba_data);
-                    true
-                } else {
-                    false
+                    frame_switched = true;
                 }
-            } else if params.data_width == 3 && !stored.frames.is_empty() {
-                // `s=3` starts playback: advance to the latest available frame if still on frame 1.
-                let last_idx = stored.frames.len() - 1;
-                if stored.active_frame != last_idx {
-                    stored.active_frame = last_idx;
-                    stored.rgba_data = Arc::clone(&stored.frames[last_idx].rgba_data);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
             }
+
+            match params.data_width {
+                1 => {
+                    stored.animation_state = AnimationState::Stopped;
+                    stored.next_frame_at = None;
+                }
+                2 => {
+                    stored.animation_state = AnimationState::Loading;
+                    stored.loops_completed = 0;
+                    if stored.frames.len() > 1 && stored.active_frame + 1 < stored.frames.len() {
+                        let gap = stored
+                            .frames
+                            .get(stored.active_frame)
+                            .map(|f| f.gap_ms.max(1))
+                            .unwrap_or(40);
+                        stored.next_frame_at =
+                            Some(now + std::time::Duration::from_millis(gap as u64));
+                    } else {
+                        stored.next_frame_at = None;
+                    }
+                }
+                3 => {
+                    stored.animation_state = AnimationState::Running;
+                    stored.loops_completed = 0;
+                    if stored.frames.len() > 1 {
+                        let gap = stored
+                            .frames
+                            .get(stored.active_frame)
+                            .map(|f| f.gap_ms.max(1))
+                            .unwrap_or(40);
+                        stored.next_frame_at =
+                            Some(now + std::time::Duration::from_millis(gap as u64));
+                    } else {
+                        stored.next_frame_at = None;
+                    }
+                }
+                _ => {
+                    if frame_switched && stored.animation_state != AnimationState::Stopped {
+                        let gap = stored
+                            .frames
+                            .get(stored.active_frame)
+                            .map(|f| f.gap_ms.max(1))
+                            .unwrap_or(40);
+                        stored.next_frame_at =
+                            Some(now + std::time::Duration::from_millis(gap as u64));
+                    }
+                }
+            }
+
+            frame_switched
         };
 
         if switched {
             self.refresh_kitty_texture_bindings(image_id);
         }
         Ok(image_id)
+    }
+
+    /// Advance active Kitty Graphics animations due at or before `now`.
+    /// Returns `(any_frame_changed, earliest_next_deadline)`.
+    pub fn tick_animations(
+        &mut self,
+        now: std::time::Instant,
+    ) -> (bool, Option<std::time::Instant>) {
+        let mut advanced_ids: Vec<u32> = Vec::new();
+        let mut earliest_deadline: Option<std::time::Instant> = None;
+
+        for stored in self.grid.kitty_images.values_mut() {
+            if stored.animation_state == AnimationState::Stopped || stored.frames.len() <= 1 {
+                stored.next_frame_at = None;
+                continue;
+            }
+            if let Some(due) = stored.next_frame_at {
+                if now >= due {
+                    if stored.active_frame + 1 < stored.frames.len() {
+                        stored.active_frame += 1;
+                        stored.rgba_data =
+                            Arc::clone(&stored.frames[stored.active_frame].rgba_data);
+                        advanced_ids.push(stored.image_id);
+                        let gap = stored.frames[stored.active_frame].gap_ms.max(1);
+                        stored.next_frame_at =
+                            Some(now + std::time::Duration::from_millis(gap as u64));
+                    } else {
+                        match stored.animation_state {
+                            AnimationState::Loading => {
+                                stored.next_frame_at = None;
+                            }
+                            AnimationState::Running => {
+                                stored.loops_completed = stored.loops_completed.saturating_add(1);
+                                let max_loops = if stored.loop_count <= 1 {
+                                    None
+                                } else {
+                                    Some(stored.loop_count - 1)
+                                };
+                                if let Some(limit) = max_loops {
+                                    if stored.loops_completed >= limit {
+                                        stored.animation_state = AnimationState::Stopped;
+                                        stored.next_frame_at = None;
+                                        continue;
+                                    }
+                                }
+                                stored.active_frame = 0;
+                                stored.rgba_data = Arc::clone(&stored.frames[0].rgba_data);
+                                advanced_ids.push(stored.image_id);
+                                let gap = stored.frames[0].gap_ms.max(1);
+                                stored.next_frame_at =
+                                    Some(now + std::time::Duration::from_millis(gap as u64));
+                            }
+                            AnimationState::Stopped => {
+                                stored.next_frame_at = None;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(next) = stored.next_frame_at {
+                earliest_deadline = Some(earliest_deadline.map_or(next, |cur| cur.min(next)));
+            }
+        }
+
+        let dirty = !advanced_ids.is_empty();
+        for id in advanced_ids {
+            self.refresh_kitty_texture_bindings(id);
+        }
+        (dirty, earliest_deadline)
     }
 }
 
@@ -3598,6 +4069,15 @@ fn parse_xparsecolor_channel(ch: &str) -> Option<u8> {
     }
 }
 
+fn default_ansi_palette_16() -> [[u8; 3]; 16] {
+    let mut out = [[0u8; 3]; 16];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let (r, g, b) = default_indexed_rgb(i as u8);
+        *slot = [r, g, b];
+    }
+    out
+}
+
 fn default_indexed_rgb(idx: u8) -> (u8, u8, u8) {
     match idx {
         0 => (0x1a, 0x1b, 0x1e),
@@ -3774,10 +4254,14 @@ fn lookup_xtgettcap(cap_name: &str) -> Option<&'static [u8]> {
         "TN" | "name" => Some(b"xterm-256color"),
         "Co" | "colors" => Some(b"256"),
         "RGB" => Some(b"8/8/8"),
-        "Tc" | "bce" | "am" | "xenl" | "msgr" | "Su" => Some(b""),
+        "Tc" | "bce" | "am" | "xenl" | "msgr" | "Su" | "Hls" | "fullkbd" => Some(b""),
         "Smulx" => Some(b"\x1b[4:%p1%dm"),
         "Setulc" => Some(b"\x1b[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%dm"),
-        "sync" => Some(b"\x1b[?2026%?%p1%{1}%-%tl%eh%;"),
+        "sync" | "Sync" => Some(b"\x1b[?2026%?%p1%{1}%-%tl%eh%;"),
+        "Smol" => Some(b"\x1b[53m"),
+        "Rmol" => Some(b"\x1b[55m"),
+        "BE" | "ED" => Some(b"\x1b[?2004h"),
+        "BD" => Some(b"\x1b[?2004l"),
         "Cs" => Some(b"\x1b]12;%p1%s\x07"),
         "Cr" => Some(b"\x1b]112\x07"),
         "Se" => Some(b"\x1b[2 q"),
